@@ -41,32 +41,74 @@ pub use memmap::KernelLayout;
 
 pub const UMODE_TEST_ELF: &'static [u8] = include_bytes!("../../../umode/target/riscv64gc-unknown-none-elf/release/umode");
 
-// Per-thread stack region layout. Each slot gets a 4 MiB chunk: a 2 MiB
-// guard (reserved vaddrs, no leaves) followed by a 2 MiB stack mapped as a
-// single superpage. Stacks grow down, so the guard sits below the stack to
-// catch overflow as a page fault. 256 slots * 4 MiB = 1 GiB; the region
-// ends exactly at USER_TRAP_FRAME_BASE below.
-pub const UPROC_STACK_BASE:   u64 = 0x2000_0000;
-pub const UPROC_STACK_STRIDE: u64 = 4 * MB;
-pub const UPROC_STACK_SIZE:   u64 = 2 * MB;
-pub const UPROC_STACK_GUARD:  u64 = 2 * MB;
+// User address-space layout (low→high). The 2–4 GiB band is owned by the
+// kernel (map_kernel_shared identity-maps kernel text, kheap, kpages into
+// every user satp), so user layout skips over it. MMIO (CLINT, ACLINT SSWI
+// at 0x02F0_0000, e1000, UART) is identity-mapped too and sits below 2 GiB
+// — user mappings steer clear by starting at USER_NULL_GUARD_END / stack
+// base above those ranges. A future higher-half kernel migration would
+// free the 2–4 GiB band back up without requiring any change here.
+//
+//   0x0000_0000_0000_0000..USER_NULL_GUARD_END   null guard (64 KiB)
+//   ..                                            reserved
+//   UPROC_STACK_BASE..UPROC_STACK_BASE + 8 GiB    256 * 32 MiB stack slots
+//   ..                                            reserved
+//   USER_TEXT_BASE..                              user ELF image
+//   USER_MMAP_BASE..USER_MMAP_TOP                 mmap arena (allocated by syscalls)
+//   USER_TRAP_FRAME_BASE..                        256 * 4 KiB TrapFrames (S-only)
 
-pub const fn user_stack_guard_vaddr(slot: u16) -> u64 {
+// Matches Linux-style mmap_min_addr; catches NULL-region derefs as faults.
+pub const USER_NULL_GUARD_END: u64 = 0x1_0000;
+
+// Per-thread stack region. 256 slots * 32 MiB stride = 8 GiB total.
+// Each slot holds a stack sized per-thread (2..=30 MiB, multiples of 2 MiB),
+// anchored at the high end of the slot; the remainder of the slot below it
+// is a guard with no leaves so overflow faults instead of clobbering the
+// neighbouring slot.
+pub const UPROC_STACK_BASE:   u64 = 0x1_0000_0000;
+pub const UPROC_STACK_STRIDE: u64 = 32 * MB;
+pub const UPROC_STACK_GRAIN:  u64 = 2  * MB;
+pub const UPROC_STACK_MIN:    u64 = UPROC_STACK_GRAIN;
+// One grain reserved for the guard at the low end of each slot.
+pub const UPROC_STACK_MAX:    u64 = UPROC_STACK_STRIDE - UPROC_STACK_GRAIN;
+pub const UPROC_STACK_DEFAULT: u64 = UPROC_STACK_GRAIN;
+
+pub const fn user_stack_slot_base(slot: u16) -> u64 {
     UPROC_STACK_BASE + (slot as u64) * UPROC_STACK_STRIDE
 }
 
-pub const fn user_stack_vaddr(slot: u16) -> u64 {
-    user_stack_guard_vaddr(slot) + UPROC_STACK_GUARD
+pub const fn user_stack_slot_top(slot: u16) -> u64 {
+    user_stack_slot_base(slot) + UPROC_STACK_STRIDE
 }
 
-// Kernel-private region inside every user pagetable that holds per-thread
-// TrapFrame mappings (no U bit — only S-mode reads them, in
-// enter_hart_context_asm, after the satp switch). One page per slot, indexed
-// by the thread's per-process slot, so siblings in the same address space
-// don't collide. Sized to cover SlotAlloc::CAPACITY. Lives above the stack
-// region (UPROC_STACK_BASE + slot * UPROC_STACK_STRIDE) and below
-// USER_TEXT_BASE so it can't alias either.
-pub const USER_TRAP_FRAME_BASE:   u64 = 0x6000_0000;
+// Low end of the writable stack; stack grows down from user_stack_slot_top.
+pub const fn user_stack_vaddr(slot: u16, stack_size: u64) -> u64 {
+    user_stack_slot_top(slot) - stack_size
+}
+
+pub const fn user_stack_guard_vaddr(slot: u16) -> u64 {
+    user_stack_slot_base(slot)
+}
+
+pub const fn user_stack_guard_size(stack_size: u64) -> u64 {
+    UPROC_STACK_STRIDE - stack_size
+}
+
+pub const fn validate_user_stack_size(size: u64) -> bool {
+    size >= UPROC_STACK_MIN
+        && size <= UPROC_STACK_MAX
+        && size % UPROC_STACK_GRAIN == 0
+}
+
+// User ELF image and mmap arena sit above the stack region.
+pub const USER_TEXT_BASE: u64 = 0x3_4000_0000;
+
+// Kernel-private per-thread TrapFrame region (no U bit; only S-mode reads
+// them in enter_hart_context_asm after the satp switch). One page per slot,
+// indexed by the thread's per-process slot so siblings don't collide.
+// Placed near the high end of the user address space so the mmap arena
+// growing up from below can't alias it.
+pub const USER_TRAP_FRAME_BASE:   u64 = 0x100_0000_0000;
 pub const USER_TRAP_FRAME_STRIDE: u64 = PAGE_SIZE as u64;
 
 pub const fn user_trap_frame_vaddr(slot: u16) -> u64 {
@@ -168,6 +210,19 @@ impl Orbit {
             .ok_or(())
             .map_err(|_| {
                 serial::println!("failed to allocate new thread stack"); })
+    }
+
+    fn allocate_user_thread_stack(&mut self, stack_size: u64) -> Result<(usize, Layout), ()> {
+        let layout = Layout::from_size_align(stack_size as usize, UPROC_STACK_GRAIN as usize)
+            .map_err(|e| {
+                serial::println!("bad user stack layout for size={stack_size}: {e:?}");
+            })?;
+        let paddr = self.kernel_pages.alloc_aligned(layout)
+            .ok_or(())
+            .map_err(|_| {
+                serial::println!("failed to allocate user thread stack size={stack_size}");
+            })?;
+        Ok((paddr, layout))
     }
 
     fn allocate_trap_frame(&mut self) -> Result<usize, ()> {
@@ -514,7 +569,16 @@ impl Orbit {
 
     fn dealloc_thread(&mut self, thread: &'static Thread) {
         match (thread.slot, thread.pid) {
-            (None, 0) => { /* kernel thread — no per-process slot expected */ }
+            (None, 0) => {
+                // Kernel thread. Its stack and trap frame were allocated
+                // directly from kernel_pages with fixed layouts and aren't
+                // recorded in any proc.maps, so free them here.
+                let tstack = thread.stack as *const _ as usize;
+                self.kernel_pages.dealloc_aligned(tstack, Self::THREAD_STACK_LAYOUT);
+
+                let trap_frame = thread.frame as *const _ as usize;
+                self.kernel_pages.dealloc_aligned(trap_frame, Self::THREAD_TRAP_FRAME_LAYOUT);
+            }
             (Some(slot), 0) => error!(
                 "dealloc_thread: tid{} is a kernel thread but carries slot{}",
                 thread.tid, slot),
@@ -523,26 +587,60 @@ impl Orbit {
                 thread.tid, pid),
             (Some(slot), pid) => match self.processes.get_mut(&pid) {
                 Some(proc) => {
-                    let tf_vaddr    = user_trap_frame_vaddr(slot);
-                    let stack_vaddr = user_stack_vaddr(slot);
-                    let guard_vaddr = user_stack_guard_vaddr(slot);
                     let root_table  = unsafe {
                         ((proc.satp.ppn() * PAGE_SIZE) as *const PageTable)
                             .as_ref_unchecked()
                     };
-                    // Drop the per-thread leaves so the slot's vaddrs are
-                    // reusable. Failure here just means the entry was already
-                    // gone (e.g. process teardown raced ahead). The guard has
-                    // no leaf — only its proc.maps entry needs clearing.
-                    unsafe {
-                        let _ = unmap_page(root_table, VirtAddr::new(tf_vaddr), 4);
-                        let _ = unmap_page(root_table, VirtAddr::new(stack_vaddr), 3);
-                        riscv::asm::sfence_vma(pid as usize, tf_vaddr as usize);
-                        riscv::asm::sfence_vma(pid as usize, stack_vaddr as usize);
+
+                    // Collect first so we can release the immutable borrow on
+                    // proc before tearing down leaves / freeing backings.
+                    let mappings: Vec<UserMapping> = proc.mappings_for_slot(slot).copied().collect();
+
+                    for m in &mappings {
+                        match m.kind {
+                            MappingKind::Stack { .. } => {
+                                // Stack is a range of 2 MiB megapages; flush
+                                // each page's TLB entry as we tear it down so
+                                // nothing survives for slots 2..N.
+                                for v in (m.vaddr..m.vaddr + m.len).step_by(UPROC_STACK_GRAIN as usize) {
+                                    unsafe {
+                                        let _ = unmap_page(root_table, VirtAddr::new(v), 3);
+                                        riscv::asm::sfence_vma(pid as usize, v as usize);
+                                    }
+                                }
+                            }
+                            MappingKind::TrapFrame { .. } => {
+                                unsafe {
+                                    let _ = unmap_page(root_table, VirtAddr::new(m.vaddr), 4);
+                                    riscv::asm::sfence_vma(pid as usize, m.vaddr as usize);
+                                }
+                            }
+                            MappingKind::Guard { .. } => {
+                                // No leaf backs the guard; only the proc.maps
+                                // entry needs clearing below.
+                            }
+                            MappingKind::Tls { .. } => {
+                                // TODO: unmap TLS leaves once TLS is wired up.
+                                // Backing (if any) is still freed by the tail
+                                // of this loop, but leaves would leak.
+                            }
+                            // mappings_for_slot filters on MappingKind::slot(),
+                            // which only returns Some for the arms above.
+                            MappingKind::Elf
+                            | MappingKind::Anon
+                            | MappingKind::NetCh { .. } => unreachable!(
+                                "mappings_for_slot yielded non-slot kind {:?}", m.kind),
+                        }
+
+                        if let Some(b) = m.backing {
+                            self.kernel_pages.dealloc_aligned(b.paddr as usize, b.layout);
+                        }
+
+                        let proc = self.processes.get_mut(&pid).expect("proc vanished mid-teardown");
+                        let _ = proc.maps.remove(&m.vaddr);
                     }
-                    let _ = proc.maps.remove(&tf_vaddr);
-                    let _ = proc.maps.remove(&stack_vaddr);
-                    let _ = proc.maps.remove(&guard_vaddr);
+
+                    let proc = self.processes.get_mut(&pid).expect("proc vanished mid-teardown");
                     proc.thread_slots.free(slot);
                 }
                 None => error!(
@@ -550,12 +648,6 @@ impl Orbit {
                     thread.tid, pid),
             }
         }
-
-        let tstack = thread.stack as *const _ as usize;
-        self.kernel_pages.dealloc_aligned(tstack, Self::THREAD_STACK_LAYOUT);
-
-        let trap_frame = thread.frame as *const _ as usize;
-        self.kernel_pages.dealloc_aligned(trap_frame, Self::THREAD_TRAP_FRAME_LAYOUT);
     }
 
     fn dealloc_process(&mut self, mut process: Process) {
@@ -959,7 +1051,7 @@ impl Orbit {
         }
     }
 
-    fn map_stack(&mut self, root_table: &'static PageTable, stackp: u64, stackv: u64) -> Result<(), ()> {
+    fn map_stack(&mut self, root_table: &'static PageTable, stackp: u64, stackv: u64, stack_size: u64) -> Result<(), ()> {
         let mut pages = PageAlloc::FA(&mut self.table_pages);
         unsafe {
             map_address_range(
@@ -967,14 +1059,14 @@ impl Orbit {
                 &mut pages,
                 &MappingConfig {
                     permissions: PagePermissions::U | PagePermissions::R | PagePermissions::W,
-                    levels: 3, page_size: UPROC_STACK_SIZE,
+                    levels: 3, page_size: UPROC_STACK_GRAIN,
                     vaddr: VirtAddr::new(stackv),
                     paddr: PhysAddr::new(stackp),
                     log: false,
                     supervisor_tag: None
                 },
-                VirtAddr::new(stackv + UPROC_STACK_SIZE),
-                PhysAddr::new(stackp + UPROC_STACK_SIZE))
+                VirtAddr::new(stackv + stack_size),
+                PhysAddr::new(stackp + stack_size))
         }
     }
 
@@ -997,7 +1089,7 @@ impl Orbit {
         }
     }
     
-    pub fn add_new_thread_to_process(&mut self, pid: u16, entrypoint: usize) -> Result<(), ()> {
+    pub fn add_new_thread_to_process(&mut self, pid: u16, entrypoint: usize, stack_size: u64) -> Result<(), ()> {
         if !self.processes.contains_key(&pid) {
             return Err(())
         }
@@ -1015,7 +1107,7 @@ impl Orbit {
 
         };
 
-        let thread = match self.create_new_thread(pid, root_table, entrypoint, slot) {
+        let thread = match self.create_new_thread(pid, root_table, entrypoint, slot, stack_size) {
             Ok(t) => t,
             Err(e) => {
                 self.processes.get_mut(&pid).unwrap().thread_slots.free(slot);
@@ -1049,11 +1141,16 @@ impl Orbit {
         Ok(())
     }
     
-    pub fn create_new_thread(&mut self, pid: u16, root_table: &'static PageTable, entrypoint: usize, slot: u16) -> Result<Thread, ()> {
+    pub fn create_new_thread(&mut self, pid: u16, root_table: &'static PageTable, entrypoint: usize, slot: u16, stack_size: u64) -> Result<Thread, ()> {
+        if !validate_user_stack_size(stack_size) {
+            serial::println!("invalid user stack size {stack_size}");
+            return Err(())
+        }
+
         let mut page_list = Vec::new();
 
-        let stackp = self.allocate_thread_stack()?;
-        page_list.push((stackp, Self::THREAD_STACK_LAYOUT));
+        let (stackp, stack_layout) = self.allocate_user_thread_stack(stack_size)?;
+        page_list.push((stackp, stack_layout));
 
         let trap_frame = self.allocate_trap_frame()
             .map_err(|_| {
@@ -1062,11 +1159,12 @@ impl Orbit {
 
         page_list.push((trap_frame, Self::THREAD_TRAP_FRAME_LAYOUT));
 
-        let stack_vaddr      = user_stack_vaddr(slot);
+        let stack_vaddr      = user_stack_vaddr(slot, stack_size);
         let guard_vaddr      = user_stack_guard_vaddr(slot);
+        let guard_size       = user_stack_guard_size(stack_size);
         let trap_frame_vaddr = user_trap_frame_vaddr(slot);
 
-        if let Err(_) = self.map_stack(root_table, stackp as u64, stack_vaddr) {
+        if let Err(_) = self.map_stack(root_table, stackp as u64, stack_vaddr, stack_size) {
             self.free_kernel_pages(&page_list[..]);
             self.table_pages.dealloc_aligned(root_table as *const _ as usize, Self::TABLE_LAYOUT);
 
@@ -1090,18 +1188,18 @@ impl Orbit {
             // into a thread kill once it consults proc.maps.
             proc.insert_mapping(UserMapping {
                 vaddr:   guard_vaddr,
-                len:     UPROC_STACK_GUARD,
+                len:     guard_size,
                 perms:   0,
                 backing: None,
                 kind:    MappingKind::Guard { slot },
             });
             proc.insert_mapping(UserMapping {
                 vaddr:   stack_vaddr,
-                len:     UPROC_STACK_SIZE,
+                len:     stack_size,
                 perms:   (PagePermissions::U | PagePermissions::R | PagePermissions::W) as u64,
                 backing: Some(PhysBacking {
                     paddr:  stackp as u64,
-                    layout: Self::THREAD_STACK_LAYOUT,
+                    layout: stack_layout,
                 }),
                 kind:    MappingKind::Stack { slot },
             });
@@ -1124,7 +1222,7 @@ impl Orbit {
             core::ptr::write_bytes(f as *mut u8, 0, PAGE_SIZE);
 
             let s = stackp as *mut Stack;
-            core::ptr::write_bytes(s as *mut u8, 0, 2 * MB as usize);
+            core::ptr::write_bytes(s as *mut u8, 0, stack_size as usize);
 
             (
                 f.as_mut_unchecked(),
@@ -1138,7 +1236,7 @@ impl Orbit {
         satp.set_ppn(root_table as *const _ as usize / PAGE_SIZE);
 
         frame.regs[1] = entrypoint;
-        frame.regs[2] = (stack_vaddr + UPROC_STACK_SIZE - 16) as usize;
+        frame.regs[2] = (stack_vaddr + stack_size - 16) as usize;
         frame.asid = pid as usize;
 
         serial::println!("ventry={:016X?},vsp=0x{:016X?},rpt={:016X?}", entrypoint, frame.regs[2], root_table as *const PageTable);
@@ -1159,7 +1257,7 @@ impl Orbit {
         })
     }
     
-    pub fn create_new_process(&mut self, elf_blob: &[u8]) -> Result<(), ()> {
+    pub fn create_new_process(&mut self, elf_blob: &[u8], stack_size: u64) -> Result<(), ()> {
         let root_table = self.create_new_page_table()?;
         let elf = self.load_elf(root_table, elf_blob)?;
         let pid = self.next_pid();
@@ -1177,7 +1275,7 @@ impl Orbit {
         // into proc.maps via self.processes.get_mut.
         self.processes.insert(pid, proc);
 
-        let thread = match self.create_new_thread(pid, root_table, elf.entrypoint, slot) {
+        let thread = match self.create_new_thread(pid, root_table, elf.entrypoint, slot, stack_size) {
             Ok(t) => t,
             Err(e) => {
                 let _ = self.processes.remove(&pid);
@@ -1233,8 +1331,8 @@ impl Orbit {
                 continue
             }
 
-            if segment.p_vaddr < (0x80000000 + (256 * MB)) {
-                serial::println!("illegal elf p_vaddr");
+            if segment.p_vaddr < USER_TEXT_BASE {
+                serial::println!("illegal elf p_vaddr 0x{:X} (below USER_TEXT_BASE 0x{:X})", segment.p_vaddr, USER_TEXT_BASE);
                 return Err(())
             }
 

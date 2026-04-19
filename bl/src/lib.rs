@@ -88,7 +88,7 @@ pub extern "C" fn kmain_enter(serial_addr: usize, dtb_addr: usize) {
         Err(e) => { println!("failed to parse kernel elf: {e:?}"); return }
     };
 
-    let base = 0x8000_0000 + GB;
+    const VBASE: u64 = 0x8000_0000 + (64 * MB);
 
     let segments = elf.segments().unwrap();
     for segment in segments.iter() {
@@ -97,7 +97,7 @@ pub extern "C" fn kmain_enter(serial_addr: usize, dtb_addr: usize) {
             continue
         }
 
-        let vaddr = base + segment.p_vaddr;
+        let vaddr = VBASE + segment.p_vaddr;
         println!("loading {}KB 0x{vaddr:08X}={segment:08x?}",
             mem::round_u64_up(segment.p_memsz, 4096) / 1024);
 
@@ -125,7 +125,7 @@ pub extern "C" fn kmain_enter(serial_addr: usize, dtb_addr: usize) {
     println!("finished loading segments?");
 
     unsafe {
-        let entrypoint = (elf.ehdr.e_entry + base) as usize;
+        let entrypoint = (elf.ehdr.e_entry + VBASE) as usize;
 
         println!("mret to 0x{entrypoint:016X}");
 

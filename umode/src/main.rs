@@ -93,8 +93,8 @@ pub unsafe extern "C" fn _start() -> ! {
 
     sleep_ms(5000);
 
-    let n = 0 as *const u64;
-    core::ptr::read_volatile(n);
+    //let n = 0 as *const u64;
+    //core::ptr::read_volatile(n);
 
     // map 4096 bytes to addr with read/write + share with kernel
     let addr = 0x9000_9000;
@@ -206,7 +206,7 @@ pub unsafe extern "C" fn _start() -> ! {
             let _ = sleep_ms(10);
         }
     }    
-    //exit(0);
+    exit(0);
 }
 
 #[panic_handler]

@@ -220,7 +220,7 @@ pub extern "C" fn k_smpstart() {
         (hart_context.cscratch as *mut kmain::kernel::Orbit).as_mut_unchecked()
     };
 
-    orbit.create_new_process(kmain::kernel::UMODE_TEST_ELF)
+    orbit.create_new_process(kmain::kernel::UMODE_TEST_ELF, kmain::kernel::UPROC_STACK_DEFAULT)
         .expect("no test uprocess");
 
     orbit.get_environment_info();
