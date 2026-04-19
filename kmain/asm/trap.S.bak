@@ -1,0 +1,184 @@
+# trap.S
+# Trap handler and global context
+# Steve Operating System
+# Stephen Marz
+# 24 February 2019
+.option norvc
+.altmacro
+.set NUM_GP_REGS, 32  # Number of registers per context
+.set REG_SIZE, 8   # Register size (in bytes)
+
+# Use macros for saving and restoring multiple registers
+.macro save_gp i, basereg=t6
+	sd	x\i, ((\i)*REG_SIZE)(\basereg)
+.endm
+.macro load_gp i, basereg=t6
+	ld	x\i, ((\i)*REG_SIZE)(\basereg)
+.endm
+.macro save_fp i, basereg=t6
+	fsd	f\i, ((NUM_GP_REGS+(\i))*REG_SIZE)(\basereg)
+.endm
+.macro load_fp i, basereg=t6
+	fld	f\i, ((NUM_GP_REGS+(\i))*REG_SIZE)(\basereg)
+.endm
+
+.section .text
+.global s_trap_vector
+# This must be aligned by 4 since the last two bits
+# of the mtvec register do not contribute to the address
+# of this vector.
+.align 4
+s_trap_vector:
+	csrrw	t6, sscratch, t6
+
+	.set 	i, 0
+	.rept	31
+		save_gp	%i
+		.set	i, i+1
+	.endr
+
+	# Save the actual t6 register, which we swapped into
+	# sscratch
+	mv		t5, t6
+	csrr	t6, sscratch
+	save_gp 31, t5
+
+	# Restore the kernel trap frame into sscratch
+	csrw	sscratch, t5
+
+	csrr	t1, sstatus
+	srli	t0, t1, 13
+	andi	t0, t0, 3
+	li		t3, 3
+	bne		t0, t3, 1f
+	# Save floating point registers
+	.set 	i, 0
+	.rept	32
+		save_fp	%i, t5
+		.set	i, i+1
+	.endr
+1:
+	# restore kernel satp from
+	# hart context
+	csrr t0, sscratch
+	ld t0, 568(t0)
+	csrw satp, t0
+	sfence.vma x0, x0
+
+	# set sp to kernel trap stack sp
+	csrr t0, sscratch
+	ld sp, 528(t0)
+
+	csrr	a0, sepc
+	csrr	a1, stval
+	csrr	a2, scause
+	csrr	a3, sstatus
+	csrr	a4, sscratch
+	call	s_trap
+
+	# When we get here, we've returned from m_trap, restore registers
+	# and return.
+	# s_trap will return the return address via a0.
+
+	csrw	sepc, a0
+	# Now load the trap frame back into t6
+	csrr	t6, sscratch
+
+	csrr	t1, sstatus
+	srli	t0, t1, 13
+	andi	t0, t0, 3
+	li		t3, 3
+	bne		t0, t3, 1f
+	.set	i, 0
+	.rept	32
+		load_fp %i
+		.set i, i+1
+	.endr
+1:
+	# Restore all GP registers
+	.set	i, 1
+	.rept	31
+		load_gp %i
+		.set	i, i+1
+	.endr
+
+	# Since we ran this loop 31 times starting with i = 1,
+	# the last one loaded t6 back to its original value.
+	sret
+
+.global enter_hart_kcontext_asm
+# Resume a supervisor-mode thread from its saved frame.
+# Caller must ensure sscratch already points at this hart's HartContext -
+# the trap vector depends on it. No satp switch happens, so a0 stays valid
+# as the frame base throughout (contrast enter_hart_context_asm, where the
+# satp switch kills a0's kernel mapping and forces the USER_TRAP_FRAME_VADDR detour).
+enter_hart_kcontext_asm:
+	mv	t6, a0
+
+	# Only touch FP regs when sstatus.FS == Dirty, matching s_trap_vector.
+	csrr	t1, sstatus
+	srli	t0, t1, 13
+	andi	t0, t0, 3
+	li	t3, 3
+	bne	t0, t3, 2f
+	.set	i, 0
+	.rept	32
+		load_fp %i
+		.set i, i+1
+	.endr
+2:
+	.set	i, 1
+	.rept	31
+		load_gp %i, t6
+		.set	i, i+1
+	.endr
+
+	sret
+
+.global enter_hart_context_asm
+# Resume a user-mode thread. Switches satp to the user address space, then
+# reads the saved register file through the user mapping at USER_TRAP_FRAME_VADDR
+# (the thread's TrapFrame is mapped R-only there in every user pagetable;
+# see map_trap_frame). After the satp switch, a0 no longer reaches the
+# kernel mapping of the frame, which is why the vaddr is hardcoded here.
+enter_hart_context_asm:
+	# Stash the kernel HartContext ptr into frame.scratch (offset 520) so
+	# we can recover it after losing the kernel mapping.
+	csrr t0, sscratch
+	sd t0, 520(a0)
+
+	# Switch to the user address space. From here on, a0 is unreachable.
+	csrw satp, a1
+	sfence.vma x0, a2
+
+	li	t6, USER_TRAP_FRAME_VADDR
+
+	# Only touch FP regs when sstatus.FS == Dirty, matching s_trap_vector.
+	csrr	t1, sstatus
+	srli	t0, t1, 13
+	andi	t0, t0, 3
+	li	t3, 3
+	bne	t0, t3, 2f
+	.set	i, 0
+	.rept	32
+		load_fp %i
+		.set i, i+1
+	.endr
+2:
+	.set	i, 1
+	.rept	31
+		load_gp %i, t6
+		.set	i, i+1
+	.endr
+	# After the loop, t6 holds the user's saved t6 (frame.regs[31]).
+
+	# Put the kernel HartContext ptr back in sscratch so the trap vector
+	# works on the next trap, then restore user t6 from frame.regs[31]
+	# (offset 31*8 = 248).
+	li	t6, USER_TRAP_FRAME_VADDR
+	ld	t6, 520(t6)
+	csrw	sscratch, t6
+	li	t6, USER_TRAP_FRAME_VADDR
+	ld	t6, 248(t6)
+
+	sret

@@ -1,0 +1,16 @@
+[package]
+name = "bl"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+riscv = { version = "0.16.0", features = ["rt"] }
+mmu = { path = "../mmu" }
+device = { path = "../device" }
+serial = { path = "../serial" }
+elf = { version = "0.8.0", default-features = false }
+process = { path = "../process" }
+mem = { path = "../mem" }
+
+[build-dependencies]
+riscv-target = "0.1.2"

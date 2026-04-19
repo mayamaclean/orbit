@@ -1,0 +1,10 @@
+[package]
+name = "mem"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+heapless = { version = "0.9.2", features = ["portable-atomic"] }
+
+[features]
+alloc = []

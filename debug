@@ -1,0 +1,5 @@
+#!/usr/bin/bash
+crate=$1
+exec=$2
+#gdb -ex "file target/riscv64gc-unknown-none-elf/debug/$exec" -ex "target extended-remote localhost:1234"
+rust-lldb --one-line "gdb-remote localhost:1234" --file "$crate/target/riscv64gc-unknown-none-elf/release/$exec"

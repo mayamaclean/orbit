@@ -1,0 +1,12 @@
+[package]
+name = "mmu"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+#bitvec = { version = "1.0.1", default-features = false, features = ["atomic"] }
+serial = { path = "../serial" }
+mem = { path = "../mem" }
+
+[features]
+alloc = ["mem/alloc"]

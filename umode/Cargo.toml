@@ -1,0 +1,7 @@
+[package]
+name = "umode"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+net_channel = {path = "../net_channel" }
