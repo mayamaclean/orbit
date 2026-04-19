@@ -2,7 +2,7 @@
 
 extern crate alloc;
 
-use core::{arch::asm, ptr::null_mut, sync::atomic::Ordering};
+use core::{arch::asm, ptr::null_mut, sync::atomic::{AtomicBool, Ordering}};
 use alloc::{collections::btree_map::BTreeMap, vec::Vec};
 use device::{HartContext, TrapFrame};
 use mmu::{PAGE_SIZE, sv48::{PageTable, VirtAddr}, mmap::virt_to_phys};
@@ -57,8 +57,20 @@ pub fn wait_for(target: u64) {
     );
 }
 
+pub static MANAGER_LOCK: AtomicBool = AtomicBool::new(false);
+
+pub fn try_acquire_manager() -> bool {
+    MANAGER_LOCK
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
+        .is_ok()
+}
+
+pub fn release_manager() {
+    MANAGER_LOCK.store(false, Ordering::Release);
+}
+
 #[unsafe(no_mangle)]
-pub extern "C" fn k_manage() -> ! {
+pub extern "C" fn k_hart_loop() -> ! {
     let hart_context = unsafe {
         (riscv::register::sscratch::read() as *const HartContext).as_ref_unchecked()
     };
@@ -68,38 +80,33 @@ pub extern "C" fn k_manage() -> ! {
     };
 
     loop {
-        while orbit.runnable_thread_count() == 0 {
-            orbit.cleanup_threads_and_processes();
-            wait_for(100_000);
-        }
-
-        orbit.check_net();
-        orbit.cleanup_threads_and_processes();
-        orbit.assign_threads(hart_context);
-
         if hart_has_thread(hart_context) {
             setup_hart_timer(1_000_000);
             unsafe { enter_hart_context(hart_context); }
         }
 
-        //orbit.print_threads();
-    }
-}
+        // Disable sstatus.SIE around the acquire + critical section. If a
+        // trap fired mid-section the handler would long-jump via kptr back
+        // to k_hart_loop without releasing MANAGER_LOCK, deadlocking all
+        // harts. setup_hart_timer restores SIE on the way out.
+        unsafe { riscv::register::sstatus::clear_sie(); }
+        if try_acquire_manager() {
+            orbit.cleanup_threads_and_processes();
+            orbit.check_net();
+            orbit.assign_threads(hart_context);
+            release_manager();
 
-#[unsafe(no_mangle)]
-pub extern "C" fn k_idle() {
-    let hart_context = unsafe {
-        (riscv::register::sscratch::read() as *const HartContext).as_ref_unchecked()
-    };
+            if hart_has_thread(hart_context) {
+                setup_hart_timer(1_000_000);
+                unsafe { enter_hart_context(hart_context); }
+            }
+        }
 
-    if hart_has_thread(hart_context) {
-        setup_hart_timer(10_000_000);
-        unsafe { enter_hart_context(hart_context); }
-    }
-    
-    unsafe {
-        riscv::register::sie::set_ssoft();
-        loop { riscv::asm::wfi(); }
+        unsafe {
+            riscv::register::sie::set_ssoft();
+            setup_hart_timer(100_000);
+            riscv::asm::wfi();
+        }
     }
 }
 
@@ -128,7 +135,7 @@ fn set_ipv4_addr(iface: &mut smoltcp::iface::Interface, cidr: smoltcp::wire::Ipv
 }
 
 fn handle_dhcp_event(mut iface: smoltcp::iface::Interface, event: dhcpv4::Event) -> smoltcp::iface::Interface {
-    use tracing::{info, warn, error};
+    use tracing::{info, warn};
 
     match event {
         dhcpv4::Event::Configured(config) => {

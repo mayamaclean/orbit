@@ -97,9 +97,9 @@ pub unsafe extern "C" fn _start() -> ! {
     //core::ptr::read_volatile(n);
 
     // map 4096 bytes to addr with read/write + share with kernel
-    let addr = 0x9000_9000;
-    let ptr = 0x9000_9000 as *mut u64;
-    if mmap(addr, 4096, 0x6, true) == 0 {
+    const AHINT: usize = 6 * 1024 * 1024 * 1024;
+    let ptr = AHINT as *mut u64;
+    if mmap(AHINT, 4096, 0x6, true) == 0 {
         unsafe {
             core::ptr::write_bytes(ptr as *mut u8, 0, 4096);
         }

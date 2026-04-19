@@ -193,12 +193,7 @@ extern "C" fn k_harthello() {
     unsafe {
         //println!("hart_context @ {:016X?} hartid={} kptr={:016X?}", hart_context as *const _, hart_context.hart_id, hart_context.kptr.load(Ordering::Relaxed));
 
-        if hart_context.hart_id == 0 {
-            hart_context.kptr.store(kmain::k_manage as *mut (), Ordering::Relaxed);
-        }
-        else {
-            hart_context.kptr.store(kmain::k_idle as *mut (), Ordering::Relaxed);
-        }
+        hart_context.kptr.store(kmain::k_hart_loop as *mut (), Ordering::Relaxed);
 
         let s_trap_addr = { s_trap_vector as *const () as usize };
         riscv::register::stvec::write(Stvec::new(s_trap_addr, TrapMode::Direct));

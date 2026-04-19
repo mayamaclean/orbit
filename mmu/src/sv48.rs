@@ -43,14 +43,6 @@ impl VirtAddr {
         self.get_raw() & Self::PAGE_OFFSET_MASK
     }
 
-    pub fn set_page_offset(&self, offset: u16) {
-        let o = offset as u64 & Self::PAGE_OFFSET_MASK;
-        let mut c = self.get_raw();
-        c &= !Self::PAGE_OFFSET_MASK;
-        c |= o;
-        self.set_raw(c);
-    }
-
     pub fn vpn_n(&self, n: usize) -> u64 {
         let i = Self::VPN_OFFSETS[n];
         let m = Self::VIRT_PAGE_NUM_MASK << i as u64;
@@ -79,51 +71,6 @@ impl VirtAddr {
         let i = Self::VPN_OFFSETS[3];
         let m = Self::VIRT_PAGE_NUM_MASK << i as u64;
         (self.get_raw() & m) >> Self::VPN_OFFSETS[3]
-    }
-
-    pub fn set_vpn_n(&self, n: usize, vpn: u64) {
-        let i = Self::VPN_OFFSETS[n];
-        let m = Self::VIRT_PAGE_NUM_MASK << i as u64;
-        let mut c = self.get_raw();
-        c &= !m;
-        c |= (vpn as u64 & Self::VIRT_PAGE_NUM_MASK) << i;
-        self.set_raw(c);
-    }
-
-    pub fn set_vpn0(&self, vpn: u16) {
-        let i = Self::VPN_OFFSETS[0];
-        let m = Self::VIRT_PAGE_NUM_MASK << i as u64;
-        let mut c = self.get_raw();
-        c &= !m;
-        c |= (vpn as u64 & Self::VIRT_PAGE_NUM_MASK) << i;
-        self.set_raw(c);
-    }
-
-    pub fn set_vpn1(&self, vpn: u16) {
-        let i = Self::VPN_OFFSETS[1];
-        let m = Self::VIRT_PAGE_NUM_MASK << i as u64;
-        let mut c = self.get_raw();
-        c &= !m;
-        c |= (vpn as u64 & Self::VIRT_PAGE_NUM_MASK) << i;
-        self.set_raw(c);
-    }
-
-    pub fn set_vpn2(&self, vpn: u16) {
-        let i = Self::VPN_OFFSETS[2];
-        let m = Self::VIRT_PAGE_NUM_MASK << i as u64;
-        let mut c = self.get_raw();
-        c &= !m;
-        c |= (vpn as u64 & Self::VIRT_PAGE_NUM_MASK) << i;
-        self.set_raw(c);
-    }
-
-    pub fn set_vpn3(&self, vpn: u32) {
-        let i = Self::VPN_OFFSETS[3];
-        let m = Self::VIRT_PAGE_NUM_MASK << i as u64;
-        let mut c = self.get_raw();
-        c &= !m;
-        c |= (vpn as u64 & Self::VIRT_PAGE_NUM_MASK) << i;
-        self.set_raw(c);
     }
 }
 
@@ -168,23 +115,8 @@ impl PhysAddr {
         self.get_raw() & Self::PAGE_OFFSET_MASK
     }
 
-    pub fn set_page_offset(&self, offset: u16) {
-        let o = offset as u64 & Self::PAGE_OFFSET_MASK;
-        let mut c = self.get_raw();
-        c &= !Self::PAGE_OFFSET_MASK;
-        c |= o;
-        self.set_raw(c);
-    }
-
     pub fn ppn(&self) -> u64 {
         (self.get_raw() & !Self::PAGE_OFFSET_MASK) >> Self::PPN_OFFSETS[0]
-    }
-
-    pub fn set_ppn(&self, ppn: u64) {
-        let mut c = self.get_raw();
-        c &= Self::PAGE_OFFSET_MASK;
-        c |= ppn << Self::PPN_OFFSETS[0];
-        self.set_raw(c);
     }
 
     pub fn ppn_n(&self, n: usize) -> u64 {
@@ -217,52 +149,6 @@ impl PhysAddr {
         let m = Self::PHYS_PAGE_NUM_MASK << i as u64;
         (self.get_raw() & m) >> Self::PPN_OFFSETS[3]
     }
-
-    pub fn set_ppn_n(&self, n: usize, ppn: u16) {
-        let i = Self::PPN_OFFSETS[n];
-        let pm = if n == 3 { Self::PHYS_PAGE_NUM_MASK3 } else { Self::PHYS_PAGE_NUM_MASK };
-        let m = pm << i as u64;
-        let mut c = self.get_raw();
-        c &= !m;
-        c |= (ppn as u64 & Self::PHYS_PAGE_NUM_MASK) << i;
-        self.set_raw(c);
-    }
-
-    pub fn set_ppn0(&self, ppn: u16) {
-        let i = Self::PPN_OFFSETS[0];
-        let m = Self::PHYS_PAGE_NUM_MASK << i as u64;
-        let mut c = self.get_raw();
-        c &= !m;
-        c |= (ppn as u64 & Self::PHYS_PAGE_NUM_MASK) << i;
-        self.set_raw(c);
-    }
-
-    pub fn set_ppn1(&self, ppn: u16) {
-        let i = Self::PPN_OFFSETS[1];
-        let m = Self::PHYS_PAGE_NUM_MASK << i as u64;
-        let mut c = self.get_raw();
-        c &= !m;
-        c |= (ppn as u64 & Self::PHYS_PAGE_NUM_MASK) << i;
-        self.set_raw(c);
-    }
-
-    pub fn set_ppn2(&self, ppn: u16) {
-        let i = Self::PPN_OFFSETS[2];
-        let m = Self::PHYS_PAGE_NUM_MASK << i as u64;
-        let mut c = self.get_raw();
-        c &= !m;
-        c |= (ppn as u64 & Self::PHYS_PAGE_NUM_MASK) << i;
-        self.set_raw(c);
-    }
-
-    pub fn set_ppn3(&self, ppn: u32) {
-        let i = Self::PPN_OFFSETS[3];
-        let m = Self::PHYS_PAGE_NUM_MASK3 << i as u64;
-        let mut c = self.get_raw();
-        c &= !m;
-        c |= (ppn as u64 & Self::PHYS_PAGE_NUM_MASK3) << i;
-        self.set_raw(c);
-    }
 }
 
 #[repr(transparent)]
@@ -277,6 +163,19 @@ impl PageTableEntry {
     pub const PPN_OFFSETS: [u64; 4] = [
         10, 19, 28, 37
     ];
+
+    // Single-bit flag masks. Using these (over repeated `1 << N`) keeps
+    // `pack_leaf` and the atomic setters readable.
+    pub const VALID:      u64 = 1 << 0;
+    pub const READABLE:   u64 = 1 << 1;
+    pub const WRITEABLE:  u64 = 1 << 2;
+    pub const EXECUTABLE: u64 = 1 << 3;
+    pub const USER_PAGE:  u64 = 1 << 4;
+    pub const GLOBAL:     u64 = 1 << 5;
+    pub const ACCESSED:   u64 = 1 << 6;
+    pub const DIRTY:      u64 = 1 << 7;
+    // R|W|X|U|G — the bits PagePermissions encodes.
+    pub const PERMS_MASK: u64 = 0x3E;
 
     pub const fn new(raw: u64) -> Self {
         Self {
@@ -294,6 +193,29 @@ impl PageTableEntry {
         self.e.store(e, Ordering::Release);
     }
 
+    /// Build a fully-formed leaf PTE value in one `u64`. Store with a single
+    /// `set_raw` so a remote hardware table walker observes either the old
+    /// value or the fully-constructed new one — never a half-built PTE.
+    ///
+    /// `ppn` is the 44-bit physical page number (paddr / PAGE_SIZE).
+    /// `perms` carries R/W/X/U/G bits (matches `PagePermissions`). `V`, `A`,
+    /// `D` are set unconditionally.
+    #[inline]
+    pub const fn pack_leaf(ppn: u64, perms: u64) -> u64 {
+        (ppn << Self::PPN_OFFSETS[0])
+            | (perms & Self::PERMS_MASK)
+            | Self::VALID
+            | Self::ACCESSED
+            | Self::DIRTY
+    }
+
+    /// Build a non-leaf (table-pointer) PTE value. The only permission bit
+    /// set is `V`; R/W/X zero makes it an interior PTE per the spec.
+    #[inline]
+    pub const fn pack_table(ppn: u64) -> u64 {
+        (ppn << Self::PPN_OFFSETS[0]) | Self::VALID
+    }
+
     pub fn get_ppn(&self) -> u64 {
         let r = self.get_raw();
         r & 0x3F_FFFF_FFFF_FC00
@@ -306,10 +228,11 @@ impl PageTableEntry {
 
     fn set_bit(&self, bit: u64, b: bool) {
         let m = 1 << bit;
-        let mut c = self.get_raw();
-        c &= !m;
-        c |= (b as u64) << bit;
-        self.set_raw(c);
+        if b {
+            self.e.fetch_or(m, Ordering::AcqRel);
+        } else {
+            self.e.fetch_and(!m, Ordering::AcqRel);
+        }
     }
     
     pub fn is_valid(&self) -> bool {
@@ -390,21 +313,14 @@ impl PageTableEntry {
     /// set the 2 rsw bits
     pub fn set_supervisor_bits(&self, bits: u8) {
         const M: u64 = 3 << 8;
-        let mut c = self.get_raw();
-        c &= !M;
-        c |= (bits as u64 & 3) << 8;
-        self.set_raw(c);
+        let new = (bits as u64 & 3) << 8;
+        let _ = self.e.fetch_update(Ordering::AcqRel, Ordering::Acquire, |c| {
+            Some((c & !M) | new)
+        });
     }
 
     pub fn ppn(&self) -> u64 {
         (self.get_raw() & !Self::STATUS_BITS_MASK) >> Self::PPN_OFFSETS[0]
-    }
-
-    pub fn set_ppn(&self, ppn: u64) {
-        let mut c = self.get_raw();
-        c &= Self::STATUS_BITS_MASK;
-        c |= ppn << Self::PPN_OFFSETS[0];
-        self.set_raw(c);
     }
 
     pub fn ppn_n(&self, n: usize) -> u64 {
@@ -435,51 +351,6 @@ impl PageTableEntry {
         let i = Self::PPN_OFFSETS[3];
         let m = PhysAddr::PHYS_PAGE_NUM_MASK3 << i as u64;
         (self.get_raw() & m) >> Self::PPN_OFFSETS[3]
-    }
-
-    pub fn set_ppn_n(&self, n: usize, ppn: u16) {
-        let i = Self::PPN_OFFSETS[n];
-        let m = PhysAddr::PHYS_PAGE_NUM_MASK << i as u64;
-        let mut c = self.get_raw();
-        c &= !m;
-        c |= (ppn as u64 & PhysAddr::PHYS_PAGE_NUM_MASK) << i;
-        self.set_raw(c);
-    }
-
-    pub fn set_ppn0(&self, ppn: u16) {
-        let i = Self::PPN_OFFSETS[0];
-        let m = PhysAddr::PHYS_PAGE_NUM_MASK << i as u64;
-        let mut c = self.get_raw();
-        c &= !m;
-        c |= (ppn as u64 & PhysAddr::PHYS_PAGE_NUM_MASK) << i;
-        self.set_raw(c);
-    }
-
-    pub fn set_ppn1(&self, ppn: u16) {
-        let i = Self::PPN_OFFSETS[1];
-        let m = PhysAddr::PHYS_PAGE_NUM_MASK << i as u64;
-        let mut c = self.get_raw();
-        c &= !m;
-        c |= (ppn as u64 & PhysAddr::PHYS_PAGE_NUM_MASK) << i;
-        self.set_raw(c);
-    }
-
-    pub fn set_ppn2(&self, ppn: u16) {
-        let i = Self::PPN_OFFSETS[2];
-        let m = PhysAddr::PHYS_PAGE_NUM_MASK << i as u64;
-        let mut c = self.get_raw();
-        c &= !m;
-        c |= (ppn as u64 & PhysAddr::PHYS_PAGE_NUM_MASK) << i;
-        self.set_raw(c);
-    }
-
-    pub fn set_ppn3(&self, ppn: u32) {
-        let i = Self::PPN_OFFSETS[3];
-        let m = PhysAddr::PHYS_PAGE_NUM_MASK3 << i as u64;
-        let mut c = self.get_raw();
-        c &= !m;
-        c |= (ppn as u64 & PhysAddr::PHYS_PAGE_NUM_MASK3) << i;
-        self.set_raw(c);
     }
 }
 

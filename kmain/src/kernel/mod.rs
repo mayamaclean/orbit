@@ -697,9 +697,13 @@ impl Orbit {
                 if !thread_alive {
                     let _ = proc.threads.remove(&t.tid);
                     tids_to_remove.push(t.tid);
-                    let boxed = unsafe { Box::from_raw(p.0) };
 
-                    match boxed.fault_info {
+                    // Read through the existing &Thread — do NOT take a Box
+                    // here. The second pass (dealloc_thread + free) runs
+                    // after this loop, and needs this Thread's fields still
+                    // readable; taking a Box would drop-free it at scope end
+                    // and leave a use-after-free in the next pass.
+                    match t.fault_info {
                         Some(f) => {
                             let label = match proc.find_mapping(f.stval as u64).map(|m| m.kind) {
                                 Some(MappingKind::Guard { .. }) => "stack overflow",
@@ -711,7 +715,7 @@ impl Orbit {
                                 t.tid, label, f.cause, f.epc, f.stval);
                         }
                         None => {
-                            let status = boxed.frame.regs[11] as isize;
+                            let status = t.frame.regs[11] as isize;
                             serial::println!("tid{} dead, removing status={status}", t.tid);
                         }
                     }
@@ -736,6 +740,10 @@ impl Orbit {
             };
 
             self.dealloc_thread(thread);
+
+            // Now that no kernel state references this Thread, take
+            // ownership and drop — frees the heap allocation exactly once.
+            drop(unsafe { Box::from_raw(p.0) });
         }
 
         for pid in pids_to_remove {

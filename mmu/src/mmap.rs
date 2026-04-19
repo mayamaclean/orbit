@@ -103,7 +103,8 @@ pub unsafe fn map_address_page<'a>(root_table: &PageTable, pages: &mut PageAlloc
             let new_table_addr = new_page_table as *const _ as u64;
 
             // set ppn of root entry for secondary table + valid bit
-            pte.set_raw(((new_table_addr / crate::PAGE_SIZE as u64) << 10) | 1);
+            let ppn = new_table_addr / crate::PAGE_SIZE as u64;
+            pte.set_raw(crate::sv48::PageTableEntry::pack_table(ppn));
 
             if config.log { println!("\ttable@0x{:08X}[vpn{lidx}={idx}]={:08x}", current_table as *const _ as usize, new_table_addr); }
 
@@ -129,12 +130,8 @@ pub unsafe fn map_address_page<'a>(root_table: &PageTable, pages: &mut PageAlloc
         return Err(())
     }
 
-    pte.set_raw(0);
-    pte.set_ppn(config.paddr.get_raw() / PAGE_SIZE as u64);
-    pte.set_raw(pte.get_raw() | config.permissions as u64);
-    pte.set_accessed(true);
-    pte.set_dirty(true);
-    pte.set_valid(true);
+    let ppn = config.paddr.get_raw() / PAGE_SIZE as u64;
+    pte.set_raw(crate::sv48::PageTableEntry::pack_leaf(ppn, config.permissions));
 
     if config.log { println!("\tleaf in table@0x{:08X}[vpn{}={idx}]=0x{:08x}", current_table as *const _ as usize, config.levels, pte.get_raw()); }
 
@@ -172,6 +169,51 @@ pub unsafe fn map_address_range<'a>(root_table: &PageTable, pages: &mut PageAllo
         range_config.vaddr.a.fetch_add(config.page_size, Ordering::AcqRel);
     }
     Ok(())
+}
+
+/// One step of a full page-table walk — the PTE read at a given level plus
+/// its index in its containing table. Read-only snapshot; the returned
+/// values reflect the PTE as observed at walk time.
+#[derive(Debug, Clone, Copy)]
+pub struct WalkStep {
+    pub level: u8,
+    pub pte_idx: u16,
+    pub pte_raw: u64,
+}
+
+impl WalkStep {
+    pub const EMPTY: Self = Self { level: 0, pte_idx: 0, pte_raw: 0 };
+}
+
+/// Top-down Sv48 walk of `root` for `vaddr`, recording every PTE visited.
+/// Stops at the first invalid or leaf PTE. Returns the number of steps
+/// written into `out` (1..=4); `out[n - 1]` is the terminal PTE.
+pub unsafe fn walk_pte_chain(
+    root_table: &PageTable,
+    vaddr: VirtAddr,
+    out: &mut [WalkStep; 4],
+) -> usize {
+    let mut table = root_table;
+    let mut n = 0;
+    for level in (0..=3).rev() {
+        let idx = vaddr.vpn_n(level) as usize;
+        let pte = &table.entries[idx];
+        let raw = pte.get_raw();
+        out[n] = WalkStep {
+            level: level as u8,
+            pte_idx: idx as u16,
+            pte_raw: raw,
+        };
+        n += 1;
+        let valid = (raw & 1) != 0;
+        let leaf = (raw & 0xE) != 0;
+        if !valid || leaf {
+            return n;
+        }
+        let next_addr = (pte.get_ppn() as usize) << 2;
+        table = unsafe { (next_addr as *const PageTable).as_ref_unchecked() };
+    }
+    n
 }
 
 #[unsafe(no_mangle)]
@@ -293,7 +335,8 @@ pub unsafe fn map_page<'a>(root_table: &PageTable, pages: &mut PageAlloc<'a>, co
             let new_table_addr = new_page_table as *const _ as u64;
 
             // set ppn of root entry for secondary table + valid bit
-            pte.set_raw(((new_table_addr / crate::PAGE_SIZE as u64) << 10) | 1);
+            let ppn = new_table_addr / crate::PAGE_SIZE as u64;
+            pte.set_raw(crate::sv48::PageTableEntry::pack_table(ppn));
 
             if config.log { println!("\ttable@0x{:08X}[vpn{lidx}={idx}]={:08x}", current_table as *const _ as usize, new_table_addr); }
 
@@ -314,12 +357,8 @@ pub unsafe fn map_page<'a>(root_table: &PageTable, pages: &mut PageAlloc<'a>, co
     let idx = config.vaddr.vpn_n(target_level);
     let pte = &current_table.entries[idx as usize];
 
-    pte.set_raw(0);
-    pte.set_ppn(config.paddr.get_raw() / PAGE_SIZE as u64);
-    pte.set_raw(pte.get_raw() | config.permissions as u64);
-    pte.set_accessed(true);
-    pte.set_dirty(true);
-    pte.set_valid(true);
+    let ppn = config.paddr.get_raw() / PAGE_SIZE as u64;
+    pte.set_raw(crate::sv48::PageTableEntry::pack_leaf(ppn, config.permissions));
 
     if config.log { println!("\tleaf in table@0x{:08X}[vpn{}={idx}]=0x{:08x}", current_table as *const _ as usize, target_level, pte.get_raw()); }
 
