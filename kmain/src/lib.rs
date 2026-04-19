@@ -18,6 +18,48 @@ pub mod drivers;
 pub mod kernel;
 pub mod ktrace;
 
+/// Scope guard that enables `sstatus.SUM` for the duration of its lifetime
+/// so the supervisor can touch `U=1` pages. Syscall handlers build one,
+/// access the user buffer through the user VA (the trap vector stays on
+/// the user's satp), and drop it before returning.
+///
+/// Outside a `UserAccess` scope any kernel access that lands on a user VA
+/// faults, which is the whole point — a stray user-pointer deref is a bug,
+/// and SUM = 0 turns it into a diagnosable trap instead of a silent read
+/// through whatever happened to be mapped at that address.
+pub struct UserAccess {
+    _private: (),
+}
+
+impl UserAccess {
+    #[inline]
+    pub fn enter() -> Self {
+        unsafe { riscv::register::sstatus::set_sum(); }
+        Self { _private: () }
+    }
+
+    /// Borrow a read-only byte slice at a user VA. Caller must have
+    /// verified (via PT walk) that the range is mapped and user-readable.
+    /// Lifetime ties the slice to this guard so it can't outlive SUM.
+    #[inline]
+    pub unsafe fn slice<'s>(&'s self, vaddr: u64, len: usize) -> &'s [u8] {
+        unsafe { core::slice::from_raw_parts(vaddr as *const u8, len) }
+    }
+
+    /// Read a value of type `T` from a user VA. Caller must have verified
+    /// the source is mapped and the read is size/alignment-safe.
+    #[inline]
+    pub unsafe fn read_volatile<T>(&self, vaddr: u64) -> T {
+        unsafe { core::ptr::read_volatile(vaddr as *const T) }
+    }
+}
+
+impl Drop for UserAccess {
+    fn drop(&mut self) {
+        unsafe { riscv::register::sstatus::clear_sum(); }
+    }
+}
+
 pub fn write_sswi(hart: usize, val: u32) {
     unsafe {
         let base = crate::kernel::memmap::kmmio_sswi() as *mut u32;
@@ -423,31 +465,33 @@ pub fn handle_serial_print(epc: usize, hart_context: &'static HartContext, frame
 
         let root_table = crate::kernel::memmap::kernel_root_from_pa(thread.root_table_addr() as u64);
 
-        // Walk the user PT by hand and access the buffer through its KDMAP
-        // alias. No SUM gate applies here — the trap vector already switched
-        // to the kernel satp, so user VAs aren't in the active address space.
+        // Syscalls run under the user's satp (no more satp-swap at trap
+        // entry), so the user VA is directly addressable — but only while
+        // SUM is set. Pre-validate the mapping via a PT walk so a bad user
+        // pointer turns into a syscall error instead of an S-mode fault.
         let mut ret = 0isize;
 
+        let arg0 = frame.regs[11] as u64;
         let arg1 = frame.regs[12];
         if arg1 > PAGE_SIZE {
             ret = -3;
         }
+        else if mmu::mmap::virt_to_phys(&root_table, mmu::sv48::VirtAddr::new(arg0)).is_none() {
+            ret = -2;
+        }
         else {
-            if let Some(kva) = crate::kernel::memmap::user_va_to_kdmap(&root_table, frame.regs[11] as u64) {
-                let slice = core::slice::from_raw_parts(kva as *const u8, arg1);
-                if let Ok(s) = core::str::from_utf8(slice) {
-                    match serial::SERIAL.print_str(s) {
-                        Ok(_) => (),
-                        Err(_) => {ret = -5}
-                    }
-                }
-                else {
-                    ret = -4;
+            let guard = UserAccess::enter();
+            let slice = guard.slice(arg0, arg1);
+            if let Ok(s) = core::str::from_utf8(slice) {
+                match serial::SERIAL.print_str(s) {
+                    Ok(_) => (),
+                    Err(_) => { ret = -5 }
                 }
             }
             else {
-                ret = -2;
+                ret = -4;
             }
+            drop(guard);
         }
 
         frame.regs[10] = ret as usize;

@@ -451,6 +451,9 @@ impl Orbit {
             (memmap::user_va_to_kdmap(&rpt, req.nc_vaddr as u64), rpt)
         };
 
+        // Deferred work: the manager runs under the kernel satp, not the
+        // user's, so SUM can't bridge user VAs here. Walk the user PT and
+        // read through the KDMAP alias of the backing page instead.
         let nc_kva = match nc_kva {
             Some(p) => p,
             None => {
@@ -462,8 +465,7 @@ impl Orbit {
         info!("nc@kva0x{nc_kva:08X?}");
 
         let mut nc = unsafe {
-            (nc_kva as *const NetChannel)
-                .read_volatile()
+            (nc_kva as *const NetChannel).read_volatile()
         };
 
         info!("nc={nc:?}");

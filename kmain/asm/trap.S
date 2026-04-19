@@ -58,14 +58,10 @@ s_trap_vector:
 		.set	i, i+1
 	.endr
 1:
-	# restore kernel satp from
-	# hart context
-	csrr t0, sscratch
-	ld t0, 568(t0)
-	csrw satp, t0
-	sfence.vma x0, x0
-
-	# set sp to kernel trap stack sp
+	# Stay on whichever satp triggered the trap. The kernel's shared surface
+	# (KTEXT / KDMAP / KMMIO / ktables) is installed in every satp, so kernel
+	# code runs correctly; user memory only becomes reachable with SUM set,
+	# which syscall handlers toggle via the UserAccess guard.
 	csrr t0, sscratch
 	ld sp, 528(t0)
 

@@ -228,7 +228,7 @@ unsafe fn kernel_elf_regions() -> [Region; 5] {
     }
 }
 
-fn pool_regions(layout: &KernelLayout) -> [Region; 2] {
+fn pool_regions(layout: &KernelLayout) -> [Region; 3] {
     [
         Region {
             range: layout.kheap.clone(),
@@ -239,6 +239,15 @@ fn pool_regions(layout: &KernelLayout) -> [Region; 2] {
             range: layout.kpages.clone(),
             perms: KRW,
             name: "kpages",
+        },
+        // ktables has to be reachable under every satp: syscall handlers can
+        // walk the user's PT (virt_to_phys, user_va_to_kdmap) while running
+        // under the user satp, and the walker follows child PPNs through the
+        // KDMAP alias of the table pool.
+        Region {
+            range: layout.ktables.clone(),
+            perms: KRW,
+            name: "ktables",
         },
     ]
 }
@@ -420,13 +429,8 @@ unsafe fn boot_only_elf_regions() -> [Region; 7] {
     }
 }
 
-fn self_only_pool_regions(layout: &KernelLayout) -> [Region; 2] {
+fn self_only_pool_regions(layout: &KernelLayout) -> [Region; 1] {
     [
-        Region {
-            range: layout.ktables.clone(),
-            perms: KRW,
-            name: "ktables",
-        },
         Region {
             range: layout.dtb.clone(),
             perms: KRO,
