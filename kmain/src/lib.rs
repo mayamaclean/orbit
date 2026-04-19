@@ -8,6 +8,7 @@ use device::{HartContext, TrapFrame};
 use mmu::{PAGE_SIZE, sv48::{PageTable, VirtAddr}, mmap::virt_to_phys};
 use net_channel::NetChannel;
 use process::{MemMapReq, NetChannelRegistrationReq, Thread, ThreadBlockReason, ThreadState};
+use riscv::register::sstatus::SPP;
 use smoltcp::{iface::{PollResult, SocketHandle, SocketSet, SocketStorage}, socket::dhcpv4, storage::{PacketBuffer, RingBuffer}};
 
 use crate::{drivers::e1000::E1000, kernel::context::{enter_hart_context, exit_thread_with_state, get_hart_context, hart_has_thread}};
@@ -358,42 +359,36 @@ pub fn check_context_and_switch() -> ! {
     }
 }
 
-pub fn update_thread_and_trap_frame(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
+pub fn update_thread_and_trap_frame(
+    epc: usize,
+    hart_context: &'static HartContext,
+    frame: &mut TrapFrame,
+    from_user: bool,
+) {
     let cptr = hart_context.current.load(Ordering::Acquire);
-    if cptr != null_mut() {
-        unsafe {
-            let thread: &Thread = (cptr as usize as *const Thread)
-                .as_ref_unchecked();
+    if cptr == null_mut() { return; }
+    unsafe {
+        let thread: &Thread = (cptr as *const Thread).as_ref_unchecked();
 
-            // restore asid after potential switch from user mode
-            frame.asid = thread.pid as usize;
+        // Always safe: asid restore is for this hart's post-trap kernel work.
+        frame.asid = thread.pid as usize;
 
-            let frame_ptr = thread.frame as *const TrapFrame as usize as *mut TrapFrame;
-            let thread_state = thread.state.load(Ordering::Acquire);
-            if thread_state == ThreadState::Running as usize {
-                core::ptr::copy_nonoverlapping(
-                frame as *const _,
-                frame_ptr,
-                1);
+        // Only snapshot thread state if the trap actually describes the
+        // thread's own execution. Mismatch means an S-mode interrupt fired
+        // while the kernel was mid-context-switch for a user thread (SIE
+        // left on inside enter_hart_context_asm) — EPC points into kernel
+        // .text, and saving it as thread.pc would break sret on resume.
+        let trap_was_in_thread = (thread.mode == SPP::User) == from_user;
+        if !trap_was_in_thread { return; }
 
-                thread.pc.store(epc, Ordering::Release);
-            }
-            else if thread_state == ThreadState::Suspended as usize {
-                core::ptr::copy_nonoverlapping(
-                frame as *const _,
-                frame_ptr,
-                1);
-
-                thread.pc.store(epc, Ordering::Release);
-            }
-            else if thread_state == ThreadState::Blocking as usize {
-                core::ptr::copy_nonoverlapping(
-                frame as *const _,
-                frame_ptr,
-                1);
-
-                thread.pc.store(epc, Ordering::Release);
-            }
+        let thread_state = thread.state.load(Ordering::Acquire);
+        if thread_state == ThreadState::Running as usize
+            || thread_state == ThreadState::Suspended as usize
+            || thread_state == ThreadState::Blocking as usize
+        {
+            let frame_ptr = thread.frame as *const TrapFrame as *mut TrapFrame;
+            core::ptr::copy_nonoverlapping(frame as *const _, frame_ptr, 1);
+            thread.pc.store(epc, Ordering::Release);
         }
     }
 }

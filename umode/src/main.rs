@@ -139,7 +139,7 @@ pub unsafe extern "C" fn _start() -> ! {
         nc.as_mut_unchecked()
     };
 
-    if let Err(_) = nc.connect_tcp(u32::from_be_bytes([192,168,1,193]), 65535) {
+    if let Err(_) = nc.connect_tcp(u32::from_be_bytes([192,168,76,2]), 65535) {
         const NC_NO_CONNECT: &'static str = "bad failed nc tcp connect!\n";
         let _ = serial_print(NC_NO_CONNECT.as_ptr() as usize, NC_NO_CONNECT.len());
 

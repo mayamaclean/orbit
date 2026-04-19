@@ -126,8 +126,8 @@ impl E1000 {
         }
 
         unsafe {
-            let ral = ((mac[0] as u32) << 24) | ((mac[1] as u32) << 16) | ((mac[2] as u32) << 8) | mac[3] as u32;            
-            let rah = 0x8000_0000u32 | ((mac[4] as u32) << 8) | mac[5] as u32;
+            let ral = (mac[0] as u32) | ((mac[1] as u32) << 8) | ((mac[2] as u32) << 16) | ((mac[3] as u32) << 24);
+            let rah = 0x8000_0000u32 | (mac[4] as u32) | ((mac[5] as u32) << 8);
 
             let base = RECV_ADDR_TABLE_ADDR + mac_idx * 2;
             self.bar.add(base).write_volatile(ral);

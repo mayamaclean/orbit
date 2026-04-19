@@ -86,7 +86,7 @@ extern "C" fn s_trap(
                     supervisor_clear_ipi(hart_context.hart_id as usize);
                     riscv::register::sip::clear_ssoft();
 
-                    kmain::update_thread_and_trap_frame(epc, hart_context, frame);
+                    kmain::update_thread_and_trap_frame(epc, hart_context, frame, from_user);
 
                     check_context_and_switch();
                 }
@@ -103,7 +103,7 @@ extern "C" fn s_trap(
 
                     riscv::register::sie::clear_stimer();
 
-                    kmain::update_thread_and_trap_frame(epc, hart_context, frame);
+                    kmain::update_thread_and_trap_frame(epc, hart_context, frame, from_user);
 
                     check_context_and_switch();
                 }
@@ -130,7 +130,7 @@ extern "C" fn s_trap(
                         //serial::println!("smode ebreak call");
 
                         hart_context.cscratch2 = 0;
-                        kmain::update_thread_and_trap_frame(epc, hart_context, frame);
+                        kmain::update_thread_and_trap_frame(epc, hart_context, frame, from_user);
                         check_context_and_switch();
                     },
                     _ => ()
@@ -144,7 +144,7 @@ extern "C" fn s_trap(
                     // exit
                     0 => {
                         unsafe {
-                            kmain::update_thread_and_trap_frame(epc, hart_context, frame);
+                            kmain::update_thread_and_trap_frame(epc, hart_context, frame, from_user);
                             kmain::kernel::context::exit_thread_with_state(ThreadState::Exited);
                         }
                     },
@@ -165,7 +165,7 @@ extern "C" fn s_trap(
                     }
                     _ => {
                         serial::println!("orbit handling u mode ecall({syscall})");
-                        kmain::update_thread_and_trap_frame(epc + 4, hart_context, frame);
+                        kmain::update_thread_and_trap_frame(epc + 4, hart_context, frame, from_user);
                     }
                 }
                 check_context_and_switch();

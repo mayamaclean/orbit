@@ -38,6 +38,14 @@ unsafe extern "C" {
 
 pub unsafe fn load_thread_into_hart_context_and_jump(context: &'static HartContext, thread: &'static Thread) -> ! {
     unsafe {
+        // No S-mode interrupts across the register-load → sret window. Without
+        // this, a stimer/SSWI landing inside enter_hart_context_asm would
+        // trap with EPC in kernel text, and update_thread_and_trap_frame
+        // would (before the mode gate) save that as thread.pc. sret restores
+        // SIE from SPIE; U-mode preemption is unaffected because S-interrupts
+        // fire in U regardless of sstatus.SIE.
+        riscv::register::sstatus::clear_sie();
+
         riscv::register::sstatus::set_spp(thread.mode);
         riscv::register::sepc::write(thread.pc.load(Ordering::Acquire));
 
