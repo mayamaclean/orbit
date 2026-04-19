@@ -79,8 +79,11 @@ m_trap_vector:
 	csrr	a3, mhartid
 	csrr	a4, mstatus
 	csrr	a5, mscratch
-	#la		t0, KERNEL_STACK_END
-	#ld		sp, 0(t0)
+	# Switch to bl's own M-mode stack before calling m_trap. The kernel's
+	# sp lives in its own address space (KDMAP VA post-higher-half) which
+	# M-mode accesses bare — dereferencing it as a physical address faults.
+	la		t0, KERNEL_STACK_END
+	ld		sp, 0(t0)
 	call	m_trap
 
 	# When we get here, we've returned from m_trap, restore registers

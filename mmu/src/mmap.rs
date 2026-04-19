@@ -44,6 +44,39 @@ impl PageTableVec {
     }
 }
 
+/// A root page-table reference paired with the offset to add to any PPN-derived
+/// PA to produce the supervisor VA of that intermediate table. Walkers read
+/// PTEs (which always store physical PPNs) and follow them by applying the
+/// bias; PTE writers invert it to recover the PA from an allocator-returned
+/// VA. bl and kmain's early trampoline allocate tables from identity-mapped
+/// RAM (bias=0); post-init kmain allocates them from the KDMAP window
+/// (bias=kdmap_base - ram_phys_base).
+#[derive(Copy, Clone)]
+pub struct RootTable<'a> {
+    pub table: &'a PageTable,
+    pub pa_to_va_bias: u64,
+}
+
+impl<'a> RootTable<'a> {
+    pub const fn new(table: &'a PageTable, pa_to_va_bias: u64) -> Self {
+        Self { table, pa_to_va_bias }
+    }
+
+    pub const fn identity(table: &'a PageTable) -> Self {
+        Self { table, pa_to_va_bias: 0 }
+    }
+
+    #[inline]
+    pub fn va_from_pa(&self, pa: u64) -> u64 {
+        pa.wrapping_add(self.pa_to_va_bias)
+    }
+
+    #[inline]
+    pub fn pa_from_va(&self, va: u64) -> u64 {
+        va.wrapping_sub(self.pa_to_va_bias)
+    }
+}
+
 pub enum PageAlloc<'a> {
     PTV(&'a mut PageTableVec),
     #[cfg(feature = "alloc")]
@@ -84,7 +117,7 @@ impl<'a> PageAlloc<'a> {
     }
 }
 
-pub unsafe fn map_address_page<'a>(root_table: &PageTable, pages: &mut PageAlloc<'a>, config: &MappingConfig) -> Result<(), ()> {
+pub unsafe fn map_address_page<'a>(root_table: &RootTable<'_>, pages: &mut PageAlloc<'a>, config: &MappingConfig) -> Result<(), ()> {
     if (config.paddr.get_raw() % config.page_size) != 0 || (config.vaddr.get_raw() % config.page_size) != 0 {
         if config.log { println!("misaligned map call: {config:?}"); }
         return Err(())
@@ -92,28 +125,30 @@ pub unsafe fn map_address_page<'a>(root_table: &PageTable, pages: &mut PageAlloc
 
     if config.log { println!("\n{:08x?}", &config); }
 
-    let mut current_table = root_table;
+    let mut current_table = root_table.table;
     for level in 0..(config.levels - 1) {
         let lidx = 4 - level - 1;
         let idx = config.vaddr.vpn_n(lidx);
         let pte = &current_table.entries[idx as usize];
-        
+
         current_table = if !pte.is_valid() {
             let new_page_table = pages.allocate_page_table()?;
-            let new_table_addr = new_page_table as *const _ as u64;
+            let new_table_va = new_page_table as *const _ as u64;
+            let new_table_pa = root_table.pa_from_va(new_table_va);
 
             // set ppn of root entry for secondary table + valid bit
-            let ppn = new_table_addr / crate::PAGE_SIZE as u64;
+            let ppn = new_table_pa / crate::PAGE_SIZE as u64;
             pte.set_raw(crate::sv48::PageTableEntry::pack_table(ppn));
 
-            if config.log { println!("\ttable@0x{:08X}[vpn{lidx}={idx}]={:08x}", current_table as *const _ as usize, new_table_addr); }
+            if config.log { println!("\ttable@0x{:08X}[vpn{lidx}={idx}]={:08x}", current_table as *const _ as usize, new_table_pa); }
 
             new_page_table
         }
         else {
-            let raw = (pte.ppn() * crate::PAGE_SIZE as u64) as *const PageTable;
+            let raw_pa = pte.ppn() * crate::PAGE_SIZE as u64;
+            let raw = root_table.va_from_pa(raw_pa) as *const PageTable;
 
-            if config.log { println!("\ttable@0x{:08X}[vpn{lidx}={idx}]={:08x}", current_table as *const _ as usize, raw as *const _ as usize); }
+            if config.log { println!("\ttable@0x{:08X}[vpn{lidx}={idx}]={:08x}", current_table as *const _ as usize, raw_pa); }
 
             unsafe {
                 raw.as_ref_unchecked()
@@ -138,7 +173,7 @@ pub unsafe fn map_address_page<'a>(root_table: &PageTable, pages: &mut PageAlloc
     Ok(())
 }
 
-pub unsafe fn map_address_range<'a>(root_table: &PageTable, pages: &mut PageAlloc<'a>, config: &MappingConfig, vend: VirtAddr, pend: PhysAddr) -> Result<(), ()> {
+pub unsafe fn map_address_range<'a>(root_table: &RootTable<'_>, pages: &mut PageAlloc<'a>, config: &MappingConfig, vend: VirtAddr, pend: PhysAddr) -> Result<(), ()> {
     let pstart = config.paddr.get_raw();
     let pend = pend.get_raw();
     let plen = pend - pstart;
@@ -146,7 +181,7 @@ pub unsafe fn map_address_range<'a>(root_table: &PageTable, pages: &mut PageAllo
     let vstart = config.vaddr.get_raw();
     let vend = vend.get_raw();
 
-    serial::println!("map range: p0x{pstart:016X?}..p0x{pend:016X?}, v0x{vstart:016X?}..v0x{vend:016X?}");
+    if config.log { println!("map range: p0x{pstart:016X?}..p0x{pend:016X?}, v0x{vstart:016X?}..v0x{vend:016X?}"); }
 
     let vlen = vend - vstart;
 
@@ -189,11 +224,11 @@ impl WalkStep {
 /// Stops at the first invalid or leaf PTE. Returns the number of steps
 /// written into `out` (1..=4); `out[n - 1]` is the terminal PTE.
 pub unsafe fn walk_pte_chain(
-    root_table: &PageTable,
+    root_table: &RootTable<'_>,
     vaddr: VirtAddr,
     out: &mut [WalkStep; 4],
 ) -> usize {
-    let mut table = root_table;
+    let mut table = root_table.table;
     let mut n = 0;
     for level in (0..=3).rev() {
         let idx = vaddr.vpn_n(level) as usize;
@@ -210,42 +245,31 @@ pub unsafe fn walk_pte_chain(
         if !valid || leaf {
             return n;
         }
-        let next_addr = (pte.get_ppn() as usize) << 2;
-        table = unsafe { (next_addr as *const PageTable).as_ref_unchecked() };
+        let next_pa = (pte.get_ppn() as u64) << 2;
+        let next_va = root_table.va_from_pa(next_pa);
+        table = unsafe { (next_va as *const PageTable).as_ref_unchecked() };
     }
     n
 }
 
 #[unsafe(no_mangle)]
-pub unsafe fn virt_to_phys(root_table: &PageTable, vaddr: VirtAddr) -> Option<usize> {
-    //serial::println!("translating {vaddr:016X?} with table@{:016X?}", root_table as *const PageTable);
-
-    let mut current_table = root_table;
+pub unsafe fn virt_to_phys(root_table: &RootTable<'_>, vaddr: VirtAddr) -> Option<usize> {
+    let mut current_table = root_table.table;
     for l in (0..=3).rev() {
         let index = vaddr.vpn_n(l) as usize;
         let entry = &current_table.entries[index];
-        let phys = (entry.get_ppn() as usize) << 2;
-
-        /*
-        serial::println!("translating l{} t0x{:016X?}[{}]=0x{:016X?},phys=0x{:016X?}",
-            l,
-            current_table as *const PageTable,
-            index,
-            entry.get_raw(),
-            phys);
-        */
+        let phys = (entry.get_ppn() as u64) << 2;
 
         if entry.is_leaf() {
             let page_offset = vaddr.page_offset() as usize;
-            return Some(phys + page_offset)
+            return Some(phys as usize + page_offset)
         }
 
+        let va = root_table.va_from_pa(phys);
         current_table = unsafe {
-            (phys as *const PageTable)
+            (va as *const PageTable)
                 .as_ref_unchecked()
         };
-
-        //serial::println!("current_table@{:016X?}", current_table as *const PageTable);
     }
     None
 }
@@ -254,16 +278,17 @@ pub unsafe fn virt_to_phys(root_table: &PageTable, vaddr: VirtAddr) -> Option<us
 /// Returns `Err(())` if the walk hits an invalid PTE or encounters a leaf at
 /// an unexpected level — the latter prevents accidentally clobbering a
 /// superpage that covers more than the caller intends to unmap.
-pub unsafe fn unmap_page(root_table: &PageTable, vaddr: VirtAddr, levels: usize) -> Result<(), ()> {
+pub unsafe fn unmap_page(root_table: &RootTable<'_>, vaddr: VirtAddr, levels: usize) -> Result<(), ()> {
     let target_level = 4 - levels;
-    let mut current_table = root_table;
+    let mut current_table = root_table.table;
     for lidx in ((target_level + 1)..=3).rev() {
         let idx = vaddr.vpn_n(lidx) as usize;
         let pte = &current_table.entries[idx];
         if !pte.is_valid() || pte.is_leaf() {
             return Err(())
         }
-        let next = (pte.ppn() * PAGE_SIZE as u64) as *const PageTable;
+        let next_pa = pte.ppn() * PAGE_SIZE as u64;
+        let next = root_table.va_from_pa(next_pa) as *const PageTable;
         current_table = unsafe { next.as_ref_unchecked() };
     }
     let idx = vaddr.vpn_n(target_level) as usize;
@@ -277,7 +302,7 @@ pub unsafe fn unmap_page(root_table: &PageTable, vaddr: VirtAddr, levels: usize)
 
 /// Clear leaf PTEs covering every 4 KiB page in `range`. Both endpoints must
 /// be page-aligned; the caller is responsible for `sfence.vma` afterwards.
-pub unsafe fn unmap_range(root_table: &PageTable, range: Range<u64>) -> Result<(), ()> {
+pub unsafe fn unmap_range(root_table: &RootTable<'_>, range: Range<u64>) -> Result<(), ()> {
     if (range.start % PAGE_SIZE as u64) != 0 || (range.end % PAGE_SIZE as u64) != 0 {
         return Err(())
     }
@@ -289,28 +314,30 @@ pub unsafe fn unmap_range(root_table: &PageTable, range: Range<u64>) -> Result<(
     Ok(())
 }
 
-pub unsafe fn unmap<'a>(root_table: &PageTable, pages: &mut PageAlloc<'a>) {
-    for (_, entry) in root_table.entries.iter().enumerate() {
+pub unsafe fn unmap<'a>(root_table: &RootTable<'_>, pages: &mut PageAlloc<'a>) {
+    for (_, entry) in root_table.table.entries.iter().enumerate() {
         if !entry.is_valid() {
             continue
         }
 
         if !entry.is_leaf() {
-            let next_table_addr = (entry.get_ppn() as usize) << 2;
+            let next_pa = (entry.get_ppn() as u64) << 2;
+            let next_va = root_table.va_from_pa(next_pa);
             let table = unsafe {
-                (next_table_addr as *const PageTable)
+                (next_va as *const PageTable)
                     .as_ref_unchecked()
             };
 
-            unsafe { unmap(table, pages); }
+            let child = RootTable::new(table, root_table.pa_to_va_bias);
+            unsafe { unmap(&child, pages); }
 
-            serial::println!("freeing t{:016X?}", root_table as *const _);
-            let _ = pages.free_page(root_table as *const _ as usize);
+            serial::println!("freeing t{:016X?}", root_table.table as *const _);
+            let _ = pages.free_page(root_table.table as *const _ as usize);
         }
     }
 }
 
-pub unsafe fn map_page<'a>(root_table: &PageTable, pages: &mut PageAlloc<'a>, config: &MappingConfig) -> Result<(), ()> {
+pub unsafe fn map_page<'a>(root_table: &RootTable<'_>, pages: &mut PageAlloc<'a>, config: &MappingConfig) -> Result<(), ()> {
     if (config.paddr.get_raw() % config.page_size) != 0 || (config.vaddr.get_raw() % config.page_size) != 0 {
         if config.log { println!("misaligned map call: {config:?}"); }
         return Err(())
@@ -320,7 +347,7 @@ pub unsafe fn map_page<'a>(root_table: &PageTable, pages: &mut PageAlloc<'a>, co
 
     let target_level = 4 - config.levels;
 
-    let mut current_table = root_table;
+    let mut current_table = root_table.table;
     for lidx in ((target_level+ 1)..=3).rev() {
         let idx = config.vaddr.vpn_n(lidx);
         let pte = &current_table.entries[idx as usize];
@@ -329,23 +356,25 @@ pub unsafe fn map_page<'a>(root_table: &PageTable, pages: &mut PageAlloc<'a>, co
             if config.log { println!("\tfound leaf pte where we didnt expect one"); }
             return Err(())
         }
-        
+
         current_table = if !pte.is_valid() {
             let new_page_table = pages.allocate_page_table()?;
-            let new_table_addr = new_page_table as *const _ as u64;
+            let new_table_va = new_page_table as *const _ as u64;
+            let new_table_pa = root_table.pa_from_va(new_table_va);
 
             // set ppn of root entry for secondary table + valid bit
-            let ppn = new_table_addr / crate::PAGE_SIZE as u64;
+            let ppn = new_table_pa / crate::PAGE_SIZE as u64;
             pte.set_raw(crate::sv48::PageTableEntry::pack_table(ppn));
 
-            if config.log { println!("\ttable@0x{:08X}[vpn{lidx}={idx}]={:08x}", current_table as *const _ as usize, new_table_addr); }
+            if config.log { println!("\ttable@0x{:08X}[vpn{lidx}={idx}]={:08x}", current_table as *const _ as usize, new_table_pa); }
 
             new_page_table
         }
         else {
-            let raw = (pte.ppn() * crate::PAGE_SIZE as u64) as *const PageTable;
+            let raw_pa = pte.ppn() * crate::PAGE_SIZE as u64;
+            let raw = root_table.va_from_pa(raw_pa) as *const PageTable;
 
-            if config.log { println!("\ttable@0x{:08X}[vpn{lidx}={idx}]={:08x}", current_table as *const _ as usize, raw as *const _ as usize); }
+            if config.log { println!("\ttable@0x{:08X}[vpn{lidx}={idx}]={:08x}", current_table as *const _ as usize, raw_pa); }
 
             unsafe {
                 raw.as_ref_unchecked()
@@ -378,12 +407,76 @@ impl Default for IdMapReport {
     }
 }
 
+/// Map a physical range to a distinct virtual start, auto-selecting gigapage
+/// / megapage / 4 KiB leaves by the alignment and remaining length — the same
+/// tiering as `id_map_range` but without the VA == PA assumption. `permissions`,
+/// `log`, and `supervisor_tag` are read from `base_config`; its `vaddr`/`paddr`/
+/// `levels`/`page_size` fields are overwritten per step.
+pub unsafe fn map_va_range<'a>(
+    root_table: &RootTable<'_>,
+    pages: &mut PageAlloc<'a>,
+    base_config: MappingConfig,
+    va_start: u64,
+    pa_range: Range<u64>,
+) -> Result<IdMapReport, ()> {
+    let mut report = IdMapReport::default();
+
+    if pa_range.end < pa_range.start {
+        if base_config.log { println!("bad map range: {pa_range:016X?}"); }
+        return Err(());
+    }
+
+    let mut cur_pa = pa_range.start;
+    let mut cur_va = va_start;
+    let mut rem = pa_range.end - pa_range.start;
+
+    while rem >= PAGE_SIZE as u64 {
+        let mut levels = 4;
+        let mut page_size = PAGE_SIZE as u64;
+
+        if rem >= GB && (cur_pa % GB) == 0 && (cur_va % GB) == 0 {
+            levels = 2;
+            page_size = GB;
+        } else if rem >= (2 * MB) && (cur_pa % (2 * MB)) == 0 && (cur_va % (2 * MB)) == 0 {
+            levels = 3;
+            page_size = 2 * MB;
+        }
+
+        let config = MappingConfig {
+            paddr: PhysAddr::new(cur_pa),
+            vaddr: VirtAddr::new(cur_va),
+            levels,
+            page_size,
+            permissions: base_config.permissions,
+            log: base_config.log,
+            supervisor_tag: base_config.supervisor_tag,
+        };
+
+        if unsafe { map_page(root_table, pages, &config).is_err() } {
+            if base_config.log { println!("failed to map v0x{cur_va:016X}..p0x{cur_pa:016X}"); }
+            return Err(());
+        }
+
+        match levels {
+            4 => report.regularpages_mapped += 1,
+            3 => report.megapages_mapped += 1,
+            2 => report.gigapages_mapped += 1,
+            _ => unreachable!(),
+        }
+
+        cur_pa += page_size;
+        cur_va += page_size;
+        rem -= page_size;
+    }
+    Ok(report)
+}
+
 /// base config for permissions
-pub unsafe fn id_map_range<'a>(root_table: &PageTable, pages: &mut PageAlloc<'a>, base_config: MappingConfig, range: Range<u64>) -> Result<IdMapReport, ()> {
+pub unsafe fn id_map_range<'a>(root_table: &RootTable<'_>, pages: &mut PageAlloc<'a>, base_config: MappingConfig, range: Range<u64>) -> Result<IdMapReport, ()> {
     let mut id_report = IdMapReport::default();
 
     if range.end < range.start {
-        println!("bad mmap range: {range:016X?} {base_config:?}");
+        if base_config.log { println!("bad mmap range: {range:016X?} {base_config:?}"); }
         return Err(())
     }
 

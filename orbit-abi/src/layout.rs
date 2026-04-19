@@ -1,7 +1,7 @@
 //! User-mode address-space layout (Sv48, low→high).
 //!
-//! The 2–4 GiB band is reserved for the kernel's shared identity map
-//! (kernel text, kheap, kpages, MMIO), so user layout skips over it.
+//! The kernel lives entirely in the high half (KTEXT / KDMAP / KMMIO) so
+//! the low half belongs to user processes minus a null guard.
 //!
 //!   0..USER_NULL_GUARD_END                         null guard
 //!   UPROC_STACK_BASE..+8 GiB                       256 * 32 MiB stack slots
@@ -17,7 +17,7 @@ pub const USER_NULL_GUARD_END: u64 = 0x1_0000;
 /// Per-thread stack region. 256 slots * 32 MiB stride = 8 GiB total.
 /// Each slot holds a stack sized per-thread (2..=30 MiB, multiples of 2 MiB),
 /// anchored at the high end of the slot; the remainder is an unmapped guard.
-pub const UPROC_STACK_BASE:    u64 = 0x1_0000_0000;
+pub const UPROC_STACK_BASE:    u64 = 0x1000_0000;
 pub const UPROC_STACK_STRIDE:  u64 = 32 * LARGE_PAGE;
 pub const UPROC_STACK_GRAIN:   u64 = LARGE_PAGE;
 pub const UPROC_STACK_MIN:     u64 = UPROC_STACK_GRAIN;
@@ -52,8 +52,8 @@ pub const fn validate_user_stack_size(size: u64) -> bool {
         && size % UPROC_STACK_GRAIN == 0
 }
 
-/// User ELF image and mmap arena sit above the stack region.
-pub const USER_TEXT_BASE: u64 = 0x3_4000_0000;
+/// User ELF image sits just above the 8 GiB stack region.
+pub const USER_TEXT_BASE: u64 = 0x2_2000_0000;
 
 /// Kernel-private per-thread TrapFrame region (no U bit). One page per slot.
 pub const USER_TRAP_FRAME_BASE:   u64 = 0x100_0000_0000;

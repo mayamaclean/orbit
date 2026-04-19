@@ -5,6 +5,8 @@ use mmu::PAGE_SIZE;
 use smoltcp::phy::{Checksum, DeviceCapabilities, Medium};
 use tracing::{info, warn, error};
 
+use crate::kernel::memmap::virt_to_phys_dmap;
+
 const SW_MTU: usize = 2048;
 
 pub const TX_RING_LEN: usize = 8;
@@ -90,7 +92,9 @@ impl E1000 {
         for idx in 0..RX_RING_LEN {
             let e = &mut rx_ring[idx];
 
-            e.addr = rx_bufs[idx].b.as_mut_ptr() as u64;
+            // Ring buffers are allocated from kernel_pages (KDMAP VAs); the
+            // NIC DMAs by physical address, so translate.
+            e.addr = virt_to_phys_dmap(rx_bufs[idx].b.as_mut_ptr() as u64);
             e.csum = 0;
             e.errors = 0;
             e.length = 0;
@@ -101,7 +105,7 @@ impl E1000 {
         for idx in 0..TX_RING_LEN {
             let e = &mut tx_ring[idx];
 
-            e.addr = tx_bufs[idx].b.as_mut_ptr() as u64;
+            e.addr = virt_to_phys_dmap(tx_bufs[idx].b.as_mut_ptr() as u64);
             e.cmd = 0;
             e.cso = 0;
             e.css = 0;
@@ -217,8 +221,9 @@ impl E1000 {
 
             info!("e1000: mac: {mac:02X?}");
 
-            // give device rx ring + rx ring len
-            let rx_phys = self.rx_ring.as_ptr() as u64;
+            // give device rx ring + rx ring len. self.rx_ring is a KDMAP VA;
+            // the NIC expects physical, so translate at the boundary.
+            let rx_phys = virt_to_phys_dmap(self.rx_ring.as_ptr() as u64);
             self.bar.add(RDBA_REG_ADDR)
                 .write_volatile(rx_phys as u32);
 
@@ -229,7 +234,7 @@ impl E1000 {
                 .write_volatile(RX_RING_BYTES as u32);
 
             // give device tx ring + tx ring len
-            let tx_phys = self.tx_ring.as_ptr() as u64;
+            let tx_phys = virt_to_phys_dmap(self.tx_ring.as_ptr() as u64);
             self.bar.add(TDBA_REG_ADDR)
                 .write_volatile(tx_phys as u32);
 

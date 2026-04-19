@@ -45,6 +45,20 @@ impl<const ORDER: usize> FrameAllocator<ORDER> {
         }
     }
 
+    /// Add a physical range `[pa_start, pa_end)` to the allocator, but have
+    /// subsequent allocations return addresses in the window starting at
+    /// `va_base`. The buddy structure tracks whatever addresses are inserted;
+    /// this helper exists so call sites can be explicit about a PA→VA rebase
+    /// (e.g. direct-map layout) instead of encoding the arithmetic inline.
+    ///
+    /// The caller is responsible for translating allocator results back to
+    /// physical addresses when they cross a hardware boundary (PTE PPN, DMA).
+    pub fn add_frame_with_va_base(&mut self, pa_start: usize, pa_end: usize, va_base: usize) {
+        assert!(pa_start <= pa_end);
+        let len = pa_end - pa_start;
+        self.add_frame(va_base, va_base + len);
+    }
+
     /// Add a range of frame number [start, end) to the allocator
     pub fn add_frame(&mut self, start: usize, end: usize) {
         assert!(start <= end);

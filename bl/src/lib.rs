@@ -28,6 +28,14 @@ pub static SYSINFO: SysInfo = SysInfo {
 };
 pub static HART_ROOT: AtomicUsize = AtomicUsize::new(0);
 
+// Offset added to a physical RAM address to produce its KDMAP alias in the
+// kernel's address space. Set by the kernel via M-mode ecall (code 4) before
+// it wakes harts 1..N. bl needs it to hand secondary harts a `sscratch` and
+// `sp` that resolve under the kernel satp (pool identity has been dropped).
+// Zero means "not yet published" — kinit_hart spins on HART_ROOT for the
+// kernel's setup ecall, so by the time it reads this the value is valid.
+pub static KDMAP_BIAS: AtomicUsize = AtomicUsize::new(0);
+
 pub fn setup_interrupts() {
     use riscv::register::{mstatus, mie, mcounteren, mideleg, medeleg};
 

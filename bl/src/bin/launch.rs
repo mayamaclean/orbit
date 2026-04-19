@@ -5,7 +5,7 @@ use core::arch::{asm, global_asm};
 use core::panic::PanicInfo;
 use core::sync::atomic::{Ordering};
 
-use mmu::mmap::{PageTableVec, id_map_range, map_address_page};
+use mmu::mmap::{PageTableVec, RootTable, id_map_range, map_address_page};
 use mmu::sv48::{PhysAddr, VirtAddr};
 use device::{TrapFrame};
 use riscv::register::mtvec::Mtvec;
@@ -143,6 +143,7 @@ extern "C" fn m_trap(epc: usize,
                     3 => unsafe {
                         wake_hart(sarg);
                     }
+                    4 => bl::KDMAP_BIAS.store(sarg, Ordering::Release),
                     _ => ()
                 }
 			},
@@ -220,9 +221,10 @@ extern "C" fn kinit(hartid: usize, dtb_addr: usize) {
             let page_table_start= bl::ID_MAP_TABLES as usize;
             let mut ptv = PageTableVec::new(page_table_start, 4096 * MAX_ID_TABLES);
             let mut pages = mmap::PageAlloc::PTV(&mut ptv);
-            let root_table = pages.allocate_page_table().unwrap();
+            let root_ref = pages.allocate_page_table().unwrap();
+            let root_table = RootTable::identity(root_ref);
 
-            println!("made page table pool @ {:016x}, root table @ {:016x}", page_table_start, root_table as *const _ as usize);
+            println!("made page table pool @ {:016x}, root table @ {:016x}", page_table_start, root_ref as *const _ as usize);
 
             let base_id_map_config = MappingConfig {
                 permissions: PagePermissions::R | PagePermissions::W | PagePermissions::X,
@@ -230,9 +232,9 @@ extern "C" fn kinit(hartid: usize, dtb_addr: usize) {
                 log: false,
                 supervisor_tag: None
             };
-            let id_mapping = id_map_range(root_table, &mut pages, base_id_map_config, ram_start..(ram_start + ram_size));
+            let id_mapping = id_map_range(&root_table, &mut pages, base_id_map_config, ram_start..(ram_start + ram_size));
 
-            let serial_perms = MappingConfig { 
+            let serial_perms = MappingConfig {
                 permissions: PagePermissions::R | PagePermissions::W,
                 levels: 4,
                 page_size: 4096,
@@ -241,15 +243,15 @@ extern "C" fn kinit(hartid: usize, dtb_addr: usize) {
                 log: false,
                 supervisor_tag: None
             };
-            map_address_page(root_table, &mut pages, &serial_perms).unwrap();
+            map_address_page(&root_table, &mut pages, &serial_perms).unwrap();
 
             println!("{id_mapping:?}");
 
             riscv::asm::sfence_vma_all();
-            let _ = riscv::register::satp::try_set(Mode::Sv48, 0, root_table as *const _ as usize / PAGE_SIZE);
+            let _ = riscv::register::satp::try_set(Mode::Sv48, 0, root_ref as *const _ as usize / PAGE_SIZE);
             riscv::asm::sfence_vma_all();
 
-            bl::ID_MAP_ADDR.store(root_table as *const _ as u64, Ordering::Release);
+            bl::ID_MAP_ADDR.store(root_ref as *const _ as u64, Ordering::Release);
 
             println!("PTABLES=0x{:016X}..0x{:016X}", bl::ID_MAP_TABLES, bl::ID_MAP_TABLES + ptv.current_tables_size());
 
@@ -277,15 +279,23 @@ extern "C" fn kinit_hart() {
             //serial::println!("hart{hartid} waking up");
 
             unsafe {
-                let hart_context = (hart_root as *const HartContext)
+                // bl still dereferences HartContext fields via PA (we're in
+                // M-mode with satp=bare). But what the kernel *runs* with —
+                // sscratch and sp — has to be a KDMAP VA, because pool
+                // identity is gone from the kernel satp. Apply the bias
+                // published by the kernel's ecall(4).
+                let kdmap_bias = bl::KDMAP_BIAS.load(Ordering::Acquire);
+                let hart_context_phys = (hart_root as *const HartContext)
                     .add(hartid);
+                let hart_context_kva = (hart_context_phys as usize).wrapping_add(kdmap_bias);
 
-                riscv::register::sscratch::write(hart_context as usize);
+                riscv::register::sscratch::write(hart_context_kva);
 
-                let hart_context = hart_context.as_ref_unchecked();
+                let hart_context = hart_context_phys.as_ref_unchecked();
                 let target = hart_context.kptr.load(Ordering::Acquire) as usize;
-                let sp = hart_context.k_stack.stack_data.as_ptr() as usize + TRAP_STACK_SIZE - 16;
-                
+                let sp_phys = hart_context.k_stack.stack_data.as_ptr() as usize + TRAP_STACK_SIZE - 16;
+                let sp = sp_phys.wrapping_add(kdmap_bias);
+
                 riscv::register::stvec::write(Stvec::new(hart_context.s_trap_addr as usize, STrapMode::Direct));
 
                 riscv::register::sepc::write(target);

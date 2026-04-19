@@ -96,8 +96,10 @@ pub unsafe extern "C" fn _start() -> ! {
     //let n = 0 as *const u64;
     //core::ptr::read_volatile(n);
 
-    // map 4096 bytes to addr with read/write + share with kernel
-    const AHINT: usize = 6 * 1024 * 1024 * 1024;
+    // map 4096 bytes to addr with read/write + share with kernel. Pick a
+    // hint above USER_TEXT_BASE (0x2_2000_0000 post-higher-half) so it can't
+    // clip into the stack region below.
+    const AHINT: usize = 0x2_4000_0000;
     let ptr = AHINT as *mut u64;
     if mmap(AHINT, 4096, 0x6, true) == 0 {
         unsafe {

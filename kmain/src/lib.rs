@@ -5,7 +5,7 @@ extern crate alloc;
 use core::{arch::asm, ptr::null_mut, sync::atomic::{AtomicBool, Ordering}};
 use alloc::{collections::btree_map::BTreeMap, vec::Vec};
 use device::{HartContext, TrapFrame};
-use mmu::{PAGE_SIZE, sv48::{PageTable, VirtAddr}, mmap::virt_to_phys};
+use mmu::{PAGE_SIZE, sv48::PageTable};
 use net_channel::NetChannel;
 use process::{MemMapReq, NetChannelRegistrationReq, Thread, ThreadBlockReason, ThreadState};
 use riscv::register::sstatus::SPP;
@@ -20,8 +20,25 @@ pub mod ktrace;
 
 pub fn write_sswi(hart: usize, val: u32) {
     unsafe {
-        const SSWI_BASE: *mut u32 = 0x2f00000 as *mut u32;
-        SSWI_BASE.add(hart).write_volatile(val);
+        let base = crate::kernel::memmap::kmmio_sswi() as *mut u32;
+        base.add(hart).write_volatile(val);
+    }
+}
+
+/// Kick a hart out of WFI by writing its CLINT MSIP slot. Used on boot to pull
+/// harts 1..N out of bl's `kinit_hart` spin. Runs S-mode under the kernel
+/// satp, so it writes via the KMMIO alias of CLINT (bl's M-mode path still
+/// uses the raw PA via `device::wake_hart`).
+pub fn kick_machine_hart(hart: usize) {
+    unsafe {
+        let base = crate::kernel::memmap::kmmio_clint() as *mut u32;
+        base.add(hart).write_volatile(1);
+    }
+}
+
+pub fn kick_machine_harts(hart_count: usize) {
+    for hart in 0..hart_count {
+        kick_machine_hart(hart);
     }
 }
 
@@ -404,22 +421,20 @@ pub fn handle_serial_print(epc: usize, hart_context: &'static HartContext, frame
         let thread = (current as *const Thread)
             .as_ref_unchecked();
 
-        let root_table = (thread.root_table_addr() as *const PageTable)
-            .as_ref_unchecked();
+        let root_table = crate::kernel::memmap::kernel_root_from_pa(thread.root_table_addr() as u64);
 
-        riscv::register::sstatus::set_sum();
-
+        // Walk the user PT by hand and access the buffer through its KDMAP
+        // alias. No SUM gate applies here — the trap vector already switched
+        // to the kernel satp, so user VAs aren't in the active address space.
         let mut ret = 0isize;
-        
+
         let arg1 = frame.regs[12];
         if arg1 > PAGE_SIZE {
             ret = -3;
         }
         else {
-            if let Some(arg0) = virt_to_phys(root_table, VirtAddr::new(frame.regs[11] as u64)) {
-                serial::println!("serial print handler translated v0x{:016X?}->p0x{:016X?} (len={arg1})", frame.regs[11], arg0);
-
-                let slice = core::slice::from_raw_parts(arg0 as *const u8, arg1);
+            if let Some(kva) = crate::kernel::memmap::user_va_to_kdmap(&root_table, frame.regs[11] as u64) {
+                let slice = core::slice::from_raw_parts(kva as *const u8, arg1);
                 if let Ok(s) = core::str::from_utf8(slice) {
                     match serial::SERIAL.print_str(s) {
                         Ok(_) => (),
@@ -434,8 +449,6 @@ pub fn handle_serial_print(epc: usize, hart_context: &'static HartContext, frame
                 ret = -2;
             }
         }
-
-        riscv::register::sstatus::clear_sum();
 
         frame.regs[10] = ret as usize;
 
