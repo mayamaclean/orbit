@@ -94,12 +94,27 @@ impl SlotAlloc {
     }
 }
 
+/// Which kernel frame pool a [`PhysBacking`] was drawn from. Drives
+/// teardown routing and, eventually, whether the page is KDMAP-visible
+/// from supervisor code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pool {
+    /// Kernel-accessible via KDMAP in every satp. Use for kernel-owned
+    /// allocations (trap frames, rings) and for shared user memory the
+    /// kernel must dereference after creation (NetChannel).
+    Shared,
+    /// Mapped only into the owning user satp. Kernel writes at setup
+    /// time have to go through a temporary window.
+    UserOnly,
+}
+
 /// Physical backing for a [`UserMapping`]. Absent for pure vaddr reservations
 /// like guard pages.
 #[derive(Debug, Clone, Copy)]
 pub struct PhysBacking {
     pub paddr:  u64,
     pub layout: Layout,
+    pub pool:   Pool,
 }
 
 #[derive(Debug, Clone, Copy)]

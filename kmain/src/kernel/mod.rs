@@ -17,7 +17,7 @@ use mmu::mmap::{PageAlloc, id_map_range, map_address_range, unmap, unmap_page};
 use mmu::sv48::{PageTable, PhysAddr, VirtAddr};
 use mmu::{KB, MB, MappingConfig, PAGE_SIZE, PagePermissions};
 use net_channel::{NetChannel, NetChannelQueue, NetChannelState};
-use process::{MappingKind, MemMapReq, NetChannelRegistrationReq, PThread, PhysBacking, Process, Thread, ThreadBlockReason, ThreadState, UserMapping};
+use process::{MappingKind, MemMapReq, NetChannelRegistrationReq, PThread, PhysBacking, Pool, Process, Thread, ThreadBlockReason, ThreadState, UserMapping};
 use riscv::register::satp::{Mode, Satp};
 use riscv::register::sstatus::SPP;
 use serial::println;
@@ -619,7 +619,12 @@ impl Orbit {
                             // PhysBacking.paddr is physical; the allocator's
                             // handles are KDMAP VAs post-migration.
                             let kva = memmap::phys_to_virt(b.paddr) as usize;
-                            self.kernel_pages.dealloc_aligned(kva, b.layout);
+                            match b.pool {
+                                Pool::Shared => self.kernel_pages.dealloc_aligned(kva, b.layout),
+                                // user_pages allocator lands in step 3; no
+                                // UserOnly backings exist yet.
+                                Pool::UserOnly => self.kernel_pages.dealloc_aligned(kva, b.layout),
+                            }
                         }
 
                         let proc = self.processes.get_mut(&pid).expect("proc vanished mid-teardown");
@@ -1226,6 +1231,7 @@ impl Orbit {
                     // construction during teardown), so convert here.
                     paddr:  memmap::virt_to_phys_dmap(stackp as u64),
                     layout: stack_layout,
+                    pool:   Pool::Shared,
                 }),
                 kind:    MappingKind::Stack { slot },
             });
@@ -1236,6 +1242,7 @@ impl Orbit {
                 backing: Some(PhysBacking {
                     paddr:  memmap::virt_to_phys_dmap(trap_frame as u64),
                     layout: Self::THREAD_TRAP_FRAME_LAYOUT,
+                    pool:   Pool::Shared,
                 }),
                 kind:    MappingKind::TrapFrame { slot },
             });
