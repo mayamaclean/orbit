@@ -68,13 +68,7 @@ fn serial_print(ptr: usize, len: usize) -> isize {
 }
 
 fn mmap(addr: usize, len: usize, permissions: usize, share_with_kernel: bool) -> isize {
-    let r = syscall_arg4(4096, addr, len, permissions, share_with_kernel as usize);
-    if r == 0 {
-        unsafe {
-            core::ptr::write_bytes(addr as *mut u8, 0, len);
-        }
-    }
-    r  
+    syscall_arg4(4096, addr, len, permissions, share_with_kernel as usize)
 }
 
 fn exit(code: isize) -> ! {
@@ -92,9 +86,6 @@ pub unsafe extern "C" fn _start() -> ! {
     let _ = serial_print(TEST.as_ptr() as usize, TEST.len());
 
     sleep_ms(5000);
-
-    //let n = 0 as *const u64;
-    //core::ptr::read_volatile(n);
 
     // map 4096 bytes to addr with read/write + share with kernel. Pick a
     // hint above USER_TEXT_BASE (0x2_2000_0000 post-higher-half) so it can't
@@ -170,6 +161,8 @@ pub unsafe extern "C" fn _start() -> ! {
         }
     }
 
+    exit(0);
+
     let mut written = false;
     loop {
         if !written && nc.writeable() > 0 {
@@ -205,10 +198,20 @@ pub unsafe extern "C" fn _start() -> ! {
         }
         else {
             // sleep for ms
-            let _ = sleep_ms(10);
+            let _ = sleep_ms(100);
+        }
+
+        let state = unsafe {
+            nc.current_state.as_ref().state.load(Ordering::Acquire)
+        };
+
+        if state <= 0 {
+            const TCP_CONN_FAILURE: &'static str = "tcp connection failed!\n";
+            let _ = serial_print(TCP_CONN_FAILURE.as_ptr() as usize, TCP_CONN_FAILURE.len());
+            break
         }
     }    
-    exit(0);
+    exit(-1);
 }
 
 #[panic_handler]

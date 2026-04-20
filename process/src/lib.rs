@@ -212,7 +212,7 @@ pub struct Process {
     pub threads: BTreeSet<u32>,
     pub thread_count: u16,
     pub satp: Satp,
-    pub heap_pages: Vec<(usize, Layout)>,
+    pub heap_pages: Vec<PhysBacking>,
     pub sockets: BTreeSet<SocketHandle>,
 
     /// VMAs for this process, keyed by vaddr. Invariant: no two entries overlap.

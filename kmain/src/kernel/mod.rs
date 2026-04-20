@@ -34,6 +34,7 @@ pub mod context;
 pub mod memmap;
 pub mod orbital_elf;
 pub mod pci;
+pub mod user_page;
 
 pub use memmap::KernelLayout;
 
@@ -41,75 +42,10 @@ pub use memmap::KernelLayout;
 
 pub const UMODE_TEST_ELF: &'static [u8] = include_bytes!("../../../umode/target/riscv64gc-unknown-none-elf/release/umode");
 
-// User address-space layout (low→high). The kernel lives fully in the high
-// half (KTEXT / KDMAP / KMMIO) and installs no low-half mappings into a
-// user satp, so the entire low half minus a null guard is user-owned.
-//
-//   0x0000_0000_0000_0000..USER_NULL_GUARD_END   null guard (64 KiB)
-//   ..                                            unused reserve
-//   UPROC_STACK_BASE..UPROC_STACK_BASE + 8 GiB    256 * 32 MiB stack slots
-//   ..                                            mmap arena (user chooses hints here)
-//   USER_TEXT_BASE..                              user ELF image
-//   USER_TRAP_FRAME_BASE..                        256 * 4 KiB TrapFrames (S-only)
-
-// Matches Linux-style mmap_min_addr; catches NULL-region derefs as faults.
-pub const USER_NULL_GUARD_END: u64 = 0x1_0000;
-
-// Per-thread stack region. 256 slots * 32 MiB stride = 8 GiB total.
-// Each slot holds a stack sized per-thread (2..=30 MiB, multiples of 2 MiB),
-// anchored at the high end of the slot; the remainder of the slot below it
-// is a guard with no leaves so overflow faults instead of clobbering the
-// neighbouring slot.
-pub const UPROC_STACK_BASE:   u64 = 0x1000_0000;
-pub const UPROC_STACK_STRIDE: u64 = 32 * MB;
-pub const UPROC_STACK_GRAIN:  u64 = 2  * MB;
-pub const UPROC_STACK_MIN:    u64 = UPROC_STACK_GRAIN;
-// One grain reserved for the guard at the low end of each slot.
-pub const UPROC_STACK_MAX:    u64 = UPROC_STACK_STRIDE - UPROC_STACK_GRAIN;
-pub const UPROC_STACK_DEFAULT: u64 = UPROC_STACK_GRAIN;
-
-pub const fn user_stack_slot_base(slot: u16) -> u64 {
-    UPROC_STACK_BASE + (slot as u64) * UPROC_STACK_STRIDE
-}
-
-pub const fn user_stack_slot_top(slot: u16) -> u64 {
-    user_stack_slot_base(slot) + UPROC_STACK_STRIDE
-}
-
-// Low end of the writable stack; stack grows down from user_stack_slot_top.
-pub const fn user_stack_vaddr(slot: u16, stack_size: u64) -> u64 {
-    user_stack_slot_top(slot) - stack_size
-}
-
-pub const fn user_stack_guard_vaddr(slot: u16) -> u64 {
-    user_stack_slot_base(slot)
-}
-
-pub const fn user_stack_guard_size(stack_size: u64) -> u64 {
-    UPROC_STACK_STRIDE - stack_size
-}
-
-pub const fn validate_user_stack_size(size: u64) -> bool {
-    size >= UPROC_STACK_MIN
-        && size <= UPROC_STACK_MAX
-        && size % UPROC_STACK_GRAIN == 0
-}
-
-// User ELF image sits just above the stack region. Stacks reach up to
-// UPROC_STACK_BASE + 8 GiB = 0x2_1000_0000; leave a 16 MiB breathing gap.
-pub const USER_TEXT_BASE: u64 = 0x2_2000_0000;
-
-// Kernel-private per-thread TrapFrame region (no U bit; only S-mode reads
-// them in enter_hart_context_asm after the satp switch). One page per slot,
-// indexed by the thread's per-process slot so siblings don't collide.
-// Placed near the high end of the user address space so the mmap arena
-// growing up from below can't alias it.
-pub const USER_TRAP_FRAME_BASE:   u64 = 0x100_0000_0000;
-pub const USER_TRAP_FRAME_STRIDE: u64 = PAGE_SIZE as u64;
-
-pub const fn user_trap_frame_vaddr(slot: u16) -> u64 {
-    USER_TRAP_FRAME_BASE + (slot as u64) * USER_TRAP_FRAME_STRIDE
-}
+// User address-space layout lives in the canonical orbit_abi::layout module.
+// Re-exported so existing `kernel::USER_TEXT_BASE`-style call sites keep
+// working.
+pub use orbit_abi::layout::*;
 
 pub struct Orbit {
     dtb_addr: usize,
@@ -126,6 +62,9 @@ pub struct Orbit {
 
     table_pages: FrameAllocator<33>,
     kernel_pages: FrameAllocator<33>,
+    // User-private backings (stacks, ELF, anon mmaps). Wired now, routed
+    // to in later steps of the pool-split milestone.
+    user_pages: FrameAllocator<33>,
 
     net_pkg: NetPackage,
     orphaned_sockets: Vec<SocketHandle>
@@ -144,7 +83,10 @@ impl Orbit {
         Layout::from_size_align_unchecked(PAGE_SIZE, PAGE_SIZE)
     };
 
-    pub const IGB_ADDR: u64 = 0x4000_0000;
+    /// Physical address we program into the e1000's BAR0; the device decodes
+    /// MMIO accesses to this PA on the bus. The kernel reaches the same
+    /// region through a high-half KMMIO alias allocated at setup_igb.
+    pub const IGB_BAR_PA: u64 = 0x4000_0000;
 
     pub fn thread_count(&self) -> usize {
         self.threads.len()
@@ -175,6 +117,7 @@ impl Orbit {
         layout: KernelLayout,
         table_pages: FrameAllocator<33>,
         kernel_pages: FrameAllocator<33>,
+        user_pages: FrameAllocator<33>,
         satp: Satp)
         -> Self
     {
@@ -183,6 +126,7 @@ impl Orbit {
             _serial_addr,
             table_pages,
             kernel_pages,
+            user_pages,
             cpu_count,
             satp,
             layout,
@@ -213,12 +157,21 @@ impl Orbit {
             .map_err(|e| {
                 serial::println!("bad user stack layout for size={stack_size}: {e:?}");
             })?;
-        let paddr = self.kernel_pages.alloc_aligned(layout)
+        let kva = self.user_pages.alloc_aligned(layout)
             .ok_or(())
             .map_err(|_| {
                 serial::println!("failed to allocate user thread stack size={stack_size}");
             })?;
-        Ok((paddr, layout))
+
+        // Zero before the PTE install exposes the stack to user code — the
+        // page may have been returned by a previous process.
+        unsafe {
+            let paddr = memmap::virt_to_phys_dmap(kva as u64);
+            let mut w = user_page::UserPageWindow::map(paddr, layout.size());
+            w.as_mut_slice().fill(0);
+        }
+
+        Ok((kva, layout))
     }
 
     fn allocate_trap_frame(&mut self) -> Result<usize, ()> {
@@ -333,7 +286,15 @@ impl Orbit {
             }
         };
 
-        let paddr = match self.kernel_pages.alloc_aligned(layout) {
+        // Shared mmaps stay in kernel_pages so the kernel (net thread,
+        // deferred handlers) can deref through KDMAP long after setup.
+        // Private mmaps go to user_pages; kernel has no long-lived alias.
+        let (pool, alloc_result) = if req.share_with_kernel {
+            (Pool::Shared, self.kernel_pages.alloc_aligned(layout))
+        } else {
+            (Pool::UserOnly, self.user_pages.alloc_aligned(layout))
+        };
+        let paddr = match alloc_result {
             Some(p) => p,
             None => {
                 serial::println!("failed to alloc pages for mmap req: {req:?}");
@@ -348,9 +309,27 @@ impl Orbit {
         }
         else { None };
 
-        // `paddr` here is the kernel_pages allocator handle — a KDMAP VA
-        // post-migration. PTE paddrs are physical, so convert at the boundary.
+        // `paddr` here is the allocator handle — a KDMAP VA while user_pages
+        // still has a KDMAP alias; PTE paddrs are physical, so convert.
         let backing_phys = memmap::virt_to_phys_dmap(paddr as u64);
+
+        // Zero before the PTE install exposes the page to user code — a
+        // previous owner's contents would otherwise be visible to the new
+        // process. Shared pages can be written through KDMAP directly; for
+        // user-only pages we go through UserPageWindow so step 8's KDMAP
+        // removal doesn't regress this.
+        unsafe {
+            match pool {
+                Pool::Shared => {
+                    let kva = memmap::phys_to_virt(backing_phys);
+                    core::ptr::write_bytes(kva as *mut u8, 0, layout.size());
+                }
+                Pool::UserOnly => {
+                    let mut w = user_page::UserPageWindow::map(backing_phys, layout.size());
+                    w.as_mut_slice().fill(0);
+                }
+            }
+        }
 
         let config = MappingConfig {
             permissions: (req.page_permissions & 0xE) | PagePermissions::U,
@@ -374,7 +353,10 @@ impl Orbit {
                 serial::println!("failed to map pages for mmap req: {req:?}");
                 thread.frame.regs[10] = -4isize as usize;
 
-                self.kernel_pages.dealloc_aligned(paddr, layout);
+                match pool {
+                    Pool::Shared   => self.kernel_pages.dealloc_aligned(paddr, layout),
+                    Pool::UserOnly => self.user_pages.dealloc_aligned(paddr, layout),
+                }
 
                 return
             }
@@ -386,13 +368,20 @@ impl Orbit {
                 serial::println!("failed to add pages to process metadata (no pid): {req:?}");
                 thread.frame.regs[10] = -5isize as usize;
 
-                self.kernel_pages.dealloc_aligned(paddr, layout);
+                match pool {
+                    Pool::Shared   => self.kernel_pages.dealloc_aligned(paddr, layout),
+                    Pool::UserOnly => self.user_pages.dealloc_aligned(paddr, layout),
+                }
 
                 return
             }
         };
 
-        owning_process.heap_pages.push((paddr, layout));
+        owning_process.heap_pages.push(PhysBacking {
+            paddr: backing_phys,
+            layout,
+            pool,
+        });
 
         core::sync::atomic::fence(Ordering::SeqCst);
         
@@ -653,9 +642,15 @@ impl Orbit {
 
         let root_table = unsafe { memmap::kernel_root_from_pa(process_root_table_pa) };
 
-        while let Some((paddr, layout)) = process.heap_pages.pop() {
-            serial::println!("dealloc heap page@{paddr:0016X} {layout:08X?}");
-            self.kernel_pages.dealloc_aligned(paddr, layout);
+        while let Some(b) = process.heap_pages.pop() {
+            // PhysBacking.paddr is physical; allocator handles are KDMAP VAs.
+            let kva = memmap::phys_to_virt(b.paddr) as usize;
+            serial::println!("dealloc heap page pa@{:016X} kva@{:016X} {:08X?} pool={:?}",
+                b.paddr, kva, b.layout, b.pool);
+            match b.pool {
+                Pool::Shared   => self.kernel_pages.dealloc_aligned(kva, b.layout),
+                Pool::UserOnly => self.user_pages.dealloc_aligned(kva, b.layout),
+            }
         }
 
         let mut pages = PageAlloc::FA(&mut self.table_pages);
@@ -815,19 +810,9 @@ impl Orbit {
     fn setup_igb(&mut self, device: &PciDevice) {
         device.print_info();
 
-        let map: MappingConfig = MappingConfig {
-            permissions: PagePermissions::R | PagePermissions::W | PagePermissions::G,
-            levels: 4,
-            page_size: 4096,
-            vaddr: VirtAddr::new(Self::IGB_ADDR),
-            paddr: PhysAddr::new(Self::IGB_ADDR),
-            log: false,
-            supervisor_tag: None
-        };
-        
         let ort = self.root();
 
-        unsafe {
+        let bar_kva = unsafe {
             let bar_size = device.get_bar_size(0) as u64;
             if bar_size > (2 * MB) {
                 serial::println!("bar2big");
@@ -838,21 +823,25 @@ impl Orbit {
 
             serial::println!("mapping {}KB BAR0", bar_size / KB);
 
-            match id_map_range(&ort, &mut pages, map, Self::IGB_ADDR..(Self::IGB_ADDR + bar_size)) {
-                Err(_) => {
-                    serial::println!("failed to map bar");
-                    return
-                },
-                Ok(id) => {
-                    serial::println!("{id:?}");
-                }
-            }
+            // BAR0's PA stays at IGB_BAR_PA (we still program that into the
+            // device's BAR register so the device decodes it on the bus);
+            // kernel-side accesses go through a high-half KMMIO alias.
+            let kva = match memmap::install_kmmio_alias(
+                &ort, &mut pages, Self::IGB_BAR_PA..(Self::IGB_BAR_PA + bar_size)
+            ) {
+                Ok(v) => v,
+                Err(_) => { serial::println!("failed to map bar"); return }
+            };
 
-            device.write_bar(0, Self::IGB_ADDR as u32);
+            device.write_bar(0, Self::IGB_BAR_PA as u32);
 
             riscv::register::satp::write(self.satp);
             riscv::asm::sfence_vma(0, 0);
 
+            kva
+        };
+
+        unsafe {
             let tx_ring = (self.kernel_pages.alloc_aligned(
                 Layout::from_size_align_unchecked(TX_RING_BYTES, PAGE_SIZE))
                 .expect("no e1000 tx ring") as *mut [TxDesc; TX_RING_LEN])
@@ -873,7 +862,7 @@ impl Orbit {
                 .expect("no e1000 rx bufs") as *mut [E1000Pbuf; RX_RING_LEN])
                 .as_mut_unchecked();
 
-            let mut e1000 = E1000::new(Self::IGB_ADDR as *mut u32, tx_ring, tx_bufs, rx_ring, rx_bufs);
+            let mut e1000 = E1000::new(bar_kva as *mut u32, tx_ring, tx_bufs, rx_ring, rx_bufs);
             let mac = e1000.read_mac().unwrap();
             if let Err(_) = e1000.init_hw(mac) {
                 // free everything ig
@@ -1013,31 +1002,26 @@ impl Orbit {
 
         serial::println!("pci@{:08X}..{:08X}", base, base+size);
 
-        // Identity-map PCI config space so scan_pci can read it under the
-        // kernel's normal satp. Previously this region was accessed under
-        // Satp::Bare, but that no longer works: kernel code runs at high-half
-        // VAs post-trampoline, and Bare mode has no translation — PC would
-        // dangle in unmapped space.
-        unsafe {
+        // PCI config space lives at a high-half KMMIO alias instead of
+        // identity-mapped at its PA — keeps the kernel root free of low-half
+        // entries that would shadow user VA space.
+        let pci_cfg_va = unsafe {
             let ort = self.root();
             let mut pages = PageAlloc::FA(&mut self.table_pages);
-            let cfg = MappingConfig {
-                permissions: PagePermissions::R | PagePermissions::W | PagePermissions::G,
-                levels: 4,
-                page_size: PAGE_SIZE as u64,
-                vaddr: VirtAddr::new(0),
-                paddr: PhysAddr::new(0),
-                log: false,
-                supervisor_tag: None,
+            let va = match memmap::install_kmmio_alias(
+                &ort, &mut pages, (base as u64)..((base + size) as u64)
+            ) {
+                Ok(v) => v,
+                Err(_) => {
+                    serial::println!("failed to map pci config space");
+                    return;
+                }
             };
-            if id_map_range(&ort, &mut pages, cfg, (base as u64)..((base + size) as u64)).is_err() {
-                serial::println!("failed to map pci config space");
-                return;
-            }
             riscv::asm::sfence_vma(0, 0);
-        }
+            va
+        };
 
-        let matches = pci::scan_pci(base, &[(0x8086, 0x100E)]);
+        let matches = pci::scan_pci(pci_cfg_va as usize, &[(0x8086, 0x100E)]);
         if matches.is_empty() {
             return
         }
@@ -1172,17 +1156,25 @@ impl Orbit {
             return Err(())
         }
 
-        let mut page_list = Vec::new();
+        let mut page_list: Vec<PhysBacking> = Vec::new();
 
         let (stackp, stack_layout) = self.allocate_user_thread_stack(stack_size)?;
-        page_list.push((stackp, stack_layout));
+        page_list.push(PhysBacking {
+            paddr: memmap::virt_to_phys_dmap(stackp as u64),
+            layout: stack_layout,
+            pool: Pool::UserOnly,
+        });
 
         let trap_frame = self.allocate_trap_frame()
             .map_err(|_| {
-                self.free_kernel_pages(&page_list[..]);
+                self.free_backings(&page_list[..]);
             })?;
 
-        page_list.push((trap_frame, Self::THREAD_TRAP_FRAME_LAYOUT));
+        page_list.push(PhysBacking {
+            paddr: memmap::virt_to_phys_dmap(trap_frame as u64),
+            layout: Self::THREAD_TRAP_FRAME_LAYOUT,
+            pool: Pool::Shared,
+        });
 
         let stack_vaddr      = user_stack_vaddr(slot, stack_size);
         let guard_vaddr      = user_stack_guard_vaddr(slot);
@@ -1193,7 +1185,7 @@ impl Orbit {
         let root_pa = memmap::virt_to_phys_dmap(root_kva as u64);
 
         if let Err(_) = self.map_stack(root_table, stackp as u64, stack_vaddr, stack_size) {
-            self.free_kernel_pages(&page_list[..]);
+            self.free_backings(&page_list[..]);
             self.table_pages.dealloc_aligned(root_kva, Self::TABLE_LAYOUT);
 
             serial::println!("failed to map stack");
@@ -1202,7 +1194,7 @@ impl Orbit {
         }
 
         if let Err(_) = self.map_trap_frame(root_table, trap_frame, trap_frame_vaddr) {
-            self.free_kernel_pages(&page_list[..]);
+            self.free_backings(&page_list[..]);
             self.table_pages.dealloc_aligned(root_kva, Self::TABLE_LAYOUT);
 
             serial::println!("failed to map trap frame");
@@ -1231,7 +1223,7 @@ impl Orbit {
                     // construction during teardown), so convert here.
                     paddr:  memmap::virt_to_phys_dmap(stackp as u64),
                     layout: stack_layout,
-                    pool:   Pool::Shared,
+                    pool:   Pool::UserOnly,
                 }),
                 kind:    MappingKind::Stack { slot },
             });
@@ -1254,8 +1246,13 @@ impl Orbit {
             let f = trap_frame as *mut TrapFrame;
             core::ptr::write_bytes(f as *mut u8, 0, PAGE_SIZE);
 
+            // Stack was zeroed inside allocate_user_thread_stack via
+            // UserPageWindow — `stackp` is a user_pages KDMAP VA that no
+            // longer resolves under any satp, so writing through it here
+            // would fault. The &mut Stack reference below is constructed
+            // for `Thread.stack` but never dereferenced kernel-side; user
+            // code reaches the same backing via the user-VA mapping.
             let s = stackp as *mut Stack;
-            core::ptr::write_bytes(s as *mut u8, 0, stack_size as usize);
 
             (
                 f.as_mut_unchecked(),
@@ -1292,7 +1289,7 @@ impl Orbit {
     
     pub fn create_new_process(&mut self, elf_blob: &[u8], stack_size: u64) -> Result<(), ()> {
         let root_table = self.create_new_page_table()?;
-        let elf = self.load_elf(&root_table, elf_blob)?;
+        let mut elf = self.load_elf(&root_table, elf_blob)?;
         let pid = self.next_pid();
 
         let root_kva = root_table.table as *const _ as u64;
@@ -1305,6 +1302,11 @@ impl Orbit {
 
         let mut proc = Process::new(pid, proc_satp);
         let slot = proc.thread_slots.alloc().ok_or(())?;
+
+        // ELF segment backings are tracked on the process so dealloc_process
+        // returns them to user_pages on teardown — previously dropped on the
+        // floor here.
+        proc.heap_pages.append(&mut elf.segments);
 
         // Insert the Process before creating the thread so create_new_thread
         // can record per-thread UserMappings (TrapFrame, eventually Stack/TLS)
@@ -1335,6 +1337,31 @@ impl Orbit {
         let tptr = Box::into_raw(t);
         serial::println!("created uprocess@{tptr:016X?},pid={pid},tid={tid},table_pa={root_pa:016X?}");
 
+        // Pool-split probe: neither the new user satp nor the kernel satp
+        // should have a KDMAP alias of user_pages. Kpages remains KDMAP-
+        // visible in both so shared-memory paths (NetChannel) keep working.
+        // A stray `phys_to_virt(user_pa)` deref now faults from either satp.
+        unsafe {
+            let kpages_kdmap = memmap::phys_to_virt(self.layout.kpages.start);
+            let user_kdmap  = memmap::phys_to_virt(self.layout.user_pages.start);
+
+            let user_root = &root_table;
+            let user_kpages_ok = mmu::mmap::virt_to_phys(user_root, VirtAddr::new(kpages_kdmap)).is_some();
+            let user_user_ok   = mmu::mmap::virt_to_phys(user_root, VirtAddr::new(user_kdmap)).is_some();
+
+            let kernel_satp_pa = (self.satp.ppn() * PAGE_SIZE) as u64;
+            let kernel_root = memmap::kernel_root_from_pa(kernel_satp_pa);
+            let kernel_kpages_ok = mmu::mmap::virt_to_phys(&kernel_root, VirtAddr::new(kpages_kdmap)).is_some();
+            let kernel_user_ok   = mmu::mmap::virt_to_phys(&kernel_root, VirtAddr::new(user_kdmap)).is_some();
+
+            serial::println!(
+                "pool-split 8b: pid{pid}  user satp: kpages-kdmap={user_kpages_ok}  user-kdmap={user_user_ok}"
+            );
+            serial::println!(
+                "pool-split 8b: kernel satp: kpages-kdmap={kernel_kpages_ok}  user-kdmap={kernel_user_ok} (want true,false in both)"
+            );
+        }
+
         let proc = self.processes.get_mut(&pid)
             .expect("just inserted");
         proc.threads.insert(tid);
@@ -1345,9 +1372,13 @@ impl Orbit {
         Ok(())
     }
 
-    fn free_kernel_pages(&mut self, pages: &[(usize, Layout)]) {
-        for page in pages {
-            self.kernel_pages.dealloc_aligned(page.0, page.1);
+    fn free_backings(&mut self, backings: &[PhysBacking]) {
+        for b in backings {
+            let kva = memmap::phys_to_virt(b.paddr) as usize;
+            match b.pool {
+                Pool::Shared   => self.kernel_pages.dealloc_aligned(kva, b.layout),
+                Pool::UserOnly => self.user_pages.dealloc_aligned(kva, b.layout),
+            }
         }
     }
     
@@ -1387,31 +1418,37 @@ impl Orbit {
 
             unsafe {
                 let layout = Layout::from_size_align_unchecked(segment_data.len(), PAGE_SIZE);
-                let phys = match self.kernel_pages.alloc_aligned(layout) {
+                let kva = match self.user_pages.alloc_aligned(layout) {
                     Some(p) => p,
                     None => {
-                        self.free_kernel_pages(&segment_allocations[..]);
+                        self.free_backings(&segment_allocations[..]);
                         serial::println!("failed to alloc segment");
                         return Err(())
                     },
                 };
+                let paddr_start = memmap::virt_to_phys_dmap(kva as u64);
 
-                segment_allocations.push((phys, layout));
-
-                // `phys` here is the kernel_pages handle — a KDMAP VA
-                // post-migration. The copy/zero use it as a kernel VA (fine
-                // through KDMAP); the PTE construction below needs physical.
-                core::ptr::copy_nonoverlapping(segment_data.as_ptr(), phys as *mut u8, segment_data.len());
-
-                if segment.p_memsz > segment.p_filesz {
-                    core::ptr::write_bytes(
-                        (phys + segment.p_filesz as usize) as *mut u8,
-                        0,
-                        (segment.p_memsz - segment.p_filesz) as usize
-                    );
+                // Segment bytes are copied in + the bss tail is zeroed through
+                // UserPageWindow so step 8's KDMAP-alias removal doesn't
+                // regress this: the kernel can't deref user_pages PAs directly
+                // post-split, only through the window's install/invalidate.
+                {
+                    let mut w = user_page::UserPageWindow::map(paddr_start, layout.size());
+                    let buf = w.as_mut_slice();
+                    let file_len = segment_data.len();
+                    buf[..file_len].copy_from_slice(segment_data);
+                    if segment.p_memsz > segment.p_filesz {
+                        let tail = &mut buf[segment.p_filesz as usize..];
+                        tail.fill(0);
+                    }
                 }
 
-                let paddr_start = memmap::virt_to_phys_dmap(phys as u64);
+                segment_allocations.push(PhysBacking {
+                    paddr: paddr_start,
+                    layout,
+                    pool: Pool::UserOnly,
+                });
+
                 let vaddr_start = round_u64_down(segment.p_vaddr, PAGE_SIZE as u64);
 
                 let segment_aligned_len = round_u64_up(segment_data.len() as u64, PAGE_SIZE as u64);
@@ -1450,7 +1487,7 @@ impl Orbit {
                     PhysAddr::new(paddr_end));
 
                 if map.is_err() {
-                    self.free_kernel_pages(&segment_allocations);
+                    self.free_backings(&segment_allocations);
                     serial::println!("failed to map segment into process");
                     return Err(())
                 }

@@ -11,6 +11,7 @@ riscv = { version = "0.16.0", features = ["rt"] }
 mem = { path = "../mem", features = ["alloc"] }
 linked_list_allocator = "0.10.5"
 process = { path = "../process" }
+orbit-abi = { path = "../orbit-abi" }
 riscv_plic = "0.2.0"
 heapless = { version = "0.9.2", features = ["portable-atomic", "mpmc_large"] }
 elf = { version = "0.8.0", default-features = false }

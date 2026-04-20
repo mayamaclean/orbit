@@ -173,6 +173,88 @@ pub unsafe fn map_address_page<'a>(root_table: &RootTable<'_>, pages: &mut PageA
     Ok(())
 }
 
+/// Materialize page-table intermediates for `[va_start, va_end)` down to (but
+/// not including) the leaf level. Leaf PTEs are left `V=0`, so the VA range
+/// walks-to-fault until a caller installs leaves on demand. Used to reserve
+/// scratch VA windows whose leaves are written and cleared transiently.
+pub unsafe fn reserve_va_range<'a>(
+    root_table: &RootTable<'_>,
+    pages: &mut PageAlloc<'a>,
+    va_start: u64,
+    va_end: u64,
+) -> Result<(), ()> {
+    if (va_start % PAGE_SIZE as u64) != 0 || (va_end % PAGE_SIZE as u64) != 0 {
+        return Err(())
+    }
+
+    // Advance by 2 MiB per iteration — the span of one L0 table, which the
+    // walk ensures exists on the way down.
+    const L0_SPAN: u64 = 512 * PAGE_SIZE as u64;
+    let mut va = va_start;
+    while va < va_end {
+        let vaddr = VirtAddr::new(va);
+        let mut current = root_table.table;
+        for level in (1..=3).rev() {
+            let idx = vaddr.vpn_n(level) as usize;
+            let pte = &current.entries[idx];
+            current = if !pte.is_valid() {
+                let new_table = pages.allocate_page_table()?;
+                let new_table_va = new_table as *const _ as u64;
+                let new_table_pa = root_table.pa_from_va(new_table_va);
+                let ppn = new_table_pa / PAGE_SIZE as u64;
+                pte.set_raw(crate::sv48::PageTableEntry::pack_table(ppn));
+                new_table
+            } else {
+                let next_pa = pte.ppn() * PAGE_SIZE as u64;
+                unsafe {
+                    (root_table.va_from_pa(next_pa) as *const PageTable)
+                        .as_ref_unchecked()
+                }
+            };
+        }
+        // `current` is the L0 table; leaves stay all-zero (from
+        // allocate_page_table).
+        va = va.saturating_add(L0_SPAN);
+    }
+    Ok(())
+}
+
+/// Install a 4 KiB leaf PTE for `vaddr` under `root_table`, pointing at
+/// `paddr` with `perms`, or clear the leaf entirely when `paddr` is None.
+/// Returns `Err(())` if the walk hits an invalid or leaf PTE above L0 —
+/// callers must pre-reserve intermediates for the VA range (e.g. via
+/// `reserve_va_range`). The caller owns the post-write `sfence.vma`.
+pub unsafe fn write_leaf_pte(
+    root_table: &RootTable<'_>,
+    vaddr: VirtAddr,
+    paddr: Option<PhysAddr>,
+    perms: u64,
+) -> Result<(), ()> {
+    let mut table = root_table.table;
+    for level in (1..=3).rev() {
+        let idx = vaddr.vpn_n(level) as usize;
+        let pte = &table.entries[idx];
+        if !pte.is_valid() || pte.is_leaf() {
+            return Err(())
+        }
+        let next_pa = pte.ppn() * PAGE_SIZE as u64;
+        table = unsafe {
+            (root_table.va_from_pa(next_pa) as *const PageTable).as_ref_unchecked()
+        };
+    }
+    let leaf_idx = vaddr.vpn_n(0) as usize;
+    match paddr {
+        Some(pa) => {
+            let ppn = pa.get_raw() / PAGE_SIZE as u64;
+            table.entries[leaf_idx].set_raw(
+                crate::sv48::PageTableEntry::pack_leaf(ppn, perms),
+            );
+        }
+        None => table.entries[leaf_idx].set_raw(0),
+    }
+    Ok(())
+}
+
 pub unsafe fn map_address_range<'a>(root_table: &RootTable<'_>, pages: &mut PageAlloc<'a>, config: &MappingConfig, vend: VirtAddr, pend: PhysAddr) -> Result<(), ()> {
     let pstart = config.paddr.get_raw();
     let pend = pend.get_raw();
@@ -258,6 +340,14 @@ pub unsafe fn virt_to_phys(root_table: &RootTable<'_>, vaddr: VirtAddr) -> Optio
     for l in (0..=3).rev() {
         let index = vaddr.vpn_n(l) as usize;
         let entry = &current_table.entries[index];
+
+        // V=0 is "not present" — without this check the walker computes
+        // va_from_pa(ppn=0) = pa_to_va_bias and derefs a bogus pointer,
+        // faulting on a legitimate unmapped lookup instead of returning None.
+        if !entry.is_valid() {
+            return None
+        }
+
         let phys = (entry.get_ppn() as u64) << 2;
 
         if entry.is_leaf() {
@@ -314,26 +404,38 @@ pub unsafe fn unmap_range(root_table: &RootTable<'_>, range: Range<u64>) -> Resu
     Ok(())
 }
 
+/// Free every intermediate (non-leaf) page-table owned by this satp, except
+/// the root itself — the caller frees that. Leaf PTEs aren't invalidated
+/// and leaf-backed physical pages aren't freed here: some leaves (kernel
+/// .text, pools, MMIO) are shared by PPN across every satp, and the
+/// user-owned leaves are freed separately from their respective pools via
+/// `PhysBacking` teardown before this call.
+///
+/// Every intermediate reached via the recursion IS per-satp — both for the
+/// user half and the kernel-shared half, since `map_kernel_shared` allocates
+/// fresh L1/L2/L3 tables from `table_pages` for each new root. So walking
+/// all 512 root entries is correct: we free the per-process intermediates,
+/// and the shared leaves hang off PPNs we never deref.
 pub unsafe fn unmap<'a>(root_table: &RootTable<'_>, pages: &mut PageAlloc<'a>) {
-    for (_, entry) in root_table.table.entries.iter().enumerate() {
-        if !entry.is_valid() {
+    unsafe { unmap_subtree(root_table, pages) }
+}
+
+unsafe fn unmap_subtree<'a>(table: &RootTable<'_>, pages: &mut PageAlloc<'a>) {
+    for entry in table.table.entries.iter() {
+        if !entry.is_valid() || entry.is_leaf() {
             continue
         }
 
-        if !entry.is_leaf() {
-            let next_pa = (entry.get_ppn() as u64) << 2;
-            let next_va = root_table.va_from_pa(next_pa);
-            let table = unsafe {
-                (next_va as *const PageTable)
-                    .as_ref_unchecked()
-            };
+        let next_pa = (entry.get_ppn() as u64) << 2;
+        let next_va = table.va_from_pa(next_pa);
+        let child_table = unsafe {
+            (next_va as *const PageTable).as_ref_unchecked()
+        };
+        let child = RootTable::new(child_table, table.pa_to_va_bias);
 
-            let child = RootTable::new(table, root_table.pa_to_va_bias);
-            unsafe { unmap(&child, pages); }
+        unsafe { unmap_subtree(&child, pages) }
 
-            serial::println!("freeing t{:016X?}", root_table.table as *const _);
-            let _ = pages.free_page(root_table.table as *const _ as usize);
-        }
+        let _ = pages.free_page(next_va as usize);
     }
 }
 

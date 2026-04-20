@@ -2,7 +2,7 @@ use core::ops::Range;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use mem::round_u64_up;
-use mmu::mmap::{PageAlloc, RootTable, id_map_range, map_va_range, unmap_range, virt_to_phys};
+use mmu::mmap::{PageAlloc, RootTable, id_map_range, map_va_range, reserve_va_range, unmap_range, virt_to_phys};
 use mmu::sv48::{PageTable, PhysAddr, VirtAddr};
 use mmu::{MappingConfig, PAGE_SIZE, PagePermissions};
 
@@ -22,17 +22,40 @@ pub const LINK_BASE: u64 = 0x1000;
 
 // Nominal high-half base values. Fixed for non-KASLR; a future randomizer
 // picks different values at boot and feeds them into `init_layout`. The
-// three windows are 16 GiB apart — well over the range any of them will
+// four windows are 16 GiB apart — well over the range any of them will
 // occupy — so they can't collide.
-pub const KTEXT_NOMINAL: u64 = 0xFFFF_FFC0_0000_0000;
-pub const KDMAP_NOMINAL: u64 = 0xFFFF_FFD0_0000_0000;
-pub const KMMIO_NOMINAL: u64 = 0xFFFF_FFE0_0000_0000;
+pub const KTEXT_NOMINAL:    u64 = 0xFFFF_FFC0_0000_0000;
+pub const KDMAP_NOMINAL:    u64 = 0xFFFF_FFD0_0000_0000;
+pub const KMMIO_NOMINAL:    u64 = 0xFFFF_FFE0_0000_0000;
+pub const KSCRATCH_NOMINAL: u64 = 0xFFFF_FFF0_0000_0000;
 
-// KMMIO window slot assignments. Three devices for now — UART, CLINT MSIP,
-// ACLINT SSWI — each getting one 4 KiB page.
+// Transient per-window view into a user_pages backing for setup-time writes.
+// Single slot, serialized by the Orbit lock; size bounded to cover the
+// largest allocation we window in one shot (UPROC_STACK_MAX, 30 MiB, rounded
+// up to a megapage multiple).
+pub const KSCRATCH_SIZE: u64 = 32 * mmu::MB;
+
+// KMMIO window slot assignments. Three single-page fixed slots at the
+// bottom of the window — UART, CLINT MSIP, ACLINT SSWI — and an arena
+// past them for dynamically-discovered MMIO (PCI config, e1000 BAR, ...).
 #[inline] pub fn kmmio_uart()  -> u64 { kmmio_base() }
 #[inline] pub fn kmmio_clint() -> u64 { kmmio_base() + PAGE_SIZE as u64 }
 #[inline] pub fn kmmio_sswi()  -> u64 { kmmio_base() + 2 * PAGE_SIZE as u64 }
+
+/// Offset within the KMMIO window past the fixed-slot pages where the
+/// dynamic arena begins. Megapage-aligned so larger regions get natural
+/// superpage alignment.
+const KMMIO_ARENA_OFFSET: u64 = 2 * mmu::MB;
+static KMMIO_ARENA_NEXT: AtomicU64 = AtomicU64::new(KMMIO_ARENA_OFFSET);
+
+/// Reserve `size` bytes of KMMIO VA space (rounded up to `PAGE_SIZE`) and
+/// return the base. Pure VA bookkeeping — caller is responsible for
+/// installing the leaf PTEs that map the returned VA to the device's PA.
+pub fn kmmio_alloc(size: u64) -> u64 {
+    let aligned = mem::round_u64_up(size, PAGE_SIZE as u64);
+    let offset = KMMIO_ARENA_NEXT.fetch_add(aligned, Ordering::AcqRel);
+    kmmio_base() + offset
+}
 
 // Runtime-parameterized kernel address-space layout. Set once by `init_layout`
 // during early `rust_main` on hart 0, before any other hart is woken. Reads
@@ -42,16 +65,18 @@ static RAM_PHYS_BASE:    AtomicU64 = AtomicU64::new(0);
 static KTEXT_BASE:       AtomicU64 = AtomicU64::new(0);
 static KDMAP_BASE:       AtomicU64 = AtomicU64::new(0);
 static KMMIO_BASE:       AtomicU64 = AtomicU64::new(0);
+static KSCRATCH_BASE:    AtomicU64 = AtomicU64::new(0);
 // Physical address of `_text_start` — the base the kernel ELF was loaded at.
 // Post-trampoline `&_text_start as u64` returns the high-half VA, so helpers
 // that need the physical (PT construction, DMA setup) read this instead.
 static KERNEL_PHYS_BASE: AtomicU64 = AtomicU64::new(0);
 
-pub fn init_layout(ram_phys: u64, ktext: u64, kdmap: u64, kmmio: u64, kernel_phys: u64) {
+pub fn init_layout(ram_phys: u64, ktext: u64, kdmap: u64, kmmio: u64, kscratch: u64, kernel_phys: u64) {
     RAM_PHYS_BASE.store(ram_phys, Ordering::Relaxed);
     KTEXT_BASE.store(ktext, Ordering::Relaxed);
     KDMAP_BASE.store(kdmap, Ordering::Relaxed);
     KMMIO_BASE.store(kmmio, Ordering::Relaxed);
+    KSCRATCH_BASE.store(kscratch, Ordering::Relaxed);
     KERNEL_PHYS_BASE.store(kernel_phys, Ordering::Relaxed);
 }
 
@@ -59,6 +84,7 @@ pub fn init_layout(ram_phys: u64, ktext: u64, kdmap: u64, kmmio: u64, kernel_phy
 #[inline] pub fn ktext_base()       -> u64 { KTEXT_BASE.load(Ordering::Relaxed) }
 #[inline] pub fn kdmap_base()       -> u64 { KDMAP_BASE.load(Ordering::Relaxed) }
 #[inline] pub fn kmmio_base()       -> u64 { KMMIO_BASE.load(Ordering::Relaxed) }
+#[inline] pub fn kscratch_base()    -> u64 { KSCRATCH_BASE.load(Ordering::Relaxed) }
 #[inline] pub fn kernel_phys_base() -> u64 { KERNEL_PHYS_BASE.load(Ordering::Relaxed) }
 
 /// Translate a physical address in the RAM region to its direct-map VA.
@@ -150,19 +176,27 @@ unsafe extern "C" {
     unsafe static _DYNAMIC_END: u8;
 }
 
-// Kernel physical pool sizes. Each pool is 128 MiB; DTB sits in a 2 MiB
-// guard at the top of RAM. Layout grows downward from the DTB guard:
-//   [kpages][kheap][ktables][dtb guard]  with `mem_end = ram_end - DTB_GUARD`.
-pub const KTABLES_SIZE:   u64 = 128 * mmu::MB;
-pub const KHEAP_SIZE:     u64 = 128 * mmu::MB;
-pub const KPAGES_SIZE:    u64 = 128 * mmu::MB;
-pub const DTB_GUARD_SIZE: u64 = 2   * mmu::MB;
+// Kernel physical pool sizes. DTB sits in a 2 MiB guard at the top of RAM.
+// Layout grows downward from the DTB guard:
+//   [user_pages][kpages][kheap][ktables][dtb guard]
+//     with `mem_end = ram_end - DTB_GUARD`.
+//
+// `user_pages` is the home of user-private allocations (stacks, ELF
+// backings, anon mmaps) once pool-split routing lands (roadmap milestone 3).
+// Reserved and tracked from day one; wiring an allocator and actually
+// drawing from it is later steps in the same milestone.
+pub const KTABLES_SIZE:    u64 = 128 * mmu::MB;
+pub const KHEAP_SIZE:      u64 = 128 * mmu::MB;
+pub const KPAGES_SIZE:     u64 = 128 * mmu::MB;
+pub const USER_PAGES_SIZE: u64 = 128 * mmu::MB;
+pub const DTB_GUARD_SIZE:  u64 = 2   * mmu::MB;
 
 #[derive(Debug, Clone)]
 pub struct KernelLayout {
     pub kheap: Range<u64>,
     pub kpages: Range<u64>,
     pub ktables: Range<u64>,
+    pub user_pages: Range<u64>,
     pub dtb: Range<u64>,
     pub serial: u64,
 }
@@ -176,10 +210,12 @@ impl KernelLayout {
         let ktables_start = mem_end - KTABLES_SIZE;
         let kheap_start = ktables_start - KHEAP_SIZE;
         let kpages_start = kheap_start - KPAGES_SIZE;
+        let user_pages_start = kpages_start - USER_PAGES_SIZE;
         Self {
             kheap: kheap_start..(kheap_start + KHEAP_SIZE),
             kpages: kpages_start..(kpages_start + KPAGES_SIZE),
             ktables: ktables_start..(ktables_start + KTABLES_SIZE),
+            user_pages: user_pages_start..(user_pages_start + USER_PAGES_SIZE),
             dtb: dtb_addr..(dtb_addr + DTB_GUARD_SIZE),
             serial: serial_addr,
         }
@@ -274,6 +310,21 @@ unsafe fn map_region(rt: &RootTable<'_>, pa: &mut PageAlloc, r: &Region) -> Resu
 /// Map `pa_range` at an explicit virtual start. Picks gigapage / megapage /
 /// 4 KiB leaves by alignment so pool-scale ranges don't explode into
 /// thousands of PTEs.
+/// Reserve a KMMIO arena slot covering `pa_range` and install RW kernel
+/// leaves at the resulting VA in `rt`. Returns the VA so the caller can
+/// hand it to a driver as `*mut u32` etc. Caller owns the post-install
+/// `sfence.vma`.
+pub unsafe fn install_kmmio_alias(
+    rt: &RootTable<'_>,
+    pa_alloc: &mut PageAlloc,
+    pa_range: Range<u64>,
+) -> Result<u64, ()> {
+    let len = pa_range.end.wrapping_sub(pa_range.start);
+    let va_start = kmmio_alloc(len);
+    unsafe { map_region_va(rt, pa_alloc, va_start, pa_range, KRW, "kmmio.dyn")? };
+    Ok(va_start)
+}
+
 unsafe fn map_region_va(
     rt: &RootTable<'_>,
     pa_alloc: &mut PageAlloc,
@@ -383,6 +434,13 @@ pub unsafe fn map_kernel_shared(
         // RAM (so pool_regions doesn't need an identity alias); KMMIO covers
         // device pages.
         map_kernel_high_half(rt, pa, layout)?;
+
+        // Pre-materialize KSCRATCH intermediates (down to L0) but leave
+        // leaves V=0. UserPageWindow opens a transient leaf PTE here to
+        // access a user_pages backing from the kernel, and invalidates it
+        // on drop. Installed in every satp so the window works regardless
+        // of which satp is live when setup-time writes happen.
+        reserve_va_range(rt, pa, kscratch_base(), kscratch_base() + KSCRATCH_SIZE)?;
     }
     Ok(())
 }

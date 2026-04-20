@@ -540,6 +540,7 @@ extern "C" fn rust_main(_hartid: usize, sysinfo: usize, load_addr: u64) -> ! {
             kmain::kernel::memmap::KTEXT_NOMINAL,
             kmain::kernel::memmap::KDMAP_NOMINAL,
             kmain::kernel::memmap::KMMIO_NOMINAL,
+            kmain::kernel::memmap::KSCRATCH_NOMINAL,
             load_addr,
         );
 
@@ -595,6 +596,17 @@ extern "C" fn rust_main(_hartid: usize, sysinfo: usize, load_addr: u64) -> ! {
             kmain::kernel::memmap::phys_to_virt(layout.kpages.start) as usize,
         );
 
+        // User-private pool. Allocator hands out KDMAP VAs for now so
+        // setup-time kernel writes can go through them directly; pool-split
+        // step 8 removes the KDMAP alias and gates those writes behind a
+        // per-hart setup window.
+        let mut user_pages = FrameAllocator::<33>::new();
+        user_pages.add_frame_with_va_base(
+            layout.user_pages.start as usize,
+            layout.user_pages.end   as usize,
+            kmain::kernel::memmap::phys_to_virt(layout.user_pages.start) as usize,
+        );
+
         let cpu_count = 4;
         let context_size = cpu_count * core::mem::size_of::<HartContext>();
         let hart_contexts = {
@@ -621,7 +633,7 @@ extern "C" fn rust_main(_hartid: usize, sysinfo: usize, load_addr: u64) -> ! {
                     as *mut Orbit)
                     .as_mut_unchecked();
 
-            *orbit_ptr = Orbit::new(dtb_addr as usize, serial_addr as usize, cpu_count, layout, kernel_tables, kpages, satp.clone());
+            *orbit_ptr = Orbit::new(dtb_addr as usize, serial_addr as usize, cpu_count, layout, kernel_tables, kpages, user_pages, satp.clone());
 
             orbit_ptr
         };
