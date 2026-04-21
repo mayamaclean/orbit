@@ -786,16 +786,17 @@ impl Orbit {
             self.dealloc_process(proc);
         }
 
-        // Drain SharedUserPtr Drops that landed since the last pass. Each
-        // queued PhysBacking is a `Shared`-pool page whose last Arc just
-        // dropped — return it to `kernel_pages` here, under the Orbit
-        // lock, not in Drop context.
-        while let Some(b) = pending_frees::pop() {
+        // Drain SharedUserPtr Drops that landed since the last pass.
+        // Each queued PhysBacking is a `Shared`-pool page whose last
+        // Arc just dropped on some hart — return it to `kernel_pages`
+        // here, under the Orbit lock, not in Drop context.
+        let kpages = &mut self.kernel_pages;
+        pending_frees::drain(|b| {
             let kva = memmap::phys_to_virt(b.paddr) as usize;
             serial::println!("dealloc shared ptr backing pa@{:016X} kva@{:016X} {:08X?}",
                 b.paddr, kva, b.layout);
-            self.kernel_pages.dealloc_aligned(kva, b.layout);
-        }
+            kpages.dealloc_aligned(kva, b.layout);
+        });
     }
     
     pub fn assign_threads(&mut self, context: &'static HartContext) {

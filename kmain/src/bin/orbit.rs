@@ -638,6 +638,12 @@ extern "C" fn rust_main(_hartid: usize, sysinfo: usize, load_addr: u64) -> ! {
             orbit_ptr
         };
 
+        // Per-hart SPSC rings for deferred frees. Sized to `cpu_count`,
+        // installed before any SharedUserPtr can exist (which means
+        // before the first umode syscall, which is long after this
+        // point).
+        kmain::kernel::pending_frees::init(cpu_count);
+
         println!("allocated orbit state @ {:016X?}", &raw const *orbit as usize);
 
         let hart_root = hart_contexts as usize;
