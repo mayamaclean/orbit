@@ -1,32 +1,23 @@
 //! NetChannel ABI.
 //!
-//! The kernel allocates the NetChannel region, maps it into the caller's
-//! address space, and returns `(fd, vaddr)`. Both sides use the constants
-//! in this module to locate substructures inside the region — neither side
-//! trusts pointer fields inside shared memory.
+//! The kernel allocates the NetChannel region, initializes its control
+//! fields and queue headers, maps it into the caller's address space, and
+//! registers it with the net thread — all in a single syscall. Neither
+//! side stores absolute pointers into shared memory; offsets are anchored
+//! off the region base, which [`NetChannel`](net_channel::NetChannel)
+//! accessors compute at runtime.
 //!
-//! Syscall signature:
+//! Syscall signature (`sys_create_netch`, syscall number
+//! [`CREATE_NETCH`](crate::syscall::CREATE_NETCH)):
 //!
 //! ```text
-//! a0 = REGISTER_NETCH
-//! a1 = sock_type  (SockType)
-//! -> a0 = fd on success, -errno on failure
-//!    a1 = vaddr of mapped region (on success)
+//! a0 = CREATE_NETCH  (4097)
+//! a1 = user_vaddr    (mapping hint, must be page-aligned)
+//! a2 = region_size   (bytes; kernel clamps to [NC_MIN_REGION_SIZE,
+//!                     NC_MAX_REGION_SIZE] and rounds up to a page)
+//! a3 = sock_type     (SockType)
+//! -> a0 = 0 on success, -errno on failure
 //! ```
-
-/// Total size of a NetChannel region. One control page plus two ring pages.
-pub const NC_SIZE:        usize = 3 * 4096;
-
-/// Offset of the `NetChannel` header (placed at region base).
-pub const NC_HEADER_OFF:  usize = 0;
-pub const NC_DESIRED_OFF: usize = 128;
-pub const NC_CURRENT_OFF: usize = 256;
-pub const NC_TX_OFF:      usize = 4096;
-pub const NC_RX_OFF:      usize = 8192;
-
-/// Per-ring usable payload capacity. Derived so each ring fits exactly in one
-/// page alongside its `NetChannelQueue` header.
-pub const NC_RING_BYTES:  usize = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]

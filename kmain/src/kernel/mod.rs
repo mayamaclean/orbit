@@ -17,7 +17,7 @@ use mmu::mmap::{PageAlloc, id_map_range, map_address_range, unmap, unmap_page};
 use mmu::sv48::{PageTable, PhysAddr, VirtAddr};
 use mmu::{KB, MB, MappingConfig, PAGE_SIZE, PagePermissions};
 use net_channel::NetChannel;
-use process::{MappingKind, MemMapReq, NetChannelRegistrationReq, PThread, PhysBacking, Pool, Process, Thread, ThreadBlockReason, ThreadState, UserMapping};
+use process::{MappingKind, MemMapReq, NetChannelCreationReq, PThread, PhysBacking, Pool, Process, Thread, ThreadBlockReason, ThreadState, UserMapping};
 use riscv::register::satp::{Mode, Satp};
 use riscv::register::sstatus::SPP;
 use serial::println;
@@ -395,52 +395,117 @@ impl Orbit {
         thread.frame.regs[10] = 0;
     }
 
-    fn handle_nc_register_req<'t>(&mut self, thread: &'t mut Thread, req: NetChannelRegistrationReq) {
-        info!("handling nc registration req: {req:08X?}");
+    fn handle_nc_create_req<'t>(&mut self, thread: &'t mut Thread, req: NetChannelCreationReq) {
+        info!("handling nc creation req: {req:08X?}");
 
-        let nc_kva = unsafe {
-            let rpt = memmap::kernel_root_from_pa(thread.root_table_addr() as u64);
-            memmap::user_va_to_kdmap(&rpt, req.nc_vaddr as u64)
+        let Some(region_size) = NetChannel::normalize_region_size(req.region_size) else {
+            warn!("nc create: bad region_size {}", req.region_size);
+            thread.frame.regs[10] = -1isize as usize;
+            return
         };
 
-        // Deferred work: the manager runs under the kernel satp, not the
-        // user's, so SUM can't bridge user VAs here. Walk the user PT and
-        // stash the KDMAP alias of the NetChannel header — accessors are
-        // self-anchored and resolve sub-regions from that base.
-        let nc_kva = match nc_kva {
-            Some(p) => p,
-            None => {
-                thread.frame.regs[10] = -1isize as usize;
+        if req.nc_vaddr % PAGE_SIZE != 0 {
+            warn!("nc create: unaligned user vaddr 0x{:X}", req.nc_vaddr);
+            thread.frame.regs[10] = -1isize as usize;
+            return
+        }
+
+        let layout = match Layout::from_size_align(region_size, PAGE_SIZE) {
+            Ok(l) => l,
+            Err(e) => {
+                warn!("nc create: bad layout {e:?}");
+                thread.frame.regs[10] = -2isize as usize;
                 return
             }
         };
 
-        info!("nc@kva0x{nc_kva:08X?}");
+        // NetChannel lives in kpages (Shared pool) so the kernel can drive
+        // smoltcp through the KDMAP alias after creation.
+        let Some(paddr) = self.kernel_pages.alloc_aligned(layout) else {
+            warn!("nc create: alloc failed for {} bytes", region_size);
+            thread.frame.regs[10] = -3isize as usize;
+            return
+        };
+
+        let backing_phys = memmap::virt_to_phys_dmap(paddr as u64);
+        let kva = memmap::phys_to_virt(backing_phys);
+
+        // Zero then init before the user PTE exists — user never observes a
+        // half-initialized NetChannel, and previous tenant bytes can't leak.
+        unsafe {
+            core::ptr::write_bytes(kva as *mut u8, 0, region_size);
+            NetChannel::init(kva as *mut u8, region_size);
+        }
+
+        let config = MappingConfig {
+            permissions: (PagePermissions::R as u64)
+                | (PagePermissions::W as u64)
+                | (PagePermissions::U as u64),
+            levels: 4,
+            page_size: PAGE_SIZE as u64,
+            vaddr: VirtAddr::new(req.nc_vaddr as u64),
+            paddr: PhysAddr::new(backing_phys),
+            log: true,
+            supervisor_tag: Some(0x1),
+        };
+
+        let vend = VirtAddr::new((req.nc_vaddr + region_size) as u64);
+        let pend = PhysAddr::new(backing_phys + region_size as u64);
+
+        unsafe {
+            let root_table = memmap::kernel_root_from_pa(thread.root_table_addr() as u64);
+            let mut pages = PageAlloc::FA(&mut self.table_pages);
+
+            if map_address_range(&root_table, &mut pages, &config, vend, pend).is_err() {
+                warn!("nc create: map failed {req:?}");
+                self.kernel_pages.dealloc_aligned(paddr, layout);
+                thread.frame.regs[10] = -4isize as usize;
+                return
+            }
+        }
+
+        let Some(owning_process) = self.processes.get_mut(&thread.pid) else {
+            warn!("nc create: no owning process {req:?}");
+            self.kernel_pages.dealloc_aligned(paddr, layout);
+            thread.frame.regs[10] = -5isize as usize;
+            return
+        };
+
+        owning_process.heap_pages.push(PhysBacking {
+            paddr: backing_phys,
+            layout,
+            pool: Pool::Shared,
+        });
+
+        core::sync::atomic::fence(Ordering::SeqCst);
+
+        unsafe {
+            riscv::asm::sfence_vma(thread.pid as usize, 0);
+        }
 
         let socket_req = SocketReq {
-            netchan: nc_kva as *mut NetChannel,
+            netchan: kva as *mut NetChannel,
             nc_type: req.nc_type,
-            pid: thread.pid
+            pid: thread.pid,
         };
 
         if let Some(np) = self.net_pkg.socket_reqs.get_mut(get_hart_context().hart_id as usize) {
             if let Err(e) = np.enqueue(socket_req) {
-                warn!("failed to queue socket req {e:?}");
-                thread.frame.regs[10] = -3isize as usize;
-                return
-            }
-            else {
-                info!("queued socket req");
-                thread.frame.regs[10] = 0;
+                warn!("nc create: failed to queue socket req {e:?}");
+                thread.frame.regs[10] = -6isize as usize;
                 return
             }
         }
+
+        info!("nc created user_va=0x{:08X} kva=0x{:016X} region={}",
+            req.nc_vaddr, kva, region_size);
+        thread.frame.regs[10] = req.nc_vaddr;
     }
 
     fn handle_block_reason<'t>(&mut self, thread: &'t mut Thread, reason: ThreadBlockReason) {
         match reason {
             ThreadBlockReason::MemMap(req) => self.handle_mmap_req(thread, req),
-            ThreadBlockReason::NetChannelRegistration(req) => self.handle_nc_register_req(thread, req),
+            ThreadBlockReason::NetChannelCreation(req) => self.handle_nc_create_req(thread, req),
             _ => {}
         }
     }

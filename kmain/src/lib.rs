@@ -7,7 +7,7 @@ use alloc::{collections::btree_map::BTreeMap, vec::Vec};
 use device::{HartContext, TrapFrame};
 use mmu::{PAGE_SIZE, sv48::PageTable};
 use net_channel::NetChannel;
-use process::{MemMapReq, NetChannelRegistrationReq, Thread, ThreadBlockReason, ThreadState};
+use process::{MemMapReq, NetChannelCreationReq, Thread, ThreadBlockReason, ThreadState};
 use riscv::register::sstatus::SPP;
 use smoltcp::{iface::{PollResult, SocketHandle, SocketSet, SocketStorage}, socket::dhcpv4, storage::{PacketBuffer, RingBuffer}};
 
@@ -584,7 +584,7 @@ pub fn handle_mmap_req(epc: usize, hart_context: &'static HartContext, frame: &m
 }
 
 #[unsafe(no_mangle)]
-pub fn handle_nc_registration_req(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
+pub fn handle_nc_create_req(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
     unsafe {
         let current = hart_context.current.load(Ordering::Acquire);
         if current == null_mut() {
@@ -595,13 +595,14 @@ pub fn handle_nc_registration_req(epc: usize, hart_context: &'static HartContext
         let thread = (current as *mut Thread)
             .as_mut_unchecked();
 
-        let nc_req = NetChannelRegistrationReq {
+        let nc_req = NetChannelCreationReq {
             nc_vaddr: frame.regs[11],
-            nc_type: frame.regs[12]
+            region_size: frame.regs[12],
+            nc_type: frame.regs[13],
         };
 
-        thread.block_reason = ThreadBlockReason::NetChannelRegistration(nc_req);
-        
+        thread.block_reason = ThreadBlockReason::NetChannelCreation(nc_req);
+
         let frame_ptr = thread.frame as *const TrapFrame as usize as *mut TrapFrame;
         core::ptr::copy_nonoverlapping(
             frame as *const _,
@@ -609,7 +610,7 @@ pub fn handle_nc_registration_req(epc: usize, hart_context: &'static HartContext
             1);
 
         thread.pc.store(epc + 4, Ordering::Release);
-        
+
         exit_thread_with_state(ThreadState::Blocking);
     }
 }

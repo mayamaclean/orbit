@@ -31,16 +31,17 @@ pub struct MemMapReq {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct NetChannelRegistrationReq {
+pub struct NetChannelCreationReq {
     pub nc_vaddr: usize,
-    pub nc_type: usize
+    pub region_size: usize,
+    pub nc_type: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub enum ThreadBlockReason {
     NotBlocking,
     MemMap(MemMapReq),
-    NetChannelRegistration(NetChannelRegistrationReq)
+    NetChannelCreation(NetChannelCreationReq),
 }
 
 #[derive(Debug, Clone, Copy)]

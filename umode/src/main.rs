@@ -75,8 +75,14 @@ fn exit(code: isize) -> ! {
     syscall_arg0_noret(0, code as usize)
 }
 
-fn register_netchannel(nc: *mut NetChannel, sock_type: usize) -> isize {
-    syscall_arg1(4097, nc as usize, sock_type)
+/// Ask the kernel to allocate a NetChannel region of `region_size` bytes,
+/// map it at `vaddr_hint`, initialize its headers, and register it with
+/// the net thread as a socket of `sock_type`. On success the kernel
+/// returns the actual user VA where the region was mapped; on failure a
+/// negative errno.
+fn create_netch(vaddr_hint: usize, region_size: usize, sock_type: usize) -> Result<usize, ()> {
+    let r = syscall_arg4(4097, vaddr_hint, region_size, sock_type, 0);
+    if r < 0 { Err(()) } else { Ok(r as usize) }
 }
 
 #[unsafe(no_mangle)]
@@ -87,50 +93,25 @@ pub unsafe extern "C" fn _start() -> ! {
 
     sleep_ms(5000);
 
-    // map 4096 bytes to addr with read/write + share with kernel. Pick a
-    // hint above USER_TEXT_BASE (0x2_2000_0000 post-higher-half) so it can't
-    // clip into the stack region below.
+    // Ask the kernel to create a NetChannel. The hint is above
+    // USER_TEXT_BASE (0x2_2000_0000) so it can't clip into the stack
+    // region below. The kernel returns the actual VA it picked — today
+    // that's always the hint, but readers should not rely on it.
     const AHINT: usize = 0x2_4000_0000;
-    let ptr = AHINT as *mut u64;
-    if mmap(AHINT, 4096, 0x6, true) == 0 {
-        unsafe {
-            core::ptr::write_bytes(ptr as *mut u8, 0, 4096);
-        }
-
-        const OK: &'static str = "mmapped!\n";
-        let _ = serial_print(OK.as_ptr() as usize, OK.len());
-    }
-    else {
-        const FAILED: &'static str = "failed to mmap!\n";
-        let _ = serial_print(FAILED.as_ptr() as usize, FAILED.len());
-
-        exit(-1isize);
-    }
-
-    let nc = match NetChannel::new(ptr as *mut u8, 4096) {
-        Some(n) => n,
-        None => {
-            const NO_NC: &'static str = "bad netchannel allocation!\n";
+    const NC_REGION_SIZE: usize = 4096;
+    let nc_vaddr = match create_netch(AHINT, NC_REGION_SIZE, 0) {
+        Ok(v) => v,
+        Err(_) => {
+            const NO_NC: &'static str = "failed to create netchannel!\n";
             let _ = serial_print(NO_NC.as_ptr() as usize, NO_NC.len());
-
-            // exit call
             exit(-2isize);
         }
     };
 
-    // register netchannel as tcp (arg1=0) channel
-    let nc_ok = register_netchannel(nc, 0) == 0;
-    if !nc_ok {
-        const NO_NC_MAP: &'static str = "bad netchannel share!\n";
-        let _ = serial_print(NO_NC_MAP.as_ptr() as usize, NO_NC_MAP.len());
+    const OK: &'static str = "netchannel created!\n";
+    let _ = serial_print(OK.as_ptr() as usize, OK.len());
 
-        // exit call
-        exit(-2isize);
-    }
-
-    let nc = unsafe {
-        nc.as_mut_unchecked()
-    };
+    let nc = unsafe { &*(nc_vaddr as *const NetChannel) };
 
     if let Err(_) = nc.connect_tcp(u32::from_be_bytes([192,168,76,2]), 65535) {
         const NC_NO_CONNECT: &'static str = "bad failed nc tcp connect!\n";

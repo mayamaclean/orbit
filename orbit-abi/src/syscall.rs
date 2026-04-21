@@ -8,7 +8,7 @@ pub const SERIAL_PRINT:    usize = 1;
 pub const SLEEP_MS:        usize = 2;
 
 pub const MMAP:            usize = 4096;
-pub const REGISTER_NETCH:  usize = 4097;
+pub const CREATE_NETCH:    usize = 4097;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(usize)]
@@ -17,7 +17,7 @@ pub enum Sysno {
     SerialPrint    = SERIAL_PRINT,
     SleepMs        = SLEEP_MS,
     Mmap           = MMAP,
-    RegisterNetch  = REGISTER_NETCH,
+    CreateNetch    = CREATE_NETCH,
 }
 
 impl Sysno {
@@ -27,7 +27,7 @@ impl Sysno {
             SERIAL_PRINT   => Self::SerialPrint,
             SLEEP_MS       => Self::SleepMs,
             MMAP           => Self::Mmap,
-            REGISTER_NETCH => Self::RegisterNetch,
+            CREATE_NETCH   => Self::CreateNetch,
             _              => return None,
         })
     }

@@ -161,7 +161,7 @@ extern "C" fn s_trap(
                     }
                     4097 => {
                         serial::println!("orbit handling u mode ecall({syscall})");
-                        kmain::handle_nc_registration_req(epc, hart_context, frame);
+                        kmain::handle_nc_create_req(epc, hart_context, frame);
                     }
                     _ => {
                         serial::println!("orbit handling u mode ecall({syscall})");

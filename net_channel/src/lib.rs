@@ -5,19 +5,31 @@ use core::mem::size_of;
 use core::sync::atomic::AtomicUsize;
 use core::{net::Ipv4Addr, sync::atomic::{AtomicI32, AtomicU16, AtomicU32, Ordering}};
 
-use mem::round_usize_down;
+use mem::round_usize_up;
 use smoltcp::{iface::Interface, wire::IpAddress};
 use smoltcp::socket::tcp::State as TcpState;
 
 #[cfg(feature = "kernel")]
 use tracing::{error, info};
 
-/// Fixed offsets within a NetChannel region. Kernel and user sides both use
-/// these anchored off `&NetChannel` (which sits at region base) — nothing in
-/// shared memory stores an absolute pointer.
+/// Fixed header offsets within a NetChannel region. The tx/rx queues follow
+/// at `NC_TX_OFF` and `NC_TX_OFF + queue_len` respectively — `queue_len` is
+/// runtime-selectable by the user at channel creation, up to
+/// [`NC_MAX_REGION_SIZE`].
 pub const NC_DESIRED_OFF: usize = 128;
 pub const NC_CURRENT_OFF: usize = 256;
 pub const NC_TX_OFF: usize = 384;
+
+/// Minimum region size. Everything — states, tx, rx — packs into a single
+/// 4 KiB page. Per-ring usable payload is
+/// `(NC_MIN_REGION_SIZE - NC_TX_OFF) / 2 - size_of::<NetChannelQueue>() + 1`
+/// (roughly ~1.7 KiB).
+pub const NC_MIN_REGION_SIZE: usize = 4096;
+
+/// Maximum region size. Cap at 256 KiB so misbehaving umode can't demand an
+/// arbitrarily large kernel-side Shared allocation. Per-ring usable payload
+/// at the cap is ~127 KiB.
+pub const NC_MAX_REGION_SIZE: usize = 256 * 1024;
 
 #[repr(C, align(128))]
 pub struct NetChannelState {
@@ -93,44 +105,71 @@ impl NetChannelQueue {
     }
 }
 
-/// Control block for a NetChannel region. Self-anchored: no absolute
-/// pointers into shared memory. State/queue accessors compute their targets
-/// from `self` + fixed offsets + the runtime `queue_len`, so they resolve
-/// correctly under the user satp *and* under the kernel satp (through KDMAP).
+/// Control header for a NetChannel region. Self-anchored: sub-region
+/// accessors compute their targets from `self` + fixed offsets + the
+/// runtime `queue_len`, so they resolve correctly under the user satp
+/// *and* under the kernel satp (through KDMAP).
+///
+/// Never construct this directly — the kernel allocates the region and
+/// calls [`NetChannel::init`].
 #[repr(C)]
 pub struct NetChannel {
     queue_len: usize,
 }
 
 impl NetChannel {
-    pub fn new(base: *mut u8, len: usize) -> Option<*mut Self> {
-        if len < 4096 {
-            return None
-        }
+    /// Normalize a user-requested region size: clamp into
+    /// `[NC_MIN_REGION_SIZE, NC_MAX_REGION_SIZE]`, round up to a page, and
+    /// align so `queue_len` (half the post-header span) ends up
+    /// `usize`-aligned.
+    pub fn normalize_region_size(requested: usize) -> Option<usize> {
+        if requested == 0 { return None }
+        let clamped = requested.clamp(NC_MIN_REGION_SIZE, NC_MAX_REGION_SIZE);
+        // Round up to page so each allocation fits cleanly in a whole
+        // number of 4 KiB frames.
+        let page_up = round_usize_up(clamped, 4096);
+        if page_up > NC_MAX_REGION_SIZE { return None }
+        if page_up < NC_MIN_REGION_SIZE { return None }
+        // NC_TX_OFF is 16-aligned; dividing the remainder in half gives a
+        // multiple of 8 as long as the region size is, which is already
+        // guaranteed by page-rounding.
+        Some(page_up)
+    }
 
-        let addr = base as usize;
-        if (addr % 128) != 0 {
-            return None
-        }
+    /// Queue subregion length (header + ring buf) for a given total region
+    /// size. Equal to `(region_size - NC_TX_OFF) / 2`.
+    pub const fn queue_len_for(region_size: usize) -> usize {
+        (region_size - NC_TX_OFF) / 2
+    }
 
-        let queue_len = round_usize_down((len - NC_TX_OFF) / 2, 8);
-        let buf_len = queue_len.checked_sub(size_of::<NetChannelQueue>() - 1)?;
+    /// Per-ring usable payload capacity for a given total region size.
+    pub const fn capacity_for(region_size: usize) -> usize {
+        // `buf: u8` is the first byte of the ring, so the header
+        // "overhead" is size_of - 1 and the rest is payload.
+        Self::queue_len_for(region_size) - size_of::<NetChannelQueue>() + 1
+    }
 
-        if buf_len == 0 {
-            return None
-        }
-
-        let ptr = base as *mut Self;
+    /// Stamp the queue capacities on a freshly-allocated, zeroed region.
+    ///
+    /// # Safety
+    /// - `base` must point at a zeroed, writable region of at least
+    ///   `region_size` bytes, page-aligned.
+    /// - `region_size` must be a value returned by
+    ///   [`normalize_region_size`](Self::normalize_region_size).
+    /// - No one else must observe the region between alloc and this call;
+    ///   the kernel maps it into user VA only after init returns.
+    pub unsafe fn init(base: *mut u8, region_size: usize) {
+        let queue_len = Self::queue_len_for(region_size);
+        let capacity = Self::capacity_for(region_size);
         unsafe {
-            (*ptr).queue_len = queue_len;
+            (*(base as *mut NetChannel)).queue_len = queue_len;
 
-            let tx_ptr = base.add(NC_TX_OFF) as *mut NetChannelQueue;
-            tx_ptr.as_mut_unchecked().capacity = buf_len;
+            let tx = base.add(NC_TX_OFF) as *mut NetChannelQueue;
+            (*tx).capacity = capacity;
 
-            let rx_ptr = (tx_ptr as *mut u8).add(queue_len) as *mut NetChannelQueue;
-            rx_ptr.as_mut_unchecked().capacity = buf_len;
+            let rx = base.add(NC_TX_OFF + queue_len) as *mut NetChannelQueue;
+            (*rx).capacity = capacity;
         }
-        Some(ptr)
     }
 
     pub fn queue_len(&self) -> usize { self.queue_len }
