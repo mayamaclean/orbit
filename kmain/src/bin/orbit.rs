@@ -232,8 +232,8 @@ pub extern "C" fn k_smpstart() {
         // bl dereferences HART_ROOT in M-mode with no paging, so it must be a
         // physical address. hart_context is a KDMAP VA post-higher-half, so
         // translate at the boundary.
-        let hart_root_phys =
-            kmain::kernel::memmap::virt_to_phys_dmap(hart_context as *const _ as u64) as usize;
+        let hart_root_phys = kmain::kernel::memmap::KdmapVa::new(
+            hart_context as *const _ as u64).to_phys().get_raw() as usize;
 
         // Tell bl how to turn a RAM PA into its KDMAP alias. bl uses this to
         // hand secondary harts a sscratch/sp that resolves under the kernel
@@ -369,10 +369,16 @@ unsafe extern "C" fn early_paging_setup(pt_base: *mut u8, pt_size: usize, load_a
     use mmu::sv48::{PhysAddr, VirtAddr};
 
     let mut ptv = PageTableVec::new(pt_base as usize, pt_size);
-    let Ok(root_ref) = (unsafe { ptv.allocate_page_table() }) else {
+    let Ok(root_pa) = (unsafe { ptv.allocate_page_table() }) else {
         loop { unsafe { riscv::asm::wfi(); } }
     };
-    // Early trampoline tables live in identity-mapped RAM (bias = 0).
+    // Early trampoline tables live in identity-mapped RAM (bias = 0), so
+    // PA == VA. Zero the freshly-allocated root before exposing it as a
+    // page table — PageAlloc no longer zeros.
+    let root_ref = unsafe {
+        core::ptr::write_bytes(root_pa as *mut u8, 0, PAGE_SIZE);
+        (root_pa as *const PageTable).as_ref_unchecked()
+    };
     let root = RootTable::identity(root_ref);
     let mut pages = PageAlloc::PTV(&mut ptv);
 
@@ -556,7 +562,8 @@ extern "C" fn rust_main(_hartid: usize, sysinfo: usize, load_addr: u64) -> ! {
         // are eventually dropped.
         KHEAP.make_guard_unchecked()
             .init(
-                kmain::kernel::memmap::phys_to_virt(layout.kheap.start) as *mut u8,
+                kmain::kernel::memmap::phys_to_kdmap(mmu::sv48::PhysAddr::new(layout.kheap.start))
+                    .as_mut_ptr::<u8>(),
                 kmain::kernel::memmap::KHEAP_SIZE as usize,
             );
 
@@ -567,71 +574,58 @@ extern "C" fn rust_main(_hartid: usize, sysinfo: usize, load_addr: u64) -> ! {
         tracing::subscriber::set_global_default(OrbitSubscriber::new(Level::TRACE))
             .expect("no tracing");
 
-        let mut kernel_tables = FrameAllocator::<33>::new();
-        kernel_tables.add_frame_with_va_base(
-            layout.ktables.start as usize,
-            layout.ktables.end   as usize,
-            kmain::kernel::memmap::phys_to_virt(layout.ktables.start) as usize,
-        );
+        let mut kernel_tables = kmain::kernel::memmap::TablePages::new();
+        kernel_tables.add_pa_range(layout.ktables.clone());
 
-        // Allocator hands back KDMAP VAs; that's the supervisor-visible
-        // address we deref through. RootTable carries the matching bias so
-        // walkers can convert PPNs (always physical) back to KDMAP VAs.
-        let orbit_root_ref = (kernel_tables.alloc_aligned(Layout::from_size_align_unchecked(PAGE_SIZE, PAGE_SIZE))
-            .unwrap() as *const PageTable).as_ref_unchecked();
+        // Allocator hands back `(PhysAddr, KdmapVa)`; we deref through the
+        // KDMAP alias. `RootTable` carries the PA→KDMAP bias so walkers
+        // convert child-PPNs (always physical) back to supervisor-visible
+        // VAs.
+        let (orbit_root_pa, orbit_root_kva) = kernel_tables
+            .alloc(Layout::from_size_align_unchecked(PAGE_SIZE, PAGE_SIZE))
+            .expect("failed to alloc orbit root table");
+        // Fresh frame — zero before exposing as a page table.
+        core::ptr::write_bytes(orbit_root_kva.as_mut_ptr::<u8>(), 0, PAGE_SIZE);
+        let orbit_root_ref = orbit_root_kva.as_ptr::<PageTable>().as_ref_unchecked();
         let orbit_root_table = kmain::kernel::memmap::kernel_root(orbit_root_ref);
 
         println!("ort=0x{:016X?}", orbit_root_ref as *const _ as usize);
 
         {
-            let mut pages = PageAlloc::FA(&mut kernel_tables);
+            let mut pages = PageAlloc::FA(kernel_tables.frames_mut());
             map_kernel_self(&orbit_root_table, &mut pages, &layout)
                 .expect("failed to map kernel self-view");
         }
 
-        let mut kpages = FrameAllocator::<33>::new();
-        kpages.add_frame_with_va_base(
-            layout.kpages.start as usize,
-            layout.kpages.end   as usize,
-            kmain::kernel::memmap::phys_to_virt(layout.kpages.start) as usize,
-        );
+        let mut kpages = kmain::kernel::memmap::KernelPages::new();
+        kpages.add_pa_range(layout.kpages.clone());
 
-        // User-private pool. Allocator hands out KDMAP VAs for now so
-        // setup-time kernel writes can go through them directly; pool-split
-        // step 8 removes the KDMAP alias and gates those writes behind a
-        // per-hart setup window.
-        let mut user_pages = FrameAllocator::<33>::new();
-        user_pages.add_frame_with_va_base(
-            layout.user_pages.start as usize,
-            layout.user_pages.end   as usize,
-            kmain::kernel::memmap::phys_to_virt(layout.user_pages.start) as usize,
-        );
+        // User-private pool. No KDMAP alias in the kernel satp — setup-time
+        // writes go through `UserPageWindow` at a KSCRATCH-reserved VA.
+        let mut user_pages = kmain::kernel::memmap::UserPages::new();
+        user_pages.add_pa_range(layout.user_pages.clone());
 
         let cpu_count = 4;
         let context_size = cpu_count * core::mem::size_of::<HartContext>();
-        let hart_contexts = {
-            kpages.alloc_aligned(Layout::from_size_align_unchecked(context_size, 4096))
-                .expect("failed to alloc hart contexts")
-                as *mut HartContext
-        };
+        let (_hart_contexts_pa, hart_contexts_kva) = kpages
+            .alloc_kdmap(Layout::from_size_align_unchecked(context_size, 4096))
+            .expect("failed to alloc hart contexts");
+        let hart_contexts = hart_contexts_kva.as_mut_ptr::<HartContext>();
 
         let mut satp = Satp::from_bits(0);
         satp.set_asid(0);
         satp.set_mode(Mode::Sv48);
-        // satp takes the physical PPN; orbit_root_ref is a KDMAP VA, so
-        // translate back to PA.
-        let orbit_root_pa =
-            kmain::kernel::memmap::virt_to_phys_dmap(orbit_root_ref as *const _ as u64) as usize;
-        satp.set_ppn(orbit_root_pa / PAGE_SIZE);
+        // satp takes the physical PPN — `TablePages::alloc` already
+        // handed us `orbit_root_pa` directly, no translation needed.
+        satp.set_ppn((orbit_root_pa.get_raw() / PAGE_SIZE as u64) as usize);
 
         let orbit = {
-            let orbit_ptr = (kpages.alloc_aligned(
-                Layout::from_size_align_unchecked(
+            let (_orbit_pa, orbit_kva) = kpages
+                .alloc_kdmap(Layout::from_size_align_unchecked(
                     round_u64_up(core::mem::size_of::<Orbit>() as u64, 4096) as usize,
                     4096))
-                    .expect("failed to alloc space for kernel state")
-                    as *mut Orbit)
-                    .as_mut_unchecked();
+                .expect("failed to alloc space for kernel state");
+            let orbit_ptr = orbit_kva.as_mut_ptr::<Orbit>().as_mut_unchecked();
 
             *orbit_ptr = Orbit::new(dtb_addr as usize, serial_addr as usize, cpu_count, layout, kernel_tables, kpages, user_pages, satp.clone());
 

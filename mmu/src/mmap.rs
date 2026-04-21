@@ -20,8 +20,11 @@ impl PageTableVec {
         }
     }
 
-    /// returns Result<page_addr, ()>
-    pub unsafe fn allocate_page_table(&mut self) -> Result<&'static PageTable, ()> {
+    /// Returns the physical address of the next available frame. The
+    /// bl-era PageTableVec is fill-once over identity-mapped RAM, so the
+    /// returned address is both PA and VA; the walker zeros through the
+    /// active `RootTable`'s `va_from_pa`.
+    pub unsafe fn allocate_page_table(&mut self) -> Result<u64, ()> {
         if self.current_page >= self.max_pages {
             return Err(())
         }
@@ -29,10 +32,7 @@ impl PageTableVec {
         let current_page_addr = self.start_addr + (self.current_page * crate::PAGE_SIZE);
         self.current_page += 1;
 
-        let table = unsafe {(current_page_addr as *const PageTable).as_ref_unchecked()};
-        table.entries.iter().for_each(|e| e.set_raw(0));
-
-        Ok(table)
+        Ok(current_page_addr as u64)
     }
 
     pub fn table_count(&self) -> (usize, usize) {
@@ -70,11 +70,6 @@ impl<'a> RootTable<'a> {
     pub fn va_from_pa(&self, pa: u64) -> u64 {
         pa.wrapping_add(self.pa_to_va_bias)
     }
-
-    #[inline]
-    pub fn pa_from_va(&self, va: u64) -> u64 {
-        va.wrapping_sub(self.pa_to_va_bias)
-    }
 }
 
 pub enum PageAlloc<'a> {
@@ -86,31 +81,25 @@ pub enum PageAlloc<'a> {
 impl<'a> PageAlloc<'a> {
     pub const PAGE_LAYOUT: Layout = unsafe { Layout::from_size_align_unchecked(PAGE_SIZE, PAGE_SIZE) };
 
-    pub fn allocate_page_table(&mut self) -> Result<&'static PageTable, ()> {
+    /// Allocate one 4 KiB frame, returning its physical address. Caller
+    /// is responsible for zeroing via the active `RootTable`'s
+    /// `va_from_pa` bias before exposing to hardware walkers.
+    pub fn allocate_page_table(&mut self) -> Result<u64, ()> {
         match self {
-            Self::PTV(v) => unsafe {v.allocate_page_table()},
+            Self::PTV(v) => unsafe { v.allocate_page_table() },
             #[cfg(feature = "alloc")]
-            Self::FA(f) => unsafe {
-                let ptr = f.alloc_aligned(Self::PAGE_LAYOUT);
-
-                if ptr.is_none() {
-                    return Err(())
-                }
-
-                let table = (ptr.unwrap() as *const PageTable).as_ref_unchecked();
-                table.entries.iter().for_each(|e| e.set_raw(0));
-
-                Ok(table)
-            }
+            Self::FA(f) => f.alloc_aligned(Self::PAGE_LAYOUT)
+                .map(|pa| pa as u64)
+                .ok_or(()),
         }
     }
 
-    pub fn free_page(&mut self, phys_addr: usize) -> Result<(), ()> {
+    pub fn free_page(&mut self, phys_addr: u64) -> Result<(), ()> {
         match self {
             Self::PTV(_v) => Err(()),
             #[cfg(feature = "alloc")]
             Self::FA(f) => {
-                f.dealloc_aligned(phys_addr, Self::PAGE_LAYOUT);
+                f.dealloc_aligned(phys_addr as usize, Self::PAGE_LAYOUT);
                 Ok(())
             }
         }
@@ -179,9 +168,13 @@ pub unsafe fn walk_to_table_materialize<'a, 'p>(
         }
 
         table = if !pte.is_valid() {
-            let new_table = pages.allocate_page_table()?;
-            let new_table_va = new_table as *const _ as u64;
-            let new_table_pa = root.pa_from_va(new_table_va);
+            let new_table_pa = pages.allocate_page_table()?;
+            let new_table_va = root.va_from_pa(new_table_pa);
+            let new_table = unsafe {
+                (new_table_va as *const PageTable).as_ref_unchecked()
+            };
+            // Fresh frame isn't guaranteed zero — zero before installing.
+            new_table.entries.iter().for_each(|e| e.set_raw(0));
             let ppn = new_table_pa / PAGE_SIZE as u64;
             pte.set_raw(crate::sv48::PageTableEntry::pack_table(ppn));
             if log {
@@ -442,7 +435,7 @@ unsafe fn unmap_subtree<'a>(table: &RootTable<'_>, pages: &mut PageAlloc<'a>) {
 
         unsafe { unmap_subtree(&child, pages) }
 
-        let _ = pages.free_page(next_va as usize);
+        let _ = pages.free_page(next_pa);
     }
 }
 

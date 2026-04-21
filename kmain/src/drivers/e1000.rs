@@ -5,7 +5,15 @@ use mmu::PAGE_SIZE;
 use smoltcp::phy::{Checksum, DeviceCapabilities, Medium};
 use tracing::{info, warn, error};
 
-use crate::kernel::memmap::virt_to_phys_dmap;
+use crate::kernel::memmap::KdmapVa;
+
+/// DMA descriptors take physical addresses; ring buffers live in the
+/// `Shared` pool (KDMAP alias), so we go KDMAP VA → PhysAddr at the
+/// boundary.
+#[inline]
+fn kdmap_ptr_to_phys<T>(p: *const T) -> u64 {
+    KdmapVa::new(p as u64).to_phys().get_raw()
+}
 
 const SW_MTU: usize = 2048;
 
@@ -94,7 +102,7 @@ impl E1000 {
 
             // Ring buffers are allocated from kernel_pages (KDMAP VAs); the
             // NIC DMAs by physical address, so translate.
-            e.addr = virt_to_phys_dmap(rx_bufs[idx].b.as_mut_ptr() as u64);
+            e.addr = kdmap_ptr_to_phys(rx_bufs[idx].b.as_mut_ptr());
             e.csum = 0;
             e.errors = 0;
             e.length = 0;
@@ -105,7 +113,7 @@ impl E1000 {
         for idx in 0..TX_RING_LEN {
             let e = &mut tx_ring[idx];
 
-            e.addr = virt_to_phys_dmap(tx_bufs[idx].b.as_mut_ptr() as u64);
+            e.addr = kdmap_ptr_to_phys(tx_bufs[idx].b.as_mut_ptr());
             e.cmd = 0;
             e.cso = 0;
             e.css = 0;
@@ -223,7 +231,7 @@ impl E1000 {
 
             // give device rx ring + rx ring len. self.rx_ring is a KDMAP VA;
             // the NIC expects physical, so translate at the boundary.
-            let rx_phys = virt_to_phys_dmap(self.rx_ring.as_ptr() as u64);
+            let rx_phys = kdmap_ptr_to_phys(self.rx_ring.as_ptr());
             self.bar.add(RDBA_REG_ADDR)
                 .write_volatile(rx_phys as u32);
 
@@ -234,7 +242,7 @@ impl E1000 {
                 .write_volatile(RX_RING_BYTES as u32);
 
             // give device tx ring + tx ring len
-            let tx_phys = virt_to_phys_dmap(self.tx_ring.as_ptr() as u64);
+            let tx_phys = kdmap_ptr_to_phys(self.tx_ring.as_ptr());
             self.bar.add(TDBA_REG_ADDR)
                 .write_volatile(tx_phys as u32);
 

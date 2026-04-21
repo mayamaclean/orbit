@@ -221,10 +221,14 @@ extern "C" fn kinit(hartid: usize, dtb_addr: usize) {
             let page_table_start= bl::ID_MAP_TABLES as usize;
             let mut ptv = PageTableVec::new(page_table_start, 4096 * MAX_ID_TABLES);
             let mut pages = mmap::PageAlloc::PTV(&mut ptv);
-            let root_ref = pages.allocate_page_table().unwrap();
+            let root_pa = pages.allocate_page_table().unwrap();
+            // PTV is identity-mapped in bl, so PA == VA. Zero before use —
+            // PageAlloc no longer zeros internally.
+            core::ptr::write_bytes(root_pa as *mut u8, 0, 4096);
+            let root_ref = (root_pa as *const mmu::sv48::PageTable).as_ref_unchecked();
             let root_table = RootTable::identity(root_ref);
 
-            println!("made page table pool @ {:016x}, root table @ {:016x}", page_table_start, root_ref as *const _ as usize);
+            println!("made page table pool @ {:016x}, root table @ {:016x}", page_table_start, root_pa as usize);
 
             let base_id_map_config = MappingConfig {
                 permissions: PagePermissions::R | PagePermissions::W | PagePermissions::X,

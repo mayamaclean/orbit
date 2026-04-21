@@ -78,8 +78,8 @@ impl<T> SharedUserPtr<T> {
     /// check [`is_revoked`](Self::is_revoked) first (revocation is a
     /// follow-up wired to the `supervisor_tag` PTE bit).
     pub fn as_ref(&self) -> &T {
-        let kva = memmap::phys_to_virt(self.inner.backing.paddr);
-        unsafe { &*(kva as *const T) }
+        let kva = memmap::phys_to_kdmap(mmu::sv48::PhysAddr::new(self.inner.backing.paddr));
+        unsafe { &*kva.as_ptr::<T>() }
     }
 
     pub fn revoke(&self) {

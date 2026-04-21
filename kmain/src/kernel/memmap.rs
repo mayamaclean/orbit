@@ -1,10 +1,173 @@
+use core::alloc::Layout;
 use core::ops::Range;
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use mem::frame::FrameAllocator;
 use mem::round_u64_up;
 use mmu::mmap::{PageAlloc, RootTable, id_map_range, map_va_range, reserve_va_range, unmap_range, virt_to_phys};
 use mmu::sv48::{PageTable, PhysAddr, VirtAddr};
 use mmu::{MappingConfig, PAGE_SIZE, PagePermissions};
+
+// =========================================================================
+// Address-kind newtypes
+//
+// `PhysAddr` / `VirtAddr` live in `mmu`. The kinds *here* are orbit's
+// kernel-specific VA flavors: they tag which window a VA lives in, which
+// in turn dictates which conversion / dereference paths are legal.
+//
+// - `KdmapVa` — kernel-side direct-map alias of `Shared`-pool RAM. The
+//   kernel can `*p` a `KdmapVa` as long as the referenced PA is in a pool
+//   that's KDMAP-mapped under the active satp. Post-pool-split, that's
+//   `kpages` / `ktables` / kheap; `user_pages` is NOT, so
+//   `phys_to_kdmap(user_pa)` is arithmetically valid but produces a VA
+//   the kernel can't deref — touch user_pages only via `UserPageWindow`.
+// - `UserVa` — a VA in user space. Only resolvable under the owning
+//   process's satp; kernel-side conversion requires walking that PT.
+// =========================================================================
+
+/// Kernel direct-map alias of physical RAM. Produced by
+/// [`phys_to_kdmap`]; reversible via [`KdmapVa::to_phys`].
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy)]
+pub struct KdmapVa(u64);
+
+impl KdmapVa {
+    pub const fn new(raw: u64) -> Self { Self(raw) }
+    pub const fn raw(self) -> u64 { self.0 }
+    pub fn to_virt(self) -> VirtAddr { VirtAddr::new(self.0) }
+    pub fn to_phys(self) -> PhysAddr {
+        PhysAddr::new(self.0.wrapping_sub(kdmap_base().wrapping_sub(ram_phys_base())))
+    }
+    pub fn as_mut_ptr<T>(self) -> *mut T { self.0 as *mut T }
+    pub fn as_ptr<T>(self) -> *const T { self.0 as *const T }
+}
+
+/// A VA that lives in user address space. Only resolvable under the
+/// owner's satp; kernel-side use goes through [`user_va_to_kdmap`].
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy)]
+pub struct UserVa(u64);
+
+impl UserVa {
+    pub const fn new(raw: u64) -> Self { Self(raw) }
+    pub const fn raw(self) -> u64 { self.0 }
+    pub fn to_virt(self) -> VirtAddr { VirtAddr::new(self.0) }
+}
+
+/// Arithmetic conversion from a physical address to its KDMAP alias.
+/// The alias is *valid to deref* only if the PA is in a pool that's
+/// KDMAP-mapped under the active satp — the type system can't enforce
+/// that today, but [`UserPages::alloc_pa`] returning a bare `PhysAddr`
+/// (no `alloc_kdmap` method) at least forces the consumer to be explicit
+/// at the boundary.
+#[inline]
+pub fn phys_to_kdmap(pa: PhysAddr) -> KdmapVa {
+    KdmapVa::new(pa.get_raw().wrapping_add(kdmap_base().wrapping_sub(ram_phys_base())))
+}
+
+// =========================================================================
+// Frame-pool wrappers
+//
+// `FrameAllocator` is kept bias-agnostic — it just tracks `usize`-valued
+// ranges. Orbit feeds it physical addresses and these wrappers expose
+// typed `PhysAddr` / `KdmapVa` return values so the caller's intent is
+// visible at the boundary.
+// =========================================================================
+
+const PAGE_LAYOUT: Layout = unsafe {
+    Layout::from_size_align_unchecked(PAGE_SIZE, PAGE_SIZE)
+};
+
+/// Pool of pages that back Sv48 intermediate tables. Every alloc
+/// materializes a new table, which the kernel always needs to zero and
+/// stamp — so returning `(PhysAddr, KdmapVa)` saves each caller a
+/// separate conversion.
+pub struct TablePages {
+    inner: FrameAllocator<33>,
+}
+
+impl TablePages {
+    pub const fn new() -> Self { Self { inner: FrameAllocator::new() } }
+
+    pub fn add_pa_range(&mut self, pa_range: Range<u64>) {
+        self.inner.add_frame(pa_range.start as usize, pa_range.end as usize);
+    }
+
+    pub fn alloc(&mut self, layout: Layout) -> Option<(PhysAddr, KdmapVa)> {
+        let pa = PhysAddr::new(self.inner.alloc_aligned(layout)? as u64);
+        Some((pa, phys_to_kdmap(pa)))
+    }
+
+    pub fn free(&mut self, pa: PhysAddr, layout: Layout) {
+        self.inner.dealloc_aligned(pa.get_raw() as usize, layout);
+    }
+
+    /// Raw inner allocator, for passing to the mmu walker via
+    /// `PageAlloc::FA`. The walker consumes PAs (see
+    /// `mmu::mmap::PageAlloc`).
+    pub fn frames_mut(&mut self) -> &mut FrameAllocator<33> {
+        &mut self.inner
+    }
+
+}
+
+/// Pool of pages that are kernel-accessible (KDMAP alias under every
+/// satp). `Shared` is the `Pool` tag on the `PhysBacking` produced here.
+/// Callers that need to deref the allocation use `alloc_kdmap`; callers
+/// that just want to hand it to a device (DMA) use `alloc_pa`.
+pub struct KernelPages {
+    inner: FrameAllocator<33>,
+}
+
+impl KernelPages {
+    pub const fn new() -> Self { Self { inner: FrameAllocator::new() } }
+
+    pub fn add_pa_range(&mut self, pa_range: Range<u64>) {
+        self.inner.add_frame(pa_range.start as usize, pa_range.end as usize);
+    }
+
+    pub fn alloc_pa(&mut self, layout: Layout) -> Option<PhysAddr> {
+        self.inner.alloc_aligned(layout).map(|pa| PhysAddr::new(pa as u64))
+    }
+
+    pub fn alloc_kdmap(&mut self, layout: Layout) -> Option<(PhysAddr, KdmapVa)> {
+        let pa = self.alloc_pa(layout)?;
+        Some((pa, phys_to_kdmap(pa)))
+    }
+
+    pub fn free(&mut self, pa: PhysAddr, layout: Layout) {
+        self.inner.dealloc_aligned(pa.get_raw() as usize, layout);
+    }
+
+    pub fn frames_mut(&mut self) -> &mut FrameAllocator<33> {
+        &mut self.inner
+    }
+
+}
+
+/// Pool of pages that are user-only. No KDMAP alias under the kernel
+/// satp, so there is deliberately no `alloc_kdmap` — touching a backing
+/// from kernel code goes through `UserPageWindow`.
+pub struct UserPages {
+    inner: FrameAllocator<33>,
+}
+
+impl UserPages {
+    pub const fn new() -> Self { Self { inner: FrameAllocator::new() } }
+
+    pub fn add_pa_range(&mut self, pa_range: Range<u64>) {
+        self.inner.add_frame(pa_range.start as usize, pa_range.end as usize);
+    }
+
+    pub fn alloc_pa(&mut self, layout: Layout) -> Option<PhysAddr> {
+        self.inner.alloc_aligned(layout).map(|pa| PhysAddr::new(pa as u64))
+    }
+
+    pub fn free(&mut self, pa: PhysAddr, layout: Layout) {
+        self.inner.dealloc_aligned(pa.get_raw() as usize, layout);
+    }
+
+}
 
 pub const KRX: u64 =
     PagePermissions::R as u64 | PagePermissions::X as u64 | PagePermissions::G as u64;
@@ -87,30 +250,18 @@ pub fn init_layout(ram_phys: u64, ktext: u64, kdmap: u64, kmmio: u64, kscratch: 
 #[inline] pub fn kscratch_base()    -> u64 { KSCRATCH_BASE.load(Ordering::Relaxed) }
 #[inline] pub fn kernel_phys_base() -> u64 { KERNEL_PHYS_BASE.load(Ordering::Relaxed) }
 
-/// Translate a physical address in the RAM region to its direct-map VA.
-#[inline]
-pub fn phys_to_virt(pa: u64) -> u64 {
-    kdmap_base() + (pa - ram_phys_base())
-}
-
-/// Translate a direct-map VA back to its physical address.
-#[inline]
-pub fn virt_to_phys_dmap(va: u64) -> u64 {
-    ram_phys_base() + (va - kdmap_base())
-}
-
-/// Resolve a user VA under `root_table` to the kernel's KDMAP alias of the
-/// same physical backing. Lets syscall handlers dereference user buffers
-/// without SUM and without identity-mapping kpages — the KDMAP VA is a
-/// supervisor mapping over the same RAM page.
+/// Resolve a user VA under `root_table` to the kernel's KDMAP alias of
+/// the same physical backing. Lets syscall handlers dereference user
+/// buffers without SUM and without identity-mapping kpages — the KDMAP
+/// VA is a supervisor mapping over the same RAM page.
 ///
 /// # Safety
-/// Walks `root_table`'s PTE tree, which must remain valid for the duration
-/// of the call.
+/// Walks `root_table`'s PTE tree, which must remain valid for the
+/// duration of the call.
 #[inline]
-pub unsafe fn user_va_to_kdmap(root_table: &RootTable<'_>, user_va: u64) -> Option<u64> {
-    unsafe { virt_to_phys(root_table, VirtAddr::new(user_va)) }
-        .map(|pa| phys_to_virt(pa as u64))
+pub unsafe fn user_va_to_kdmap(root_table: &RootTable<'_>, user_va: UserVa) -> Option<KdmapVa> {
+    unsafe { virt_to_phys(root_table, user_va.to_virt()) }
+        .map(|pa| phys_to_kdmap(PhysAddr::new(pa as u64)))
 }
 
 /// PA → KDMAP VA offset shared by every kernel-allocated page table. Lets
@@ -376,7 +527,7 @@ unsafe fn map_kernel_high_half(
             map_region_va(rt, pa, va_start, pa_start..pa_start + len, r.perms, r.name)?;
         }
         for r in pool_regions(layout).iter() {
-            let va_start = phys_to_virt(r.range.start);
+            let va_start = phys_to_kdmap(PhysAddr::new(r.range.start)).raw();
             map_region_va(rt, pa, va_start, r.range.clone(), r.perms, r.name)?;
         }
         map_region_va(rt, pa, kmmio_uart(),
@@ -411,7 +562,7 @@ unsafe fn map_kernel_self_high_half(
             // Pool ranges are physical. ktables is in RAM so phys_to_virt
             // works; dtb sits in the reserved top-of-RAM region which is
             // still within the kdmap span.
-            let va_start = phys_to_virt(r.range.start);
+            let va_start = phys_to_kdmap(PhysAddr::new(r.range.start)).raw();
             map_region_va(rt, pa, va_start, r.range.clone(), r.perms, r.name)?;
         }
     }
