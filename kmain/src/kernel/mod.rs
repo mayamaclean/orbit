@@ -482,6 +482,8 @@ impl Orbit {
             netchan: shared,
             nc_type: req.nc_type,
             pid: thread.pid,
+            pending_rx_ack: false,
+            pending_tx_ack: false,
         };
 
         if let Some(np) = self.net_pkg.socket_reqs.get_mut(get_hart_context().hart_id as usize) {

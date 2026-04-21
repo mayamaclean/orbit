@@ -1,6 +1,7 @@
 #![no_std]
 
 use core::cell::UnsafeCell;
+use core::marker::PhantomData;
 use core::mem::size_of;
 use core::sync::atomic::AtomicUsize;
 use core::{net::Ipv4Addr, sync::atomic::{AtomicI32, AtomicU16, AtomicU32, Ordering}};
@@ -11,6 +12,256 @@ use smoltcp::socket::tcp::State as TcpState;
 
 #[cfg(feature = "kernel")]
 use tracing::{error, info};
+
+/// Mutable view into a region of shared memory handed to `send_tcp`'s
+/// closure. Writes go through [`core::ptr::write_volatile`], which
+/// LLVM can't DCE the way it can writes through `&mut [u8]` — that
+/// slice type carries `noalias`, so LLVM assumes nothing else can
+/// observe the writes and deletes them (the bug that was silently
+/// zeroing outbound TCP payloads).
+pub struct VolSliceMut<'a> {
+    ptr: *mut u8,
+    len: usize,
+    _m: PhantomData<&'a mut [u8]>,
+}
+
+impl<'a> VolSliceMut<'a> {
+    /// # Safety
+    /// `ptr` must be valid for writes of `len` bytes, and no other
+    /// `&mut [u8]` may alias this region for the `'a` lifetime.
+    #[inline]
+    pub unsafe fn from_raw_parts(ptr: *mut u8, len: usize) -> Self {
+        Self { ptr, len, _m: PhantomData }
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize { self.len }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool { self.len == 0 }
+
+    /// Copy up to `self.len()` bytes from `src`, returning the number
+    /// actually written.
+    pub fn copy_from_slice(&self, src: &[u8]) -> usize {
+        let n = core::cmp::min(self.len, src.len());
+        for i in 0..n {
+            unsafe { self.ptr.add(i).write_volatile(src[i]); }
+        }
+        n
+    }
+
+    /// Read the byte at `i`. Panics if out of bounds (matches `slice[i]`).
+    #[inline]
+    pub fn get(&self, i: usize) -> u8 {
+        assert!(i < self.len, "VolSliceMut::get: index {i} out of bounds (len {})", self.len);
+        unsafe { self.ptr.add(i).read_volatile() }
+    }
+
+    /// Bounds-checked read. Returns `None` if out of range.
+    #[inline]
+    pub fn get_checked(&self, i: usize) -> Option<u8> {
+        if i >= self.len { return None; }
+        Some(unsafe { self.ptr.add(i).read_volatile() })
+    }
+
+    /// Write `b` at `i`. Panics if out of bounds.
+    #[inline]
+    pub fn set(&self, i: usize, b: u8) {
+        assert!(i < self.len, "VolSliceMut::set: index {i} out of bounds (len {})", self.len);
+        unsafe { self.ptr.add(i).write_volatile(b); }
+    }
+
+    /// Bounds-checked write. Returns `None` if out of range.
+    #[inline]
+    pub fn set_checked(&self, i: usize, b: u8) -> Option<()> {
+        if i >= self.len { return None; }
+        unsafe { self.ptr.add(i).write_volatile(b); }
+        Some(())
+    }
+
+    /// Legacy name for [`set_checked`]. Kept for callers that already
+    /// use the `write_at` API; new code should prefer `set` / `set_checked`.
+    #[inline]
+    pub fn write_at(&self, offset: usize, b: u8) -> Option<()> {
+        self.set_checked(offset, b)
+    }
+
+    /// Sub-slice `[start, end)`. Panics if out of bounds.
+    pub fn sub(&self, start: usize, end: usize) -> VolSliceMut<'_> {
+        assert!(start <= end, "VolSliceMut::sub: start {start} > end {end}");
+        assert!(end <= self.len, "VolSliceMut::sub: end {end} > len {}", self.len);
+        unsafe {
+            VolSliceMut::from_raw_parts(self.ptr.add(start), end - start)
+        }
+    }
+
+    /// Read-only reborrow. Useful when a function wants a `VolSlice`
+    /// but the caller only has a `VolSliceMut`.
+    #[inline]
+    pub fn as_readonly(&self) -> VolSlice<'_> {
+        unsafe { VolSlice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
+/// Read-only view of a region of shared memory handed to `recv_tcp`'s
+/// closure. Reads go through [`core::ptr::read_volatile`] — symmetric
+/// with [`VolSliceMut`] so the compiler can't cache stale values that
+/// may have been written by the other side of the channel.
+pub struct VolSlice<'a> {
+    ptr: *const u8,
+    len: usize,
+    _m: PhantomData<&'a [u8]>,
+}
+
+impl<'a> VolSlice<'a> {
+    /// # Safety
+    /// `ptr` must be valid for reads of `len` bytes.
+    #[inline]
+    pub unsafe fn from_raw_parts(ptr: *const u8, len: usize) -> Self {
+        Self { ptr, len, _m: PhantomData }
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize { self.len }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool { self.len == 0 }
+
+    /// Copy up to `dst.len()` bytes into `dst`, returning the number
+    /// actually copied.
+    pub fn copy_to_slice(&self, dst: &mut [u8]) -> usize {
+        let n = core::cmp::min(self.len, dst.len());
+        for i in 0..n {
+            dst[i] = unsafe { self.ptr.add(i).read_volatile() };
+        }
+        n
+    }
+
+    /// Read the byte at `i`. Panics if out of bounds (matches `slice[i]`).
+    #[inline]
+    pub fn get(&self, i: usize) -> u8 {
+        assert!(i < self.len, "VolSlice::get: index {i} out of bounds (len {})", self.len);
+        unsafe { self.ptr.add(i).read_volatile() }
+    }
+
+    /// Bounds-checked read. Returns `None` if out of range.
+    #[inline]
+    pub fn get_checked(&self, i: usize) -> Option<u8> {
+        if i >= self.len { return None; }
+        Some(unsafe { self.ptr.add(i).read_volatile() })
+    }
+
+    /// Legacy name for [`get_checked`]. New code should prefer `get`
+    /// (panic on OOB) or `get_checked`.
+    #[inline]
+    pub fn read_at(&self, offset: usize) -> Option<u8> {
+        self.get_checked(offset)
+    }
+
+    /// Sub-slice `[start, end)`. Panics if out of bounds.
+    pub fn sub(&self, start: usize, end: usize) -> VolSlice<'_> {
+        assert!(start <= end, "VolSlice::sub: start {start} > end {end}");
+        assert!(end <= self.len, "VolSlice::sub: end {end} > len {}", self.len);
+        unsafe {
+            VolSlice::from_raw_parts(self.ptr.add(start), end - start)
+        }
+    }
+
+    /// True if the first `prefix.len()` bytes equal `prefix`.
+    pub fn starts_with(&self, prefix: &[u8]) -> bool {
+        if self.len < prefix.len() { return false; }
+        for i in 0..prefix.len() {
+            if unsafe { self.ptr.add(i).read_volatile() } != prefix[i] {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Raw pointer, for syscalls that read this memory from a
+    /// non-compiler context (e.g. `serial_print`, whose read happens
+    /// in the kernel under SUM — the compiler can't elide the syscall).
+    #[inline]
+    pub fn as_ptr(&self) -> *const u8 { self.ptr }
+}
+
+/// Fixed-layout single-producer / single-consumer queue. Baked here
+/// (rather than reusing `heapless::spsc`) because:
+///
+/// 1. The layout is part of the user/kernel NetChannel ABI. `heapless`'s
+///    `Queue` is plain `repr(Rust)` — field ordering isn't guaranteed
+///    stable across rustc versions or compilation flags. `#[repr(C)]`
+///    here pins it.
+/// 2. Slot reads/writes go through `read_volatile` / `write_volatile`.
+///    Defensive against any alias-analysis-driven DCE of the slot write
+///    (the bug we hit that sent us down this path).
+///
+/// Capacity is `N - 1` — one slot is always reserved so `head == tail`
+/// unambiguously means empty.
+#[repr(C)]
+pub struct SpscQueue<T: Copy, const N: usize> {
+    /// Consumer-owned: index of next slot to dequeue from.
+    head: AtomicUsize,
+    /// Producer-owned: index of next slot to enqueue into.
+    tail: AtomicUsize,
+    /// Backing ring storage. Raw `UnsafeCell<T>` so the slots can be
+    /// written under `&self` via `.get()` → `*mut T`. Zero-init is a
+    /// valid starting state since `head == tail == 0` marks empty and no
+    /// slot is observed before being written.
+    buffer: [UnsafeCell<T>; N],
+}
+
+// Producer and consumer are on different harts / threads; heads/tails
+// are atomic, slots are synchronized via release/acquire.
+unsafe impl<T: Copy + Send, const N: usize> Sync for SpscQueue<T, N> {}
+
+impl<T: Copy, const N: usize> SpscQueue<T, N> {
+    /// # Safety
+    /// Caller must be the sole producer on this queue.
+    #[inline]
+    pub unsafe fn enqueue(&self, val: T) -> Result<(), T> {
+        let tail = self.tail.load(Ordering::Relaxed);
+        let next = (tail + 1) % N;
+        if next == self.head.load(Ordering::Acquire) {
+            return Err(val);
+        }
+        unsafe { self.buffer[tail].get().write_volatile(val); }
+        self.tail.store(next, Ordering::Release);
+        Ok(())
+    }
+
+    /// # Safety
+    /// Caller must be the sole consumer on this queue.
+    #[inline]
+    pub unsafe fn dequeue(&self) -> Option<T> {
+        let head = self.head.load(Ordering::Relaxed);
+        if head == self.tail.load(Ordering::Acquire) {
+            return None;
+        }
+        let val = unsafe { self.buffer[head].get().read_volatile() };
+        self.head.store((head + 1) % N, Ordering::Release);
+        Some(val)
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.head.load(Ordering::Acquire) == self.tail.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    pub fn is_full(&self) -> bool {
+        let tail = self.tail.load(Ordering::Acquire);
+        let head = self.head.load(Ordering::Acquire);
+        (tail + 1) % N == head
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        let head = self.head.load(Ordering::Acquire);
+        let tail = self.tail.load(Ordering::Acquire);
+        (tail + N - head) % N
+    }
+}
 
 /// Fixed header offsets within a NetChannel region. The tx/rx queues follow
 /// at `NC_TX_OFF` and `NC_TX_OFF + queue_len` respectively — `queue_len` is
@@ -31,6 +282,26 @@ pub const NC_MIN_REGION_SIZE: usize = 4096;
 /// at the cap is ~127 KiB.
 pub const NC_MAX_REGION_SIZE: usize = 256 * 1024;
 
+// Compile-time checks so layout invariants fail the build, not the boot.
+// If these fire, `NC_TX_OFF` / `NetChannelQueue` layout / min-region math
+// have drifted: either the fixed header offsets or `queue_len_for` need
+// updating.
+const _: () = {
+    assert!(
+        NC_TX_OFF % core::mem::align_of::<NetChannelQueue>() == 0,
+        "NC_TX_OFF must be aligned for NetChannelQueue",
+    );
+    assert!(
+        NetChannel::queue_len_for(NC_MIN_REGION_SIZE)
+            % core::mem::align_of::<NetChannelQueue>() == 0,
+        "queue_len at NC_MIN_REGION_SIZE must align the rx subregion",
+    );
+    assert!(
+        NetChannel::capacity_for(NC_MIN_REGION_SIZE) > 0,
+        "NC_MIN_REGION_SIZE leaves no room for a ring payload",
+    );
+};
+
 #[repr(C, align(128))]
 pub struct NetChannelState {
     pub state_addr: AtomicU32,
@@ -39,19 +310,19 @@ pub struct NetChannelState {
     pub state_local_port: AtomicU16
 }
 
-type SliceQueue = heapless::spsc::Queue<(usize, usize), 2>;
-type IncrementQueue = heapless::spsc::Queue<usize, 2>;
+/// Ring holding `(offset, len)` pairs pointing into [`NetChannelQueue::buf`].
+/// N=2 → capacity 1.
+type SliceQueue = SpscQueue<(usize, usize), 2>;
+/// Ring of byte counts the consumer has advanced past. N=2 → capacity 1.
+type IncrementQueue = SpscQueue<usize, 2>;
 
 /// Shared producer/consumer queues + payload ring for one direction.
-///
-/// `slices` and `increments` sit behind `UnsafeCell` because they live in
-/// memory shared between kernel and user: each side gets `&self` (not
-/// `&mut self`) and reaches through the cell. SPSC correctness — not
-/// Rust's borrow checker — guarantees non-aliasing of slots.
+/// `#[repr(C)]` pins the field order so kernel- and user-side
+/// compilations land at the same offsets.
 #[repr(C)]
 pub struct NetChannelQueue {
-    slices: UnsafeCell<SliceQueue>,
-    increments: UnsafeCell<IncrementQueue>,
+    slices: SliceQueue,
+    increments: IncrementQueue,
     pub avail: AtomicUsize,
     capacity: usize,
     buf: u8,
@@ -67,42 +338,32 @@ impl NetChannelQueue {
     /// # Safety
     /// Caller must be the single producer for `slices` on this queue.
     pub unsafe fn enqueue_slice(&self, v: (usize, usize)) -> Result<(), (usize, usize)> {
-        unsafe { (*self.slices.get()).enqueue(v) }
+        unsafe { self.slices.enqueue(v) }
     }
 
     /// # Safety
     /// Caller must be the single consumer for `slices` on this queue.
     pub unsafe fn dequeue_slice(&self) -> Option<(usize, usize)> {
-        unsafe { (*self.slices.get()).dequeue() }
+        unsafe { self.slices.dequeue() }
     }
 
-    pub fn slices_is_empty(&self) -> bool {
-        unsafe { (*self.slices.get()).is_empty() }
-    }
-
-    pub fn slices_len(&self) -> usize {
-        unsafe { (*self.slices.get()).len() }
-    }
+    pub fn slices_is_empty(&self) -> bool { self.slices.is_empty() }
+    pub fn slices_len(&self) -> usize { self.slices.len() }
 
     /// # Safety
     /// Caller must be the single producer for `increments` on this queue.
     pub unsafe fn enqueue_increment(&self, v: usize) -> Result<(), usize> {
-        unsafe { (*self.increments.get()).enqueue(v) }
+        unsafe { self.increments.enqueue(v) }
     }
 
     /// # Safety
     /// Caller must be the single consumer for `increments` on this queue.
     pub unsafe fn dequeue_increment(&self) -> Option<usize> {
-        unsafe { (*self.increments.get()).dequeue() }
+        unsafe { self.increments.dequeue() }
     }
 
-    pub fn increments_is_full(&self) -> bool {
-        unsafe { (*self.increments.get()).is_full() }
-    }
-
-    pub fn increments_len(&self) -> usize {
-        unsafe { (*self.increments.get()).len() }
-    }
+    pub fn increments_is_full(&self) -> bool { self.increments.is_full() }
+    pub fn increments_len(&self) -> usize { self.increments.len() }
 }
 
 /// Control header for a NetChannel region. Self-anchored: sub-region
@@ -137,9 +398,15 @@ impl NetChannel {
     }
 
     /// Queue subregion length (header + ring buf) for a given total region
-    /// size. Equal to `(region_size - NC_TX_OFF) / 2`.
+    /// size. Rounded down to `align_of::<NetChannelQueue>()` so
+    /// `NC_TX_OFF + queue_len` (the rx subregion base) lands on an
+    /// alignment valid for `*mut NetChannelQueue`. Wastes at most
+    /// `align - 1` bytes of ring capacity; keeps the layout correct under
+    /// any page-rounded `region_size`.
     pub const fn queue_len_for(region_size: usize) -> usize {
-        (region_size - NC_TX_OFF) / 2
+        let raw = (region_size - NC_TX_OFF) / 2;
+        let align = core::mem::align_of::<NetChannelQueue>();
+        raw & !(align - 1)
     }
 
     /// Per-ring usable payload capacity for a given total region size.
@@ -194,7 +461,22 @@ impl NetChannel {
         unsafe { &*(self.anchor().add(NC_TX_OFF + self.queue_len) as *const NetChannelQueue) }
     }
 
-    pub fn update_tcp(&self, mut iface: Interface, socket: &mut smoltcp::socket::tcp::Socket) -> Interface {
+    /// Pump one poll cycle against `socket`. `pending_rx_ack` /
+    /// `pending_tx_ack` are kernel-local state (held per socket in
+    /// `SocketReq`): each is "a slice is enqueued and we haven't drained
+    /// the matching increment yet." They gate re-enqueue so we don't
+    /// double-post a slice in the window between the user's
+    /// `dequeue_slice` and their `enqueue_increment`. Without them,
+    /// `get_next_rx` / `get_next_tx` returns the same bytes (smoltcp
+    /// hasn't been advanced yet) and we'd stage a duplicate that
+    /// deadlocks the queue once the real ack drains.
+    pub fn update_tcp(
+        &self,
+        mut iface: Interface,
+        socket: &mut smoltcp::socket::tcp::Socket,
+        pending_rx_ack: &mut bool,
+        pending_tx_ack: &mut bool,
+    ) -> Interface {
         let current_state = self.current_state();
 
         let channel_state = current_state.state.load(Ordering::Relaxed);
@@ -257,9 +539,12 @@ impl NetChannel {
 
                     return iface
                 }
+                // User has acknowledged the prior slice; clear so the
+                // next `get_next_rx` can stage a fresh one.
+                *pending_rx_ack = false;
             }
 
-            if rx.slices_is_empty() {
+            if rx.slices_is_empty() && !*pending_rx_ack {
                 let next_rx = socket.get_next_rx();
                 if next_rx.1 > 0 {
                     // SAFETY: kernel is the sole producer of rx.slices.
@@ -279,6 +564,7 @@ impl NetChannel {
 
                     core::sync::atomic::fence(Ordering::SeqCst);
                     rx.avail.store(next_rx.1, Ordering::Release);
+                    *pending_rx_ack = true;
                 }
             }
         }
@@ -293,9 +579,10 @@ impl NetChannel {
 
                     return iface
                 }
+                *pending_tx_ack = false;
             }
 
-            if tx.slices_is_empty() {
+            if tx.slices_is_empty() && !*pending_tx_ack {
                 let next_tx = socket.get_next_tx();
                 if next_tx.1 > 0 {
                     // SAFETY: kernel is the sole producer of tx.slices.
@@ -310,6 +597,7 @@ impl NetChannel {
 
                     core::sync::atomic::fence(Ordering::SeqCst);
                     tx.avail.store(next_tx.1, Ordering::Release);
+                    *pending_tx_ack = true;
                 }
             }
         }
@@ -317,7 +605,7 @@ impl NetChannel {
     }
 
     pub fn send_tcp<F>(&self, f: F) -> Result<usize, isize>
-        where F: FnOnce(&mut [u8]) -> usize
+        where F: FnOnce(&VolSliceMut) -> usize
     {
         let current_state = self.current_state();
 
@@ -336,28 +624,29 @@ impl NetChannel {
             return Err(-5)
         }
 
-        // SAFETY: user is the sole consumer of tx.slices and sole producer
-        // of tx.increments.
+        // SAFETY: user is the sole consumer of tx.slices and sole
+        // producer of tx.increments.
         let (offset, len) = unsafe { tx.dequeue_slice() }.ok_or(-4isize)?;
-        let slice = unsafe {
-            core::slice::from_raw_parts_mut(tx.buf_ptr().add(offset), len)
+        let buf = unsafe {
+            VolSliceMut::from_raw_parts(tx.buf_ptr().add(offset), len)
         };
 
-        let written = f(slice);
+        let written = f(&buf);
         if written == 0 {
             return Ok(0)
         }
 
-        tx.avail.fetch_sub(written, Ordering::AcqRel);
-
         unsafe {
             let _ = tx.enqueue_increment(written);
         }
+
+        tx.avail.fetch_sub(written, Ordering::AcqRel);
+
         Ok(written)
     }
 
     pub fn recv_tcp<F>(&self, f: F) -> Result<usize, isize>
-        where F: FnOnce(&[u8]) -> usize
+        where F: FnOnce(&VolSlice) -> usize
     {
         let current_state = self.current_state();
 
@@ -376,23 +665,24 @@ impl NetChannel {
             return Err(-5)
         }
 
-        // SAFETY: user is the sole consumer of rx.slices and sole producer
-        // of rx.increments.
+        // SAFETY: user is the sole consumer of rx.slices and sole
+        // producer of rx.increments.
         let (offset, len) = unsafe { rx.dequeue_slice() }.ok_or(-4isize)?;
-        let slice = unsafe {
-            core::slice::from_raw_parts(rx.buf_ptr().add(offset), len)
+        let buf = unsafe {
+            VolSlice::from_raw_parts(rx.buf_ptr().add(offset), len)
         };
 
-        let written = f(slice);
+        let written = f(&buf);
         if written == 0 {
             return Ok(0)
         }
 
-        rx.avail.fetch_sub(written, Ordering::AcqRel);
-
         unsafe {
             let _ = rx.enqueue_increment(written);
         }
+
+        rx.avail.fetch_sub(written, Ordering::AcqRel);
+
         Ok(written)
     }
 

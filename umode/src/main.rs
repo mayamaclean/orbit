@@ -140,29 +140,29 @@ pub unsafe extern "C" fn _start() -> ! {
         }
     }
 
-    exit(0);
+    //exit(0);
 
     let mut written = false;
+    let mut br = false;
     loop {
         if !written && nc.writeable() > 0 {
             let wr = nc.send_tcp(|b| {
                 let msg = b"Hello World!\n";
-                let len = core::cmp::min(b.len(), msg.len());
-                b[..len].copy_from_slice(&msg[..]);
-
-                len
+                b.copy_from_slice(msg)
             });
 
-            if wr.is_ok() {
-                written = true;
+            if let Ok(n) = wr {
+                if n > 0 {
+                    written = true;
+                }
             }
         }
 
         if nc.readable() > 0 {
-            const TCP_CONNECTED: &'static str = "tcp readable!\n";
-            let _ = serial_print(TCP_CONNECTED.as_ptr() as usize, TCP_CONNECTED.len());
-
             let r = nc.recv_tcp(|rx| {
+                if rx.starts_with(b"exit") {
+                    br = true;
+                }
                 serial_print(rx.as_ptr() as usize, rx.len());
                 rx.len()
             });
@@ -173,6 +173,10 @@ pub unsafe extern "C" fn _start() -> ! {
                     exit(e);
                 }
                 _ => {}
+            }
+
+            if br {
+                exit(0);
             }
         }
         else {
@@ -188,10 +192,45 @@ pub unsafe extern "C" fn _start() -> ! {
             break
         }
     }    
-    exit(-1);
+    exit(-99);
+}
+
+/// Tiny `fmt::Write` that buffers into a 256-byte stack array and
+/// flushes via the serial-print syscall. Enough to get a panic message
+/// out before exit without any allocator.
+struct SerialWriter {
+    buf: [u8; 256],
+    len: usize,
+}
+
+impl SerialWriter {
+    const fn new() -> Self { Self { buf: [0u8; 256], len: 0 } }
+    fn flush(&mut self) {
+        if self.len > 0 {
+            let _ = serial_print(self.buf.as_ptr() as usize, self.len);
+            self.len = 0;
+        }
+    }
+}
+
+impl core::fmt::Write for SerialWriter {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        for &b in s.as_bytes() {
+            if self.len >= self.buf.len() {
+                self.flush();
+            }
+            self.buf[self.len] = b;
+            self.len += 1;
+        }
+        Ok(())
+    }
 }
 
 #[panic_handler]
-fn panic_time(_p: &PanicInfo) -> ! {
+fn panic_time(p: &PanicInfo) -> ! {
+    use core::fmt::Write;
+    let mut w = SerialWriter::new();
+    let _ = writeln!(w, "umode panic: {p}");
+    w.flush();
     syscall_arg0_noret(0, isize::MIN as usize);
 }

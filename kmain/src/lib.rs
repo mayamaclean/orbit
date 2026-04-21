@@ -180,6 +180,16 @@ pub struct SocketReq {
     netchan: SharedUserPtr<NetChannel>,
     nc_type: usize,
     pid: u16,
+    /// "A slice is enqueued on rx.slices and we haven't yet drained the
+    /// matching increment." Set when `update_tcp` enqueues an rx slice,
+    /// cleared when it drains an increment. Gates re-enqueue so we don't
+    /// race with the user's dequeue→f→increment sequence and deposit a
+    /// duplicate slice pointing at bytes smoltcp hasn't been told are
+    /// consumed yet.
+    pending_rx_ack: bool,
+    /// Same invariant on the tx side: set on enqueue of a tx slice,
+    /// cleared when we drain the user's send-ack increment.
+    pending_tx_ack: bool,
 }
 
 #[repr(align(64))]
@@ -309,7 +319,12 @@ pub extern "C" fn k_net(device: *mut NetPackage) {
 
             if req.nc_type == 0 {
                 let socket = sockets.get_mut::<smoltcp::socket::tcp::Socket>(*sock_handle);
-                iface = nc.update_tcp(iface, socket);
+                iface = nc.update_tcp(
+                    iface,
+                    socket,
+                    &mut req.pending_rx_ack,
+                    &mut req.pending_tx_ack,
+                );
             }
         }
         
