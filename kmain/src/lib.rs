@@ -173,10 +173,15 @@ pub extern "C" fn k_hart_loop() -> ! {
 
 #[derive(Debug, Clone, Copy)]
 pub struct SocketReq {
-    netchan: NetChannel,
+    /// KDMAP alias of the NetChannel header in the owning process. The
+    /// struct is self-anchored — sub-region accessors compute their targets
+    /// from this base, so we never stash absolute pointers into shared mem.
+    netchan: *mut NetChannel,
     nc_type: usize,
     pid: u16
 }
+
+unsafe impl Send for SocketReq {}
 
 #[repr(align(64))]
 pub struct NetPackage {
@@ -301,13 +306,11 @@ pub extern "C" fn k_net(device: *mut NetPackage) {
         }
 
         for (sock_handle, req) in user_conns.iter_mut() {
-            let nc = &mut req.netchan;
+            let nc = unsafe { &*req.netchan };
 
             if req.nc_type == 0 {
                 let socket = sockets.get_mut::<smoltcp::socket::tcp::Socket>(*sock_handle);
-                unsafe {
-                    iface = nc.update_tcp(iface, socket);
-                }   
+                iface = nc.update_tcp(iface, socket);
             }
         }
         
@@ -319,10 +322,10 @@ pub extern "C" fn k_net(device: *mut NetPackage) {
         next_poll = wake_time;
 
         for q in socket_reqs.iter_mut() {
-            while let Some(mut req) = q.dequeue() {
+            while let Some(req) = q.dequeue() {
                 info!("net: processing req {req:016X?}");
 
-                let mut nc = &mut req.netchan;
+                let nc = unsafe { &*req.netchan };
 
                 if req.nc_type == 0 {
                     let (txr, rxr) = nc.rings();

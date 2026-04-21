@@ -141,10 +141,8 @@ pub unsafe extern "C" fn _start() -> ! {
     }
 
     loop {
-        let state = unsafe {
-            nc.current_state.as_ref().state.load(Ordering::Acquire)
-        };
-        
+        let state = nc.current_state().state.load(Ordering::Acquire);
+
         if state > 0 {
             const TCP_CONNECTED: &'static str = "tcp connected!\n";
             let _ = serial_print(TCP_CONNECTED.as_ptr() as usize, TCP_CONNECTED.len());
@@ -201,9 +199,7 @@ pub unsafe extern "C" fn _start() -> ! {
             let _ = sleep_ms(100);
         }
 
-        let state = unsafe {
-            nc.current_state.as_ref().state.load(Ordering::Acquire)
-        };
+        let state = nc.current_state().state.load(Ordering::Acquire);
 
         if state <= 0 {
             const TCP_CONN_FAILURE: &'static str = "tcp connection failed!\n";

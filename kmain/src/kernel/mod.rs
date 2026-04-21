@@ -1,5 +1,5 @@
 use core::alloc::Layout;
-use core::ptr::{NonNull, null_mut};
+use core::ptr::null_mut;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use core::time::Duration;
 
@@ -16,7 +16,7 @@ use mem::{round_u64_down, round_u64_up, round_usize_up};
 use mmu::mmap::{PageAlloc, id_map_range, map_address_range, unmap, unmap_page};
 use mmu::sv48::{PageTable, PhysAddr, VirtAddr};
 use mmu::{KB, MB, MappingConfig, PAGE_SIZE, PagePermissions};
-use net_channel::{NetChannel, NetChannelQueue, NetChannelState};
+use net_channel::NetChannel;
 use process::{MappingKind, MemMapReq, NetChannelRegistrationReq, PThread, PhysBacking, Pool, Process, Thread, ThreadBlockReason, ThreadState, UserMapping};
 use riscv::register::satp::{Mode, Satp};
 use riscv::register::sstatus::SPP;
@@ -395,54 +395,18 @@ impl Orbit {
         thread.frame.regs[10] = 0;
     }
 
-    fn translate_nc_addrs(rpt: &mmu::mmap::RootTable<'_>, nc: &mut NetChannel) -> bool {
-        // User-supplied pointers name pages in the user address space. The
-        // kernel-side network thread runs under a kernel satp later, so the
-        // long-lived pointers we stash have to resolve there — rewrite each
-        // field to the KDMAP alias of the same physical backing.
-        unsafe {
-            {
-                let v = nc.desired_state.as_ptr() as u64;
-                let Some(kva) = memmap::user_va_to_kdmap(rpt, v) else { return false };
-                info!("translated v0x{v:08X?}->kva0x{kva:08X?}");
-                nc.desired_state = NonNull::new_unchecked(kva as *mut NetChannelState);
-            }
-
-            {
-                let v = nc.current_state.as_ptr() as u64;
-                let Some(kva) = memmap::user_va_to_kdmap(rpt, v) else { return false };
-                info!("translated v0x{v:08X?}->kva0x{kva:08X?}");
-                nc.current_state = NonNull::new_unchecked(kva as *mut NetChannelState);
-            }
-
-            {
-                let v = nc.tx.as_ptr() as u64;
-                let Some(kva) = memmap::user_va_to_kdmap(rpt, v) else { return false };
-                info!("translated v0x{v:08X?}->kva0x{kva:08X?}");
-                nc.tx = NonNull::new_unchecked(kva as *mut NetChannelQueue);
-            }
-
-            {
-                let v = nc.rx.as_ptr() as u64;
-                let Some(kva) = memmap::user_va_to_kdmap(rpt, v) else { return false };
-                info!("translated v0x{v:08X?}->kva0x{kva:08X?}");
-                nc.rx = NonNull::new_unchecked(kva as *mut NetChannelQueue);
-            }
-        }
-        true
-    }
-
     fn handle_nc_register_req<'t>(&mut self, thread: &'t mut Thread, req: NetChannelRegistrationReq) {
         info!("handling nc registration req: {req:08X?}");
 
-        let (nc_kva, rpt) = unsafe {
+        let nc_kva = unsafe {
             let rpt = memmap::kernel_root_from_pa(thread.root_table_addr() as u64);
-            (memmap::user_va_to_kdmap(&rpt, req.nc_vaddr as u64), rpt)
+            memmap::user_va_to_kdmap(&rpt, req.nc_vaddr as u64)
         };
 
         // Deferred work: the manager runs under the kernel satp, not the
         // user's, so SUM can't bridge user VAs here. Walk the user PT and
-        // read through the KDMAP alias of the backing page instead.
+        // stash the KDMAP alias of the NetChannel header — accessors are
+        // self-anchored and resolve sub-regions from that base.
         let nc_kva = match nc_kva {
             Some(p) => p,
             None => {
@@ -453,27 +417,15 @@ impl Orbit {
 
         info!("nc@kva0x{nc_kva:08X?}");
 
-        let mut nc = unsafe {
-            (nc_kva as *const NetChannel).read_volatile()
-        };
-
-        info!("nc={nc:?}");
-
-        if !Self::translate_nc_addrs(&rpt, &mut nc) {
-            warn!("failed to translate socket req {req:?}");
-            thread.frame.regs[10] = -2isize as usize;
-            return
-        }
-
         let socket_req = SocketReq {
-            netchan: nc,
+            netchan: nc_kva as *mut NetChannel,
             nc_type: req.nc_type,
             pid: thread.pid
         };
 
         if let Some(np) = self.net_pkg.socket_reqs.get_mut(get_hart_context().hart_id as usize) {
             if let Err(e) = np.enqueue(socket_req) {
-                warn!("failed to queue socket req {socket_req:?}");
+                warn!("failed to queue socket req {e:?}");
                 thread.frame.regs[10] = -3isize as usize;
                 return
             }
