@@ -7,6 +7,7 @@ use alloc::{collections::btree_map::BTreeMap, vec::Vec};
 use device::{HartContext, TrapFrame};
 use mmu::{PAGE_SIZE, sv48::PageTable};
 use net_channel::NetChannel;
+use crate::kernel::shared_user_ptr::SharedUserPtr;
 use process::{MemMapReq, NetChannelCreationReq, Thread, ThreadBlockReason, ThreadState};
 use riscv::register::sstatus::SPP;
 use smoltcp::{iface::{PollResult, SocketHandle, SocketSet, SocketStorage}, socket::dhcpv4, storage::{PacketBuffer, RingBuffer}};
@@ -171,17 +172,15 @@ pub extern "C" fn k_hart_loop() -> ! {
 }
 
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct SocketReq {
-    /// KDMAP alias of the NetChannel header in the owning process. The
-    /// struct is self-anchored — sub-region accessors compute their targets
-    /// from this base, so we never stash absolute pointers into shared mem.
-    netchan: *mut NetChannel,
+    /// Refcounted handle on the NetChannel. Cloned from the registry when
+    /// the manager enqueues the request; k_net drops its clone when the
+    /// socket goes through `socket_deletions`.
+    netchan: SharedUserPtr<NetChannel>,
     nc_type: usize,
-    pid: u16
+    pid: u16,
 }
-
-unsafe impl Send for SocketReq {}
 
 #[repr(align(64))]
 pub struct NetPackage {
@@ -306,7 +305,7 @@ pub extern "C" fn k_net(device: *mut NetPackage) {
         }
 
         for (sock_handle, req) in user_conns.iter_mut() {
-            let nc = unsafe { &*req.netchan };
+            let nc = req.netchan.as_ref();
 
             if req.nc_type == 0 {
                 let socket = sockets.get_mut::<smoltcp::socket::tcp::Socket>(*sock_handle);
@@ -323,12 +322,11 @@ pub extern "C" fn k_net(device: *mut NetPackage) {
 
         for q in socket_reqs.iter_mut() {
             while let Some(req) = q.dequeue() {
-                info!("net: processing req {req:016X?}");
-
-                let nc = unsafe { &*req.netchan };
+                info!("net: processing req {req:?}");
 
                 if req.nc_type == 0 {
-                    let (txr, rxr) = nc.rings();
+                    let req_pid = req.pid;
+                    let (txr, rxr) = req.netchan.as_ref().rings();
 
                     info!("net: tcp socket ring lens: rx={},tx={}", rxr.len(), txr.len());
 
@@ -343,7 +341,7 @@ pub extern "C" fn k_net(device: *mut NetPackage) {
 
                     next_poll = 0;
 
-                    if let Err(assoc) = socket_associations.enqueue((req.pid as usize, handle)) {
+                    if let Err(assoc) = socket_associations.enqueue((req_pid as usize, handle)) {
                         error!("net: was unable to inform manager of socket association {assoc:?}");
                     }
                 }

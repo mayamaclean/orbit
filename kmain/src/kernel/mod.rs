@@ -18,6 +18,8 @@ use mmu::sv48::{PageTable, PhysAddr, VirtAddr};
 use mmu::{KB, MB, MappingConfig, PAGE_SIZE, PagePermissions};
 use net_channel::NetChannel;
 use process::{MappingKind, MemMapReq, NetChannelCreationReq, PThread, PhysBacking, Pool, Process, Thread, ThreadBlockReason, ThreadState, UserMapping};
+
+use crate::kernel::shared_user_ptr::SharedUserPtr;
 use riscv::register::satp::{Mode, Satp};
 use riscv::register::sstatus::SPP;
 use serial::println;
@@ -33,6 +35,8 @@ use crate::{NetPackage, SocketReq, supervisor_wake_hart};
 pub mod context;
 pub mod memmap;
 pub mod orbital_elf;
+pub mod pending_frees;
+pub mod shared_user_ptr;
 pub mod pci;
 pub mod user_page;
 
@@ -67,7 +71,14 @@ pub struct Orbit {
     user_pages: FrameAllocator<33>,
 
     net_pkg: NetPackage,
-    orphaned_sockets: Vec<SocketHandle>
+    orphaned_sockets: Vec<SocketHandle>,
+
+    /// Per-process NetChannel handles. `SharedUserPtr<NetChannel>` owns
+    /// the backing via refcount — entries here are the kernel's own
+    /// strong refs. Cloned into `SocketReq` for k_net. Removed when the
+    /// process exits; last Arc to drop pushes the backing to
+    /// `pending_frees`.
+    nc_channels: BTreeMap<u16, Vec<SharedUserPtr<NetChannel>>>,
 }
 
 impl Orbit {
@@ -141,7 +152,8 @@ impl Orbit {
                 socket_associations: heapless::spsc::Queue::new(),
                 socket_deletions: heapless::spsc::Queue::new()
             },
-            orphaned_sockets: Vec::new()
+            orphaned_sockets: Vec::new(),
+            nc_channels: BTreeMap::new(),
         }
     }
 
@@ -464,18 +476,29 @@ impl Orbit {
             }
         }
 
-        let Some(owning_process) = self.processes.get_mut(&thread.pid) else {
+        if !self.processes.contains_key(&thread.pid) {
             warn!("nc create: no owning process {req:?}");
             self.kernel_pages.dealloc_aligned(paddr, layout);
             thread.frame.regs[10] = -5isize as usize;
             return
-        };
+        }
 
-        owning_process.heap_pages.push(PhysBacking {
+        // Backing ownership moves into the SharedUserPtr's Arc — not into
+        // `proc.heap_pages`, which would double-free on teardown. The
+        // Arc's last drop pushes to `pending_frees`; the manager returns
+        // it to `kernel_pages` during cleanup.
+        let backing = PhysBacking {
             paddr: backing_phys,
             layout,
             pool: Pool::Shared,
-        });
+        };
+        let shared: SharedUserPtr<NetChannel> = SharedUserPtr::new(
+            backing, req.nc_vaddr as u64, region_size, thread.pid);
+
+        self.nc_channels
+            .entry(thread.pid)
+            .or_insert_with(Vec::new)
+            .push(shared.clone());
 
         core::sync::atomic::fence(Ordering::SeqCst);
 
@@ -484,7 +507,7 @@ impl Orbit {
         }
 
         let socket_req = SocketReq {
-            netchan: kva as *mut NetChannel,
+            netchan: shared,
             nc_type: req.nc_type,
             pid: thread.pid,
         };
@@ -652,10 +675,17 @@ impl Orbit {
 
         while let Some(socket_handle) = process.sockets.pop_last() {
             if let Err(e) = self.net_pkg.socket_deletions.enqueue(socket_handle) {
-                error!("failed to queue socket for deletion while deallocating pid{}", process.pid);
+                error!("failed to queue socket for deletion while deallocating pid{} ({e:?})", process.pid);
                 self.orphaned_sockets.push(socket_handle);
             }
         }
+
+        // Drop the manager's SharedUserPtr clones for this pid. k_net
+        // still holds its own clones via `user_conns`; those drop later
+        // when `socket_deletions` removes them. When *both* sides have
+        // released, the SharedInner Drop fires and pushes the backing
+        // onto `pending_frees`.
+        let _ = self.nc_channels.remove(&process.pid);
 
         let root_table = unsafe { memmap::kernel_root_from_pa(process_root_table_pa) };
 
@@ -754,6 +784,17 @@ impl Orbit {
                 .unwrap();
 
             self.dealloc_process(proc);
+        }
+
+        // Drain SharedUserPtr Drops that landed since the last pass. Each
+        // queued PhysBacking is a `Shared`-pool page whose last Arc just
+        // dropped — return it to `kernel_pages` here, under the Orbit
+        // lock, not in Drop context.
+        while let Some(b) = pending_frees::pop() {
+            let kva = memmap::phys_to_virt(b.paddr) as usize;
+            serial::println!("dealloc shared ptr backing pa@{:016X} kva@{:016X} {:08X?}",
+                b.paddr, kva, b.layout);
+            self.kernel_pages.dealloc_aligned(kva, b.layout);
         }
     }
     
