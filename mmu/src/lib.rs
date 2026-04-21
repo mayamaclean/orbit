@@ -76,7 +76,7 @@ impl BitAnd<PagePermissions> for u64 {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct MappingConfig {
     pub permissions: u64,
     pub levels: usize,
@@ -85,18 +85,4 @@ pub struct MappingConfig {
     pub paddr: PhysAddr,
     pub log: bool,
     pub supervisor_tag: Option<u8>
-}
-
-impl MappingConfig {
-    pub fn copy(&self) -> Self {
-        Self {
-            permissions: self.permissions,
-            levels: self.levels,
-            page_size: self.page_size,
-            vaddr: self.vaddr.copy(),
-            paddr: self.paddr.copy(),
-            log: self.log,
-            supervisor_tag: self.supervisor_tag
-        }
-    }
 }

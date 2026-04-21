@@ -392,11 +392,11 @@ unsafe extern "C" fn early_paging_setup(pt_base: *mut u8, pt_size: usize, load_a
     };
 
     // Identity [0, 1 GiB) — low-half MMIO range
-    if unsafe { id_map_range(&root, &mut pages, cfg.copy(), 0..(1u64 << 30)) }.is_err() {
+    if unsafe { id_map_range(&root, &mut pages, cfg, 0..(1u64 << 30)) }.is_err() {
         loop { unsafe { riscv::asm::wfi(); } }
     }
     // Identity [2, 4 GiB) — all of RAM (kernel image, kheap, kpages, ktables, dtb)
-    if unsafe { id_map_range(&root, &mut pages, cfg.copy(), (2u64 << 30)..(4u64 << 30)) }.is_err() {
+    if unsafe { id_map_range(&root, &mut pages, cfg, (2u64 << 30)..(4u64 << 30)) }.is_err() {
         loop { unsafe { riscv::asm::wfi(); } }
     }
 
@@ -406,7 +406,7 @@ unsafe extern "C" fn early_paging_setup(pt_base: *mut u8, pt_size: usize, load_a
     // load_addr + X, which matches the convention the final satp uses.
     let ktext = kmain::kernel::memmap::KTEXT_NOMINAL;
     let len = 2u64 * 1024 * 1024;
-    if unsafe { map_va_range(&root, &mut pages, cfg.copy(), ktext, load_addr..(load_addr + len)) }.is_err() {
+    if unsafe { map_va_range(&root, &mut pages, cfg, ktext, load_addr..(load_addr + len)) }.is_err() {
         loop { unsafe { riscv::asm::wfi(); } }
     }
 
@@ -415,7 +415,7 @@ unsafe extern "C" fn early_paging_setup(pt_base: *mut u8, pt_size: usize, load_a
     // in the final satp) so rust_main can initialize KHEAP/kpages through
     // their KDMAP VAs before the final satp is installed.
     let kdmap = kmain::kernel::memmap::KDMAP_NOMINAL;
-    if unsafe { map_va_range(&root, &mut pages, cfg.copy(), kdmap, (2u64 << 30)..(4u64 << 30)) }.is_err() {
+    if unsafe { map_va_range(&root, &mut pages, cfg, kdmap, (2u64 << 30)..(4u64 << 30)) }.is_err() {
         loop { unsafe { riscv::asm::wfi(); } }
     }
 

@@ -1,5 +1,5 @@
 use core::alloc::Layout;
-use core::{ops::Range, sync::atomic::Ordering};
+use core::ops::Range;
 
 #[cfg(feature = "alloc")]
 use mem::frame::FrameAllocator;
@@ -117,6 +117,91 @@ impl<'a> PageAlloc<'a> {
     }
 }
 
+/// Sv48 table depth. Counted so that 3 = root (its PTEs are indexed by
+/// vpn3 and point at L2 tables) and 0 = leaf table (its PTEs are
+/// 4 KiB-leaf PTEs). For superpages the leaf PTE is installed at
+/// the *table* whose depth matches `4 - config.levels`: 4 KiB leaves go
+/// in the depth-0 table, 2 MiB superpages in the depth-1 table, 1 GiB in
+/// depth-2.
+pub type Level = u8;
+
+/// Descend `root` toward the table at `target_level` without allocating
+/// or modifying anything. Returns `None` if any PTE above the target is
+/// invalid (`V=0`) or a leaf (superpage present above target level).
+///
+/// # Safety
+/// - `root.table` must reference a live Sv48 table.
+/// - PTE PPNs along the walk must correspond to live page tables
+///   reachable via `root.pa_to_va_bias`.
+pub unsafe fn walk_to_table<'a>(
+    root: &'a RootTable<'_>,
+    vaddr: VirtAddr,
+    target_level: Level,
+) -> Option<&'a PageTable> {
+    let mut table = root.table;
+    for lvl in ((target_level + 1)..=3).rev() {
+        let idx = vaddr.vpn_n(lvl as usize) as usize;
+        let pte = &table.entries[idx];
+        if !pte.is_valid() || pte.is_leaf() {
+            return None;
+        }
+        let next_pa = pte.ppn() * PAGE_SIZE as u64;
+        let next_va = root.va_from_pa(next_pa) as *const PageTable;
+        table = unsafe { next_va.as_ref_unchecked() };
+    }
+    Some(table)
+}
+
+/// Descend `root` toward the table at `target_level`, materializing any
+/// missing intermediate tables from `pages`. Errors if an intermediate
+/// PTE is a leaf (superpage conflict with a deeper target) or if
+/// allocation fails.
+///
+/// # Safety
+/// - Same invariants as [`walk_to_table`].
+/// - `pages` must hand back page-table frames that the caller owns for
+///   the lifetime of the resulting mappings.
+pub unsafe fn walk_to_table_materialize<'a, 'p>(
+    root: &'a RootTable<'_>,
+    pages: &mut PageAlloc<'p>,
+    vaddr: VirtAddr,
+    target_level: Level,
+    log: bool,
+) -> Result<&'a PageTable, ()> {
+    let mut table = root.table;
+    for lvl in ((target_level + 1)..=3).rev() {
+        let idx = vaddr.vpn_n(lvl as usize) as usize;
+        let pte = &table.entries[idx];
+
+        if pte.is_leaf() {
+            if log { println!("\twalk_materialize: unexpected leaf at level {lvl}"); }
+            return Err(());
+        }
+
+        table = if !pte.is_valid() {
+            let new_table = pages.allocate_page_table()?;
+            let new_table_va = new_table as *const _ as u64;
+            let new_table_pa = root.pa_from_va(new_table_va);
+            let ppn = new_table_pa / PAGE_SIZE as u64;
+            pte.set_raw(crate::sv48::PageTableEntry::pack_table(ppn));
+            if log {
+                println!("\ttable@0x{:08X}[vpn{lvl}={idx}]={:08x}",
+                    table as *const _ as usize, new_table_pa);
+            }
+            new_table
+        } else {
+            let next_pa = pte.ppn() * PAGE_SIZE as u64;
+            if log {
+                println!("\ttable@0x{:08X}[vpn{lvl}={idx}]={:08x}",
+                    table as *const _ as usize, next_pa);
+            }
+            let next_va = root.va_from_pa(next_pa) as *const PageTable;
+            unsafe { next_va.as_ref_unchecked() }
+        };
+    }
+    Ok(table)
+}
+
 pub unsafe fn map_address_page<'a>(root_table: &RootTable<'_>, pages: &mut PageAlloc<'a>, config: &MappingConfig) -> Result<(), ()> {
     if (config.paddr.get_raw() % config.page_size) != 0 || (config.vaddr.get_raw() % config.page_size) != 0 {
         if config.log { println!("misaligned map call: {config:?}"); }
@@ -125,40 +210,13 @@ pub unsafe fn map_address_page<'a>(root_table: &RootTable<'_>, pages: &mut PageA
 
     if config.log { println!("\n{:08x?}", &config); }
 
-    let mut current_table = root_table.table;
-    for level in 0..(config.levels - 1) {
-        let lidx = 4 - level - 1;
-        let idx = config.vaddr.vpn_n(lidx);
-        let pte = &current_table.entries[idx as usize];
+    let target_level = (4 - config.levels) as Level;
+    let table = unsafe {
+        walk_to_table_materialize(root_table, pages, config.vaddr, target_level, config.log)?
+    };
 
-        current_table = if !pte.is_valid() {
-            let new_page_table = pages.allocate_page_table()?;
-            let new_table_va = new_page_table as *const _ as u64;
-            let new_table_pa = root_table.pa_from_va(new_table_va);
-
-            // set ppn of root entry for secondary table + valid bit
-            let ppn = new_table_pa / crate::PAGE_SIZE as u64;
-            pte.set_raw(crate::sv48::PageTableEntry::pack_table(ppn));
-
-            if config.log { println!("\ttable@0x{:08X}[vpn{lidx}={idx}]={:08x}", current_table as *const _ as usize, new_table_pa); }
-
-            new_page_table
-        }
-        else {
-            let raw_pa = pte.ppn() * crate::PAGE_SIZE as u64;
-            let raw = root_table.va_from_pa(raw_pa) as *const PageTable;
-
-            if config.log { println!("\ttable@0x{:08X}[vpn{lidx}={idx}]={:08x}", current_table as *const _ as usize, raw_pa); }
-
-            unsafe {
-                raw.as_ref_unchecked()
-            }
-        };
-    }
-
-    // current table should now be at the table containing our leaves
-    let idx = config.vaddr.vpn_n(4 - config.levels);
-    let pte = &current_table.entries[idx as usize];
+    let idx = config.vaddr.vpn_n(target_level as usize) as usize;
+    let pte = &table.entries[idx];
 
     if pte.is_valid() {
         if config.log { println!("leaf pte already exists"); }
@@ -168,7 +226,10 @@ pub unsafe fn map_address_page<'a>(root_table: &RootTable<'_>, pages: &mut PageA
     let ppn = config.paddr.get_raw() / PAGE_SIZE as u64;
     pte.set_raw(crate::sv48::PageTableEntry::pack_leaf(ppn, config.permissions));
 
-    if config.log { println!("\tleaf in table@0x{:08X}[vpn{}={idx}]=0x{:08x}", current_table as *const _ as usize, config.levels, pte.get_raw()); }
+    if config.log {
+        println!("\tleaf in table@0x{:08X}[vpn{}={idx}]=0x{:08x}",
+            table as *const _ as usize, config.levels, pte.get_raw());
+    }
 
     Ok(())
 }
@@ -192,28 +253,9 @@ pub unsafe fn reserve_va_range<'a>(
     const L0_SPAN: u64 = 512 * PAGE_SIZE as u64;
     let mut va = va_start;
     while va < va_end {
-        let vaddr = VirtAddr::new(va);
-        let mut current = root_table.table;
-        for level in (1..=3).rev() {
-            let idx = vaddr.vpn_n(level) as usize;
-            let pte = &current.entries[idx];
-            current = if !pte.is_valid() {
-                let new_table = pages.allocate_page_table()?;
-                let new_table_va = new_table as *const _ as u64;
-                let new_table_pa = root_table.pa_from_va(new_table_va);
-                let ppn = new_table_pa / PAGE_SIZE as u64;
-                pte.set_raw(crate::sv48::PageTableEntry::pack_table(ppn));
-                new_table
-            } else {
-                let next_pa = pte.ppn() * PAGE_SIZE as u64;
-                unsafe {
-                    (root_table.va_from_pa(next_pa) as *const PageTable)
-                        .as_ref_unchecked()
-                }
-            };
+        unsafe {
+            walk_to_table_materialize(root_table, pages, VirtAddr::new(va), 0, false)?;
         }
-        // `current` is the L0 table; leaves stay all-zero (from
-        // allocate_page_table).
         va = va.saturating_add(L0_SPAN);
     }
     Ok(())
@@ -230,18 +272,7 @@ pub unsafe fn write_leaf_pte(
     paddr: Option<PhysAddr>,
     perms: u64,
 ) -> Result<(), ()> {
-    let mut table = root_table.table;
-    for level in (1..=3).rev() {
-        let idx = vaddr.vpn_n(level) as usize;
-        let pte = &table.entries[idx];
-        if !pte.is_valid() || pte.is_leaf() {
-            return Err(())
-        }
-        let next_pa = pte.ppn() * PAGE_SIZE as u64;
-        table = unsafe {
-            (root_table.va_from_pa(next_pa) as *const PageTable).as_ref_unchecked()
-        };
-    }
+    let table = unsafe { walk_to_table(root_table, vaddr, 0) }.ok_or(())?;
     let leaf_idx = vaddr.vpn_n(0) as usize;
     match paddr {
         Some(pa) => {
@@ -278,12 +309,12 @@ pub unsafe fn map_address_range<'a>(root_table: &RootTable<'_>, pages: &mut Page
     }
 
     let pages_needed = plen / config.page_size;
-    let range_config = config.copy();
+    let mut range_config = *config;
 
     for _ in 0..pages_needed {
         unsafe { map_address_page(root_table, pages, &range_config)?; }
-        range_config.paddr.a.fetch_add(config.page_size, Ordering::AcqRel);
-        range_config.vaddr.a.fetch_add(config.page_size, Ordering::AcqRel);
+        range_config.paddr = PhysAddr::new(range_config.paddr.get_raw() + config.page_size);
+        range_config.vaddr = VirtAddr::new(range_config.vaddr.get_raw() + config.page_size);
     }
     Ok(())
 }
@@ -336,32 +367,18 @@ pub unsafe fn walk_pte_chain(
 
 #[unsafe(no_mangle)]
 pub unsafe fn virt_to_phys(root_table: &RootTable<'_>, vaddr: VirtAddr) -> Option<usize> {
-    let mut current_table = root_table.table;
-    for l in (0..=3).rev() {
-        let index = vaddr.vpn_n(l) as usize;
-        let entry = &current_table.entries[index];
-
-        // V=0 is "not present" — without this check the walker computes
-        // va_from_pa(ppn=0) = pa_to_va_bias and derefs a bogus pointer,
-        // faulting on a legitimate unmapped lookup instead of returning None.
-        if !entry.is_valid() {
-            return None
-        }
-
-        let phys = (entry.get_ppn() as u64) << 2;
-
-        if entry.is_leaf() {
-            let page_offset = vaddr.page_offset() as usize;
-            return Some(phys as usize + page_offset)
-        }
-
-        let va = root_table.va_from_pa(phys);
-        current_table = unsafe {
-            (va as *const PageTable)
-                .as_ref_unchecked()
-        };
-    }
-    None
+    let mut chain = [WalkStep::EMPTY; 4];
+    let n = unsafe { walk_pte_chain(root_table, vaddr, &mut chain) };
+    let terminal = chain[n - 1];
+    let valid = (terminal.pte_raw & 1) != 0;
+    let leaf = (terminal.pte_raw & 0xE) != 0;
+    if !valid || !leaf { return None; }
+    // Shift PPN from in-place (bit 10) down and back up to PA (bit 12):
+    // net shift by 2 is equivalent to `(pte_raw >> 10) * PAGE_SIZE`.
+    let phys_base = (terminal.pte_raw & !crate::sv48::PageTableEntry::STATUS_BITS_MASK) << 2;
+    // 4 KiB-leaf assumption: superpage leaves would need a bigger
+    // offset mask. Orbit has no user superpages today.
+    Some(phys_base as usize + vaddr.page_offset() as usize)
 }
 
 /// Walk to the leaf PTE for `vaddr` at `levels` granularity and clear it.
@@ -369,20 +386,10 @@ pub unsafe fn virt_to_phys(root_table: &RootTable<'_>, vaddr: VirtAddr) -> Optio
 /// an unexpected level — the latter prevents accidentally clobbering a
 /// superpage that covers more than the caller intends to unmap.
 pub unsafe fn unmap_page(root_table: &RootTable<'_>, vaddr: VirtAddr, levels: usize) -> Result<(), ()> {
-    let target_level = 4 - levels;
-    let mut current_table = root_table.table;
-    for lidx in ((target_level + 1)..=3).rev() {
-        let idx = vaddr.vpn_n(lidx) as usize;
-        let pte = &current_table.entries[idx];
-        if !pte.is_valid() || pte.is_leaf() {
-            return Err(())
-        }
-        let next_pa = pte.ppn() * PAGE_SIZE as u64;
-        let next = root_table.va_from_pa(next_pa) as *const PageTable;
-        current_table = unsafe { next.as_ref_unchecked() };
-    }
-    let idx = vaddr.vpn_n(target_level) as usize;
-    let pte = &current_table.entries[idx];
+    let target_level = (4 - levels) as Level;
+    let table = unsafe { walk_to_table(root_table, vaddr, target_level) }.ok_or(())?;
+    let idx = vaddr.vpn_n(target_level as usize) as usize;
+    let pte = &table.entries[idx];
     if !pte.is_valid() || !pte.is_leaf() {
         return Err(())
     }
@@ -439,6 +446,10 @@ unsafe fn unmap_subtree<'a>(table: &RootTable<'_>, pages: &mut PageAlloc<'a>) {
     }
 }
 
+/// Like [`map_address_page`] but overwrites any existing leaf PTE at the
+/// target slot rather than failing. Used by the bulk-mapping helpers
+/// ([`map_va_range`], [`id_map_range`]) which iterate over fresh VA
+/// ranges owned by the caller and don't expect prior contents.
 pub unsafe fn map_page<'a>(root_table: &RootTable<'_>, pages: &mut PageAlloc<'a>, config: &MappingConfig) -> Result<(), ()> {
     if (config.paddr.get_raw() % config.page_size) != 0 || (config.vaddr.get_raw() % config.page_size) != 0 {
         if config.log { println!("misaligned map call: {config:?}"); }
@@ -447,51 +458,20 @@ pub unsafe fn map_page<'a>(root_table: &RootTable<'_>, pages: &mut PageAlloc<'a>
 
     if config.log { println!("\n{:08x?}", &config); }
 
-    let target_level = 4 - config.levels;
+    let target_level = (4 - config.levels) as Level;
+    let table = unsafe {
+        walk_to_table_materialize(root_table, pages, config.vaddr, target_level, config.log)?
+    };
 
-    let mut current_table = root_table.table;
-    for lidx in ((target_level+ 1)..=3).rev() {
-        let idx = config.vaddr.vpn_n(lidx);
-        let pte = &current_table.entries[idx as usize];
-
-        if pte.is_leaf() {
-            if config.log { println!("\tfound leaf pte where we didnt expect one"); }
-            return Err(())
-        }
-
-        current_table = if !pte.is_valid() {
-            let new_page_table = pages.allocate_page_table()?;
-            let new_table_va = new_page_table as *const _ as u64;
-            let new_table_pa = root_table.pa_from_va(new_table_va);
-
-            // set ppn of root entry for secondary table + valid bit
-            let ppn = new_table_pa / crate::PAGE_SIZE as u64;
-            pte.set_raw(crate::sv48::PageTableEntry::pack_table(ppn));
-
-            if config.log { println!("\ttable@0x{:08X}[vpn{lidx}={idx}]={:08x}", current_table as *const _ as usize, new_table_pa); }
-
-            new_page_table
-        }
-        else {
-            let raw_pa = pte.ppn() * crate::PAGE_SIZE as u64;
-            let raw = root_table.va_from_pa(raw_pa) as *const PageTable;
-
-            if config.log { println!("\ttable@0x{:08X}[vpn{lidx}={idx}]={:08x}", current_table as *const _ as usize, raw_pa); }
-
-            unsafe {
-                raw.as_ref_unchecked()
-            }
-        };
-    }
-
-    // current table should now be at the table containing our leaves
-    let idx = config.vaddr.vpn_n(target_level);
-    let pte = &current_table.entries[idx as usize];
-
+    let idx = config.vaddr.vpn_n(target_level as usize) as usize;
+    let pte = &table.entries[idx];
     let ppn = config.paddr.get_raw() / PAGE_SIZE as u64;
     pte.set_raw(crate::sv48::PageTableEntry::pack_leaf(ppn, config.permissions));
 
-    if config.log { println!("\tleaf in table@0x{:08X}[vpn{}={idx}]=0x{:08x}", current_table as *const _ as usize, target_level, pte.get_raw()); }
+    if config.log {
+        println!("\tleaf in table@0x{:08X}[vpn{}={idx}]=0x{:08x}",
+            table as *const _ as usize, target_level, pte.get_raw());
+    }
 
     Ok(())
 }

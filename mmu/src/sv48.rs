@@ -1,12 +1,17 @@
 use core::sync::atomic::{self as atomic, AtomicU64};
 use atomic::Ordering;
 
-type BaseUnit = atomic::AtomicU64;
+/// Atomic storage for page-table entries. Hardware page-table walkers on
+/// any hart can race with our writes, so PTE reads/writes go through
+/// `AtomicU64`. Plain address wrappers (`VirtAddr` / `PhysAddr`) don't —
+/// those are single-threaded scratch values built up during a mapping
+/// call, so they're `Copy`.
+type AtomicPte = atomic::AtomicU64;
 
 #[repr(transparent)]
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct VirtAddr {
-    pub(crate) a: BaseUnit
+    pub(crate) a: u64,
 }
 
 impl VirtAddr {
@@ -18,35 +23,22 @@ impl VirtAddr {
     ];
 
     pub const fn new(raw: u64) -> Self {
-        Self {
-            a: AtomicU64::new(raw)
-        }
+        Self { a: raw }
     }
 
-    pub fn copy(&self) -> Self {
-        Self {
-            a: BaseUnit::new(self.get_raw())
-        }
-    }
-    
     #[inline(always)]
     pub fn get_raw(&self) -> u64 {
-        self.a.load(Ordering::Acquire)
-    }
-
-    #[inline(always)]
-    pub fn set_raw(&self, vaddr: u64) {
-        self.a.store(vaddr, Ordering::Release);
+        self.a
     }
 
     pub fn page_offset(&self) -> u64 {
-        self.get_raw() & Self::PAGE_OFFSET_MASK
+        self.a & Self::PAGE_OFFSET_MASK
     }
 
     pub fn vpn_n(&self, n: usize) -> u64 {
         let i = Self::VPN_OFFSETS[n];
         let m = Self::VIRT_PAGE_NUM_MASK << i as u64;
-        (self.get_raw() & m) >> Self::VPN_OFFSETS[n]
+        (self.a & m) >> Self::VPN_OFFSETS[n]
     }
 
     pub fn vpn0(&self) -> u64 {
@@ -70,14 +62,14 @@ impl VirtAddr {
     pub fn vpn3(&self) -> u64 {
         let i = Self::VPN_OFFSETS[3];
         let m = Self::VIRT_PAGE_NUM_MASK << i as u64;
-        (self.get_raw() & m) >> Self::VPN_OFFSETS[3]
+        (self.a & m) >> Self::VPN_OFFSETS[3]
     }
 }
 
 #[repr(transparent)]
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct PhysAddr {
-    pub(crate) a: BaseUnit
+    pub(crate) a: u64,
 }
 
 impl PhysAddr {
@@ -90,71 +82,58 @@ impl PhysAddr {
     ];
 
     pub const fn new(raw: u64) -> Self {
-        Self {
-            a: AtomicU64::new(raw)
-        }
-    }
-
-    pub fn copy(&self) -> Self {
-        Self {
-            a: BaseUnit::new(self.get_raw())
-        }
+        Self { a: raw }
     }
 
     #[inline(always)]
     pub fn get_raw(&self) -> u64 {
-        self.a.load(Ordering::Acquire)
-    }
-
-    #[inline(always)]
-    pub fn set_raw(&self, paddr: u64) {
-        self.a.store(paddr, Ordering::Release);
+        self.a
     }
 
     pub fn page_offset(&self) -> u64 {
-        self.get_raw() & Self::PAGE_OFFSET_MASK
+        self.a & Self::PAGE_OFFSET_MASK
     }
 
     pub fn ppn(&self) -> u64 {
-        (self.get_raw() & !Self::PAGE_OFFSET_MASK) >> Self::PPN_OFFSETS[0]
+        (self.a & !Self::PAGE_OFFSET_MASK) >> Self::PPN_OFFSETS[0]
     }
 
     pub fn ppn_n(&self, n: usize) -> u64 {
         let i = Self::PPN_OFFSETS[n];
         let pm = if n == 3 { Self::PHYS_PAGE_NUM_MASK3 } else { Self::PHYS_PAGE_NUM_MASK };
         let m = pm << i as u64;
-        (self.get_raw() & m) >> Self::PPN_OFFSETS[n]
+        (self.a & m) >> Self::PPN_OFFSETS[n]
     }
 
     pub fn ppn0(&self) -> u64 {
         let i = Self::PPN_OFFSETS[0];
         let m = Self::PHYS_PAGE_NUM_MASK << i as u64;
-        (self.get_raw() & m) >> Self::PPN_OFFSETS[0]
+        (self.a & m) >> Self::PPN_OFFSETS[0]
     }
 
     pub fn ppn1(&self) -> u64 {
         let i = Self::PPN_OFFSETS[1];
         let m = Self::PHYS_PAGE_NUM_MASK << i as u64;
-        (self.get_raw() & m) >> Self::PPN_OFFSETS[1]
+        (self.a & m) >> Self::PPN_OFFSETS[1]
     }
 
     pub fn ppn2(&self) -> u64 {
         let i = Self::PPN_OFFSETS[2];
         let m = Self::PHYS_PAGE_NUM_MASK << i as u64;
-        (self.get_raw() & m) >> Self::PPN_OFFSETS[2]
+        (self.a & m) >> Self::PPN_OFFSETS[2]
     }
 
     pub fn ppn3(&self) -> u64 {
         let i = Self::PPN_OFFSETS[3];
         let m = Self::PHYS_PAGE_NUM_MASK << i as u64;
-        (self.get_raw() & m) >> Self::PPN_OFFSETS[3]
+        (self.a & m) >> Self::PPN_OFFSETS[3]
     }
 }
 
 #[repr(transparent)]
 #[derive(Debug)]
 pub struct PageTableEntry {
-    pub(crate) e: BaseUnit
+    pub(crate) e: AtomicPte,
 }
 
 impl PageTableEntry {
