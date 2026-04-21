@@ -3,11 +3,14 @@
 extern crate alloc;
 
 use core::alloc::Layout;
+use core::fmt;
+use core::marker::PhantomData;
 use core::sync::atomic::{AtomicUsize};
 
 use alloc::collections::{btree_map::BTreeMap, btree_set::BTreeSet};
 use alloc::vec::Vec;
 use device::{Stack, TrapFrame};
+use mmu::sv48::PhysAddr;
 use riscv::register::{satp::Satp, sstatus::SPP};
 use smoltcp::iface::SocketHandle;
 
@@ -95,27 +98,94 @@ impl SlotAlloc {
     }
 }
 
-/// Which kernel frame pool a [`PhysBacking`] was drawn from. Drives
-/// teardown routing and, eventually, whether the page is KDMAP-visible
-/// from supervisor code.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Pool {
-    /// Kernel-accessible via KDMAP in every satp. Use for kernel-owned
-    /// allocations (trap frames, rings) and for shared user memory the
-    /// kernel must dereference after creation (NetChannel).
-    Shared,
-    /// Mapped only into the owning user satp. Kernel writes at setup
-    /// time have to go through a temporary window.
-    UserOnly,
+/// Kernel frame pool marker. Type-level tag used by [`Frame<P>`] to track
+/// which allocator a physical page came from, and whether it's reachable
+/// from kernel code via KDMAP. The trait has no methods — it exists just
+/// to gate which [`Frame<P>`] conversions are legal.
+pub trait Pool: Copy + fmt::Debug + 'static {
+    /// For runtime diagnostics where a concrete pool is needed (logs,
+    /// debug prints). Not used for control flow.
+    fn name() -> &'static str;
 }
 
-/// Physical backing for a [`UserMapping`]. Absent for pure vaddr reservations
-/// like guard pages.
+/// Kernel-accessible pool. Pages have a KDMAP alias under every satp and
+/// can be dereferenced from supervisor code. Use for kernel-owned
+/// allocations (trap frames, rings) and for shared user memory the
+/// kernel must dereference after creation (NetChannel).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)] pub struct Shared;
+/// User-private pool. Mapped only under the owning user satp. Kernel
+/// writes at setup time have to go through a temporary window
+/// (`UserPageWindow`) — there is no `to_kdmap` conversion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)] pub struct UserOnly;
+/// Page-table pool. Shares KDMAP-visibility with [`Shared`] but is
+/// distinct so that returning a table to `kernel_pages` (or vice versa)
+/// is a compile error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)] pub struct Table;
+
+impl Pool for Shared   { fn name() -> &'static str { "Shared" } }
+impl Pool for UserOnly { fn name() -> &'static str { "UserOnly" } }
+impl Pool for Table    { fn name() -> &'static str { "Table" } }
+
+/// A physical address tagged with the pool it was drawn from. `Frame<P>`
+/// is the tagged counterpart of [`mmu::sv48::PhysAddr`]: the walker
+/// consumes the raw `PhysAddr`, but the rest of the kernel works in
+/// terms of `Frame<P>` so wrong-pool mix-ups are caught at compile time.
+///
+/// Construction is `pub` to keep call sites readable — the pool
+/// commitment happens where a caller decides what pool the PA belongs to
+/// (typically the allocator wrapper). Treat `new` as a promise that
+/// `pa` came from the `P` pool.
+#[repr(transparent)]
+pub struct Frame<P: Pool> {
+    pa: PhysAddr,
+    _p: PhantomData<P>,
+}
+
+impl<P: Pool> Frame<P> {
+    pub const fn new(pa: PhysAddr) -> Self {
+        Self { pa, _p: PhantomData }
+    }
+    pub fn raw(self) -> PhysAddr { self.pa }
+    pub fn get_raw(self) -> u64 { self.pa.get_raw() }
+}
+
+impl<P: Pool> Clone for Frame<P> { fn clone(&self) -> Self { *self } }
+impl<P: Pool> Copy for Frame<P> {}
+impl<P: Pool> fmt::Debug for Frame<P> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Frame<{}>(pa=0x{:016X})", P::name(), self.pa.get_raw())
+    }
+}
+
+/// Physical backing for a [`UserMapping`]. Absent for pure vaddr
+/// reservations like guard pages. The variant tag (`Shared` / `User`)
+/// is the pool the backing was drawn from — free paths match on this
+/// to dispatch to the right typed allocator.
 #[derive(Debug, Clone, Copy)]
-pub struct PhysBacking {
-    pub paddr:  u64,
-    pub layout: Layout,
-    pub pool:   Pool,
+pub enum PhysBacking {
+    Shared { frame: Frame<Shared>,   layout: Layout },
+    User   { frame: Frame<UserOnly>, layout: Layout },
+}
+
+impl PhysBacking {
+    pub fn pa(&self) -> PhysAddr {
+        match self {
+            Self::Shared { frame, .. } => frame.raw(),
+            Self::User   { frame, .. } => frame.raw(),
+        }
+    }
+    pub fn layout(&self) -> Layout {
+        match self {
+            Self::Shared { layout, .. } => *layout,
+            Self::User   { layout, .. } => *layout,
+        }
+    }
+    pub fn pool_name(&self) -> &'static str {
+        match self {
+            Self::Shared { .. } => Shared::name(),
+            Self::User   { .. } => UserOnly::name(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

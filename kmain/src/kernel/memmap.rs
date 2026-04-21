@@ -7,6 +7,7 @@ use mem::round_u64_up;
 use mmu::mmap::{PageAlloc, RootTable, id_map_range, map_va_range, reserve_va_range, unmap_range, virt_to_phys};
 use mmu::sv48::{PageTable, PhysAddr, VirtAddr};
 use mmu::{MappingConfig, PAGE_SIZE, PagePermissions};
+use process::{Frame, Shared, Table, UserOnly};
 
 // =========================================================================
 // Address-kind newtypes
@@ -55,14 +56,31 @@ impl UserVa {
 }
 
 /// Arithmetic conversion from a physical address to its KDMAP alias.
-/// The alias is *valid to deref* only if the PA is in a pool that's
-/// KDMAP-mapped under the active satp — the type system can't enforce
-/// that today, but [`UserPages::alloc_pa`] returning a bare `PhysAddr`
-/// (no `alloc_kdmap` method) at least forces the consumer to be explicit
-/// at the boundary.
+/// Raw `PhysAddr` input — the caller asserts that the PA is in a pool
+/// that's KDMAP-mapped under the active satp. Prefer
+/// [`FrameToKdmap::to_kdmap`] on a `Frame<Shared>` / `Frame<Table>`,
+/// which makes this promise a compile-time property.
 #[inline]
 pub fn phys_to_kdmap(pa: PhysAddr) -> KdmapVa {
     KdmapVa::new(pa.get_raw().wrapping_add(kdmap_base().wrapping_sub(ram_phys_base())))
+}
+
+/// Extension trait adding `to_kdmap()` to frames drawn from pools with
+/// a kernel-side KDMAP alias. Explicitly unimplemented for
+/// `Frame<UserOnly>`: the kernel has no KDMAP for user_pages, so
+/// attempting that conversion must be a compile error.
+pub trait FrameToKdmap {
+    fn to_kdmap(self) -> KdmapVa;
+}
+
+impl FrameToKdmap for Frame<Shared> {
+    #[inline]
+    fn to_kdmap(self) -> KdmapVa { phys_to_kdmap(self.raw()) }
+}
+
+impl FrameToKdmap for Frame<Table> {
+    #[inline]
+    fn to_kdmap(self) -> KdmapVa { phys_to_kdmap(self.raw()) }
 }
 
 // =========================================================================
@@ -93,17 +111,18 @@ impl TablePages {
         self.inner.add_frame(pa_range.start as usize, pa_range.end as usize);
     }
 
-    pub fn alloc(&mut self, layout: Layout) -> Option<(PhysAddr, KdmapVa)> {
+    pub fn alloc(&mut self, layout: Layout) -> Option<(Frame<Table>, KdmapVa)> {
         let pa = PhysAddr::new(self.inner.alloc_aligned(layout)? as u64);
-        Some((pa, phys_to_kdmap(pa)))
+        let frame = Frame::<Table>::new(pa);
+        Some((frame, frame.to_kdmap()))
     }
 
-    pub fn free(&mut self, pa: PhysAddr, layout: Layout) {
-        self.inner.dealloc_aligned(pa.get_raw() as usize, layout);
+    pub fn free(&mut self, frame: Frame<Table>, layout: Layout) {
+        self.inner.dealloc_aligned(frame.get_raw() as usize, layout);
     }
 
     /// Raw inner allocator, for passing to the mmu walker via
-    /// `PageAlloc::FA`. The walker consumes PAs (see
+    /// `PageAlloc::FA`. The walker consumes raw PAs (see
     /// `mmu::mmap::PageAlloc`).
     pub fn frames_mut(&mut self) -> &mut FrameAllocator<33> {
         &mut self.inner
@@ -112,9 +131,9 @@ impl TablePages {
 }
 
 /// Pool of pages that are kernel-accessible (KDMAP alias under every
-/// satp). `Shared` is the `Pool` tag on the `PhysBacking` produced here.
-/// Callers that need to deref the allocation use `alloc_kdmap`; callers
-/// that just want to hand it to a device (DMA) use `alloc_pa`.
+/// satp). Allocations tag as `Frame<Shared>`. Callers that need to deref
+/// use `alloc_kdmap`; callers that just want a PA (DMA, PTE install) use
+/// `alloc_pa`.
 pub struct KernelPages {
     inner: FrameAllocator<33>,
 }
@@ -126,17 +145,17 @@ impl KernelPages {
         self.inner.add_frame(pa_range.start as usize, pa_range.end as usize);
     }
 
-    pub fn alloc_pa(&mut self, layout: Layout) -> Option<PhysAddr> {
-        self.inner.alloc_aligned(layout).map(|pa| PhysAddr::new(pa as u64))
+    pub fn alloc_pa(&mut self, layout: Layout) -> Option<Frame<Shared>> {
+        self.inner.alloc_aligned(layout).map(|pa| Frame::<Shared>::new(PhysAddr::new(pa as u64)))
     }
 
-    pub fn alloc_kdmap(&mut self, layout: Layout) -> Option<(PhysAddr, KdmapVa)> {
-        let pa = self.alloc_pa(layout)?;
-        Some((pa, phys_to_kdmap(pa)))
+    pub fn alloc_kdmap(&mut self, layout: Layout) -> Option<(Frame<Shared>, KdmapVa)> {
+        let frame = self.alloc_pa(layout)?;
+        Some((frame, frame.to_kdmap()))
     }
 
-    pub fn free(&mut self, pa: PhysAddr, layout: Layout) {
-        self.inner.dealloc_aligned(pa.get_raw() as usize, layout);
+    pub fn free(&mut self, frame: Frame<Shared>, layout: Layout) {
+        self.inner.dealloc_aligned(frame.get_raw() as usize, layout);
     }
 
     pub fn frames_mut(&mut self) -> &mut FrameAllocator<33> {
@@ -147,7 +166,8 @@ impl KernelPages {
 
 /// Pool of pages that are user-only. No KDMAP alias under the kernel
 /// satp, so there is deliberately no `alloc_kdmap` — touching a backing
-/// from kernel code goes through `UserPageWindow`.
+/// from kernel code goes through `UserPageWindow`. Attempting
+/// `to_kdmap()` on a `Frame<UserOnly>` is a compile error.
 pub struct UserPages {
     inner: FrameAllocator<33>,
 }
@@ -159,12 +179,12 @@ impl UserPages {
         self.inner.add_frame(pa_range.start as usize, pa_range.end as usize);
     }
 
-    pub fn alloc_pa(&mut self, layout: Layout) -> Option<PhysAddr> {
-        self.inner.alloc_aligned(layout).map(|pa| PhysAddr::new(pa as u64))
+    pub fn alloc_pa(&mut self, layout: Layout) -> Option<Frame<UserOnly>> {
+        self.inner.alloc_aligned(layout).map(|pa| Frame::<UserOnly>::new(PhysAddr::new(pa as u64)))
     }
 
-    pub fn free(&mut self, pa: PhysAddr, layout: Layout) {
-        self.inner.dealloc_aligned(pa.get_raw() as usize, layout);
+    pub fn free(&mut self, frame: Frame<UserOnly>, layout: Layout) {
+        self.inner.dealloc_aligned(frame.get_raw() as usize, layout);
     }
 
 }

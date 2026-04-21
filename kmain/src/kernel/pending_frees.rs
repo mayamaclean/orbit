@@ -20,6 +20,7 @@
 //! CPU count; the `AtomicPtr` lets later accessors (which run after the
 //! `Release` store in [`init`]) see it with `Acquire` ordering.
 
+use core::alloc::Layout;
 use core::cell::UnsafeCell;
 use core::ptr::null_mut;
 use core::sync::atomic::{AtomicPtr, Ordering};
@@ -28,17 +29,23 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 use heapless::spsc::{Consumer, Producer, Queue};
 
-use process::PhysBacking;
+use process::{Frame, Shared};
 
 use crate::kernel::context::get_hart_context;
+
+/// Deferred-free item: a `Shared`-pool frame + its Layout. The pool tag
+/// is a compile-time guarantee — only Shared frames ever queue here
+/// (UserOnly backings are freed synchronously from `proc.heap_pages` at
+/// teardown, not through the refcount path).
+pub type FreeItem = (Frame<Shared>, Layout);
 
 /// Per-hart free-ring capacity. Sized well above orbit's current
 /// drop rate (single-digit per process teardown); overflow is a signal
 /// to revisit rather than absorb silently.
 pub const FREE_RING_CAP: usize = 64;
 
-type FreeProducer = Producer<'static, PhysBacking>;
-type FreeConsumer = Consumer<'static, PhysBacking>;
+type FreeProducer = Producer<'static, FreeItem>;
+type FreeConsumer = Consumer<'static, FreeItem>;
 
 struct FreeRings {
     /// One slot per hart, indexed by `HartContext.hart_id`. Only the
@@ -75,7 +82,7 @@ pub fn init(num_harts: usize) {
     for _ in 0..num_harts {
         // Leak the Queue so the (Producer, Consumer) borrows are 'static.
         // Drop on shutdown is not a concern — the kernel doesn't shut down.
-        let queue: &'static mut Queue<PhysBacking, FREE_RING_CAP> =
+        let queue: &'static mut Queue<FreeItem, FREE_RING_CAP> =
             Box::leak(Box::new(Queue::new()));
         let (prod, cons) = queue.split();
         producers.push(UnsafeCell::new(prod));
@@ -96,29 +103,30 @@ fn rings() -> &'static FreeRings {
     unsafe { &*p }
 }
 
-/// Push a backing onto the current hart's ring. Safe to call from any
-/// kernel context; indexes the producer array by the hart's `sscratch`.
-pub fn push(b: PhysBacking) {
+/// Push a Shared-pool frame + layout onto the current hart's ring. Safe
+/// to call from any kernel context; indexes the producer array by the
+/// hart's `sscratch`.
+pub fn push(frame: Frame<Shared>, layout: Layout) {
     let hartid = get_hart_context().hart_id as usize;
     let rings = rings();
     let producer = unsafe { &mut *rings.producers[hartid].get() };
-    if let Err(returned) = producer.enqueue(b) {
+    if let Err((returned_frame, _)) = producer.enqueue((frame, layout)) {
         panic!(
             "pending_frees: hart{} ring exhausted; dropped {:?}. Raise FREE_RING_CAP or throttle drops.",
-            hartid, returned,
+            hartid, returned_frame,
         );
     }
 }
 
-/// Drain every hart's ring, calling `f` on each backing. The manager
-/// invokes this under the Orbit lock, which guarantees it is the sole
-/// consumer across all rings for the duration of the call.
-pub fn drain<F: FnMut(PhysBacking)>(mut f: F) {
+/// Drain every hart's ring, calling `f` on each (frame, layout). The
+/// manager invokes this under the Orbit lock, which guarantees it is
+/// the sole consumer across all rings for the duration of the call.
+pub fn drain<F: FnMut(Frame<Shared>, Layout)>(mut f: F) {
     let rings = rings();
     for cell in rings.consumers.iter() {
         let consumer = unsafe { &mut *cell.get() };
-        while let Some(b) = consumer.dequeue() {
-            f(b);
+        while let Some((frame, layout)) = consumer.dequeue() {
+            f(frame, layout);
         }
     }
 }

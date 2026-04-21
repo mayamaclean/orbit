@@ -17,8 +17,9 @@ use mmu::mmap::{PageAlloc, id_map_range, map_address_range, unmap, unmap_page};
 use mmu::sv48::{PageTable, PhysAddr, VirtAddr};
 use mmu::{KB, MB, MappingConfig, PAGE_SIZE, PagePermissions};
 use net_channel::NetChannel;
-use process::{MappingKind, MemMapReq, NetChannelCreationReq, PThread, PhysBacking, Pool, Process, Thread, ThreadBlockReason, ThreadState, UserMapping};
+use process::{Frame, MappingKind, MemMapReq, NetChannelCreationReq, PThread, PhysBacking, Process, Shared, Thread, ThreadBlockReason, ThreadState, UserMapping, UserOnly};
 
+use crate::kernel::memmap::FrameToKdmap;
 use crate::kernel::shared_user_ptr::SharedUserPtr;
 use riscv::register::satp::{Mode, Satp};
 use riscv::register::sstatus::SPP;
@@ -156,22 +157,20 @@ impl Orbit {
     }
 
     /// Allocate a kthread stack. Kernel-accessible (Shared pool) so the
-    /// kernel can write through KDMAP during setup. Returns
-    /// `(PhysAddr, KdmapVa)` — PA for the user PTE, KdmapVa for kernel
-    /// writes.
-    fn allocate_thread_stack(&mut self) -> Result<(PhysAddr, memmap::KdmapVa), ()> {
+    /// kernel can write through KDMAP during setup.
+    fn allocate_thread_stack(&mut self) -> Result<(Frame<Shared>, memmap::KdmapVa), ()> {
         self.kernel_pages.alloc_kdmap(Self::THREAD_STACK_LAYOUT)
             .ok_or_else(|| { serial::println!("failed to allocate new thread stack"); })
     }
 
     /// Allocate a user thread stack. `user_pages` has no KDMAP alias in
     /// the kernel satp — setup-time zeroing goes through `UserPageWindow`.
-    fn allocate_user_thread_stack(&mut self, stack_size: u64) -> Result<(PhysAddr, Layout), ()> {
+    fn allocate_user_thread_stack(&mut self, stack_size: u64) -> Result<(Frame<UserOnly>, Layout), ()> {
         let layout = Layout::from_size_align(stack_size as usize, UPROC_STACK_GRAIN as usize)
             .map_err(|e| {
                 serial::println!("bad user stack layout for size={stack_size}: {e:?}");
             })?;
-        let pa = self.user_pages.alloc_pa(layout)
+        let frame = self.user_pages.alloc_pa(layout)
             .ok_or_else(|| {
                 serial::println!("failed to allocate user thread stack size={stack_size}");
             })?;
@@ -179,28 +178,28 @@ impl Orbit {
         // Zero before the PTE install exposes the stack to user code — the
         // page may have been returned by a previous process.
         unsafe {
-            let mut w = user_page::UserPageWindow::map(pa.get_raw(), layout.size());
+            let mut w = user_page::UserPageWindow::map(frame.get_raw(), layout.size());
             w.as_mut_slice().fill(0);
         }
 
-        Ok((pa, layout))
+        Ok((frame, layout))
     }
 
     /// Allocate a trap-frame page (Shared pool, kernel-writable via KDMAP).
-    fn allocate_trap_frame(&mut self) -> Result<(PhysAddr, memmap::KdmapVa), ()> {
+    fn allocate_trap_frame(&mut self) -> Result<(Frame<Shared>, memmap::KdmapVa), ()> {
         self.kernel_pages.alloc_kdmap(Self::THREAD_TRAP_FRAME_LAYOUT)
             .ok_or_else(|| { serial::println!("failed to allocate new trap frame"); })
     }
 
     /// Allocate a fresh page table from `table_pages` and return a
     /// `RootTable` view on it. The page is zeroed before handoff.
-    fn create_new_page_table(&mut self) -> Result<(PhysAddr, mmu::mmap::RootTable<'static>), ()> {
-        let (pa, kva) = self.table_pages.alloc(Self::TABLE_LAYOUT)
+    fn create_new_page_table(&mut self) -> Result<(Frame<process::Table>, mmu::mmap::RootTable<'static>), ()> {
+        let (frame, kva) = self.table_pages.alloc(Self::TABLE_LAYOUT)
             .ok_or_else(|| { serial::println!("failed to allocate new page table"); })?;
         unsafe {
             core::ptr::write_bytes(kva.as_mut_ptr::<u8>(), 0, PAGE_SIZE);
             let table = kva.as_ptr::<PageTable>().as_ref_unchecked();
-            Ok((pa, memmap::kernel_root(table)))
+            Ok((frame, memmap::kernel_root(table)))
         }
     }
 
@@ -210,12 +209,12 @@ impl Orbit {
             return Err(())
         }
         
-        let (stack_pa, stack_kva) = self.allocate_thread_stack()?;
+        let (stack_frame, stack_kva) = self.allocate_thread_stack()?;
 
-        let (_trap_frame_pa, trap_frame_kva) = match self.allocate_trap_frame() {
+        let (_trap_frame_frame, trap_frame_kva) = match self.allocate_trap_frame() {
             Ok(p) => p,
             Err(_) => {
-                self.kernel_pages.free(stack_pa, Self::THREAD_STACK_LAYOUT);
+                self.kernel_pages.free(stack_frame, Self::THREAD_STACK_LAYOUT);
                 serial::println!("failed to alloc trap_frame for kthread");
                 return Err(())
             }
@@ -300,55 +299,48 @@ impl Orbit {
         // Shared mmaps stay in kernel_pages so the kernel (net thread,
         // deferred handlers) can deref through KDMAP long after setup.
         // Private mmaps go to user_pages; kernel has no long-lived alias.
-        let (pool, backing_pa) = if req.share_with_kernel {
-            (Pool::Shared, self.kernel_pages.alloc_pa(layout))
-        } else {
-            (Pool::UserOnly, self.user_pages.alloc_pa(layout))
-        };
-        let backing_pa = match backing_pa {
-            Some(p) => p,
-            None => {
-                serial::println!("failed to alloc pages for mmap req: {req:?}");
+        // The two branches produce different typed frames — normalize to
+        // (backing_pa_raw, PhysBacking) at the end.
+        let (backing_pa_raw, backing) = if req.share_with_kernel {
+            let Some(frame) = self.kernel_pages.alloc_pa(layout) else {
+                serial::println!("failed to alloc shared pages for mmap req: {req:?}");
                 thread.frame.regs[10] = -3isize as usize;
-
                 return
+            };
+            // Zero via KDMAP alias.
+            unsafe {
+                let kva = frame.to_kdmap();
+                core::ptr::write_bytes(kva.as_mut_ptr::<u8>(), 0, layout.size());
             }
+            (frame.get_raw(), PhysBacking::Shared { frame, layout })
+        } else {
+            let Some(frame) = self.user_pages.alloc_pa(layout) else {
+                serial::println!("failed to alloc user pages for mmap req: {req:?}");
+                thread.frame.regs[10] = -3isize as usize;
+                return
+            };
+            // Zero via a transient kernel window — no KDMAP alias exists.
+            unsafe {
+                let mut w = user_page::UserPageWindow::map(frame.get_raw(), layout.size());
+                w.as_mut_slice().fill(0);
+            }
+            (frame.get_raw(), PhysBacking::User { frame, layout })
         };
 
-        let supervisor_tag = if req.share_with_kernel {
-            Some(0x1)
-        }
-        else { None };
-
-        // Zero before the PTE install exposes the page to user code — a
-        // previous owner's contents would otherwise be visible to the new
-        // process. Shared pages can be written through KDMAP directly; for
-        // user-only pages we go through UserPageWindow.
-        unsafe {
-            match pool {
-                Pool::Shared => {
-                    let kva = memmap::phys_to_kdmap(backing_pa);
-                    core::ptr::write_bytes(kva.as_mut_ptr::<u8>(), 0, layout.size());
-                }
-                Pool::UserOnly => {
-                    let mut w = user_page::UserPageWindow::map(backing_pa.get_raw(), layout.size());
-                    w.as_mut_slice().fill(0);
-                }
-            }
-        }
+        let supervisor_tag = if req.share_with_kernel { Some(0x1) } else { None };
 
         let config = MappingConfig {
             permissions: (req.page_permissions & 0xE) | PagePermissions::U,
             levels,
             page_size: align as u64,
             vaddr: VirtAddr::new(req.vaddr as u64),
-            paddr: backing_pa,
+            paddr: PhysAddr::new(backing_pa_raw),
             log: true,
             supervisor_tag
         };
 
         let vend = VirtAddr::new((req.vaddr + req.size) as u64);
-        let pend = PhysAddr::new(backing_pa.get_raw() + req.size as u64);
+        let pend = PhysAddr::new(backing_pa_raw + req.size as u64);
 
         unsafe {
             let root_table = memmap::kernel_root_from_pa(thread.root_table_addr() as u64);
@@ -358,12 +350,7 @@ impl Orbit {
             if let Err(_) = map_address_range(&root_table, &mut pages, &config, vend, pend) {
                 serial::println!("failed to map pages for mmap req: {req:?}");
                 thread.frame.regs[10] = -4isize as usize;
-
-                match pool {
-                    Pool::Shared   => self.kernel_pages.free(backing_pa, layout),
-                    Pool::UserOnly => self.user_pages.free(backing_pa, layout),
-                }
-
+                self.free_backing(backing);
                 return
             }
         }
@@ -373,32 +360,31 @@ impl Orbit {
             None => {
                 serial::println!("failed to add pages to process metadata (no pid): {req:?}");
                 thread.frame.regs[10] = -5isize as usize;
-
-                match pool {
-                    Pool::Shared   => self.kernel_pages.free(backing_pa, layout),
-                    Pool::UserOnly => self.user_pages.free(backing_pa, layout),
-                }
-
+                self.free_backing(backing);
                 return
             }
         };
 
-        owning_process.heap_pages.push(PhysBacking {
-            paddr: backing_pa.get_raw(),
-            layout,
-            pool,
-        });
+        owning_process.heap_pages.push(backing);
 
         core::sync::atomic::fence(Ordering::SeqCst);
-        
+
         unsafe {
             riscv::asm::sfence_vma(thread.pid as usize, 0);
             riscv::asm::sfence_vma(0, 0);
         }
 
-        serial::println!("fulfilled {req:?}:\n\tpa=0x{:016X} {layout:08X?}", backing_pa.get_raw());
+        serial::println!("fulfilled {req:?}:\n\tpa=0x{backing_pa_raw:016X} {layout:08X?}");
 
         thread.frame.regs[10] = 0;
+    }
+
+    /// Dispatch a single typed free based on the backing's pool variant.
+    fn free_backing(&mut self, backing: PhysBacking) {
+        match backing {
+            PhysBacking::Shared { frame, layout } => self.kernel_pages.free(frame, layout),
+            PhysBacking::User   { frame, layout } => self.user_pages.free(frame, layout),
+        }
     }
 
     fn handle_nc_create_req<'t>(&mut self, thread: &'t mut Thread, req: NetChannelCreationReq) {
@@ -427,7 +413,7 @@ impl Orbit {
 
         // NetChannel lives in kpages (Shared pool) so the kernel can drive
         // smoltcp through the KDMAP alias after creation.
-        let Some((backing_pa, kva)) = self.kernel_pages.alloc_kdmap(layout) else {
+        let Some((frame, kva)) = self.kernel_pages.alloc_kdmap(layout) else {
             warn!("nc create: alloc failed for {} bytes", region_size);
             thread.frame.regs[10] = -3isize as usize;
             return
@@ -447,13 +433,13 @@ impl Orbit {
             levels: 4,
             page_size: PAGE_SIZE as u64,
             vaddr: VirtAddr::new(req.nc_vaddr as u64),
-            paddr: backing_pa,
+            paddr: frame.raw(),
             log: true,
             supervisor_tag: Some(0x1),
         };
 
         let vend = VirtAddr::new((req.nc_vaddr + region_size) as u64);
-        let pend = PhysAddr::new(backing_pa.get_raw() + region_size as u64);
+        let pend = PhysAddr::new(frame.get_raw() + region_size as u64);
 
         unsafe {
             let root_table = memmap::kernel_root_from_pa(thread.root_table_addr() as u64);
@@ -461,7 +447,7 @@ impl Orbit {
 
             if map_address_range(&root_table, &mut pages, &config, vend, pend).is_err() {
                 warn!("nc create: map failed {req:?}");
-                self.kernel_pages.free(backing_pa, layout);
+                self.kernel_pages.free(frame, layout);
                 thread.frame.regs[10] = -4isize as usize;
                 return
             }
@@ -469,22 +455,17 @@ impl Orbit {
 
         if !self.processes.contains_key(&thread.pid) {
             warn!("nc create: no owning process {req:?}");
-            self.kernel_pages.free(backing_pa, layout);
+            self.kernel_pages.free(frame, layout);
             thread.frame.regs[10] = -5isize as usize;
             return
         }
 
-        // Backing ownership moves into the SharedUserPtr's Arc — not into
+        // Frame ownership moves into the SharedUserPtr's Arc — not into
         // `proc.heap_pages`, which would double-free on teardown. The
         // Arc's last drop pushes to `pending_frees`; the manager returns
         // it to `kernel_pages` during cleanup.
-        let backing = PhysBacking {
-            paddr: backing_pa.get_raw(),
-            layout,
-            pool: Pool::Shared,
-        };
         let shared: SharedUserPtr<NetChannel> = SharedUserPtr::new(
-            backing, req.nc_vaddr as u64, region_size, thread.pid);
+            frame, layout, req.nc_vaddr as u64, region_size, thread.pid);
 
         self.nc_channels
             .entry(thread.pid)
@@ -576,12 +557,14 @@ impl Orbit {
             (None, 0) => {
                 // Kernel thread. Its stack and trap frame were allocated
                 // directly from kernel_pages with fixed layouts and aren't
-                // recorded in any proc.maps, so free them here.
+                // recorded in any proc.maps, so free them here. The
+                // Thread references them by KDMAP VA; reverse through
+                // KdmapVa → PhysAddr → Frame<Shared> at the boundary.
                 let tstack_kva = memmap::KdmapVa::new(thread.stack as *const _ as u64);
-                self.kernel_pages.free(tstack_kva.to_phys(), Self::THREAD_STACK_LAYOUT);
+                self.kernel_pages.free(Frame::<Shared>::new(tstack_kva.to_phys()), Self::THREAD_STACK_LAYOUT);
 
                 let trap_frame_kva = memmap::KdmapVa::new(thread.frame as *const _ as u64);
-                self.kernel_pages.free(trap_frame_kva.to_phys(), Self::THREAD_TRAP_FRAME_LAYOUT);
+                self.kernel_pages.free(Frame::<Shared>::new(trap_frame_kva.to_phys()), Self::THREAD_TRAP_FRAME_LAYOUT);
             }
             (Some(slot), 0) => error!(
                 "dealloc_thread: tid{} is a kernel thread but carries slot{}",
@@ -636,11 +619,7 @@ impl Orbit {
                         }
 
                         if let Some(b) = m.backing {
-                            let pa = PhysAddr::new(b.paddr);
-                            match b.pool {
-                                Pool::Shared   => self.kernel_pages.free(pa, b.layout),
-                                Pool::UserOnly => self.user_pages.free(pa, b.layout),
-                            }
+                            self.free_backing(b);
                         }
 
                         let proc = self.processes.get_mut(&pid).expect("proc vanished mid-teardown");
@@ -677,21 +656,20 @@ impl Orbit {
         let root_table = unsafe { memmap::kernel_root_from_pa(process_root_table_pa) };
 
         while let Some(b) = process.heap_pages.pop() {
-            let pa = PhysAddr::new(b.paddr);
-            serial::println!("dealloc heap page pa@{:016X} {:08X?} pool={:?}",
-                b.paddr, b.layout, b.pool);
-            match b.pool {
-                Pool::Shared   => self.kernel_pages.free(pa, b.layout),
-                Pool::UserOnly => self.user_pages.free(pa, b.layout),
-            }
+            serial::println!("dealloc heap page pa@{:016X} {:08X?} pool={}",
+                b.pa().get_raw(), b.layout(), b.pool_name());
+            self.free_backing(b);
         }
 
         let mut pages = PageAlloc::FA(self.table_pages.frames_mut());
         unsafe {
             unmap(&root_table, &mut pages);
-            // table_pages now returns PAs — the walker's `free_page` takes
-            // a PA directly, and the root was allocated from this pool.
-            self.table_pages.free(PhysAddr::new(process_root_table_pa), Self::TABLE_LAYOUT);
+            // table_pages now returns typed frames — the walker's
+            // `free_page` takes a raw PA directly; the root was allocated
+            // from this pool so we reconstruct a `Frame<Table>` here.
+            self.table_pages.free(
+                Frame::<process::Table>::new(PhysAddr::new(process_root_table_pa)),
+                Self::TABLE_LAYOUT);
         }
     }
 
@@ -772,14 +750,14 @@ impl Orbit {
         }
 
         // Drain SharedUserPtr Drops that landed since the last pass.
-        // Each queued PhysBacking is a `Shared`-pool page whose last
-        // Arc just dropped on some hart — return it to `kernel_pages`
-        // here, under the Orbit lock, not in Drop context.
+        // Each queued item is a `Frame<Shared>` whose last Arc just
+        // dropped on some hart — return it to `kernel_pages` here,
+        // under the Orbit lock, not in Drop context.
         let kpages = &mut self.kernel_pages;
-        pending_frees::drain(|b| {
+        pending_frees::drain(|frame, layout| {
             serial::println!("dealloc shared ptr backing pa@{:016X} {:08X?}",
-                b.paddr, b.layout);
-            kpages.free(PhysAddr::new(b.paddr), b.layout);
+                frame.get_raw(), layout);
+            kpages.free(frame, layout);
         });
     }
     
@@ -1201,23 +1179,15 @@ impl Orbit {
 
         let mut page_list: Vec<PhysBacking> = Vec::new();
 
-        let (stack_pa, stack_layout) = self.allocate_user_thread_stack(stack_size)?;
-        page_list.push(PhysBacking {
-            paddr: stack_pa.get_raw(),
-            layout: stack_layout,
-            pool: Pool::UserOnly,
-        });
+        let (stack_frame, stack_layout) = self.allocate_user_thread_stack(stack_size)?;
+        page_list.push(PhysBacking::User { frame: stack_frame, layout: stack_layout });
 
-        let (trap_frame_pa, trap_frame_kva) = self.allocate_trap_frame()
+        let (tf_frame, trap_frame_kva) = self.allocate_trap_frame()
             .map_err(|_| {
                 self.free_backings(&page_list[..]);
             })?;
 
-        page_list.push(PhysBacking {
-            paddr: trap_frame_pa.get_raw(),
-            layout: Self::THREAD_TRAP_FRAME_LAYOUT,
-            pool: Pool::Shared,
-        });
+        page_list.push(PhysBacking::Shared { frame: tf_frame, layout: Self::THREAD_TRAP_FRAME_LAYOUT });
 
         let stack_vaddr      = user_stack_vaddr(slot, stack_size);
         let guard_vaddr      = user_stack_guard_vaddr(slot);
@@ -1225,22 +1195,22 @@ impl Orbit {
         let trap_frame_vaddr = user_trap_frame_vaddr(slot);
 
         // Root table PA is what satp wants. The `RootTable` handle stores
-        // a `&PageTable` at its KDMAP alias — reverse that to PA.
+        // a `&PageTable` at its KDMAP alias — reverse that to a `Frame<Table>`.
         let root_kva = memmap::KdmapVa::new(root_table.table as *const _ as u64);
-        let root_pa = root_kva.to_phys();
+        let root_frame = Frame::<process::Table>::new(root_kva.to_phys());
 
-        if let Err(_) = self.map_stack(root_table, stack_pa.get_raw(), stack_vaddr, stack_size) {
+        if let Err(_) = self.map_stack(root_table, stack_frame.get_raw(), stack_vaddr, stack_size) {
             self.free_backings(&page_list[..]);
-            self.table_pages.free(root_pa, Self::TABLE_LAYOUT);
+            self.table_pages.free(root_frame, Self::TABLE_LAYOUT);
 
             serial::println!("failed to map stack");
 
             return Err(())
         }
 
-        if let Err(_) = self.map_trap_frame(root_table, trap_frame_pa.get_raw(), trap_frame_vaddr) {
+        if let Err(_) = self.map_trap_frame(root_table, tf_frame.get_raw(), trap_frame_vaddr) {
             self.free_backings(&page_list[..]);
-            self.table_pages.free(root_pa, Self::TABLE_LAYOUT);
+            self.table_pages.free(root_frame, Self::TABLE_LAYOUT);
 
             serial::println!("failed to map trap frame");
 
@@ -1262,22 +1232,14 @@ impl Orbit {
                 vaddr:   stack_vaddr,
                 len:     stack_size,
                 perms:   (PagePermissions::U | PagePermissions::R | PagePermissions::W) as u64,
-                backing: Some(PhysBacking {
-                    paddr:  stack_pa.get_raw(),
-                    layout: stack_layout,
-                    pool:   Pool::UserOnly,
-                }),
+                backing: Some(PhysBacking::User { frame: stack_frame, layout: stack_layout }),
                 kind:    MappingKind::Stack { slot },
             });
             proc.insert_mapping(UserMapping {
                 vaddr:   trap_frame_vaddr,
                 len:     PAGE_SIZE as u64,
                 perms:   PagePermissions::R as u64,
-                backing: Some(PhysBacking {
-                    paddr:  trap_frame_pa.get_raw(),
-                    layout: Self::THREAD_TRAP_FRAME_LAYOUT,
-                    pool:   Pool::Shared,
-                }),
+                backing: Some(PhysBacking::Shared { frame: tf_frame, layout: Self::THREAD_TRAP_FRAME_LAYOUT }),
                 kind:    MappingKind::TrapFrame { slot },
             });
         }
@@ -1294,7 +1256,7 @@ impl Orbit {
             // through it here would fault. The &mut Stack reference below
             // is built for `Thread.stack` but never derefed kernel-side;
             // user code reaches the same backing via the user-VA mapping.
-            let s = stack_pa.get_raw() as *mut Stack;
+            let s = stack_frame.get_raw() as *mut Stack;
 
             (
                 f.as_mut_unchecked(),
@@ -1305,13 +1267,13 @@ impl Orbit {
         let mut satp = Satp::from_bits(0);
         satp.set_asid(pid as usize);
         satp.set_mode(riscv::register::satp::Mode::Sv48);
-        satp.set_ppn(root_pa.get_raw() as usize / PAGE_SIZE);
+        satp.set_ppn(root_frame.get_raw() as usize / PAGE_SIZE);
 
         frame.regs[1] = entrypoint;
         frame.regs[2] = (stack_vaddr + stack_size - 16) as usize;
         frame.asid = pid as usize;
 
-        serial::println!("ventry={:016X?},vsp=0x{:016X?},rpt_pa={:016X?}", entrypoint, frame.regs[2], root_pa.get_raw());
+        serial::println!("ventry={:016X?},vsp=0x{:016X?},rpt_pa={:016X?}", entrypoint, frame.regs[2], root_frame.get_raw());
 
         Ok(Thread {
             pc: AtomicUsize::new(entrypoint),
@@ -1388,11 +1350,7 @@ impl Orbit {
 
     fn free_backings(&mut self, backings: &[PhysBacking]) {
         for b in backings {
-            let pa = PhysAddr::new(b.paddr);
-            match b.pool {
-                Pool::Shared   => self.kernel_pages.free(pa, b.layout),
-                Pool::UserOnly => self.user_pages.free(pa, b.layout),
-            }
+            self.free_backing(*b);
         }
     }
     
@@ -1457,11 +1415,7 @@ impl Orbit {
                     }
                 }
 
-                segment_allocations.push(PhysBacking {
-                    paddr: paddr_start,
-                    layout,
-                    pool: Pool::UserOnly,
-                });
+                segment_allocations.push(PhysBacking::User { frame: seg_pa, layout });
 
                 let vaddr_start = round_u64_down(segment.p_vaddr, PAGE_SIZE as u64);
 

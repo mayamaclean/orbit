@@ -12,17 +12,21 @@
 //! drops but k_net's clone keeps the page alive until k_net's next poll
 //! drops it too. No stop-the-world coordination required.
 
+use core::alloc::Layout;
 use core::marker::PhantomData;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use alloc::sync::Arc;
 
-use process::{PhysBacking, Pool};
+use process::{Frame, Shared};
 
-use crate::kernel::{memmap, pending_frees};
+use crate::kernel::{memmap::FrameToKdmap, pending_frees};
 
 struct SharedInner<T> {
-    backing: PhysBacking,
+    /// Strictly `Frame<Shared>` — only Shared-pool backings are legal for
+    /// a SharedUserPtr (the kernel dereferences them via KDMAP).
+    frame: Frame<Shared>,
+    layout: Layout,
     user_va: u64,
     len: usize,
     owner_pid: u16,
@@ -32,10 +36,10 @@ struct SharedInner<T> {
 
 impl<T> Drop for SharedInner<T> {
     fn drop(&mut self) {
-        // The backing lives in `Shared` pool, so the manager can reach it
-        // through KDMAP to hand back to `kernel_pages`. We just enqueue
-        // here — no allocator work from drop context.
-        pending_frees::push(self.backing);
+        // The backing lives in `Shared` pool, so the manager can reach
+        // it through KDMAP to hand back to `kernel_pages`. We just
+        // enqueue here — no allocator work from drop context.
+        pending_frees::push(self.frame, self.layout);
     }
 }
 
@@ -52,18 +56,15 @@ impl<T> Clone for SharedUserPtr<T> {
 }
 
 impl<T> SharedUserPtr<T> {
-    /// Build a handle over `backing` (must be `Shared`-pool) mapped at
-    /// `user_va` spanning `len` bytes in the address space of
-    /// `owner_pid`.
-    pub fn new(backing: PhysBacking, user_va: u64, len: usize, owner_pid: u16) -> Self {
-        assert!(
-            matches!(backing.pool, Pool::Shared),
-            "SharedUserPtr requires a Shared-pool backing; got {:?}",
-            backing.pool,
-        );
+    /// Build a handle over a `Shared`-pool frame mapped at `user_va`
+    /// spanning `len` bytes in the address space of `owner_pid`. The
+    /// `Frame<Shared>` type requirement makes wrong-pool construction a
+    /// compile error.
+    pub fn new(frame: Frame<Shared>, layout: Layout, user_va: u64, len: usize, owner_pid: u16) -> Self {
         Self {
             inner: Arc::new(SharedInner {
-                backing,
+                frame,
+                layout,
                 user_va,
                 len,
                 owner_pid,
@@ -78,7 +79,7 @@ impl<T> SharedUserPtr<T> {
     /// check [`is_revoked`](Self::is_revoked) first (revocation is a
     /// follow-up wired to the `supervisor_tag` PTE bit).
     pub fn as_ref(&self) -> &T {
-        let kva = memmap::phys_to_kdmap(mmu::sv48::PhysAddr::new(self.inner.backing.paddr));
+        let kva = self.inner.frame.to_kdmap();
         unsafe { &*kva.as_ptr::<T>() }
     }
 
