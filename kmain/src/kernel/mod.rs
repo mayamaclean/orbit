@@ -1337,31 +1337,6 @@ impl Orbit {
         let tptr = Box::into_raw(t);
         serial::println!("created uprocess@{tptr:016X?},pid={pid},tid={tid},table_pa={root_pa:016X?}");
 
-        // Pool-split probe: neither the new user satp nor the kernel satp
-        // should have a KDMAP alias of user_pages. Kpages remains KDMAP-
-        // visible in both so shared-memory paths (NetChannel) keep working.
-        // A stray `phys_to_virt(user_pa)` deref now faults from either satp.
-        unsafe {
-            let kpages_kdmap = memmap::phys_to_virt(self.layout.kpages.start);
-            let user_kdmap  = memmap::phys_to_virt(self.layout.user_pages.start);
-
-            let user_root = &root_table;
-            let user_kpages_ok = mmu::mmap::virt_to_phys(user_root, VirtAddr::new(kpages_kdmap)).is_some();
-            let user_user_ok   = mmu::mmap::virt_to_phys(user_root, VirtAddr::new(user_kdmap)).is_some();
-
-            let kernel_satp_pa = (self.satp.ppn() * PAGE_SIZE) as u64;
-            let kernel_root = memmap::kernel_root_from_pa(kernel_satp_pa);
-            let kernel_kpages_ok = mmu::mmap::virt_to_phys(&kernel_root, VirtAddr::new(kpages_kdmap)).is_some();
-            let kernel_user_ok   = mmu::mmap::virt_to_phys(&kernel_root, VirtAddr::new(user_kdmap)).is_some();
-
-            serial::println!(
-                "pool-split 8b: pid{pid}  user satp: kpages-kdmap={user_kpages_ok}  user-kdmap={user_user_ok}"
-            );
-            serial::println!(
-                "pool-split 8b: kernel satp: kpages-kdmap={kernel_kpages_ok}  user-kdmap={kernel_user_ok} (want true,false in both)"
-            );
-        }
-
         let proc = self.processes.get_mut(&pid)
             .expect("just inserted");
         proc.threads.insert(tid);
