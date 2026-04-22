@@ -173,7 +173,7 @@ impl Orbit {
     /// kernel can write through KDMAP during setup.
     fn allocate_thread_stack(&mut self) -> Result<(Frame<Shared>, memmap::KdmapVa), ()> {
         self.kernel_pages.alloc_kdmap(Self::THREAD_STACK_LAYOUT)
-            .ok_or_else(|| { serial::println!("failed to allocate new thread stack"); })
+            .ok_or_else(|| { error!("failed to allocate new thread stack"); })
     }
 
     /// Allocate a user thread stack. `user_pages` has no KDMAP alias in
@@ -181,11 +181,11 @@ impl Orbit {
     fn allocate_user_thread_stack(&mut self, stack_size: u64) -> Result<(Frame<UserOnly>, Layout), ()> {
         let layout = Layout::from_size_align(stack_size as usize, UPROC_STACK_GRAIN as usize)
             .map_err(|e| {
-                serial::println!("bad user stack layout for size={stack_size}: {e:?}");
+                error!("bad user stack layout for size={stack_size}: {e:?}");
             })?;
         let frame = self.user_pages.alloc_pa(layout)
             .ok_or_else(|| {
-                serial::println!("failed to allocate user thread stack size={stack_size}");
+                error!("failed to allocate user thread stack size={stack_size}");
             })?;
 
         // Zero before the PTE install exposes the stack to user code — the
@@ -201,14 +201,14 @@ impl Orbit {
     /// Allocate a trap-frame page (Shared pool, kernel-writable via KDMAP).
     fn allocate_trap_frame(&mut self) -> Result<(Frame<Shared>, memmap::KdmapVa), ()> {
         self.kernel_pages.alloc_kdmap(Self::THREAD_TRAP_FRAME_LAYOUT)
-            .ok_or_else(|| { serial::println!("failed to allocate new trap frame"); })
+            .ok_or_else(|| { error!("failed to allocate new trap frame"); })
     }
 
     /// Allocate a fresh page table from `table_pages` and return a
     /// `RootTable` view on it. The page is zeroed before handoff.
     fn create_new_page_table(&mut self) -> Result<(Frame<process::Table>, mmu::mmap::RootTable<'static>), ()> {
         let (frame, kva) = self.table_pages.alloc(Self::TABLE_LAYOUT)
-            .ok_or_else(|| { serial::println!("failed to allocate new page table"); })?;
+            .ok_or_else(|| { error!("failed to allocate new page table"); })?;
         unsafe {
             core::ptr::write_bytes(kva.as_mut_ptr::<u8>(), 0, PAGE_SIZE);
             let table = kva.as_ptr::<PageTable>().as_ref_unchecked();
@@ -218,7 +218,7 @@ impl Orbit {
 
     pub fn create_kernel_thread(&mut self, entrypoint: usize, a0: Option<usize>) -> Result<(), ()> {
         if self.current_process_id == u16::MAX {
-            serial::println!("too many processes running to spawn another");
+            error!("too many processes running to spawn another");
             return Err(())
         }
         
@@ -228,7 +228,7 @@ impl Orbit {
             Ok(p) => p,
             Err(_) => {
                 self.kernel_pages.free(stack_frame, Self::THREAD_STACK_LAYOUT);
-                serial::println!("failed to alloc trap_frame for kthread");
+                error!("failed to alloc trap_frame for kthread");
                 return Err(())
             }
         };
@@ -273,7 +273,7 @@ impl Orbit {
         // or move this to a pool
         let t = Box::new(kthread);
         let tptr = Box::into_raw(t);
-        serial::println!("created kthread@{:016X?}", tptr);
+        info!("created kthread@{:016X?}", tptr);
 
         self.threads.insert(tid, PThread(tptr));
 
@@ -281,7 +281,7 @@ impl Orbit {
     }
 
     fn handle_mmap_req<'t>(&mut self, thread: &'t mut Thread, req: MemMapReq) {
-        serial::println!("handling mmap req {req:08X?}");
+        info!("handling mmap req {req:08X?}");
         
         let large_align = 2 * MB as usize;
         let (align, levels) = if (req.size % large_align) == 0 && (req.vaddr % large_align) == 0 {
@@ -291,7 +291,7 @@ impl Orbit {
             (PAGE_SIZE, 4)
         }
         else {
-            serial::println!("failed to select alignment for mmap req: {req:?}");
+            error!("failed to select alignment for mmap req: {req:?}");
             thread.frame.regs[10] = -1isize as usize;
 
             return
@@ -302,7 +302,7 @@ impl Orbit {
         let layout = match Layout::from_size_align(size, align) {
             Ok(l) => l,
             Err(e) => {
-                serial::println!("failed to create alignment for mmap req: {e:?}");
+                error!("failed to create alignment for mmap req: {e:?}");
                 thread.frame.regs[10] = -2isize as usize;
 
                 return
@@ -316,7 +316,7 @@ impl Orbit {
         // (backing_pa_raw, PhysBacking) at the end.
         let (backing_pa_raw, backing) = if req.share_with_kernel {
             let Some(frame) = self.kernel_pages.alloc_pa(layout) else {
-                serial::println!("failed to alloc shared pages for mmap req: {req:?}");
+                error!("failed to alloc shared pages for mmap req: {req:?}");
                 thread.frame.regs[10] = -3isize as usize;
                 return
             };
@@ -328,7 +328,7 @@ impl Orbit {
             (frame.get_raw(), PhysBacking::Shared { frame, layout })
         } else {
             let Some(frame) = self.user_pages.alloc_pa(layout) else {
-                serial::println!("failed to alloc user pages for mmap req: {req:?}");
+                error!("failed to alloc user pages for mmap req: {req:?}");
                 thread.frame.regs[10] = -3isize as usize;
                 return
             };
@@ -365,7 +365,7 @@ impl Orbit {
             let mut pages = PageAlloc::FA(self.table_pages.frames_mut());
 
             if let Err(_) = map_address_range(&root_table, &mut pages, &config, vend, pend) {
-                serial::println!("failed to map pages for mmap req: {req:?}");
+                error!("failed to map pages for mmap req: {req:?}");
                 thread.frame.regs[10] = -4isize as usize;
                 self.free_backing(backing);
                 return
@@ -375,7 +375,7 @@ impl Orbit {
         let owning_process = match self.processes.get_mut(&thread.pid) {
             Some(proc) => proc,
             None => {
-                serial::println!("failed to add pages to process metadata (no pid): {req:?}");
+                error!("failed to add pages to process metadata (no pid): {req:?}");
                 thread.frame.regs[10] = -5isize as usize;
                 self.free_backing(backing);
                 return
@@ -389,7 +389,7 @@ impl Orbit {
         riscv::asm::sfence_vma(thread.pid as usize, 0);
         riscv::asm::sfence_vma(0, 0);
 
-        serial::println!("fulfilled {req:?}:\n\tpa=0x{backing_pa_raw:016X} {layout:08X?}");
+        info!("fulfilled {req:?}:\n\tpa=0x{backing_pa_raw:016X} {layout:08X?}");
 
         thread.frame.regs[10] = 0;
     }
@@ -752,7 +752,7 @@ impl Orbit {
         let _ = self.process_handles.remove(&process.pid);
 
         while let Some(b) = process.heap_pages.pop() {
-            serial::println!("dealloc heap page pa@{:016X} {:08X?} pool={}",
+            info!("dealloc heap page pa@{:016X} {:08X?} pool={}",
                 b.pa().get_raw(), b.layout(), b.pool_name());
             self.free_backing(b);
         }
@@ -802,13 +802,13 @@ impl Orbit {
                                 Some(_)                         => "permission/range violation",
                                 None                            => "bad access",
                             };
-                            serial::println!(
+                            warn!(
                                 "tid{} killed: {} cause={} epc={:#x} stval={:#x}",
                                 t.tid, label, f.cause, f.epc, f.stval);
                         }
                         None => {
                             let status = t.frame.regs[11] as isize;
-                            serial::println!("tid{} dead, removing status={status}", t.tid);
+                            info!("tid{} dead, removing status={status}", t.tid);
                         }
                     }
                 }
@@ -818,7 +818,7 @@ impl Orbit {
                 }
             }
 
-            serial::println!("pid{} dead, removing", t.pid);
+            info!("pid{} dead, removing", t.pid);
 
             pids_to_remove.push(t.pid);
         }
@@ -851,7 +851,7 @@ impl Orbit {
         // under the Orbit lock, not in Drop context.
         let kpages = &mut self.kernel_pages;
         pending_frees::drain(|frame, layout| {
-            serial::println!("dealloc shared ptr backing pa@{:016X} {:08X?}",
+            info!("dealloc shared ptr backing pa@{:016X} {:08X?}",
                 frame.get_raw(), layout);
             kpages.free(frame, layout);
         });
@@ -913,7 +913,7 @@ impl Orbit {
                 (t.0 as *const Thread).as_ref_unchecked()
             };
 
-            serial::println!("tid{}: state{}", thread.tid, thread.state.load(Ordering::Acquire));
+            info!("tid{}: state{}", thread.tid, thread.state.load(Ordering::Acquire));
         }
     }
 
@@ -932,13 +932,13 @@ impl Orbit {
         let bar_kva = unsafe {
             let bar_size = device.get_bar_size(0) as u64;
             if bar_size > (2 * MB) {
-                serial::println!("bar2big");
+                error!("bar2big");
                 return
             }
 
             let mut pages = PageAlloc::FA(self.table_pages.frames_mut());
 
-            serial::println!("mapping {}KB BAR0", bar_size / KB);
+            info!("mapping {}KB BAR0", bar_size / KB);
 
             // BAR0's PA stays at IGB_BAR_PA (we still program that into the
             // device's BAR register so the device decodes it on the bus);
@@ -947,7 +947,7 @@ impl Orbit {
                 &ort, &mut pages, Self::IGB_BAR_PA..(Self::IGB_BAR_PA + bar_size)
             ) {
                 Ok(v) => v,
-                Err(_) => { serial::println!("failed to map bar"); return }
+                Err(_) => { error!("failed to map bar"); return }
             };
 
             device.write_bar(0, Self::IGB_BAR_PA as u32);
@@ -983,7 +983,7 @@ impl Orbit {
             let mac = e1000.read_mac().unwrap();
             if let Err(_) = e1000.init_hw(mac) {
                 // free everything ig
-                serial::println!("failed to init e1000");
+                error!("failed to init e1000");
             }
 
             let mut config = Config::new(EthernetAddress(mac).into());
@@ -1004,10 +1004,10 @@ impl Orbit {
             let entrypoint = crate::k_net as *const () as usize;
             let a0 = (&mut self.net_pkg) as *mut NetPackage;
             if let Err(_) = self.create_kernel_thread(entrypoint, Some(a0 as usize)) {
-                serial::println!("failed to create knet thread");
+                error!("failed to create knet thread");
             }
             else {
-                serial::println!("created knet thread");
+                info!("created knet thread");
             }
 
             /*
@@ -1105,7 +1105,7 @@ impl Orbit {
             _ => return
         };
 
-        serial::println!("reg={reg:?}");
+        info!("reg={reg:?}");
 
         let base = match reg.address::<u64>() {
             Ok(b) => b as usize,
@@ -1117,7 +1117,7 @@ impl Orbit {
             Err(_) => return
         };
 
-        serial::println!("pci@{:08X}..{:08X}", base, base+size);
+        info!("pci@{:08X}..{:08X}", base, base+size);
 
         // PCI config space lives at a high-half KMMIO alias instead of
         // identity-mapped at its PA — keeps the kernel root free of low-half
@@ -1130,7 +1130,7 @@ impl Orbit {
             ) {
                 Ok(v) => v,
                 Err(_) => {
-                    serial::println!("failed to map pci config space");
+                    error!("failed to map pci config space");
                     return;
                 }
             };
@@ -1248,7 +1248,7 @@ impl Orbit {
         // or move this to a pool
         let t = Box::new(thread);
         let tptr = Box::into_raw(t);
-        serial::println!("created uthread@{tptr:016X?},pid={pid},tid={tid},table={rpt:016X?}");
+        info!("created uthread@{tptr:016X?},pid={pid},tid={tid},table={rpt:016X?}");
 
         let owning_process = self.processes.get_mut(&pid)
             .unwrap();
@@ -1269,7 +1269,7 @@ impl Orbit {
     
     pub fn create_new_thread(&mut self, pid: u16, root_table: &mmu::mmap::RootTable<'_>, entrypoint: usize, slot: u16, stack_size: u64) -> Result<Thread, ()> {
         if !validate_user_stack_size(stack_size) {
-            serial::println!("invalid user stack size {stack_size}");
+            error!("invalid user stack size {stack_size}");
             return Err(())
         }
 
@@ -1306,7 +1306,7 @@ impl Orbit {
             self.kernel_pages.free(tf_frame, Self::THREAD_TRAP_FRAME_LAYOUT);
             self.table_pages.free(root_frame, Self::TABLE_LAYOUT);
 
-            serial::println!("failed to map stack");
+            error!("failed to map stack");
 
             return Err(())
         }
@@ -1316,7 +1316,7 @@ impl Orbit {
             self.kernel_pages.free(tf_frame, Self::THREAD_TRAP_FRAME_LAYOUT);
             self.table_pages.free(root_frame, Self::TABLE_LAYOUT);
 
-            serial::println!("failed to map trap frame");
+            error!("failed to map trap frame");
 
             return Err(())
         }
@@ -1377,7 +1377,7 @@ impl Orbit {
         frame.regs[2] = (stack_vaddr + stack_size - 16) as usize;
         frame.asid = pid as usize;
 
-        serial::println!("ventry={:016X?},vsp=0x{:016X?},rpt_pa={:016X?}", entrypoint, frame.regs[2], root_frame.get_raw());
+        info!("ventry={:016X?},vsp=0x{:016X?},rpt_pa={:016X?}", entrypoint, frame.regs[2], root_frame.get_raw());
 
         Ok(Thread {
             pc: AtomicUsize::new(entrypoint),
@@ -1431,7 +1431,7 @@ impl Orbit {
             let _ = self.processes.remove(&pid);
             self.table_pages.free(root_pa, Self::TABLE_LAYOUT);
 
-            serial::println!("failed to map kernel into process");
+            error!("failed to map kernel into process");
 
             return Err(())
         }
@@ -1440,7 +1440,7 @@ impl Orbit {
         // or move this to a pool
         let t = Box::new(thread);
         let tptr = Box::into_raw(t);
-        serial::println!("created uprocess@{tptr:016X?},pid={pid},tid={tid},table_pa={:016X?}", root_pa.get_raw());
+        info!("created uprocess@{tptr:016X?},pid={pid},tid={tid},table_pa={:016X?}", root_pa.get_raw());
 
         let proc = self.processes.get_mut(&pid)
             .expect("just inserted");
@@ -1461,7 +1461,7 @@ impl Orbit {
     pub fn load_elf(&mut self, root_table: &mmu::mmap::RootTable<'_>, elf_blob: &[u8]) -> Result<orbital_elf::ElfInfo, ()> {
         let elf = match elf::ElfBytes::<LittleEndian>::minimal_parse(elf_blob) {
             Ok(e) => e,
-            Err(e) => { serial::println!("failed to parse umode elf: {e:?}"); return Err(()) }
+            Err(e) => { error!("failed to parse umode elf: {e:?}"); return Err(()) }
         };
 
         let mut segment_allocations = Vec::new();
@@ -1474,7 +1474,7 @@ impl Orbit {
             }
 
             if segment.p_vaddr < USER_TEXT_BASE {
-                serial::println!("illegal elf p_vaddr 0x{:X} (below USER_TEXT_BASE 0x{:X})", segment.p_vaddr, USER_TEXT_BASE);
+                error!("illegal elf p_vaddr 0x{:X} (below USER_TEXT_BASE 0x{:X})", segment.p_vaddr, USER_TEXT_BASE);
                 return Err(())
             }
 
@@ -1482,12 +1482,12 @@ impl Orbit {
                 continue
             }
 
-            serial::println!("loading {segment:08x?}");
+            info!("loading {segment:08x?}");
 
             let segment_data = match elf.segment_data(&segment) {
                 Ok(seg) => seg,
                 Err(e) => {
-                    serial::println!("error parsing loadable segment data: {e:?}");
+                    error!("error parsing loadable segment data: {e:?}");
                     return Err(())
                 }
             };
@@ -1498,7 +1498,7 @@ impl Orbit {
                     Some(p) => p,
                     None => {
                         self.free_backings(segment_allocations);
-                        serial::println!("failed to alloc segment");
+                        error!("failed to alloc segment");
                         return Err(())
                     },
                 };
@@ -1560,7 +1560,7 @@ impl Orbit {
 
                 if map.is_err() {
                     self.free_backings(segment_allocations);
-                    serial::println!("failed to map segment into process");
+                    error!("failed to map segment into process");
                     return Err(())
                 }
             }

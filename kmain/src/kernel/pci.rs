@@ -1,5 +1,7 @@
 use alloc::vec::Vec;
 
+use tracing::info;
+
 #[derive(Debug, Clone, Copy)]
 pub struct PciDevice {
     pub address: usize,
@@ -60,7 +62,7 @@ impl PciDevice {
 
     pub fn print_info(&self) {
         unsafe {
-            serial::println!("vid:{:04X?},did:{:04X?},status:{:04X?},command:{:04X?},class:{:06X?},rev:{:02?},htype:{:02X?},cacheline:{:02X?}",
+            info!("vid:{:04X?},did:{:04X?},status:{:04X?},command:{:04X?},class:{:06X?},rev:{:02?},htype:{:02X?},cacheline:{:02X?}",
                 self.vendor_id,
                 self.device_id,
                 self.status,
@@ -84,7 +86,7 @@ impl PciDevice {
 
                     bar.write_volatile(bar_orig);
 
-                    serial::println!("\tbar{bar_num} v=0x{bar_val:08X?},l=0x{bar_len:08X?}");
+                    info!("\tbar{bar_num} v=0x{bar_val:08X?},l=0x{bar_len:08X?}");
                 }
             }
         }

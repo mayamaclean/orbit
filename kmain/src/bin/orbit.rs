@@ -25,7 +25,7 @@ use linked_list_allocator::LockedHeap;
 use mem::{round_u64_up};
 use serial::println;
 
-use tracing::{Level};
+use tracing::{Level, debug, error, info};
 
 use device::TrapFrame;
 
@@ -108,7 +108,7 @@ extern "C" fn s_trap(
                 }
             }
             c => {
-                println!("unhandled kint {c}");
+                error!("unhandled kint {c}");
             }
         }
     }
@@ -148,26 +148,26 @@ extern "C" fn s_trap(
                         }
                     },
                     1 => {
-                        serial::println!("orbit handling u mode ecall({syscall})");
+                        debug!("orbit handling u mode ecall({syscall})");
                         kmain::handle_serial_print(epc, hart_context, frame);
                     }
                     2 => {
                         kmain::handle_ms_sleep(epc, hart_context, frame);
                     }
                     4096 => {
-                        serial::println!("orbit handling u mode ecall({syscall})");
+                        debug!("orbit handling u mode ecall({syscall})");
                         kmain::handle_mmap_req(epc, hart_context, frame);
                     }
                     4097 => {
-                        serial::println!("orbit handling u mode ecall({syscall})");
+                        debug!("orbit handling u mode ecall({syscall})");
                         kmain::handle_nc_create_req(epc, hart_context, frame);
                     }
                     4098 => {
-                        serial::println!("orbit handling u mode ecall({syscall})");
+                        debug!("orbit handling u mode ecall({syscall})");
                         kmain::handle_close_req(epc, hart_context, frame);
                     }
                     _ => {
-                        serial::println!("orbit handling u mode ecall({syscall})");
+                        debug!("orbit handling u mode ecall({syscall})");
                         kmain::update_thread_and_trap_frame(epc + 4, hart_context, frame, from_user);
                     }
                 }
@@ -592,7 +592,7 @@ extern "C" fn rust_main(_hartid: usize, sysinfo: usize, load_addr: u64) -> ! {
         let orbit_root_ref = orbit_root_kva.as_ptr::<PageTable>().as_ref_unchecked();
         let orbit_root_table = kmain::kernel::memmap::kernel_root(orbit_root_ref);
 
-        println!("ort=0x{:016X?}", orbit_root_ref as *const _ as usize);
+        info!("ort=0x{:016X?}", orbit_root_ref as *const _ as usize);
 
         {
             let mut pages = PageAlloc::FA(kernel_tables.frames_mut());
@@ -641,12 +641,12 @@ extern "C" fn rust_main(_hartid: usize, sysinfo: usize, load_addr: u64) -> ! {
         // point).
         kmain::kernel::pending_frees::init(cpu_count);
 
-        println!("allocated orbit state @ {:016X?}", &raw const *orbit as usize);
+        info!("allocated orbit state @ {:016X?}", &raw const *orbit as usize);
 
         let hart_root = hart_contexts as usize;
         riscv::register::sscratch::write(hart_root);
 
-        println!("allocated hart contexts @ {hart_root:016X?}");
+        info!("allocated hart contexts @ {hart_root:016X?}");
 
         let s_trap_addr = { s_trap_vector as *const () as usize };
         riscv::register::stvec::write(Stvec::new(s_trap_addr, TrapMode::Direct));
@@ -667,7 +667,7 @@ extern "C" fn rust_main(_hartid: usize, sysinfo: usize, load_addr: u64) -> ! {
                 &hart_context.trap_stack.stack_data[hart_context.trap_stack.stack_data.len() - 16]
                 as *const _ as usize;
 
-            println!("setting hart context @ {ptr:016X?} to kidle hart{hart}");
+            info!("setting hart context @ {ptr:016X?} to kidle hart{hart}");
         }
 
         let this_sp = hart_contexts.as_ref_unchecked().k_stack.stack_data.as_ptr() as usize + TRAP_STACK_SIZE - 16;
@@ -679,7 +679,7 @@ extern "C" fn rust_main(_hartid: usize, sysinfo: usize, load_addr: u64) -> ! {
         unmap_boot_only_regions(&orbit_root_table)
             .expect("failed to unmap boot-only regions");
 
-        println!("jump sp={this_sp:016X} pc={this_pc:016X?}");
+        info!("jump sp={this_sp:016X} pc={this_pc:016X?}");
 
         asm!(
             "fence.i",

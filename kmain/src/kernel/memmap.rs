@@ -8,6 +8,7 @@ use mmu::mmap::{PageAlloc, RootTable, map_va_range, reserve_va_range, unmap_rang
 use mmu::sv48::{PageTable, PhysAddr, VirtAddr};
 use mmu::{MappingConfig, PAGE_SIZE, PagePermissions, SupervisorTag};
 use process::{Frame, Shared, Table, UserOnly};
+use tracing::error;
 
 // =========================================================================
 // Address-kind newtypes
@@ -495,7 +496,7 @@ unsafe fn map_region_va(
     match unsafe { map_va_range(rt, pa_alloc, cfg, va_start, pa_range.clone()) } {
         Ok(_) => Ok(()),
         Err(()) => {
-            serial::println!(
+            error!(
                 "memmap: failed high-half {} v0x{:016X} p{:016X?}",
                 name, va_start, pa_range
             );
@@ -676,7 +677,7 @@ pub unsafe fn unmap_boot_only_regions(rt: &RootTable<'_>) -> Result<(), ()> {
     unsafe {
         for r in boot_only_elf_regions().iter() {
             if let Err(_) = unmap_range(rt, r.range.clone()) {
-                serial::println!("memmap: failed unmapping {} {:016X?}", r.name, r.range);
+                error!("memmap: failed unmapping {} {:016X?}", r.name, r.range);
                 return Err(())
             }
         }

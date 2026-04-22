@@ -499,10 +499,7 @@ pub fn handle_serial_print(epc: usize, hart_context: &'static HartContext, frame
             let guard = UserAccess::enter();
             let slice = guard.slice(arg0, arg1);
             if let Ok(s) = core::str::from_utf8(slice) {
-                match serial::SERIAL.print_str(s) {
-                    Ok(_) => (),
-                    Err(_) => { ret = -5 }
-                }
+                serial::print!("USER[{}.{}] {s}", thread.pid, thread.tid);
             }
             else {
                 ret = -4;
