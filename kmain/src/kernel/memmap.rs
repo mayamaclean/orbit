@@ -70,17 +70,17 @@ pub fn phys_to_kdmap(pa: PhysAddr) -> KdmapVa {
 /// `Frame<UserOnly>`: the kernel has no KDMAP for user_pages, so
 /// attempting that conversion must be a compile error.
 pub trait FrameToKdmap {
-    fn to_kdmap(self) -> KdmapVa;
+    fn to_kdmap(&self) -> KdmapVa;
 }
 
 impl FrameToKdmap for Frame<Shared> {
     #[inline]
-    fn to_kdmap(self) -> KdmapVa { phys_to_kdmap(self.raw()) }
+    fn to_kdmap(&self) -> KdmapVa { phys_to_kdmap(self.raw()) }
 }
 
 impl FrameToKdmap for Frame<Table> {
     #[inline]
-    fn to_kdmap(self) -> KdmapVa { phys_to_kdmap(self.raw()) }
+    fn to_kdmap(&self) -> KdmapVa { phys_to_kdmap(self.raw()) }
 }
 
 // =========================================================================
@@ -114,7 +114,8 @@ impl TablePages {
     pub fn alloc(&mut self, layout: Layout) -> Option<(Frame<Table>, KdmapVa)> {
         let pa = PhysAddr::new(self.inner.alloc_aligned(layout)? as u64);
         let frame = Frame::<Table>::new(pa);
-        Some((frame, frame.to_kdmap()))
+        let kva = frame.to_kdmap();
+        Some((frame, kva))
     }
 
     pub fn free(&mut self, frame: Frame<Table>, layout: Layout) {
@@ -151,7 +152,8 @@ impl KernelPages {
 
     pub fn alloc_kdmap(&mut self, layout: Layout) -> Option<(Frame<Shared>, KdmapVa)> {
         let frame = self.alloc_pa(layout)?;
-        Some((frame, frame.to_kdmap()))
+        let kva = frame.to_kdmap();
+        Some((frame, kva))
     }
 
     pub fn free(&mut self, frame: Frame<Shared>, layout: Layout) {

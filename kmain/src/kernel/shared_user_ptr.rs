@@ -50,7 +50,12 @@ pub enum RevokeError {
 struct SharedInner<T> {
     /// Strictly `Frame<Shared>` — only Shared-pool backings are legal for
     /// a SharedUserPtr (the kernel dereferences them via KDMAP).
-    frame: Frame<Shared>,
+    ///
+    /// `Option` because `Drop` needs to move the frame out of `&mut
+    /// self` into `pending_frees::push`, and `Frame<P>` isn't `Copy`.
+    /// Between `new` and `drop` the slot is always `Some`; `take()`
+    /// happens exactly once, in `Drop`.
+    frame: Option<Frame<Shared>>,
     layout: Layout,
     user_va: u64,
     len: usize,
@@ -64,7 +69,9 @@ impl<T> Drop for SharedInner<T> {
         // The backing lives in `Shared` pool, so the manager can reach
         // it through KDMAP to hand back to `kernel_pages`. We just
         // enqueue here — no allocator work from drop context.
-        pending_frees::push(self.frame, self.layout);
+        if let Some(frame) = self.frame.take() {
+            pending_frees::push(frame, self.layout);
+        }
     }
 }
 
@@ -105,7 +112,7 @@ impl<T> SharedUserPtr<T> {
         );
         Self {
             inner: Arc::new(SharedInner {
-                frame,
+                frame: Some(frame),
                 layout,
                 user_va,
                 len,
@@ -120,8 +127,13 @@ impl<T> SharedUserPtr<T> {
     /// consult `revoked` — hot-path callers (k_net per-poll) have already
     /// decided they want to keep going regardless. Use [`try_as_ref`] if
     /// you want revocation to fail-closed.
+    ///
+    /// `self.inner.frame` is `Some` for the whole non-Drop lifetime of
+    /// the Arc; the `expect` documents that invariant.
     pub fn as_ref(&self) -> &T {
-        let kva = self.inner.frame.to_kdmap();
+        let kva = self.inner.frame.as_ref()
+            .expect("SharedUserPtr::as_ref after frame.take() in Drop")
+            .to_kdmap();
         unsafe { &*kva.as_ptr::<T>() }
     }
 

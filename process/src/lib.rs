@@ -151,12 +151,10 @@ impl<P: Pool> Frame<P> {
     pub const fn new(pa: PhysAddr) -> Self {
         Self { pa, _p: PhantomData }
     }
-    pub fn raw(self) -> PhysAddr { self.pa }
-    pub fn get_raw(self) -> u64 { self.pa.get_raw() }
+    pub fn raw(&self) -> PhysAddr { self.pa }
+    pub fn get_raw(&self) -> u64 { self.pa.get_raw() }
 }
 
-impl<P: Pool> Clone for Frame<P> { fn clone(&self) -> Self { *self } }
-impl<P: Pool> Copy for Frame<P> {}
 impl<P: Pool> fmt::Debug for Frame<P> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Frame<{}>(pa=0x{:016X})", P::name(), self.pa.get_raw())
@@ -167,7 +165,7 @@ impl<P: Pool> fmt::Debug for Frame<P> {
 /// reservations like guard pages. The variant tag (`Shared` / `User`)
 /// is the pool the backing was drawn from — free paths match on this
 /// to dispatch to the right typed allocator.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 pub enum PhysBacking {
     Shared { frame: Frame<Shared>,   layout: Layout },
     User   { frame: Frame<UserOnly>, layout: Layout },
@@ -227,7 +225,7 @@ impl MappingKind {
 
 /// A contiguous [`vaddr`, `vaddr + len`) region in a process's address space.
 /// Keyed by `vaddr` in [`Process::maps`]; ranges never overlap.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 pub struct UserMapping {
     pub vaddr:   u64,
     pub len:     u64,

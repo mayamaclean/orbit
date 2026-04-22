@@ -634,11 +634,23 @@ impl Orbit {
                         memmap::kernel_root_from_pa((proc.satp.ppn() * PAGE_SIZE) as u64)
                     };
 
-                    // Collect first so we can release the immutable borrow on
-                    // proc before tearing down leaves / freeing backings.
-                    let mappings: Vec<UserMapping> = proc.mappings_for_slot(slot).copied().collect();
+                    // Two passes: gather the vaddrs matching this slot
+                    // (u64 is Copy so the collect doesn't tangle with
+                    // proc's borrow), then pull each UserMapping out of
+                    // proc.maps by `remove` — that transfers ownership
+                    // of its `backing: Option<PhysBacking>`, which we
+                    // can hand to `free_backing`. Single copy avoided
+                    // because `PhysBacking` (and therefore UserMapping)
+                    // is no longer Copy.
+                    let vaddrs: Vec<u64> = proc.mappings_for_slot(slot)
+                        .map(|m| m.vaddr)
+                        .collect();
 
-                    for m in &mappings {
+                    for v in &vaddrs {
+                        let proc = self.processes.get_mut(&pid)
+                            .expect("proc vanished mid-teardown");
+                        let Some(m) = proc.maps.remove(v) else { continue };
+
                         match m.kind {
                             MappingKind::Stack { .. } => {
                                 // Stack is a range of 2 MiB megapages; flush
@@ -677,9 +689,6 @@ impl Orbit {
                         if let Some(b) = m.backing {
                             self.free_backing(b);
                         }
-
-                        let proc = self.processes.get_mut(&pid).expect("proc vanished mid-teardown");
-                        let _ = proc.maps.remove(&m.vaddr);
                     }
 
                     let proc = self.processes.get_mut(&pid).expect("proc vanished mid-teardown");
@@ -1257,17 +1266,22 @@ impl Orbit {
             return Err(())
         }
 
-        let mut page_list: Vec<PhysBacking> = Vec::new();
-
         let (stack_frame, stack_layout) = self.allocate_user_thread_stack(stack_size)?;
-        page_list.push(PhysBacking::User { frame: stack_frame, layout: stack_layout });
 
-        let (tf_frame, trap_frame_kva) = self.allocate_trap_frame()
-            .map_err(|_| {
-                self.free_backings(&page_list[..]);
-            })?;
+        let (tf_frame, trap_frame_kva) = match self.allocate_trap_frame() {
+            Ok(v) => v,
+            Err(_) => {
+                self.user_pages.free(stack_frame, stack_layout);
+                return Err(());
+            }
+        };
 
-        page_list.push(PhysBacking::Shared { frame: tf_frame, layout: Self::THREAD_TRAP_FRAME_LAYOUT });
+        // Snapshot PAs now — we need them for the map_* calls below and
+        // also for the &mut Stack build, but the frames themselves move
+        // into `PhysBacking` at the end. `&self` readers on Frame keep
+        // the originals intact across these lines.
+        let stack_pa = stack_frame.get_raw();
+        let tf_pa = tf_frame.get_raw();
 
         let stack_vaddr      = user_stack_vaddr(slot, stack_size);
         let guard_vaddr      = user_stack_guard_vaddr(slot);
@@ -1278,9 +1292,11 @@ impl Orbit {
         // a `&PageTable` at its KDMAP alias — reverse that to a `Frame<Table>`.
         let root_kva = memmap::KdmapVa::new(root_table.table as *const _ as u64);
         let root_frame = Frame::<process::Table>::new(root_kva.to_phys());
+        let root_ppn = root_frame.get_raw() as usize / PAGE_SIZE;
 
-        if let Err(_) = self.map_stack(root_table, stack_frame.get_raw(), stack_vaddr, stack_size) {
-            self.free_backings(&page_list[..]);
+        if let Err(_) = self.map_stack(root_table, stack_pa, stack_vaddr, stack_size) {
+            self.user_pages.free(stack_frame, stack_layout);
+            self.kernel_pages.free(tf_frame, Self::THREAD_TRAP_FRAME_LAYOUT);
             self.table_pages.free(root_frame, Self::TABLE_LAYOUT);
 
             serial::println!("failed to map stack");
@@ -1288,8 +1304,9 @@ impl Orbit {
             return Err(())
         }
 
-        if let Err(_) = self.map_trap_frame(root_table, tf_frame.get_raw(), trap_frame_vaddr) {
-            self.free_backings(&page_list[..]);
+        if let Err(_) = self.map_trap_frame(root_table, tf_pa, trap_frame_vaddr) {
+            self.user_pages.free(stack_frame, stack_layout);
+            self.kernel_pages.free(tf_frame, Self::THREAD_TRAP_FRAME_LAYOUT);
             self.table_pages.free(root_frame, Self::TABLE_LAYOUT);
 
             serial::println!("failed to map trap frame");
@@ -1336,7 +1353,7 @@ impl Orbit {
             // through it here would fault. The &mut Stack reference below
             // is built for `Thread.stack` but never derefed kernel-side;
             // user code reaches the same backing via the user-VA mapping.
-            let s = stack_frame.get_raw() as *mut Stack;
+            let s = stack_pa as *mut Stack;
 
             (
                 f.as_mut_unchecked(),
@@ -1347,7 +1364,7 @@ impl Orbit {
         let mut satp = Satp::from_bits(0);
         satp.set_asid(pid as usize);
         satp.set_mode(riscv::register::satp::Mode::Sv48);
-        satp.set_ppn(root_frame.get_raw() as usize / PAGE_SIZE);
+        satp.set_ppn(root_ppn);
 
         frame.regs[1] = entrypoint;
         frame.regs[2] = (stack_vaddr + stack_size - 16) as usize;
@@ -1428,9 +1445,9 @@ impl Orbit {
         Ok(())
     }
 
-    fn free_backings(&mut self, backings: &[PhysBacking]) {
+    fn free_backings(&mut self, backings: Vec<PhysBacking>) {
         for b in backings {
-            self.free_backing(*b);
+            self.free_backing(b);
         }
     }
     
@@ -1473,7 +1490,7 @@ impl Orbit {
                 let seg_pa = match self.user_pages.alloc_pa(layout) {
                     Some(p) => p,
                     None => {
-                        self.free_backings(&segment_allocations[..]);
+                        self.free_backings(segment_allocations);
                         serial::println!("failed to alloc segment");
                         return Err(())
                     },
@@ -1535,7 +1552,7 @@ impl Orbit {
                     PhysAddr::new(paddr_end));
 
                 if map.is_err() {
-                    self.free_backings(&segment_allocations);
+                    self.free_backings(segment_allocations);
                     serial::println!("failed to map segment into process");
                     return Err(())
                 }
