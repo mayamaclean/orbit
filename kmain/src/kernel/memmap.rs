@@ -6,7 +6,7 @@ use mem::frame::FrameAllocator;
 use mem::round_u64_up;
 use mmu::mmap::{PageAlloc, RootTable, id_map_range, map_va_range, reserve_va_range, unmap_range, virt_to_phys};
 use mmu::sv48::{PageTable, PhysAddr, VirtAddr};
-use mmu::{MappingConfig, PAGE_SIZE, PagePermissions};
+use mmu::{MappingConfig, PAGE_SIZE, PagePermissions, SupervisorTag};
 use process::{Frame, Shared, Table, UserOnly};
 
 // =========================================================================
@@ -467,7 +467,7 @@ unsafe fn map_region(rt: &RootTable<'_>, pa: &mut PageAlloc, r: &Region) -> Resu
         vaddr: VirtAddr::new(0),
         paddr: PhysAddr::new(0),
         log: false,
-        supervisor_tag: None,
+        supervisor_tag: SupervisorTag::None,
     };
     match unsafe { id_map_range(rt, pa, cfg, r.range.clone()) } {
         Ok(_) => Ok(()),
@@ -511,7 +511,7 @@ unsafe fn map_region_va(
         vaddr: VirtAddr::new(0),
         paddr: PhysAddr::new(0),
         log: false,
-        supervisor_tag: None,
+        supervisor_tag: SupervisorTag::None,
     };
     match unsafe { map_va_range(rt, pa_alloc, cfg, va_start, pa_range.clone()) } {
         Ok(_) => Ok(()),

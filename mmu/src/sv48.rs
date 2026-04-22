@@ -177,12 +177,16 @@ impl PageTableEntry {
     /// value or the fully-constructed new one — never a half-built PTE.
     ///
     /// `ppn` is the 44-bit physical page number (paddr / PAGE_SIZE).
-    /// `perms` carries R/W/X/U/G bits (matches `PagePermissions`). `V`, `A`,
-    /// `D` are set unconditionally.
+    /// `perms` carries R/W/X/U/G bits (matches `PagePermissions`). `rsw`
+    /// is stashed into PTE[8:9] (the two reserved-for-supervisor-software
+    /// bits); orbit policy assigns meaning to specific values (e.g.
+    /// "Shared-pool user mapping, revocable"). `V`, `A`, `D` are set
+    /// unconditionally.
     #[inline]
-    pub const fn pack_leaf(ppn: u64, perms: u64) -> u64 {
+    pub const fn pack_leaf(ppn: u64, perms: u64, rsw: u8) -> u64 {
         (ppn << Self::PPN_OFFSETS[0])
             | (perms & Self::PERMS_MASK)
+            | (((rsw as u64) & 0b11) << 8)
             | Self::VALID
             | Self::ACCESSED
             | Self::DIRTY
@@ -337,5 +341,5 @@ pub const PAGE_TABLE_ENTRY_COUNT: usize = 4096 / core::mem::size_of::<PageTableE
 
 #[repr(C, align(4096))]
 pub struct PageTable {
-    pub(super) entries: [PageTableEntry; PAGE_TABLE_ENTRY_COUNT]
+    pub entries: [PageTableEntry; PAGE_TABLE_ENTRY_COUNT]
 }

@@ -15,10 +15,11 @@ use mem::frame::FrameAllocator;
 use mem::{round_u64_down, round_u64_up, round_usize_up};
 use mmu::mmap::{PageAlloc, id_map_range, map_address_range, unmap, unmap_page};
 use mmu::sv48::{PageTable, PhysAddr, VirtAddr};
-use mmu::{KB, MB, MappingConfig, PAGE_SIZE, PagePermissions};
+use mmu::{KB, MB, MappingConfig, PAGE_SIZE, PagePermissions, SupervisorTag};
 use net_channel::NetChannel;
-use process::{Frame, MappingKind, MemMapReq, NetChannelCreationReq, PThread, PhysBacking, Process, Shared, Thread, ThreadBlockReason, ThreadState, UserMapping, UserOnly};
+use process::{CloseHandleReq, Frame, MappingKind, MemMapReq, NetChannelCreationReq, PThread, PhysBacking, Process, Shared, Thread, ThreadBlockReason, ThreadState, UserMapping, UserOnly};
 
+use crate::kernel::handle::{Handle, ProcessHandles};
 use crate::kernel::memmap::FrameToKdmap;
 use crate::kernel::shared_user_ptr::SharedUserPtr;
 use riscv::register::satp::{Mode, Satp};
@@ -34,6 +35,7 @@ use crate::kernel::pci::PciDevice;
 use crate::{NetPackage, SocketReq, supervisor_wake_hart};
 
 pub mod context;
+pub mod handle;
 pub mod memmap;
 pub mod orbital_elf;
 pub mod pending_frees;
@@ -72,12 +74,12 @@ pub struct Orbit {
     net_pkg: NetPackage,
     orphaned_sockets: Vec<SocketHandle>,
 
-    /// Per-process NetChannel handles. `SharedUserPtr<NetChannel>` owns
-    /// the backing via refcount — entries here are the kernel's own
-    /// strong refs. Cloned into `SocketReq` for k_net. Removed when the
-    /// process exits; last Arc to drop pushes the backing to
-    /// `pending_frees`.
-    nc_channels: BTreeMap<u16, Vec<SharedUserPtr<NetChannel>>>,
+    /// Per-process handle tables. The manager's strong refs on
+    /// `SharedUserPtr`-backed resources live here, keyed by the u32 Fd
+    /// assigned at creation. k_net gets separate clones via
+    /// `SocketReq`. On process exit the table is walked to revoke
+    /// every Shared mapping before the manager drops its Arcs.
+    process_handles: BTreeMap<u16, ProcessHandles>,
 }
 
 impl Orbit {
@@ -152,7 +154,7 @@ impl Orbit {
                 socket_deletions: heapless::spsc::Queue::new()
             },
             orphaned_sockets: Vec::new(),
-            nc_channels: BTreeMap::new(),
+            process_handles: BTreeMap::new(),
         }
     }
 
@@ -327,7 +329,11 @@ impl Orbit {
             (frame.get_raw(), PhysBacking::User { frame, layout })
         };
 
-        let supervisor_tag = if req.share_with_kernel { Some(0x1) } else { None };
+        let supervisor_tag = if req.share_with_kernel {
+            SupervisorTag::SharedRevocable
+        } else {
+            SupervisorTag::None
+        };
 
         let config = MappingConfig {
             permissions: (req.page_permissions & 0xE) | PagePermissions::U,
@@ -435,7 +441,7 @@ impl Orbit {
             vaddr: VirtAddr::new(req.nc_vaddr as u64),
             paddr: frame.raw(),
             log: true,
-            supervisor_tag: Some(0x1),
+            supervisor_tag: SupervisorTag::SharedRevocable,
         };
 
         let vend = VirtAddr::new((req.nc_vaddr + region_size) as u64);
@@ -467,10 +473,15 @@ impl Orbit {
         let shared: SharedUserPtr<NetChannel> = SharedUserPtr::new(
             frame, layout, req.nc_vaddr as u64, region_size, thread.pid);
 
-        self.nc_channels
+        // Register the manager's strong ref and grab the Fd. Return it
+        // to the user in a1 alongside the VA in a0 — avoids taking a
+        // user out-pointer, which would have to resolve through KDMAP
+        // (Shared-pool only) or a transient UserPageWindow, neither of
+        // which is worth the machinery for 4 bytes.
+        let fd = self.process_handles
             .entry(thread.pid)
-            .or_insert_with(Vec::new)
-            .push(shared.clone());
+            .or_insert_with(ProcessHandles::new)
+            .insert(Handle::NetChannel(shared.clone()));
 
         core::sync::atomic::fence(Ordering::SeqCst);
 
@@ -494,15 +505,58 @@ impl Orbit {
             }
         }
 
-        info!("nc created user_va=0x{:08X} kva=0x{:016X} region={}",
-            req.nc_vaddr, kva.raw(), region_size);
+        info!("nc created user_va=0x{:08X} kva=0x{:016X} region={} fd={}",
+            req.nc_vaddr, kva.raw(), region_size, fd);
         thread.frame.regs[10] = req.nc_vaddr;
+        thread.frame.regs[11] = fd as usize;
+    }
+
+    fn handle_close_req<'t>(&mut self, thread: &'t mut Thread, req: CloseHandleReq) {
+        info!("handling close req: {req:?}");
+
+        // Look up the handle, revoke if Shared, then drop the Arc.
+        // k_net may still hold a clone; the backing lives until it's
+        // dropped too. Post-revoke, any user access to the old VA
+        // faults, and `try_as_ref` returns None for future kernel
+        // observers — close is safe to race against an in-flight
+        // update_tcp on another hart.
+        let Some(ph) = self.process_handles.get_mut(&thread.pid) else {
+            thread.frame.regs[10] = -1isize as usize;
+            return;
+        };
+        let Some(handle) = ph.remove(req.fd) else {
+            thread.frame.regs[10] = -2isize as usize;
+            return;
+        };
+
+        let root_table = unsafe {
+            memmap::kernel_root_from_pa(thread.root_table_addr() as u64)
+        };
+
+        match &handle {
+            Handle::NetChannel(sup) => {
+                if let Err(e) = sup.revoke(&root_table) {
+                    warn!("close_handle: revoke failed for fd={} sup={sup:?}: {e:?}",
+                        req.fd);
+                    thread.frame.regs[10] = -3isize as usize;
+                    return;
+                }
+            }
+        }
+
+        // `handle` drops here, releasing the manager's Arc. If k_net
+        // still holds a clone the backing survives until its next
+        // drop.
+        drop(handle);
+
+        thread.frame.regs[10] = 0;
     }
 
     fn handle_block_reason<'t>(&mut self, thread: &'t mut Thread, reason: ThreadBlockReason) {
         match reason {
             ThreadBlockReason::MemMap(req) => self.handle_mmap_req(thread, req),
             ThreadBlockReason::NetChannelCreation(req) => self.handle_nc_create_req(thread, req),
+            ThreadBlockReason::CloseHandle(req) => self.handle_close_req(thread, req),
             _ => {}
         }
     }
@@ -648,14 +702,38 @@ impl Orbit {
             }
         }
 
-        // Drop the manager's SharedUserPtr clones for this pid. k_net
-        // still holds its own clones via `user_conns`; those drop later
-        // when `socket_deletions` removes them. When *both* sides have
-        // released, the SharedInner Drop fires and pushes the backing
-        // onto `pending_frees`.
-        let _ = self.nc_channels.remove(&process.pid);
-
+        // Revoke every Shared user mapping for this pid *before* tearing
+        // down the manager's Arcs and the PT itself. Revoke walks the
+        // user PT and clears each tagged leaf — so once this loop
+        // completes, the user VA is unreachable even though k_net might
+        // still hold an nc clone for one more poll. Two invariants fall
+        // out:
+        //   1. revoked == true ⇒ user PTEs are already gone (post-
+        //      condition, not plan), so k_net observers using
+        //      try_as_ref() can bail safely.
+        //   2. Must happen before `unmap` below, which frees the
+        //      intermediate PT pages the revoker walks.
         let root_table = unsafe { memmap::kernel_root_from_pa(process_root_table_pa) };
+        if let Some(ph) = self.process_handles.get(&process.pid) {
+            for (_fd, handle) in ph.iter() {
+                match handle {
+                    Handle::NetChannel(sup) => {
+                        if let Err(e) = sup.revoke(&root_table) {
+                            warn!(
+                                "dealloc_process: revoke failed for pid{} sup={sup:?}: {e:?}",
+                                process.pid,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        // Drop the manager's Arcs. k_net still holds its own clones via
+        // `user_conns`; those drop later when `socket_deletions`
+        // removes them. When *both* sides have released, the
+        // SharedInner Drop fires and pushes the backing onto
+        // `pending_frees`.
+        let _ = self.process_handles.remove(&process.pid);
 
         while let Some(b) = process.heap_pages.pop() {
             serial::println!("dealloc heap page pa@{:016X} {:08X?} pool={}",
@@ -1096,7 +1174,7 @@ impl Orbit {
                     vaddr: VirtAddr::new(stackv),
                     paddr: PhysAddr::new(stack_pa),
                     log: false,
-                    supervisor_tag: None
+                    supervisor_tag: SupervisorTag::None
                 },
                 VirtAddr::new(stackv + stack_size),
                 PhysAddr::new(stack_pa + stack_size))
@@ -1116,7 +1194,7 @@ impl Orbit {
                     vaddr: VirtAddr::new(user_vaddr),
                     paddr: PhysAddr::new(trap_frame as u64),
                     log: false,
-                    supervisor_tag: None
+                    supervisor_tag: SupervisorTag::None
                 },
                 VirtAddr::new(user_vaddr + PAGE_SIZE as u64),
                 PhysAddr::new((trap_frame + PAGE_SIZE) as u64))
@@ -1446,7 +1524,7 @@ impl Orbit {
                     vaddr: VirtAddr::new(vaddr_start),
                     paddr: PhysAddr::new(paddr_start),
                     log: true,
-                    supervisor_tag: None
+                    supervisor_tag: SupervisorTag::None
                 };
 
                 let map = map_address_range(

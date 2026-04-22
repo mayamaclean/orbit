@@ -59,6 +59,29 @@ extern "C" fn syscall_arg4(code: usize, arg0: usize, arg1: usize, arg2: usize, a
     r
 }
 
+/// Two-return variant: primary in a0, secondary in a1. Used by
+/// `create_netch` to hand back both the mapped VA (a0) and the Fd the
+/// kernel assigned (a1) in one trap — avoids needing a user
+/// out-pointer, which the kernel would have to resolve through KDMAP
+/// or a transient page window.
+extern "C" fn syscall_arg4_ret2(code: usize, arg0: usize, arg1: usize, arg2: usize, arg3: usize) -> (isize, isize) {
+    let mut r0 = 0isize;
+    let mut r1 = 0isize;
+    unsafe {
+        asm!(
+            "ecall",
+            in("a0") code,
+            in("a1") arg0,
+            in("a2") arg1,
+            in("a3") arg2,
+            in("a4") arg3,
+            lateout("a0") r0,
+            lateout("a1") r1,
+        );
+    }
+    (r0, r1)
+}
+
 fn sleep_ms(ms: usize) -> isize {
     syscall_arg0(2, ms)
 }
@@ -77,12 +100,21 @@ fn exit(code: isize) -> ! {
 
 /// Ask the kernel to allocate a NetChannel region of `region_size` bytes,
 /// map it at `vaddr_hint`, initialize its headers, and register it with
-/// the net thread as a socket of `sock_type`. On success the kernel
-/// returns the actual user VA where the region was mapped; on failure a
-/// negative errno.
-fn create_netch(vaddr_hint: usize, region_size: usize, sock_type: usize) -> Result<usize, ()> {
-    let r = syscall_arg4(4097, vaddr_hint, region_size, sock_type, 0);
-    if r < 0 { Err(()) } else { Ok(r as usize) }
+/// the net thread as a socket of `sock_type`. On success returns
+/// `(user_va, fd)` — the VA the region landed at and the Fd the kernel
+/// assigned (pass this to `close_handle` to tear down the channel).
+/// On failure returns a negative errno.
+fn create_netch(vaddr_hint: usize, region_size: usize, sock_type: usize) -> Result<(usize, u32), ()> {
+    let (va, fd) = syscall_arg4_ret2(4097, vaddr_hint, region_size, sock_type, 0);
+    if va < 0 { Err(()) } else { Ok((va as usize, fd as u32)) }
+}
+
+/// Release a handle previously returned by `create_netch`. Kernel
+/// revokes the user mapping (future accesses to the old VA fault)
+/// before dropping its strong ref. Returns 0 on success, negative on
+/// error.
+fn close_handle(fd: u32) -> isize {
+    syscall_arg0(4098, fd as usize)
 }
 
 #[unsafe(no_mangle)]
@@ -99,7 +131,7 @@ pub unsafe extern "C" fn _start() -> ! {
     // that's always the hint, but readers should not rely on it.
     const AHINT: usize = 0x2_4000_0000;
     const NC_REGION_SIZE: usize = 4096;
-    let nc_vaddr = match create_netch(AHINT, NC_REGION_SIZE, 0) {
+    let (nc_vaddr, nc_fd) = match create_netch(AHINT, NC_REGION_SIZE, 0) {
         Ok(v) => v,
         Err(_) => {
             const NO_NC: &'static str = "failed to create netchannel!\n";
@@ -176,7 +208,23 @@ pub unsafe extern "C" fn _start() -> ! {
             }
 
             if br {
-                exit(0);
+                // Close the handle before exit so we exercise the
+                // revoke path from a live process, not just from
+                // teardown. After this returns, `nc` is invalid — the
+                // user mapping has been torn down.
+                let cr = close_handle(nc_fd);
+                if cr != 0 {
+                    const CLOSE_FAIL: &'static str = "close_handle failed!\n";
+                    let _ = serial_print(CLOSE_FAIL.as_ptr() as usize, CLOSE_FAIL.len());
+                    exit(cr);
+                }
+
+                const CLOSE_OK: &'static str = "close_handle ok!\n";
+                let _ = serial_print(CLOSE_OK.as_ptr() as usize, CLOSE_OK.len());
+
+                let _ = unsafe {
+                    core::ptr::read_volatile(nc as *const _ as *const u8);
+                };
             }
         }
         else {

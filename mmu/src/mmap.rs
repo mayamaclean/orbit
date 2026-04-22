@@ -217,7 +217,11 @@ pub unsafe fn map_address_page<'a>(root_table: &RootTable<'_>, pages: &mut PageA
     }
 
     let ppn = config.paddr.get_raw() / PAGE_SIZE as u64;
-    pte.set_raw(crate::sv48::PageTableEntry::pack_leaf(ppn, config.permissions));
+    pte.set_raw(crate::sv48::PageTableEntry::pack_leaf(
+        ppn,
+        config.permissions,
+        config.supervisor_tag as u8,
+    ));
 
     if config.log {
         println!("\tleaf in table@0x{:08X}[vpn{}={idx}]=0x{:08x}",
@@ -256,14 +260,17 @@ pub unsafe fn reserve_va_range<'a>(
 
 /// Install a 4 KiB leaf PTE for `vaddr` under `root_table`, pointing at
 /// `paddr` with `perms`, or clear the leaf entirely when `paddr` is None.
-/// Returns `Err(())` if the walk hits an invalid or leaf PTE above L0 —
-/// callers must pre-reserve intermediates for the VA range (e.g. via
-/// `reserve_va_range`). The caller owns the post-write `sfence.vma`.
+/// `rsw` is stashed into PTE[8:9] (supervisor software bits) — callers
+/// that aren't tagging pass 0. Returns `Err(())` if the walk hits an
+/// invalid or leaf PTE above L0 — callers must pre-reserve intermediates
+/// for the VA range (e.g. via `reserve_va_range`). The caller owns the
+/// post-write `sfence.vma`.
 pub unsafe fn write_leaf_pte(
     root_table: &RootTable<'_>,
     vaddr: VirtAddr,
     paddr: Option<PhysAddr>,
     perms: u64,
+    rsw: u8,
 ) -> Result<(), ()> {
     let table = unsafe { walk_to_table(root_table, vaddr, 0) }.ok_or(())?;
     let leaf_idx = vaddr.vpn_n(0) as usize;
@@ -271,7 +278,7 @@ pub unsafe fn write_leaf_pte(
         Some(pa) => {
             let ppn = pa.get_raw() / PAGE_SIZE as u64;
             table.entries[leaf_idx].set_raw(
-                crate::sv48::PageTableEntry::pack_leaf(ppn, perms),
+                crate::sv48::PageTableEntry::pack_leaf(ppn, perms, rsw),
             );
         }
         None => table.entries[leaf_idx].set_raw(0),
@@ -459,7 +466,11 @@ pub unsafe fn map_page<'a>(root_table: &RootTable<'_>, pages: &mut PageAlloc<'a>
     let idx = config.vaddr.vpn_n(target_level as usize) as usize;
     let pte = &table.entries[idx];
     let ppn = config.paddr.get_raw() / PAGE_SIZE as u64;
-    pte.set_raw(crate::sv48::PageTableEntry::pack_leaf(ppn, config.permissions));
+    pte.set_raw(crate::sv48::PageTableEntry::pack_leaf(
+        ppn,
+        config.permissions,
+        config.supervisor_tag as u8,
+    ));
 
     if config.log {
         println!("\tleaf in table@0x{:08X}[vpn{}={idx}]=0x{:08x}",

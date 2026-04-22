@@ -234,7 +234,7 @@ extern "C" fn kinit(hartid: usize, dtb_addr: usize) {
                 permissions: PagePermissions::R | PagePermissions::W | PagePermissions::X,
                 levels: 0, page_size: 0, vaddr: VirtAddr::new(0), paddr: PhysAddr::new(0),
                 log: false,
-                supervisor_tag: None
+                supervisor_tag: SupervisorTag::None
             };
             let id_mapping = id_map_range(&root_table, &mut pages, base_id_map_config, ram_start..(ram_start + ram_size));
 
@@ -245,7 +245,7 @@ extern "C" fn kinit(hartid: usize, dtb_addr: usize) {
                 vaddr: VirtAddr::new(addr as u64),
                 paddr: PhysAddr::new(addr as u64),
                 log: false,
-                supervisor_tag: None
+                supervisor_tag: SupervisorTag::None
             };
             map_address_page(&root_table, &mut pages, &serial_perms).unwrap();
 

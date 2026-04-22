@@ -18,9 +18,34 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use alloc::sync::Arc;
 
+use mmu::{PAGE_SIZE, SupervisorTag};
+use mmu::mmap::{RootTable, walk_to_table};
+use mmu::sv48::VirtAddr;
 use process::{Frame, Shared};
 
 use crate::kernel::{memmap::FrameToKdmap, pending_frees};
+
+/// Why a revoke walk couldn't complete. All variants leave the PTE(s)
+/// untouched — revoke is all-or-nothing per call (though partial progress
+/// may be visible for VA ranges spanning multiple leaves if we ever
+/// extend this to keep going past a bad leaf; today we stop on the first
+/// error).
+#[derive(Debug, Clone, Copy)]
+pub enum RevokeError {
+    /// The walk hit an invalid or superpage PTE above L0 — something is
+    /// mapping this VA at a granularity we don't expect. Shared mappings
+    /// are always 4 KiB leaves, so this would mean the map path drifted.
+    MissingIntermediate(u64),
+    /// Leaf PTE is `V=0` or not a leaf. Either the mapping was never
+    /// installed or something else already tore it down.
+    NotMapped(u64),
+    /// Leaf PTE exists but its RSW bits aren't `SharedRevocable`. Either
+    /// the mapper forgot to tag a Shared mapping, or something else
+    /// stomped this VA with a regular mapping after the fact. Refusing
+    /// to clear it protects a legitimate non-shared tenant from being
+    /// silently unmapped.
+    WrongTag { va: u64, tag: u8 },
+}
 
 struct SharedInner<T> {
     /// Strictly `Frame<Shared>` — only Shared-pool backings are legal for
@@ -60,7 +85,24 @@ impl<T> SharedUserPtr<T> {
     /// spanning `len` bytes in the address space of `owner_pid`. The
     /// `Frame<Shared>` type requirement makes wrong-pool construction a
     /// compile error.
+    ///
+    /// Panics if `user_va` or `len` aren't 4 KiB-aligned. The revoke
+    /// walker assumes one 4 KiB leaf per PAGE_SIZE step through the
+    /// range; an unaligned input would walk past the end or start
+    /// mid-page. The invariant holds implicitly today because every
+    /// current construction path runs through `map_address_range`
+    /// (which rejects unaligned VAs) and `normalize_region_size`
+    /// (which page-rounds `len`), but this assert makes it explicit
+    /// at the construction boundary instead of relying on callers.
     pub fn new(frame: Frame<Shared>, layout: Layout, user_va: u64, len: usize, owner_pid: u16) -> Self {
+        assert!(
+            user_va % PAGE_SIZE as u64 == 0,
+            "SharedUserPtr::new: user_va {:#x} not page-aligned", user_va,
+        );
+        assert!(
+            len % PAGE_SIZE == 0 && len > 0,
+            "SharedUserPtr::new: len {len} must be a nonzero multiple of PAGE_SIZE",
+        );
         Self {
             inner: Arc::new(SharedInner {
                 frame,
@@ -75,16 +117,72 @@ impl<T> SharedUserPtr<T> {
     }
 
     /// Dereference through the KDMAP alias of the backing. Does *not*
-    /// consult `revoked` — callers who need revocation semantics should
-    /// check [`is_revoked`](Self::is_revoked) first (revocation is a
-    /// follow-up wired to the `supervisor_tag` PTE bit).
+    /// consult `revoked` — hot-path callers (k_net per-poll) have already
+    /// decided they want to keep going regardless. Use [`try_as_ref`] if
+    /// you want revocation to fail-closed.
     pub fn as_ref(&self) -> &T {
         let kva = self.inner.frame.to_kdmap();
         unsafe { &*kva.as_ptr::<T>() }
     }
 
-    pub fn revoke(&self) {
+    /// `Some(&T)` if the handle is still live, `None` if the user mapping
+    /// has been revoked. k_net-style consumers should prefer this over
+    /// `as_ref` so a mid-poll revoke turns into a graceful socket
+    /// teardown instead of continuing to drive a page the user can no
+    /// longer see.
+    pub fn try_as_ref(&self) -> Option<&T> {
+        if self.is_revoked() {
+            return None;
+        }
+        Some(self.as_ref())
+    }
+
+    /// Walk the owner's user PT and invalidate every leaf covering
+    /// `[user_va, user_va + len)`. `root` must be the kernel-side
+    /// [`RootTable`] built from the owner's satp
+    /// (`kernel_root_from_pa(satp.ppn() * 4096)` — Orbit has the helper).
+    ///
+    /// Order: clear each leaf's V bit and `sfence.vma` before moving on,
+    /// and flip `revoked` only after the last PTE is gone. So a concurrent
+    /// observer of `is_revoked() == true` is guaranteed the user mapping
+    /// is actually unreachable — "revoked" is a post-condition, not a
+    /// plan.
+    ///
+    /// Local-hart sfence only. Cross-hart TLB shootdown is a follow-up;
+    /// the rest of orbit's unmap paths have the same limitation today.
+    pub fn revoke(&self, root: &RootTable<'_>) -> Result<(), RevokeError> {
+        if self.is_revoked() {
+            return Ok(());
+        }
+
+        let pid = self.inner.owner_pid;
+        let start = self.inner.user_va;
+        let end = start + self.inner.len as u64;
+
+        let mut va = start;
+        while va < end {
+            let table = unsafe { walk_to_table(root, VirtAddr::new(va), 0) }
+                .ok_or(RevokeError::MissingIntermediate(va))?;
+            let idx = VirtAddr::new(va).vpn_n(0) as usize;
+            let pte = &table.entries[idx];
+
+            if !pte.is_valid() || !pte.is_leaf() {
+                return Err(RevokeError::NotMapped(va));
+            }
+
+            let tag = pte.get_supervisor_bits();
+            if tag != SupervisorTag::SharedRevocable as u8 {
+                return Err(RevokeError::WrongTag { va, tag });
+            }
+
+            pte.set_raw(0);
+            unsafe { riscv::asm::sfence_vma(pid as usize, va as usize); }
+
+            va += PAGE_SIZE as u64;
+        }
+
         self.inner.revoked.store(true, Ordering::Release);
+        Ok(())
     }
 
     pub fn is_revoked(&self) -> bool {

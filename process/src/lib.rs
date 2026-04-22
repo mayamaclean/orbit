@@ -41,10 +41,16 @@ pub struct NetChannelCreationReq {
 }
 
 #[derive(Debug, Clone, Copy)]
+pub struct CloseHandleReq {
+    pub fd: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
 pub enum ThreadBlockReason {
     NotBlocking,
     MemMap(MemMapReq),
     NetChannelCreation(NetChannelCreationReq),
+    CloseHandle(CloseHandleReq),
 }
 
 #[derive(Debug, Clone, Copy)]

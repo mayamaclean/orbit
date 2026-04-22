@@ -8,7 +8,7 @@ use device::{HartContext, TrapFrame};
 use mmu::{PAGE_SIZE, sv48::PageTable};
 use net_channel::NetChannel;
 use crate::kernel::shared_user_ptr::SharedUserPtr;
-use process::{MemMapReq, NetChannelCreationReq, Thread, ThreadBlockReason, ThreadState};
+use process::{CloseHandleReq, MemMapReq, NetChannelCreationReq, Thread, ThreadBlockReason, ThreadState};
 use riscv::register::sstatus::SPP;
 use smoltcp::{iface::{PollResult, SocketHandle, SocketSet, SocketStorage}, socket::dhcpv4, storage::{PacketBuffer, RingBuffer}};
 
@@ -242,7 +242,7 @@ fn handle_dhcp_event(mut iface: smoltcp::iface::Interface, event: dhcpv4::Event)
 
 #[unsafe(no_mangle)]
 pub extern "C" fn k_net(device: *mut NetPackage) {
-    use tracing::{info, warn, error};
+    use tracing::{info, error};
 
     unsafe {
         riscv::register::sstatus::clear_sie();
@@ -329,7 +329,7 @@ pub extern "C" fn k_net(device: *mut NetPackage) {
         }
         
         let default_wake = now + 100_000;
-        let mut wake_time = iface.poll_at(timestamp, &mut sockets)
+        let wake_time = iface.poll_at(timestamp, &mut sockets)
             .map(|i| i.total_micros() as usize * 10)
             .unwrap_or(default_wake);
 
@@ -592,6 +592,36 @@ pub fn handle_mmap_req(epc: usize, hart_context: &'static HartContext, frame: &m
 
         thread.pc.store(epc + 4, Ordering::Release);
         
+        exit_thread_with_state(ThreadState::Blocking);
+    }
+}
+
+#[unsafe(no_mangle)]
+pub fn handle_close_req(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
+    unsafe {
+        let current = hart_context.current.load(Ordering::Acquire);
+        if current == null_mut() {
+            frame.regs[10] = (-1 as isize) as usize;
+            return
+        }
+
+        let thread = (current as *mut Thread)
+            .as_mut_unchecked();
+
+        let req = CloseHandleReq {
+            fd: frame.regs[11] as u32,
+        };
+
+        thread.block_reason = ThreadBlockReason::CloseHandle(req);
+
+        let frame_ptr = thread.frame as *const TrapFrame as usize as *mut TrapFrame;
+        core::ptr::copy_nonoverlapping(
+            frame as *const _,
+            frame_ptr,
+            1);
+
+        thread.pc.store(epc + 4, Ordering::Release);
+
         exit_thread_with_state(ThreadState::Blocking);
     }
 }

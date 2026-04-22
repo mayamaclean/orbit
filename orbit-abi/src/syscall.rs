@@ -9,6 +9,7 @@ pub const SLEEP_MS:        usize = 2;
 
 pub const MMAP:            usize = 4096;
 pub const CREATE_NETCH:    usize = 4097;
+pub const CLOSE_HANDLE:    usize = 4098;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(usize)]
@@ -18,6 +19,7 @@ pub enum Sysno {
     SleepMs        = SLEEP_MS,
     Mmap           = MMAP,
     CreateNetch    = CREATE_NETCH,
+    CloseHandle    = CLOSE_HANDLE,
 }
 
 impl Sysno {
@@ -28,6 +30,7 @@ impl Sysno {
             SLEEP_MS       => Self::SleepMs,
             MMAP           => Self::Mmap,
             CREATE_NETCH   => Self::CreateNetch,
+            CLOSE_HANDLE   => Self::CloseHandle,
             _              => return None,
         })
     }

@@ -64,6 +64,7 @@ impl UserPageWindow {
                     VirtAddr::new(vaddr),
                     Some(PhysAddr::new(paddr)),
                     perms,
+                    0,
                 ).expect("KSCRATCH intermediate missing — reserve_va_range not run?");
                 riscv::asm::sfence_vma(0, vaddr as usize);
             }
@@ -88,7 +89,7 @@ impl Drop for UserPageWindow {
         for i in 0..self.mapped_pages {
             let vaddr = base + (i * PAGE_SIZE) as u64;
             unsafe {
-                write_leaf_pte(&root, VirtAddr::new(vaddr), None, 0)
+                write_leaf_pte(&root, VirtAddr::new(vaddr), None, 0, 0)
                     .expect("KSCRATCH leaf walk failed on drop");
                 riscv::asm::sfence_vma(0, vaddr as usize);
             }

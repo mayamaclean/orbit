@@ -163,6 +163,10 @@ extern "C" fn s_trap(
                         serial::println!("orbit handling u mode ecall({syscall})");
                         kmain::handle_nc_create_req(epc, hart_context, frame);
                     }
+                    4098 => {
+                        serial::println!("orbit handling u mode ecall({syscall})");
+                        kmain::handle_close_req(epc, hart_context, frame);
+                    }
                     _ => {
                         serial::println!("orbit handling u mode ecall({syscall})");
                         kmain::update_thread_and_trap_frame(epc + 4, hart_context, frame, from_user);
@@ -364,7 +368,7 @@ pub unsafe extern "C" fn _start() -> ! {
 #[unsafe(no_mangle)]
 #[inline(never)]
 unsafe extern "C" fn early_paging_setup(pt_base: *mut u8, pt_size: usize, load_addr: u64) -> u64 {
-    use mmu::{MappingConfig, PAGE_SIZE, PagePermissions};
+    use mmu::{MappingConfig, PAGE_SIZE, PagePermissions, SupervisorTag};
     use mmu::mmap::{PageAlloc, PageTableVec, RootTable, id_map_range, map_va_range};
     use mmu::sv48::{PhysAddr, VirtAddr};
 
@@ -394,7 +398,7 @@ unsafe extern "C" fn early_paging_setup(pt_base: *mut u8, pt_size: usize, load_a
         vaddr: VirtAddr::new(0),
         paddr: PhysAddr::new(0),
         log: false,
-        supervisor_tag: None,
+        supervisor_tag: SupervisorTag::None,
     };
 
     // Identity [0, 1 GiB) — low-half MMIO range
