@@ -470,6 +470,7 @@ impl NetChannel {
     /// `get_next_rx` / `get_next_tx` returns the same bytes (smoltcp
     /// hasn't been advanced yet) and we'd stage a duplicate that
     /// deadlocks the queue once the real ack drains.
+    #[cfg_attr(not(feature = "kernel"), allow(unused_variables))]
     pub fn update_tcp(
         &self,
         mut iface: Interface,

@@ -4,7 +4,7 @@ use core::arch::asm;
 use core::sync::{atomic::{AtomicU64, AtomicUsize, Ordering}};
 
 use device::{SysInfo, TrapFrame};
-use mmu::{GB, MB};
+use mmu::{MB};
 use serial::println;
 
 use elf::{endian::LittleEndian};

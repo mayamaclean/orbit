@@ -36,7 +36,7 @@ unsafe extern "C" {
     unsafe fn enter_hart_kcontext_asm(trap_frame: *const ()) -> !;
 }
 
-pub unsafe fn load_thread_into_hart_context_and_jump(context: &'static HartContext, thread: &'static Thread) -> ! {
+pub unsafe fn load_thread_into_hart_context_and_jump(_context: &'static HartContext, thread: &'static Thread) -> ! {
     unsafe {
         // No S-mode interrupts across the register-load → sret window. Without
         // this, a stimer/SSWI landing inside enter_hart_context_asm would

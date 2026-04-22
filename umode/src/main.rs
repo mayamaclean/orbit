@@ -43,6 +43,7 @@ extern "C" fn syscall_arg1(code: usize, arg0: usize, arg1: usize) -> isize {
     r
 }
 
+#[allow(dead_code)]
 extern "C" fn syscall_arg4(code: usize, arg0: usize, arg1: usize, arg2: usize, arg3: usize) -> isize {
     let mut r = 0isize;
     unsafe {
@@ -64,7 +65,7 @@ extern "C" fn syscall_arg4(code: usize, arg0: usize, arg1: usize, arg2: usize, a
 /// kernel assigned (a1) in one trap — avoids needing a user
 /// out-pointer, which the kernel would have to resolve through KDMAP
 /// or a transient page window.
-extern "C" fn syscall_arg4_ret2(code: usize, arg0: usize, arg1: usize, arg2: usize, arg3: usize) -> (isize, isize) {
+extern "C" fn syscall_arg4_ret2(code: usize, arg0: usize, arg1: usize, arg2: usize, arg3: usize, fd: &mut u32) -> isize {
     let mut r0 = 0isize;
     let mut r1 = 0isize;
     unsafe {
@@ -79,7 +80,11 @@ extern "C" fn syscall_arg4_ret2(code: usize, arg0: usize, arg1: usize, arg2: usi
             lateout("a1") r1,
         );
     }
-    (r0, r1)
+    
+    if r0 == 0 {
+        *fd = r1 as u32;
+    }
+    r0
 }
 
 fn sleep_ms(ms: usize) -> isize {
@@ -90,6 +95,7 @@ fn serial_print(ptr: usize, len: usize) -> isize {
     syscall_arg1(1, ptr, len)
 }
 
+#[allow(dead_code)]
 fn mmap(addr: usize, len: usize, permissions: usize, share_with_kernel: bool) -> isize {
     syscall_arg4(4096, addr, len, permissions, share_with_kernel as usize)
 }
@@ -105,7 +111,8 @@ fn exit(code: isize) -> ! {
 /// assigned (pass this to `close_handle` to tear down the channel).
 /// On failure returns a negative errno.
 fn create_netch(vaddr_hint: usize, region_size: usize, sock_type: usize) -> Result<(usize, u32), ()> {
-    let (va, fd) = syscall_arg4_ret2(4097, vaddr_hint, region_size, sock_type, 0);
+    let mut fd = 0;
+    let va = syscall_arg4_ret2(4097, vaddr_hint, region_size, sock_type, 0, &mut fd);
     if va < 0 { Err(()) } else { Ok((va as usize, fd as u32)) }
 }
 

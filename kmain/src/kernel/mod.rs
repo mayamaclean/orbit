@@ -10,26 +10,37 @@ use device::{HartContext, Stack, TrapFrame};
 use dtoolkit::fdt::FdtNode;
 use dtoolkit::{Node, fdt::{Fdt}};
 use elf::endian::LittleEndian;
-use heapless::spsc::Queue;
-use mem::frame::FrameAllocator;
-use mem::{round_u64_down, round_u64_up, round_usize_up};
-use mmu::mmap::{PageAlloc, id_map_range, map_address_range, unmap, unmap_page};
+use mem::{round_u64_down, round_u64_up};
+use mmu::mmap::{PageAlloc, map_address_range, unmap, unmap_page};
 use mmu::sv48::{PageTable, PhysAddr, VirtAddr};
+// `PAGE_SIZE` (usize) intentionally shadows the u64 re-export from
+// `orbit_abi::layout::*` below — kmain consumes the usize form internally.
+#[allow(hidden_glob_reexports)]
 use mmu::{KB, MB, MappingConfig, PAGE_SIZE, PagePermissions, SupervisorTag};
 use net_channel::NetChannel;
-use process::{CloseHandleReq, Frame, MappingKind, MemMapReq, NetChannelCreationReq, PThread, PhysBacking, Process, Shared, Thread, ThreadBlockReason, ThreadState, UserMapping, UserOnly};
+use process::{
+    CloseHandleReq, Frame, MappingKind, MemMapReq, 
+    NetChannelCreationReq, PThread, PhysBacking, Process,
+    Shared, Thread, ThreadBlockReason, ThreadState,
+    UserMapping, UserOnly
+};
 
 use crate::kernel::handle::{Handle, ProcessHandles};
 use crate::kernel::memmap::FrameToKdmap;
 use crate::kernel::shared_user_ptr::SharedUserPtr;
 use riscv::register::satp::{Mode, Satp};
 use riscv::register::sstatus::SPP;
-use serial::println;
 use smoltcp::iface::{Config, Interface, SocketHandle};
 use smoltcp::wire::{EthernetAddress};
 use tracing::{error, info, warn};
 
-use crate::drivers::e1000::{E1000, E1000Pbuf, RX_RING_BUFS_BYTES, RX_RING_BYTES, RX_RING_LEN, RxDesc, TX_RING_BUFS_BYTES, TX_RING_BYTES, TX_RING_LEN, TxDesc};
+use crate::drivers::e1000::{
+    E1000, E1000Pbuf, RX_RING_BUFS_BYTES,
+    RX_RING_BYTES, RX_RING_LEN, RxDesc,
+    TX_RING_BUFS_BYTES, TX_RING_BYTES,
+    TX_RING_LEN, TxDesc
+};
+
 use crate::kernel::context::get_hart_context;
 use crate::kernel::pci::PciDevice;
 use crate::{NetPackage, SocketReq, supervisor_wake_hart};
@@ -375,10 +386,8 @@ impl Orbit {
 
         core::sync::atomic::fence(Ordering::SeqCst);
 
-        unsafe {
-            riscv::asm::sfence_vma(thread.pid as usize, 0);
-            riscv::asm::sfence_vma(0, 0);
-        }
+        riscv::asm::sfence_vma(thread.pid as usize, 0);
+        riscv::asm::sfence_vma(0, 0);
 
         serial::println!("fulfilled {req:?}:\n\tpa=0x{backing_pa_raw:016X} {layout:08X?}");
 
@@ -485,9 +494,7 @@ impl Orbit {
 
         core::sync::atomic::fence(Ordering::SeqCst);
 
-        unsafe {
-            riscv::asm::sfence_vma(thread.pid as usize, 0);
-        }
+        riscv::asm::sfence_vma(thread.pid as usize, 0);
 
         let socket_req = SocketReq {
             netchan: shared,

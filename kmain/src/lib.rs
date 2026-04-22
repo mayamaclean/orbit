@@ -5,12 +5,12 @@ extern crate alloc;
 use core::{arch::asm, ptr::null_mut, sync::atomic::{AtomicBool, Ordering}};
 use alloc::{collections::btree_map::BTreeMap, vec::Vec};
 use device::{HartContext, TrapFrame};
-use mmu::{PAGE_SIZE, sv48::PageTable};
+use mmu::PAGE_SIZE;
 use net_channel::NetChannel;
 use crate::kernel::shared_user_ptr::SharedUserPtr;
 use process::{CloseHandleReq, MemMapReq, NetChannelCreationReq, Thread, ThreadBlockReason, ThreadState};
 use riscv::register::sstatus::SPP;
-use smoltcp::{iface::{PollResult, SocketHandle, SocketSet, SocketStorage}, socket::dhcpv4, storage::{PacketBuffer, RingBuffer}};
+use smoltcp::{iface::{PollResult, SocketHandle, SocketSet}, socket::dhcpv4, storage::RingBuffer};
 
 use crate::{drivers::e1000::E1000, kernel::context::{enter_hart_context, exit_thread_with_state, get_hart_context, hart_has_thread}};
 

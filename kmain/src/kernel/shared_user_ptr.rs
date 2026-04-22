@@ -188,7 +188,7 @@ impl<T> SharedUserPtr<T> {
             }
 
             pte.set_raw(0);
-            unsafe { riscv::asm::sfence_vma(pid as usize, va as usize); }
+            riscv::asm::sfence_vma(pid as usize, va as usize);
 
             va += PAGE_SIZE as u64;
         }

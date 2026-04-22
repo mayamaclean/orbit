@@ -4,7 +4,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use mem::frame::FrameAllocator;
 use mem::round_u64_up;
-use mmu::mmap::{PageAlloc, RootTable, id_map_range, map_va_range, reserve_va_range, unmap_range, virt_to_phys};
+use mmu::mmap::{PageAlloc, RootTable, map_va_range, reserve_va_range, unmap_range, virt_to_phys};
 use mmu::sv48::{PageTable, PhysAddr, VirtAddr};
 use mmu::{MappingConfig, PAGE_SIZE, PagePermissions, SupervisorTag};
 use process::{Frame, Shared, Table, UserOnly};
@@ -91,10 +91,6 @@ impl FrameToKdmap for Frame<Table> {
 // typed `PhysAddr` / `KdmapVa` return values so the caller's intent is
 // visible at the boundary.
 // =========================================================================
-
-const PAGE_LAYOUT: Layout = unsafe {
-    Layout::from_size_align_unchecked(PAGE_SIZE, PAGE_SIZE)
-};
 
 /// Pool of pages that back Sv48 intermediate tables. Every alloc
 /// materializes a new table, which the kernel always needs to zero and
@@ -459,25 +455,6 @@ fn pool_regions(layout: &KernelLayout) -> [Region; 3] {
             name: "ktables",
         },
     ]
-}
-
-unsafe fn map_region(rt: &RootTable<'_>, pa: &mut PageAlloc, r: &Region) -> Result<(), ()> {
-    let cfg = MappingConfig {
-        permissions: r.perms,
-        levels: 4,
-        page_size: PAGE_SIZE as u64,
-        vaddr: VirtAddr::new(0),
-        paddr: PhysAddr::new(0),
-        log: false,
-        supervisor_tag: SupervisorTag::None,
-    };
-    match unsafe { id_map_range(rt, pa, cfg, r.range.clone()) } {
-        Ok(_) => Ok(()),
-        Err(_) => {
-            serial::println!("memmap: failed mapping {} {:016X?}", r.name, r.range);
-            Err(())
-        }
-    }
 }
 
 /// Map `pa_range` at an explicit virtual start. Picks gigapage / megapage /

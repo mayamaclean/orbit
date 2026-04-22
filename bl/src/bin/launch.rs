@@ -53,9 +53,7 @@ extern "C" fn m_trap(epc: usize,
 {
     if cause == 0 {
         loop {
-            unsafe {
-                riscv::asm::wfi();
-            }
+            riscv::asm::wfi();
         }
     }
 
@@ -128,7 +126,7 @@ extern "C" fn m_trap(epc: usize,
 				// Environment (system) call from User mode
 				println!("E-call from User mode! CPU#{} -> 0x{:08x}", hart, epc);
                 loop{riscv::asm::wfi();}
-				return_pc += 4;
+				//return_pc += 4;
 			},
 			9 => {
 				// Environment (system) call from Supervisor mode

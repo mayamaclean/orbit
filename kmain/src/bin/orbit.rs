@@ -14,7 +14,6 @@ use kmain::{check_context_and_switch, supervisor_clear_ipi};
 use kmain::kernel::Orbit;
 use kmain::kernel::context::{enter_hart_context, fault_thread};
 use kmain::kernel::memmap::{map_kernel_self, unmap_boot_only_regions};
-use mmu::{GB, MB};
 use mmu::mmap::PageAlloc;
 use mmu::{PAGE_SIZE, sv48::PageTable};
 use process::{FaultInfo, ThreadState};
@@ -23,7 +22,7 @@ use riscv::{register::{satp::Mode, stvec::{Stvec, TrapMode}}};
 
 use linked_list_allocator::LockedHeap;
 
-use mem::{frame::FrameAllocator, round_u64_up};
+use mem::{round_u64_up};
 use serial::println;
 
 use tracing::{Level};
@@ -374,7 +373,7 @@ unsafe extern "C" fn early_paging_setup(pt_base: *mut u8, pt_size: usize, load_a
 
     let mut ptv = PageTableVec::new(pt_base as usize, pt_size);
     let Ok(root_pa) = (unsafe { ptv.allocate_page_table() }) else {
-        loop { unsafe { riscv::asm::wfi(); } }
+        loop { riscv::asm::wfi(); }
     };
     // Early trampoline tables live in identity-mapped RAM (bias = 0), so
     // PA == VA. Zero the freshly-allocated root before exposing it as a
@@ -403,11 +402,11 @@ unsafe extern "C" fn early_paging_setup(pt_base: *mut u8, pt_size: usize, load_a
 
     // Identity [0, 1 GiB) — low-half MMIO range
     if unsafe { id_map_range(&root, &mut pages, cfg, 0..(1u64 << 30)) }.is_err() {
-        loop { unsafe { riscv::asm::wfi(); } }
+        loop { riscv::asm::wfi(); }
     }
     // Identity [2, 4 GiB) — all of RAM (kernel image, kheap, kpages, ktables, dtb)
     if unsafe { id_map_range(&root, &mut pages, cfg, (2u64 << 30)..(4u64 << 30)) }.is_err() {
-        loop { unsafe { riscv::asm::wfi(); } }
+        loop { riscv::asm::wfi(); }
     }
 
     // High-half kernel image: 2 MiB at KTEXT_NOMINAL -> load_addr. One 2 MiB
@@ -417,7 +416,7 @@ unsafe extern "C" fn early_paging_setup(pt_base: *mut u8, pt_size: usize, load_a
     let ktext = kmain::kernel::memmap::KTEXT_NOMINAL;
     let len = 2u64 * 1024 * 1024;
     if unsafe { map_va_range(&root, &mut pages, cfg, ktext, load_addr..(load_addr + len)) }.is_err() {
-        loop { unsafe { riscv::asm::wfi(); } }
+        loop { riscv::asm::wfi(); }
     }
 
     // KDMAP: 2 GiB of RAM at KDMAP_NOMINAL → [2 GiB, 4 GiB). Both ends are
@@ -426,7 +425,7 @@ unsafe extern "C" fn early_paging_setup(pt_base: *mut u8, pt_size: usize, load_a
     // their KDMAP VAs before the final satp is installed.
     let kdmap = kmain::kernel::memmap::KDMAP_NOMINAL;
     if unsafe { map_va_range(&root, &mut pages, cfg, kdmap, (2u64 << 30)..(4u64 << 30)) }.is_err() {
-        loop { unsafe { riscv::asm::wfi(); } }
+        loop { riscv::asm::wfi(); }
     }
 
     // satp: Sv48 (mode=9), asid=0, ppn = root / 4096. Early tables are

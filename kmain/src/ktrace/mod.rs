@@ -1,8 +1,4 @@
-use core::str::FromStr;
-
-use alloc::string::String;
 use tracing::{Event, Id, Level, Metadata, Subscriber, field::Visit};
-use tracing_subscriber::Layer;
 
 pub struct OrbitSubscriber {
     max_level: Level

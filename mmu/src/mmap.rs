@@ -94,6 +94,7 @@ impl<'a> PageAlloc<'a> {
         }
     }
 
+    #[cfg_attr(not(feature = "alloc"), allow(unused_variables))]
     pub fn free_page(&mut self, phys_addr: u64) -> Result<(), ()> {
         match self {
             Self::PTV(_v) => Err(()),
