@@ -15,6 +15,7 @@ use mmu::PAGE_SIZE;
 use mmu::PagePermissions;
 use mmu::mmap::write_leaf_pte;
 use mmu::sv48::{PhysAddr, VirtAddr};
+use tracing::warn;
 
 use crate::kernel::memmap;
 
@@ -84,17 +85,35 @@ impl UserPageWindow {
 
 impl Drop for UserPageWindow {
     fn drop(&mut self) {
+        // Scope guard so `WINDOW_ACTIVE` clears even if the per-leaf
+        // teardown panics or early-returns. Without this, a failure
+        // here would strand the single-slot window forever and
+        // permanently block every subsequent `map()`. The nested
+        // struct exists only for its Drop.
+        struct ActiveGuard;
+        impl Drop for ActiveGuard {
+            fn drop(&mut self) {
+                WINDOW_ACTIVE.store(false, Ordering::Release);
+            }
+        }
+        let _active_guard = ActiveGuard;
+
         let base = memmap::kscratch_base();
         let root = current_satp_root();
         for i in 0..self.mapped_pages {
             let vaddr = base + (i * PAGE_SIZE) as u64;
             unsafe {
-                write_leaf_pte(&root, VirtAddr::new(vaddr), None, 0, 0)
-                    .expect("KSCRATCH leaf walk failed on drop");
+                // Log and continue rather than panic — the worst
+                // consequence of a skipped leaf clear is a stale R/W
+                // mapping at a kernel-only VA (KSCRATCH), overwritten
+                // on the next `map()`. Panicking in Drop compounds a
+                // recoverable issue into a dead kernel.
+                if let Err(e) = write_leaf_pte(&root, VirtAddr::new(vaddr), None, 0, 0) {
+                    warn!("UserPageWindow::drop: leaf teardown failed at {vaddr:#x}: {e:?}");
+                }
                 riscv::asm::sfence_vma(0, vaddr as usize);
             }
         }
-        WINDOW_ACTIVE.store(false, Ordering::Release);
     }
 }
 

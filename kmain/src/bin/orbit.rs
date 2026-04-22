@@ -148,7 +148,7 @@ extern "C" fn s_trap(
                         }
                     },
                     1 => {
-                        debug!("orbit handling u mode ecall({syscall})");
+                        //debug!("orbit handling u mode ecall({syscall})");
                         kmain::handle_serial_print(epc, hart_context, frame);
                     }
                     2 => {

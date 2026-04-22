@@ -34,7 +34,9 @@ struct OrbitVisitor(pub(super) &'static str);
 impl Visit for OrbitVisitor {
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn core::fmt::Debug) {
         if field.name() == "message" {
-            serial::println!("{}: {:?}", self.0, value);
+            serial::println!("{}t {}: {:?}",
+                riscv::register::time::read64(),
+                self.0, value);
         } else {
             serial::println!("{}: {}=\"{:?}\"", self.0, field.name(), value);
         }
@@ -50,7 +52,9 @@ impl log::Log for OrbitLogger {
 
     fn log(&self, record: &log::Record) {
         if self.enabled(record.metadata()) {
-            serial::println!("{}: {}", record.level(), record.args());
+            serial::println!("{}t {}: {}",
+                riscv::register::time::read64(),
+                record.level(), record.args());
         }
     }
 

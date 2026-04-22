@@ -154,11 +154,13 @@ impl<T> SharedUserPtr<T> {
     /// [`RootTable`] built from the owner's satp
     /// (`kernel_root_from_pa(satp.ppn() * 4096)` — Orbit has the helper).
     ///
-    /// Order: clear each leaf's V bit and `sfence.vma` before moving on,
-    /// and flip `revoked` only after the last PTE is gone. So a concurrent
-    /// observer of `is_revoked() == true` is guaranteed the user mapping
-    /// is actually unreachable — "revoked" is a post-condition, not a
-    /// plan.
+    /// `revoked` flips `true` on every exit path that reached the walk,
+    /// whether it completed or bailed mid-range. An error's `Err` tells
+    /// the caller *how far* we got; the flag tells them *anything was
+    /// touched*. Without this, a mid-walk error would leave earlier
+    /// leaves cleared but `revoked == false`, so `try_as_ref` would
+    /// still hand back `Some(&T)` for a region that's partially
+    /// unreachable — a silent lie.
     ///
     /// Local-hart sfence only. Cross-hart TLB shootdown is a follow-up;
     /// the rest of orbit's unmap paths have the same limitation today.
@@ -167,6 +169,16 @@ impl<T> SharedUserPtr<T> {
             return Ok(());
         }
 
+        let walk_result = self.revoke_walk(root);
+
+        // Set unconditionally after the walk — see above for why a
+        // mid-walk error still needs the flag set.
+        self.inner.revoked.store(true, Ordering::Release);
+
+        walk_result
+    }
+
+    fn revoke_walk(&self, root: &RootTable<'_>) -> Result<(), RevokeError> {
         let pid = self.inner.owner_pid;
         let start = self.inner.user_va;
         let end = start + self.inner.len as u64;
@@ -193,7 +205,6 @@ impl<T> SharedUserPtr<T> {
             va += PAGE_SIZE as u64;
         }
 
-        self.inner.revoked.store(true, Ordering::Release);
         Ok(())
     }
 

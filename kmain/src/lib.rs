@@ -310,8 +310,31 @@ pub extern "C" fn k_net(device: *mut NetPackage) {
         }
 
         while let Some(handle) = socket_deletions.dequeue() {
-            let _ = user_conns.remove(&handle);
-            sockets.remove(handle);
+            // Defensive: the revoked-flag prune below may have already
+            // removed this handle via close_handle's indirect path. If
+            // user_conns doesn't know about it, smoltcp's `sockets`
+            // doesn't either, and `sockets.remove` panics on an absent
+            // handle. Tie the two removals together.
+            if user_conns.remove(&handle).is_some() {
+                sockets.remove(handle);
+            }
+        }
+
+        // Prune any user_conns whose channel has been revoked — today
+        // that means close_handle fired kernel-side, flipping the flag
+        // and dropping the manager's Arc. Without this loop, k_net
+        // keeps polling a dead channel and holding the last clone of
+        // the backing, so neither the smoltcp socket state nor the
+        // Shared frame ever gets released until the process itself
+        // exits. Collect-then-remove to sidestep the mut-borrow
+        // conflict on user_conns.
+        let revoked: Vec<SocketHandle> = user_conns.iter()
+            .filter_map(|(h, req)| req.netchan.is_revoked().then_some(*h))
+            .collect();
+
+        for h in revoked {
+            let _ = user_conns.remove(&h);
+            sockets.remove(h);
         }
 
         for (sock_handle, req) in user_conns.iter_mut() {
@@ -499,7 +522,9 @@ pub fn handle_serial_print(epc: usize, hart_context: &'static HartContext, frame
             let guard = UserAccess::enter();
             let slice = guard.slice(arg0, arg1);
             if let Ok(s) = core::str::from_utf8(slice) {
-                serial::print!("USER[{}.{}] {s}", thread.pid, thread.tid);
+                serial::print!("{}t USER[{}.{}] {s}",
+                    riscv::register::time::read64(),
+                    thread.pid, thread.tid);
             }
             else {
                 ret = -4;
