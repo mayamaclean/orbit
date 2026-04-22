@@ -275,6 +275,7 @@ pub extern "C" fn k_net(device: *mut NetPackage) {
     let dhcp_handle = sockets.add(dhcp_sock);
 
     let mut user_conns: BTreeMap<smoltcp::iface::SocketHandle, SocketReq> = BTreeMap::new();
+    let mut user_revocations: Vec<SocketHandle> = Vec::new();
 
     let mut next_poll = 0;
     loop {
@@ -328,27 +329,36 @@ pub extern "C" fn k_net(device: *mut NetPackage) {
         // Shared frame ever gets released until the process itself
         // exits. Collect-then-remove to sidestep the mut-borrow
         // conflict on user_conns.
-        let revoked: Vec<SocketHandle> = user_conns.iter()
-            .filter_map(|(h, req)| req.netchan.is_revoked().then_some(*h))
-            .collect();
+        user_conns.iter()
+            .for_each(|(h, req)| {
+                req.netchan.is_revoked().then(|| user_revocations.push(*h));
+            });
 
-        for h in revoked {
+        for h in user_revocations.drain(..) {
             let _ = user_conns.remove(&h);
             sockets.remove(h);
         }
 
         for (sock_handle, req) in user_conns.iter_mut() {
-            let nc = req.netchan.as_ref();
-
-            if req.nc_type == 0 {
-                let socket = sockets.get_mut::<smoltcp::socket::tcp::Socket>(*sock_handle);
-                iface = nc.update_tcp(
-                    iface,
-                    socket,
-                    &mut req.pending_rx_ack,
-                    &mut req.pending_tx_ack,
-                );
+            if let Some(nc) = req.netchan.try_as_ref() {
+                if req.nc_type == 0 {
+                    let socket = sockets.get_mut::<smoltcp::socket::tcp::Socket>(*sock_handle);
+                    iface = nc.update_tcp(
+                        iface,
+                        socket,
+                        &mut req.pending_rx_ack,
+                        &mut req.pending_tx_ack,
+                    );
+                }
             }
+            else {
+                user_revocations.push(*sock_handle);
+            }
+        }
+
+        for h in user_revocations.drain(..) {
+            let _ = user_conns.remove(&h);
+            sockets.remove(h);
         }
         
         let default_wake = now + 100_000;
