@@ -22,3 +22,11 @@ net_channel = {path = "../net_channel", features = ["kernel"] }
 tracing = { version = "0.1.44", default-features = false, features = [] }
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["alloc"] }
 log = { version = "0.4.29",  default-features = false }
+
+[features]
+# Default: kmain embeds orbit-loader and the initial process is the
+# network-driven loader (see orbit-loader/). Enable `smoke` to embed
+# umode directly — used by ./smoke so the automated self-test doesn't
+# need a host-side sender.
+default = []
+smoke   = []

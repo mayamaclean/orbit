@@ -28,14 +28,17 @@ die()  { echo "FAIL: $*" >&2; exit 1; }
 note() { printf ">> %s\n" "$*"; }
 
 # --- build layers ---
-# Profile choice is fixed by the include_bytes paths in each upper layer:
-#   kmain/src/kernel/mod.rs   embeds umode/target/…/release/umode
+# Smoke uses kmain's `smoke` feature to embed umode directly instead of
+# orbit-loader; the automated self-test doesn't need the network-driven
+# spawn loop and this keeps the run deterministic (no DHCP latency, no
+# host-side payload sender). Include paths per layer:
+#   kmain/src/kernel/mod.rs   embeds umode/target/…/release/umode under `smoke`
 #   bl/src/lib.rs             embeds kmain/target/…/release/orbit
 note "building umode (release)"
 ( cd "$ROOT/umode" && time cargo build --release --bin umode >/dev/null )
 
-note "building kmain (release via build.sh)"
-( cd "$ROOT/kmain" && time ./build.sh >/tmp/orbit-smoke-kmain-build.log 2>&1 ) \
+note "building kmain (release via build.sh, --features smoke)"
+( cd "$ROOT/kmain" && time ./build.sh --features smoke >/tmp/orbit-smoke-kmain-build.log 2>&1 ) \
   || die "kmain build failed (see /tmp/orbit-smoke-kmain-build.log)"
 
 note "building bl (release)"
