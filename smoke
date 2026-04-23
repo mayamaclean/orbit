@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+#
+# Orbit end-to-end smoke test. Builds the three privilege layers in the
+# order their include_bytes paths require, boots QEMU, and drives the
+# umode TCP loopback demo via an nc(1) listener on the host.
+#
+# QEMU's user-mode NAT maps the guest's default gateway (192.168.76.2)
+# to the host loopback, so an nc listener on host :65535 receives the
+# guest's connection. The feeder sends "hi!" then "exit" after the guest
+# has connected; "exit" is what umode's recv loop looks for to drop into
+# the close_handle path.
+#
+# Expected path:
+#   hello world → sleep 5s → nc_create → tcp connect
+#     → send "Hello World!" → recv "hi!" → recv "exit" → close_handle
+#
+# Exit 0 on success; non-zero on first missing marker. Override
+# QEMU_TIMEOUT in the environment to adjust the overall wall-clock cap.
+
+set -euo pipefail
+
+ROOT=$(cd "$(dirname "$0")" && pwd)
+QEMU_LOG=/tmp/orbit-smoke-qemu.log
+NC_LOG=/tmp/orbit-smoke-nc.log
+: "${QEMU_TIMEOUT:=25}"
+
+die()  { echo "FAIL: $*" >&2; exit 1; }
+note() { printf ">> %s\n" "$*"; }
+
+# --- build layers ---
+# Profile choice is fixed by the include_bytes paths in each upper layer:
+#   kmain/src/kernel/mod.rs   embeds umode/target/…/release/umode
+#   bl/src/lib.rs             embeds kmain/target/…/release/orbit
+note "building umode (release)"
+( cd "$ROOT/umode" && time cargo build --release --bin umode >/dev/null )
+
+note "building kmain (release via build.sh)"
+( cd "$ROOT/kmain" && time ./build.sh >/tmp/orbit-smoke-kmain-build.log 2>&1 ) \
+  || die "kmain build failed (see /tmp/orbit-smoke-kmain-build.log)"
+
+note "building bl (release)"
+( cd "$ROOT/bl" && time cargo build --release --bin launch >/dev/null )
+
+BL_BIN="$ROOT/bl/target/riscv64gc-unknown-none-elf/release/launch"
+[ -x "$BL_BIN" ] || die "bl binary missing at $BL_BIN"
+
+# --- pre-flight: is port 65535 free? ---
+# A stale nc from a prior failed run will squat on the port and make the
+# new listener fail silently, after which the guest's SYN gets RST and
+# "tcp connected!" never appears in the log.
+if ss -ltn 2>/dev/null | grep -q ':65535 '; then
+  die "port 65535 already in use — kill the existing listener first (ss -ltnp | grep :65535)"
+fi
+
+# --- host-side listener ---
+# The feeder runs as nc's stdin. The initial sleep lets the guest finish
+# its 5s sleep, create the netchannel, and complete the TCP handshake
+# before we send anything. The gap between "hi!" and "exit" is so umode
+# sees them as distinct TCP segments — recv_tcp looks for "exit" as a
+# prefix, and a combined "hi!\nexit\n" packet would start with "hi!".
+note "starting nc listener on :65535"
+(
+  sleep 10
+  printf 'hi!\n'
+  sleep 2
+  printf 'exit\n'
+  sleep 1
+) | nc -l 65535 >"$NC_LOG" 2>&1 &
+NC_PID=$!
+
+# Give nc a moment to bind before we launch QEMU. A guest SYN that
+# arrives before nc is listening gets RST by the host kernel.
+sleep 1
+kill -0 "$NC_PID" 2>/dev/null || die "nc failed to start (port 65535 in use?)"
+
+trap 'kill "$NC_PID" 2>/dev/null || true' EXIT
+
+# --- run qemu ---
+# stdin is explicitly /dev/null so QEMU doesn't put the user's terminal
+# into raw mode (via -serial mon:stdio) and then stall waiting on reads.
+# Without this, when run from an interactive shell the serial output
+# never reaches the log before timeout kills QEMU.
+note "booting qemu (timeout ${QEMU_TIMEOUT}s)"
+timeout "$QEMU_TIMEOUT" qemu-system-riscv64 \
+  -d guest_errors -smp 4 -m 2G \
+  -machine virt,aclint=on -cpu max,sstc=true \
+  -nographic -bios none -serial mon:stdio \
+  -netdev user,id=orbit0,net=192.168.76.0/24,dhcpstart=192.168.76.9 \
+  -device e1000,netdev=orbit0 \
+  -kernel "$BL_BIN" \
+  </dev/null >"$QEMU_LOG" 2>&1 || true
+
+# Kill nc explicitly before waiting — if QEMU timed out before umode's
+# close_handle reached the socket, nc never sees a clean FIN and would
+# otherwise hang here indefinitely.
+kill "$NC_PID" 2>/dev/null || true
+wait "$NC_PID" 2>/dev/null || true
+
+# --- verify guest serial log ---
+[ -s "$QEMU_LOG" ] || die "QEMU produced no output (log empty: $QEMU_LOG). \
+Is qemu-system-riscv64 on PATH? Did something kill QEMU before it could boot?"
+
+note "checking QEMU serial log markers"
+MARKERS=(
+  'USER\[1\.1\] hello world!'
+  'USER\[1\.1\] netchannel created!'
+  'USER\[1\.1\] tcp connected!'
+  'USER\[1\.1\] hi!'
+  'USER\[1\.1\] exit'
+  'USER\[1\.1\] close_handle ok!'
+)
+for pat in "${MARKERS[@]}"; do
+  if ! grep -qE "$pat" "$QEMU_LOG"; then
+    die "missing marker in QEMU log: $pat  (see $QEMU_LOG)"
+  fi
+done
+
+# --- verify host-side receive ---
+note "checking nc received guest payload"
+grep -q 'Hello World!' "$NC_LOG" \
+  || die "nc did not receive 'Hello World!' from guest (see $NC_LOG)"
+
+tail -n 25 $QEMU_LOG
+note "PASS"

@@ -1,5 +1,4 @@
 use core::alloc::Layout;
-use core::ptr::null_mut;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use core::time::Duration;
 
@@ -43,7 +42,7 @@ use crate::drivers::e1000::{
 
 use crate::kernel::context::get_hart_context;
 use crate::kernel::pci::PciDevice;
-use crate::{NetPackage, SocketReq, supervisor_wake_hart};
+use crate::{NetPackage, SocketReq};
 
 pub mod context;
 pub mod handle;
@@ -283,17 +282,11 @@ impl Orbit {
     fn handle_mmap_req<'t>(&mut self, thread: &'t mut Thread, req: MemMapReq) {
         info!("handling mmap req {req:08X?}");
         
-        let large_align = 2 * MB as usize;
-        let (align, levels) = if (req.size % large_align) == 0 && (req.vaddr % large_align) == 0 {
-            (large_align, 3)
-        }
-        else if (req.size % PAGE_SIZE) == 0 && (req.vaddr % PAGE_SIZE) == 0 {
-            (PAGE_SIZE, 4)
-        }
+        let Some(orbit_core::manager::MappingGeometry { align, levels }) =
+            orbit_core::manager::select_mapping_geometry(req.vaddr, req.size)
         else {
             error!("failed to select alignment for mmap req: {req:?}");
             thread.frame.regs[10] = -1isize as usize;
-
             return
         };
 
@@ -858,53 +851,33 @@ impl Orbit {
     }
     
     pub fn assign_threads(&mut self, context: &'static HartContext) {
+        use orbit_core::sched::HartView;
+
+        // `sscratch` on this hart points at its own HartContext inside the
+        // contiguous array allocated at boot; subtract the hart id to get
+        // the array base, then index for each remote. Built lazily so no
+        // per-tick allocation happens.
         let hart_root = unsafe {
             (riscv::register::sscratch::read() as *const HartContext)
                 .sub(context.hart_id as usize)
         };
+        let self_hart_id = context.hart_id as usize;
+        let cpu_count = self.cpu_count;
 
-        for hart in 0..self.cpu_count {
-            if hart == context.hart_id as usize {
-                continue
+        let self_view = HartView {
+            hart_id: context.hart_id as u32,
+            current: &context.current,
+        };
+        let remotes = (0..cpu_count).filter(move |&i| i != self_hart_id).map(move |i| {
+            let hc = unsafe { hart_root.add(i).as_ref_unchecked() };
+            HartView {
+                hart_id: hc.hart_id as u32,
+                current: &hc.current,
             }
+        });
 
-            let hart_context = unsafe {
-                hart_root.add(hart).as_ref_unchecked()
-            };
-
-            if hart_context.current.load(Ordering::Acquire) != null_mut() {
-                //serial::println!("skipping CPU{hart} (busy)");
-                continue
-            }
-
-            if let Some(t) = self.get_runnable_thread() {
-                let thread = unsafe {
-                    t.0.as_mut_unchecked()
-                };
-
-                //info!("assigning thread{} state{} to CPU{hart}", thread.tid, thread.state.load(Ordering::Acquire));
-
-                thread.ticks = thread.ticks.wrapping_add(1);
-                thread.state.store(ThreadState::Assigned as usize, Ordering::Release);
-
-                hart_context.current.store(t.0 as usize as *mut (), Ordering::Release);
-
-                supervisor_wake_hart(hart);
-            }
-        }
-
-        if let Some(t) = self.get_runnable_thread() {
-            let thread = unsafe {
-                t.0.as_mut_unchecked()
-            };
-
-            //info!("assigning thread{} state{} to CPU{}", thread.tid, thread.state.load(Ordering::Acquire), context.hart_id);
-
-            thread.ticks = thread.ticks.wrapping_add(1);
-            thread.state.store(ThreadState::Assigned as usize, Ordering::Release);
-
-            context.current.store(t.0 as usize as *mut (), Ordering::Release);
-        }
+        let mut hw = crate::hw::RiscvHardware;
+        orbit_core::sched::assign_threads(&self_view, remotes, self, &mut hw);
     }
 
     pub fn print_threads(&self) {
@@ -1629,6 +1602,13 @@ impl Orbit {
                 }
             }
         }
+    }
+}
+
+impl orbit_core::sched::Scheduler for Orbit {
+    fn next_runnable(&mut self) -> Option<&mut Thread> {
+        self.get_runnable_thread()
+            .map(|pt| unsafe { pt.0.as_mut_unchecked() })
     }
 }
 

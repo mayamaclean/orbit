@@ -5,17 +5,16 @@ extern crate alloc;
 use core::{arch::asm, ptr::null_mut, sync::atomic::{AtomicBool, Ordering}};
 use alloc::{collections::btree_map::BTreeMap, vec::Vec};
 use device::{HartContext, TrapFrame};
-use mmu::PAGE_SIZE;
 use net_channel::NetChannel;
 use crate::kernel::shared_user_ptr::SharedUserPtr;
-use process::{CloseHandleReq, MemMapReq, NetChannelCreationReq, Thread, ThreadBlockReason, ThreadState};
-use riscv::register::sstatus::SPP;
+use process::{Thread, ThreadState};
 use smoltcp::{iface::{PollResult, SocketHandle, SocketSet}, socket::dhcpv4, storage::RingBuffer};
 
 use crate::{drivers::e1000::E1000, kernel::context::{enter_hart_context, exit_thread_with_state, get_hart_context, hart_has_thread}};
 
 pub mod channel;
 pub mod drivers;
+pub mod hw;
 pub mod kernel;
 pub mod ktrace;
 
@@ -475,217 +474,71 @@ pub fn update_thread_and_trap_frame(
 ) {
     let cptr = hart_context.current.load(Ordering::Acquire);
     if cptr == null_mut() { return; }
-    unsafe {
-        let thread: &Thread = (cptr as *const Thread).as_ref_unchecked();
-
-        // Always safe: asid restore is for this hart's post-trap kernel work.
-        frame.asid = thread.pid as usize;
-
-        // Only snapshot thread state if the trap actually describes the
-        // thread's own execution. Mismatch means an S-mode interrupt fired
-        // while the kernel was mid-context-switch for a user thread (SIE
-        // left on inside enter_hart_context_asm) — EPC points into kernel
-        // .text, and saving it as thread.pc would break sret on resume.
-        let trap_was_in_thread = (thread.mode == SPP::User) == from_user;
-        if !trap_was_in_thread { return; }
-
-        let thread_state = thread.state.load(Ordering::Acquire);
-        if thread_state == ThreadState::Running as usize
-            || thread_state == ThreadState::Suspended as usize
-            || thread_state == ThreadState::Blocking as usize
-        {
-            let frame_ptr = thread.frame as *const TrapFrame as *mut TrapFrame;
-            core::ptr::copy_nonoverlapping(frame as *const _, frame_ptr, 1);
-            thread.pc.store(epc, Ordering::Release);
-        }
-    }
+    let thread: &Thread = unsafe { (cptr as *const Thread).as_ref_unchecked() };
+    orbit_core::trap::update_trap_frame(thread, epc, frame, from_user);
 }
 
 pub fn handle_serial_print(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
+    dispatch_syscall(epc, hart_context, frame, |t, f| {
+        orbit_core::syscall::serial_print(t, f, &mut crate::hw::RiscvHardware)
+    });
+}
+
+/// Shared dispatch shim for syscall handlers whose body lives in
+/// `orbit_core::syscall`. Resolves the current thread, invokes `body`, then
+/// applies the [`orbit_core::SyscallOutcome`] — writing the return register,
+/// snapshotting the frame into `thread.frame`, and invoking
+/// `exit_thread_with_state` on yield.
+fn dispatch_syscall<F>(
+    epc: usize,
+    hart_context: &'static HartContext,
+    frame: &mut TrapFrame,
+    body: F,
+) where
+    F: FnOnce(&mut Thread, &mut TrapFrame) -> orbit_core::SyscallOutcome,
+{
     unsafe {
         let current = hart_context.current.load(Ordering::Acquire);
         if current == null_mut() {
             frame.regs[10] = (-1 as isize) as usize;
-            return
+            return;
         }
+        let thread = (current as *mut Thread).as_mut_unchecked();
 
-        let thread = (current as *const Thread)
-            .as_ref_unchecked();
-
-        let root_table = crate::kernel::memmap::kernel_root_from_pa(thread.root_table_addr() as u64);
-
-        // Syscalls run under the user's satp (no more satp-swap at trap
-        // entry), so the user VA is directly addressable — but only while
-        // SUM is set. Pre-validate the mapping via a PT walk so a bad user
-        // pointer turns into a syscall error instead of an S-mode fault.
-        let mut ret = 0isize;
-
-        let arg0 = frame.regs[11] as u64;
-        let arg1 = frame.regs[12];
-        if arg1 > PAGE_SIZE {
-            ret = -3;
-        }
-        else if mmu::mmap::virt_to_phys(&root_table, mmu::sv48::VirtAddr::new(arg0)).is_none() {
-            ret = -2;
-        }
-        else {
-            let guard = UserAccess::enter();
-            let slice = guard.slice(arg0, arg1);
-            if let Ok(s) = core::str::from_utf8(slice) {
-                serial::print!("{}t USER[{}.{}] {s}",
-                    riscv::register::time::read64(),
-                    thread.pid, thread.tid);
+        match body(thread, frame) {
+            orbit_core::SyscallOutcome::Return { ret } => {
+                frame.regs[10] = ret as usize;
             }
-            else {
-                ret = -4;
+            orbit_core::SyscallOutcome::Yield { state, ret } => {
+                if let Some(r) = ret {
+                    frame.regs[10] = r as usize;
+                }
+                let frame_ptr = thread.frame as *const TrapFrame as usize as *mut TrapFrame;
+                core::ptr::copy_nonoverlapping(frame as *const _, frame_ptr, 1);
+                thread.pc.store(epc + 4, Ordering::Release);
+                exit_thread_with_state(state);
             }
-            drop(guard);
         }
-
-        frame.regs[10] = ret as usize;
-
-        // restore asid after potential switch from user mode
-        frame.asid = thread.pid as usize;
-
-        let frame_ptr = thread.frame as *const TrapFrame as usize as *mut TrapFrame;
-        core::ptr::copy_nonoverlapping(
-            frame as *const _,
-            frame_ptr,
-            1);
-
-        thread.pc.store(epc + 4, Ordering::Release);
-
-        exit_thread_with_state(ThreadState::Ready)
     }
 }
 
 pub fn handle_ms_sleep(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
-    unsafe {
-        let current = hart_context.current.load(Ordering::Acquire);
-        if current == null_mut() {
-            frame.regs[10] = (-1 as isize) as usize;
-            return
-        }
-
-        if frame.regs[11] >= (60 * 60 * 1000) {
-            frame.regs[10] = (-2 as isize) as usize;
-            return
-        }
-
-        let thread = (current as *mut Thread)
-            .as_mut_unchecked();
-
-        const TICKS_PER_MS: usize = 10_000;
-        let wake_time = riscv::register::time::read()
-            .wrapping_add(frame.regs[11].wrapping_mul(TICKS_PER_MS));
-
-        thread.wake_time = wake_time;
-
-        frame.regs[10] = 0;
-
-        let frame_ptr = thread.frame as *const TrapFrame as usize as *mut TrapFrame;
-        core::ptr::copy_nonoverlapping(
-            frame as *const _,
-            frame_ptr,
-            1);
-
-        thread.pc.store(epc + 4, Ordering::Release);
-        
-        exit_thread_with_state(ThreadState::Suspended);
-    }
+    dispatch_syscall(epc, hart_context, frame, |t, f| {
+        orbit_core::syscall::ms_sleep(t, f.regs[11], &crate::hw::RiscvHardware)
+    });
 }
 
 #[unsafe(no_mangle)]
 pub fn handle_mmap_req(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
-    unsafe {
-        let current = hart_context.current.load(Ordering::Acquire);
-        if current == null_mut() {
-            frame.regs[10] = (-1 as isize) as usize;
-            return
-        }
-
-        let thread = (current as *mut Thread)
-            .as_mut_unchecked();
-
-        let mmap_req = MemMapReq {
-            vaddr: frame.regs[11],
-            size: frame.regs[12],
-            page_permissions: frame.regs[13] as u64,
-            share_with_kernel: frame.regs[14] > 0
-        };
-
-        thread.block_reason = ThreadBlockReason::MemMap(mmap_req);
-        
-        let frame_ptr = thread.frame as *const TrapFrame as usize as *mut TrapFrame;
-        core::ptr::copy_nonoverlapping(
-            frame as *const _,
-            frame_ptr,
-            1);
-
-        thread.pc.store(epc + 4, Ordering::Release);
-        
-        exit_thread_with_state(ThreadState::Blocking);
-    }
+    dispatch_syscall(epc, hart_context, frame, |t, f| orbit_core::syscall::mmap_req(t, f));
 }
 
 #[unsafe(no_mangle)]
 pub fn handle_close_req(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
-    unsafe {
-        let current = hart_context.current.load(Ordering::Acquire);
-        if current == null_mut() {
-            frame.regs[10] = (-1 as isize) as usize;
-            return
-        }
-
-        let thread = (current as *mut Thread)
-            .as_mut_unchecked();
-
-        let req = CloseHandleReq {
-            fd: frame.regs[11] as u32,
-        };
-
-        thread.block_reason = ThreadBlockReason::CloseHandle(req);
-
-        let frame_ptr = thread.frame as *const TrapFrame as usize as *mut TrapFrame;
-        core::ptr::copy_nonoverlapping(
-            frame as *const _,
-            frame_ptr,
-            1);
-
-        thread.pc.store(epc + 4, Ordering::Release);
-
-        exit_thread_with_state(ThreadState::Blocking);
-    }
+    dispatch_syscall(epc, hart_context, frame, |t, f| orbit_core::syscall::close_req(t, f));
 }
 
 #[unsafe(no_mangle)]
 pub fn handle_nc_create_req(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
-    unsafe {
-        let current = hart_context.current.load(Ordering::Acquire);
-        if current == null_mut() {
-            frame.regs[10] = (-1 as isize) as usize;
-            return
-        }
-
-        let thread = (current as *mut Thread)
-            .as_mut_unchecked();
-
-        let nc_req = NetChannelCreationReq {
-            nc_vaddr: frame.regs[11],
-            region_size: frame.regs[12],
-            nc_type: frame.regs[13],
-        };
-
-        thread.block_reason = ThreadBlockReason::NetChannelCreation(nc_req);
-
-        let frame_ptr = thread.frame as *const TrapFrame as usize as *mut TrapFrame;
-        core::ptr::copy_nonoverlapping(
-            frame as *const _,
-            frame_ptr,
-            1);
-
-        thread.pc.store(epc + 4, Ordering::Release);
-
-        exit_thread_with_state(ThreadState::Blocking);
-    }
+    dispatch_syscall(epc, hart_context, frame, |t, f| orbit_core::syscall::nc_create_req(t, f));
 }

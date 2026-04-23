@@ -130,7 +130,7 @@ pub unsafe extern "C" fn _start() -> ! {
     const TEST: &'static str = "hello world!\n";
     let _ = serial_print(TEST.as_ptr() as usize, TEST.len());
 
-    sleep_ms(5000);
+    sleep_ms(2000);
 
     // Ask the kernel to create a NetChannel. The hint is above
     // USER_TEXT_BASE (0x2_2000_0000) so it can't clip into the stack
