@@ -32,13 +32,17 @@ impl FakeSched {
 }
 
 impl Scheduler for FakeSched {
-    fn next_runnable(&mut self) -> Option<&mut Thread> {
+    fn next_runnable(&mut self) -> Option<*mut Thread> {
         let idx = self.next;
         if idx >= self.threads.len() {
             return None;
         }
         self.next += 1;
-        self.threads.get_mut(idx)
+        // Raw pointer with provenance from the Vec's allocation, not
+        // from a per-element `&mut` reborrow — the pointer must survive
+        // the scope of this call so the remote hart can deref it later.
+        // SAFETY: `idx` is in-bounds (checked above).
+        Some(unsafe { self.threads.as_mut_ptr().add(idx) })
     }
 }
 
@@ -220,4 +224,67 @@ fn no_remotes_still_assigns_to_self() {
 
     assert!(assigned(&slots[0]));
     assert!(hw.wakes.is_empty());
+}
+
+/// One pass must satisfy several simultaneous invariants per thread:
+///   - each assigned thread has `ticks` bumped by EXACTLY 1
+///   - each assigned thread is in `ThreadState::Assigned`
+///   - every slot points to a distinct thread from our queue
+///   - every thread in the queue ends up pointed-at by some slot
+///
+/// Using distinct initial ticks across threads (so a shared/global
+/// increment wouldn't look right) and asserting per-thread.
+#[test]
+fn distribution_preserves_per_thread_invariants() {
+    let slots = make_slots(4);
+    let (self_view, remote_views) = views(&slots);
+    let mut sched = FakeSched::with(4);
+    // Seed distinct starting ticks: [10, 20, 30, 40]
+    for (i, t) in sched.threads.iter_mut().enumerate() {
+        t.ticks = 10 * (i as u8 + 1);
+    }
+    let expected_addrs: Vec<*const Thread> =
+        sched.threads.iter().map(|t| t as *const _).collect();
+    let mut hw = FakeHw::default();
+
+    assign_threads(&self_view, remote_views.iter().copied(), &mut sched, &mut hw);
+
+    // Per-thread: tick+=1 (NOT shared), state==Assigned.
+    let expected_ticks: [u8; 4] = [11, 21, 31, 41];
+    for (i, t) in sched.threads.iter().enumerate() {
+        assert_eq!(
+            t.ticks, expected_ticks[i],
+            "thread[{i}] ticks should be {} (was {}), bumped by exactly 1",
+            expected_ticks[i], t.ticks
+        );
+        assert_eq!(
+            t.state.load(Ordering::Acquire),
+            ThreadState::Assigned as usize,
+            "thread[{i}] should be Assigned"
+        );
+    }
+
+    // Published ptrs are distinct and cover every thread in the queue.
+    let published: Vec<*const Thread> = slots
+        .iter()
+        .map(|s| s.load(Ordering::Acquire) as *const Thread)
+        .collect();
+    let mut sorted_pub = published.clone();
+    sorted_pub.sort();
+    sorted_pub.dedup();
+    assert_eq!(
+        sorted_pub.len(),
+        4,
+        "four slots must hold four distinct thread pointers"
+    );
+    for addr in &expected_addrs {
+        assert!(
+            published.contains(addr),
+            "every queued thread must be pointed at by some slot"
+        );
+    }
+
+    // No Ready thread left over (queue drained).
+    assert!(sched.threads.iter().all(|t| t.state.load(Ordering::Acquire)
+        != ThreadState::Ready as usize));
 }

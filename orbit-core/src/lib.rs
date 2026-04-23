@@ -10,6 +10,7 @@
 use process::ThreadState;
 
 pub mod manager;
+pub mod net;
 pub mod sched;
 pub mod syscall;
 pub mod trap;
@@ -53,10 +54,9 @@ pub trait Hardware {
 
 /// What a pure syscall handler tells the shim to do after it returns.
 ///
-/// The shim is responsible for the actual side effects (writing the return
-/// register, snapshotting the trap frame into the thread, bumping `pc`,
-/// invoking `exit_thread_with_state`). The pure handler only mutates
-/// in-memory state and reports the intended outcome.
+/// The pure handler only mutates in-memory state and reports the intended
+/// outcome; [`apply_syscall_outcome`] translates that into the concrete
+/// frame / pc / state mutations a shim needs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyscallOutcome {
     /// Commit side effects (snapshot frame, bump pc) and yield the current
@@ -67,7 +67,59 @@ pub enum SyscallOutcome {
     /// value is written into `thread.frame.regs[10]` at unblock time.
     Yield { state: ThreadState, ret: Option<isize> },
 
-    /// Write `ret` into `regs[10]` and return to the trap dispatcher without
-    /// yielding. Used for synchronous error returns.
+    /// Write `ret` into `regs[10]`, commit the frame snapshot + pc bump
+    /// (so the thread resumes past the ecall with `ret` visible), and
+    /// return to the trap dispatcher without yielding. Used for
+    /// synchronous error returns from handlers that don't block.
     Return { ret: isize },
+}
+
+/// What the shim should do after [`apply_syscall_outcome`] commits the
+/// thread/frame state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShimAction {
+    /// The thread's state is already runnable; the shim returns
+    /// normally from the trap dispatcher (kmain's s_trap then calls
+    /// `check_context_and_switch`).
+    Resume,
+    /// The thread must yield into `state` via the context-switch asm.
+    /// kmain's shim invokes `exit_thread_with_state(state)` which
+    /// doesn't return.
+    Yield(ThreadState),
+}
+
+/// Translate a [`SyscallOutcome`] into thread-state mutations + a
+/// [`ShimAction`]. Shared between kmain's real shim and host tests so
+/// the two can't drift — a bug in here is caught at
+/// `cargo test`, not only when QEMU boots and a thread loops on an
+/// ecall forever.
+///
+/// Both variants commit the frame snapshot into `thread.frame` and
+/// advance `thread.pc` to `epc + 4`. The variants differ only in what
+/// the shim does next: `Return` falls back through the trap dispatcher,
+/// `Yield` triggers the context-switch asm.
+pub fn apply_syscall_outcome(
+    outcome: SyscallOutcome,
+    thread: &mut process::Thread,
+    frame: &mut device::TrapFrame,
+    epc: usize,
+) -> ShimAction {
+    use core::sync::atomic::Ordering;
+
+    match outcome {
+        SyscallOutcome::Return { ret } => {
+            frame.regs[10] = ret as usize;
+            *thread.frame = *frame;
+            thread.pc.store(epc + 4, Ordering::Release);
+            ShimAction::Resume
+        }
+        SyscallOutcome::Yield { state, ret } => {
+            if let Some(r) = ret {
+                frame.regs[10] = r as usize;
+            }
+            *thread.frame = *frame;
+            thread.pc.store(epc + 4, Ordering::Release);
+            ShimAction::Yield(state)
+        }
+    }
 }

@@ -343,3 +343,131 @@ pub const PAGE_TABLE_ENTRY_COUNT: usize = 4096 / core::mem::size_of::<PageTableE
 pub struct PageTable {
     pub entries: [PageTableEntry; PAGE_TABLE_ENTRY_COUNT]
 }
+
+#[cfg(test)]
+mod pte_pack_tests {
+    use super::*;
+    use crate::PagePermissions;
+
+    // ---- pack_leaf ----
+
+    #[test]
+    fn leaf_always_sets_v_a_d() {
+        let raw = PageTableEntry::pack_leaf(0, 0, 0);
+        assert_ne!(raw & PageTableEntry::VALID, 0, "V must be set");
+        assert_ne!(raw & PageTableEntry::ACCESSED, 0, "A must be set");
+        assert_ne!(raw & PageTableEntry::DIRTY, 0, "D must be set");
+    }
+
+    #[test]
+    fn leaf_encodes_ppn_at_bit_10() {
+        let ppn = 0x12345;
+        let raw = PageTableEntry::pack_leaf(ppn, 0, 0);
+        // PPN lives at bits [10..54) — shift back should recover it.
+        assert_eq!((raw >> PageTableEntry::PPN_OFFSETS[0]) & 0x0F_FFFF_FFFF_FFFF, ppn);
+    }
+
+    #[test]
+    fn leaf_masks_perms_to_r_w_x_u_g_only() {
+        // A dirty permission input with junk bits outside PERMS_MASK
+        // must not leak into the PTE.
+        let junky = 0xFFFFu64;
+        let raw = PageTableEntry::pack_leaf(0, junky, 0);
+        // Only the PERMS_MASK (R|W|X|U|G = 0x3E) bits of `junky` should
+        // appear in the PTE's permission slot.
+        let perm_bits = raw & PageTableEntry::PERMS_MASK;
+        assert_eq!(perm_bits, junky & PageTableEntry::PERMS_MASK);
+        // Junk outside PERMS_MASK must not contaminate bits 8..10 (rsw)
+        // or bit 0 (V).
+        assert_eq!(raw & (1 << 0), PageTableEntry::VALID);
+    }
+
+    #[test]
+    fn leaf_encodes_permissions_roundtrip() {
+        let perms = (PagePermissions::R | PagePermissions::W) | PagePermissions::U as u64;
+        let raw = PageTableEntry::pack_leaf(0, perms, 0);
+        assert_ne!(raw & PageTableEntry::READABLE, 0);
+        assert_ne!(raw & PageTableEntry::WRITEABLE, 0);
+        assert_ne!(raw & PageTableEntry::USER_PAGE, 0);
+        assert_eq!(raw & PageTableEntry::EXECUTABLE, 0);
+    }
+
+    #[test]
+    fn leaf_encodes_rsw_in_bits_8_9() {
+        for rsw in 0u8..=3 {
+            let raw = PageTableEntry::pack_leaf(0, 0, rsw);
+            assert_eq!(((raw >> 8) & 0b11) as u8, rsw);
+        }
+        // High bits of rsw are truncated to 2 bits.
+        let raw = PageTableEntry::pack_leaf(0, 0, 0b1110);
+        assert_eq!(((raw >> 8) & 0b11) as u8, 0b10);
+    }
+
+    // ---- pack_table ----
+
+    #[test]
+    fn table_sets_only_v_no_perms() {
+        let raw = PageTableEntry::pack_table(0x2222);
+        assert_ne!(raw & PageTableEntry::VALID, 0);
+        // Interior PTEs must not have R/W/X set — that's what makes
+        // them interior per the Sv48 spec.
+        assert_eq!(raw & PageTableEntry::READABLE, 0);
+        assert_eq!(raw & PageTableEntry::WRITEABLE, 0);
+        assert_eq!(raw & PageTableEntry::EXECUTABLE, 0);
+        // A/D not set either.
+        assert_eq!(raw & PageTableEntry::ACCESSED, 0);
+        assert_eq!(raw & PageTableEntry::DIRTY, 0);
+    }
+
+    #[test]
+    fn table_encodes_ppn() {
+        let ppn = 0xABCDE;
+        let raw = PageTableEntry::pack_table(ppn);
+        assert_eq!((raw >> PageTableEntry::PPN_OFFSETS[0]) & 0x0F_FFFF_FFFF_FFFF, ppn);
+    }
+
+    // ---- set_raw / get_raw ----
+
+    #[test]
+    fn raw_roundtrip_via_set_get() {
+        let pte = PageTableEntry::new(0);
+        let value = PageTableEntry::pack_leaf(0x1_2345, PagePermissions::R as u64, 0);
+        pte.set_raw(value);
+        assert_eq!(pte.get_raw(), value);
+    }
+
+    #[test]
+    fn get_ppn_extracts_full_ppn_field() {
+        let ppn = 0x3_FFFF;
+        let pte = PageTableEntry::new(PageTableEntry::pack_leaf(ppn, 0, 0));
+        // get_ppn masks the full PPN region; shifted back it recovers ppn.
+        assert_eq!(pte.get_ppn() >> PageTableEntry::PPN_OFFSETS[0], ppn);
+    }
+
+    // ---- constants sanity ----
+
+    #[test]
+    fn perms_mask_covers_r_w_x_u_g() {
+        assert_eq!(
+            PageTableEntry::PERMS_MASK,
+            PageTableEntry::READABLE
+                | PageTableEntry::WRITEABLE
+                | PageTableEntry::EXECUTABLE
+                | PageTableEntry::USER_PAGE
+                | PageTableEntry::GLOBAL
+        );
+    }
+
+    #[test]
+    fn flag_bit_positions_match_spec() {
+        // RISC-V priv-spec layout: V=0, R=1, W=2, X=3, U=4, G=5, A=6, D=7.
+        assert_eq!(PageTableEntry::VALID,      1 << 0);
+        assert_eq!(PageTableEntry::READABLE,   1 << 1);
+        assert_eq!(PageTableEntry::WRITEABLE,  1 << 2);
+        assert_eq!(PageTableEntry::EXECUTABLE, 1 << 3);
+        assert_eq!(PageTableEntry::USER_PAGE,  1 << 4);
+        assert_eq!(PageTableEntry::GLOBAL,     1 << 5);
+        assert_eq!(PageTableEntry::ACCESSED,   1 << 6);
+        assert_eq!(PageTableEntry::DIRTY,      1 << 7);
+    }
+}

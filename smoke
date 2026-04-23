@@ -108,6 +108,16 @@ MARKERS=(
   'USER\[1\.1\] hi!'
   'USER\[1\.1\] exit'
   'USER\[1\.1\] close_handle ok!'
+  # Syscall error-path assertions run from the umode test harness —
+  # each validates a specific kernel return-code branch that the happy
+  # path never touches.
+  'PASS: sleep_ms at cap got -2'
+  'PASS: sleep_ms above cap got -2'
+  'PASS: serial_print null VA got -2'
+  'PASS: serial_print too long got -3'
+  'PASS: serial_print non-utf8 got -4'
+  'PASS: close_handle no registry got -1'
+  'PASS: close_handle bogus fd got -2'
 )
 for pat in "${MARKERS[@]}"; do
   if ! grep -qE "$pat" "$QEMU_LOG"; then

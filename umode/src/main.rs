@@ -124,11 +124,71 @@ fn close_handle(fd: u32) -> isize {
     syscall_arg0(4098, fd as usize)
 }
 
+/// Emit a line through the serial-print syscall. Wraps `serial_print`
+/// for string-literal callers; the kernel prepends its standard
+/// `{time}t USER[pid.tid] ` tag via the handler.
+fn print(s: &str) {
+    let _ = serial_print(s.as_ptr() as usize, s.len());
+}
+
+/// Report a PASS/FAIL line for a single error-path scenario. The smoke
+/// script greps for "PASS: <name>" lines to validate each branch fired.
+fn check(name: &str, got: isize, want: isize) {
+    use core::fmt::Write;
+    let mut w = SerialWriter::new();
+    if got == want {
+        let _ = writeln!(w, "PASS: {name} got {got}");
+    } else {
+        let _ = writeln!(w, "FAIL: {name} want {want} got {got}");
+    }
+    w.flush();
+}
+
+/// Exercise syscall error paths that QEMU smoke otherwise never hits.
+/// Each check prints a PASS/FAIL marker the smoke script verifies.
+fn run_error_path_tests() {
+    print("=== error path tests ===\n");
+
+    // --- sleep_ms edge cases ---
+    // The kernel caps sleep at 60*60*1000 ms. `>=` MAX returns -2.
+    check("sleep_ms at cap",    sleep_ms(60 * 60 * 1000),     -2);
+    check("sleep_ms above cap", sleep_ms(60 * 60 * 1000 + 1), -2);
+
+    // --- serial_print error paths ---
+    // NULL-region VA (inside USER_NULL_GUARD_END) never translates → -2.
+    check("serial_print null VA", serial_print(0x1000, 5), -2);
+
+    // len > PAGE_SIZE rejected with -3 before any memory is touched,
+    // so the pointer just needs to be plausible.
+    static FILLER: [u8; 16] = [b'x'; 16];
+    check(
+        "serial_print too long",
+        serial_print(&FILLER as *const u8 as usize, 4097),
+        -3,
+    );
+
+    // Non-UTF-8 bytes rejected with -4. 0xFF is never a valid start byte.
+    static BAD_UTF8: [u8; 4] = [0xFF, 0xFE, 0xFD, 0xFC];
+    check(
+        "serial_print non-utf8",
+        serial_print(&BAD_UTF8 as *const u8 as usize, 4),
+        -4,
+    );
+
+    // --- close_handle before any netchannel exists ---
+    // No process_handles entry for this pid → -1.
+    check("close_handle no registry", close_handle(7), -1);
+
+    print("=== error path tests done ===\n");
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn _start() -> ! {
     // print to serial
     const TEST: &'static str = "hello world!\n";
     let _ = serial_print(TEST.as_ptr() as usize, TEST.len());
+
+    run_error_path_tests();
 
     sleep_ms(2000);
 
@@ -149,6 +209,11 @@ pub unsafe extern "C" fn _start() -> ! {
 
     const OK: &'static str = "netchannel created!\n";
     let _ = serial_print(OK.as_ptr() as usize, OK.len());
+
+    // Bogus fd AFTER a netchannel has been created — process_handles
+    // now has an entry for this pid, but fd 999 isn't in it → -2.
+    // (The earlier `no registry` test hit the no-pid-entry branch.)
+    check("close_handle bogus fd", close_handle(999), -2);
 
     let nc = unsafe { &*(nc_vaddr as *const NetChannel) };
 

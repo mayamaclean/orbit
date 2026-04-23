@@ -364,3 +364,120 @@ pub struct OverlapErr;
 const fn round_up(v: u64, align: u64) -> u64 {
     (v + align - 1) & !(align - 1)
 }
+
+#[cfg(test)]
+mod slot_alloc_tests {
+    use super::SlotAlloc;
+
+    #[test]
+    fn new_is_empty() {
+        let sa = SlotAlloc::new();
+        assert_eq!(sa.len(), 0);
+        for i in 0..SlotAlloc::CAPACITY {
+            assert!(!sa.is_allocated(i));
+        }
+    }
+
+    #[test]
+    fn alloc_returns_0_then_1_then_2() {
+        let mut sa = SlotAlloc::new();
+        assert_eq!(sa.alloc(), Some(0));
+        assert_eq!(sa.alloc(), Some(1));
+        assert_eq!(sa.alloc(), Some(2));
+        assert_eq!(sa.len(), 3);
+        assert!(sa.is_allocated(0));
+        assert!(sa.is_allocated(1));
+        assert!(sa.is_allocated(2));
+        assert!(!sa.is_allocated(3));
+    }
+
+    #[test]
+    fn free_releases_slot_and_next_alloc_reuses() {
+        let mut sa = SlotAlloc::new();
+        let _ = sa.alloc(); // 0
+        let _ = sa.alloc(); // 1
+        sa.free(0);
+        assert!(!sa.is_allocated(0));
+        assert_eq!(sa.len(), 1);
+        // trailing_ones-based alloc finds the first hole → 0 again.
+        assert_eq!(sa.alloc(), Some(0));
+    }
+
+    #[test]
+    fn fills_to_capacity_and_then_returns_none() {
+        let mut sa = SlotAlloc::new();
+        for i in 0..SlotAlloc::CAPACITY {
+            assert_eq!(sa.alloc(), Some(i));
+        }
+        assert_eq!(sa.len(), SlotAlloc::CAPACITY as u32);
+        assert!(sa.alloc().is_none());
+    }
+
+    #[test]
+    fn free_non_allocated_slot_is_noop() {
+        let mut sa = SlotAlloc::new();
+        sa.free(42);
+        assert_eq!(sa.len(), 0);
+        // Subsequent alloc still starts at 0.
+        assert_eq!(sa.alloc(), Some(0));
+    }
+
+    #[test]
+    fn free_in_middle_then_allocate_fills_the_hole() {
+        let mut sa = SlotAlloc::new();
+        for _ in 0..10 {
+            sa.alloc();
+        }
+        sa.free(5);
+        assert_eq!(sa.len(), 9);
+        assert!(!sa.is_allocated(5));
+        // trailing_ones finds bit 5 first.
+        assert_eq!(sa.alloc(), Some(5));
+    }
+
+    #[test]
+    fn len_matches_is_allocated_count() {
+        let mut sa = SlotAlloc::new();
+        let taken: [u16; 5] = [0, 1, 2, 3, 4];
+        for _ in &taken {
+            sa.alloc();
+        }
+        sa.free(1);
+        sa.free(3);
+        let counted = (0..SlotAlloc::CAPACITY)
+            .filter(|i| sa.is_allocated(*i))
+            .count() as u32;
+        assert_eq!(sa.len(), counted);
+    }
+
+    #[test]
+    fn word_boundary_alloc_sequence() {
+        // Capacity is 256 = 4 * 64; allocs cross word boundaries at 64, 128,
+        // 192. Confirm trailing_ones math works across them.
+        let mut sa = SlotAlloc::new();
+        for expected in 0..200u16 {
+            assert_eq!(sa.alloc(), Some(expected));
+        }
+        assert!(sa.is_allocated(63));
+        assert!(sa.is_allocated(64));
+        assert!(sa.is_allocated(127));
+        assert!(sa.is_allocated(128));
+        assert!(sa.is_allocated(199));
+        assert!(!sa.is_allocated(200));
+    }
+
+    #[test]
+    fn free_and_realloc_across_word_boundary() {
+        // Allocate past a word boundary so bit 128 exists, then free
+        // holes in two different words and confirm trailing_ones picks
+        // them up in the expected order (word 1 hole before word 2).
+        let mut sa = SlotAlloc::new();
+        for _ in 0..=128 {
+            sa.alloc();
+        }
+        sa.free(65); // word 1, bit 1
+        sa.free(128); // word 2, bit 0
+        assert_eq!(sa.alloc(), Some(65), "word 1 hole filled first");
+        assert_eq!(sa.alloc(), Some(128), "then word 2");
+    }
+}

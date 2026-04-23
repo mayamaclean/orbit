@@ -38,3 +38,44 @@ impl Errno {
     /// Encode an errno back into a syscall return value.
     pub const fn to_ret(self) -> isize { -(self.0 as isize) }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn non_negative_decodes_as_ok() {
+        assert_eq!(Errno::from_ret(0), Ok(0));
+        assert_eq!(Errno::from_ret(1), Ok(1));
+        assert_eq!(Errno::from_ret(42), Ok(42));
+        assert_eq!(Errno::from_ret(isize::MAX), Ok(isize::MAX as usize));
+    }
+
+    #[test]
+    fn negative_decodes_as_err() {
+        assert_eq!(Errno::from_ret(-EPERM as isize), Err(Errno(EPERM)));
+        assert_eq!(Errno::from_ret(-ENOENT as isize), Err(Errno(ENOENT)));
+        assert_eq!(Errno::from_ret(-EINVAL as isize), Err(Errno(EINVAL)));
+    }
+
+    #[test]
+    fn to_ret_round_trips_through_from_ret() {
+        for &code in &[EPERM, ENOENT, EIO, EAGAIN, ENOMEM, EFAULT, EBUSY,
+                       EEXIST, ENODEV, EINVAL, ENFILE, ENOSYS] {
+            let ret = Errno::new(code).to_ret();
+            assert!(ret < 0, "errno {code} encoded as non-negative {ret}");
+            assert_eq!(Errno::from_ret(ret), Err(Errno(code)));
+        }
+    }
+
+    #[test]
+    fn well_known_codes_match_linux_riscv() {
+        // Pin the numeric values — consumers like a future `std::sys::orbit`
+        // rely on these being identical to Linux's errno table.
+        assert_eq!(EPERM, 1);
+        assert_eq!(ENOENT, 2);
+        assert_eq!(EAGAIN, 11);
+        assert_eq!(EINVAL, 22);
+        assert_eq!(ENOSYS, 38);
+    }
+}

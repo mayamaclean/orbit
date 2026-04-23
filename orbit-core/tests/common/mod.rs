@@ -13,13 +13,36 @@ use riscv::register::sstatus::SPP;
 
 use orbit_core::Hardware;
 
+/// miri extern — marks an allocation as a known root so the leak
+/// checker ignores it. Intentionally leaked test fixtures (our `Thread`
+/// fields are `&'static mut T`, so we can't clean them up without
+/// violating the type) register themselves here.
+#[cfg(miri)]
+unsafe extern "Rust" {
+    fn miri_static_root(ptr: *const u8);
+}
+
+#[cfg(miri)]
+unsafe fn register_root(ptr: *const u8) {
+    unsafe { miri_static_root(ptr); }
+}
+
+#[cfg(not(miri))]
+unsafe fn register_root(_ptr: *const u8) {}
+
 /// Build a minimal runnable `Thread` on the test heap. `frame` and `stack`
 /// are zero-initialized leaked allocations — sufficient for pure-logic
-/// tests that don't execute any asm.
+/// tests that don't execute any asm. Each allocation is registered with
+/// miri so the leak checker accepts it; on non-miri builds
+/// `register_root` is a no-op and the leak is simply tolerated.
 pub fn make_thread(state: ThreadState, mode: SPP) -> Thread {
     unsafe {
-        let frame = &mut *(alloc_zeroed(Layout::new::<TrapFrame>()) as *mut TrapFrame);
-        let stack = &mut *(alloc_zeroed(Layout::new::<Stack>()) as *mut Stack);
+        let frame_ptr = alloc_zeroed(Layout::new::<TrapFrame>()) as *mut TrapFrame;
+        let stack_ptr = alloc_zeroed(Layout::new::<Stack>()) as *mut Stack;
+        register_root(frame_ptr as *const u8);
+        register_root(stack_ptr as *const u8);
+        let frame = &mut *frame_ptr;
+        let stack = &mut *stack_ptr;
         Thread {
             pc: AtomicUsize::new(0),
             state: AtomicUsize::new(state as usize),

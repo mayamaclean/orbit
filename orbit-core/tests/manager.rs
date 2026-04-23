@@ -84,3 +84,36 @@ fn zero_vaddr_is_megapage_aligned() {
         Some(megapage())
     );
 }
+
+/// Brute 5x5 grid over common boundary values. Catches regressions in
+/// the modular-arithmetic predicates that a hand-picked handful would
+/// miss. The expected geometry is computed by the same predicate a
+/// reader would check mentally, so a symmetric bug in both would still
+/// escape — but sign/off-by-one errors against the constants won't.
+#[test]
+fn alignment_grid_matches_predicate() {
+    let values = [
+        0,
+        PAGE_SIZE,
+        MEGAPAGE_SIZE - 1,
+        MEGAPAGE_SIZE,
+        MEGAPAGE_SIZE + PAGE_SIZE,
+    ];
+
+    for &vaddr in &values {
+        for &size in &values {
+            let expected = if vaddr % MEGAPAGE_SIZE == 0 && size % MEGAPAGE_SIZE == 0 {
+                Some(megapage())
+            } else if vaddr % PAGE_SIZE == 0 && size % PAGE_SIZE == 0 {
+                Some(page())
+            } else {
+                None
+            };
+            let got = select_mapping_geometry(vaddr, size);
+            assert_eq!(
+                got, expected,
+                "select_mapping_geometry(vaddr={vaddr:#x}, size={size:#x})"
+            );
+        }
+    }
+}

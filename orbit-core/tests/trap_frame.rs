@@ -12,7 +12,7 @@ use common::{make_frame, make_thread};
 /// User thread, user trap → snapshot proceeds.
 #[test]
 fn user_thread_user_trap_snapshots() {
-    let t = make_thread(ThreadState::Running, SPP::User);
+    let mut t = make_thread(ThreadState::Running, SPP::User);
     t.pc.store(0xDEAD, Ordering::Release);
     t.frame.regs[10] = 0xAA;
 
@@ -20,7 +20,7 @@ fn user_thread_user_trap_snapshots() {
     frame.regs[10] = 0xBB;
     frame.regs[11] = 0xCC;
 
-    trap::update_trap_frame(&t, 0x1000, &mut frame, /* from_user = */ true);
+    trap::update_trap_frame(&mut t, 0x1000, &mut frame, /* from_user = */ true);
 
     assert_eq!(frame.asid, t.pid as usize);
     // pc should have been advanced to the new epc.
@@ -35,14 +35,14 @@ fn user_thread_user_trap_snapshots() {
 /// mode gate exists to prevent (see docs/trap-mode-guard.md).
 #[test]
 fn user_thread_s_mode_trap_does_not_snapshot() {
-    let t = make_thread(ThreadState::Running, SPP::User);
+    let mut t = make_thread(ThreadState::Running, SPP::User);
     t.pc.store(0xDEAD, Ordering::Release);
     t.frame.regs[10] = 0xAA;
 
     let mut frame = make_frame();
     frame.regs[10] = 0xBB;
 
-    trap::update_trap_frame(&t, 0x1000, &mut frame, /* from_user = */ false);
+    trap::update_trap_frame(&mut t, 0x1000, &mut frame, /* from_user = */ false);
 
     assert_eq!(frame.asid, t.pid as usize);
     assert_eq!(t.pc.load(Ordering::Acquire), 0xDEAD, "pc must not move");
@@ -52,13 +52,13 @@ fn user_thread_s_mode_trap_does_not_snapshot() {
 /// Supervisor thread (k_net), S-mode trap → snapshot proceeds.
 #[test]
 fn supervisor_thread_s_mode_trap_snapshots() {
-    let t = make_thread(ThreadState::Running, SPP::Supervisor);
+    let mut t = make_thread(ThreadState::Running, SPP::Supervisor);
     t.pc.store(0xDEAD, Ordering::Release);
 
     let mut frame = make_frame();
     frame.regs[10] = 0xBB;
 
-    trap::update_trap_frame(&t, 0x2000, &mut frame, /* from_user = */ false);
+    trap::update_trap_frame(&mut t, 0x2000, &mut frame, /* from_user = */ false);
 
     assert_eq!(t.pc.load(Ordering::Acquire), 0x2000);
     assert_eq!(t.frame.regs[10], 0xBB);
@@ -68,14 +68,14 @@ fn supervisor_thread_s_mode_trap_snapshots() {
 /// mode gate still rejects) → no snapshot.
 #[test]
 fn supervisor_thread_user_trap_does_not_snapshot() {
-    let t = make_thread(ThreadState::Running, SPP::Supervisor);
+    let mut t = make_thread(ThreadState::Running, SPP::Supervisor);
     t.pc.store(0xDEAD, Ordering::Release);
     t.frame.regs[10] = 0xAA;
 
     let mut frame = make_frame();
     frame.regs[10] = 0xBB;
 
-    trap::update_trap_frame(&t, 0x2000, &mut frame, /* from_user = */ true);
+    trap::update_trap_frame(&mut t, 0x2000, &mut frame, /* from_user = */ true);
 
     assert_eq!(t.pc.load(Ordering::Acquire), 0xDEAD);
     assert_eq!(t.frame.regs[10], 0xAA);
@@ -91,7 +91,7 @@ fn asid_always_updated() {
     let mut frame = make_frame();
     frame.asid = 0;
 
-    trap::update_trap_frame(&t, 0x1000, &mut frame, /* from_user = */ false);
+    trap::update_trap_frame(&mut t, 0x1000, &mut frame, /* from_user = */ false);
 
     assert_eq!(frame.asid, 42);
 }
@@ -99,15 +99,81 @@ fn asid_always_updated() {
 /// Ready/Assigned/Exited states don't snapshot — only Running/Suspended/Blocking do.
 #[test]
 fn non_runnable_state_skips_snapshot() {
-    let t = make_thread(ThreadState::Ready, SPP::User);
+    let mut t = make_thread(ThreadState::Ready, SPP::User);
     t.pc.store(0xDEAD, Ordering::Release);
     t.frame.regs[10] = 0xAA;
 
     let mut frame = make_frame();
     frame.regs[10] = 0xBB;
 
-    trap::update_trap_frame(&t, 0x1000, &mut frame, /* from_user = */ true);
+    trap::update_trap_frame(&mut t, 0x1000, &mut frame, /* from_user = */ true);
 
     assert_eq!(t.pc.load(Ordering::Acquire), 0xDEAD);
     assert_eq!(t.frame.regs[10], 0xAA);
+}
+
+/// Exhaustive `ThreadState × mode × from_user` matrix. Asserts the
+/// snapshot decision matches the documented rule:
+///   gate passes  = (mode == User) == from_user
+///   snapshots if = gate && state ∈ {Running, Suspended, Blocking}
+/// asid is always written regardless of gate.
+#[test]
+fn state_mode_from_user_matrix_is_exhaustive() {
+    const STATES: &[(ThreadState, bool)] = &[
+        (ThreadState::Ready,     false),
+        (ThreadState::Blocking,  true),
+        (ThreadState::Assigned,  false),
+        (ThreadState::Running,   true),
+        (ThreadState::Exited,    false),
+        (ThreadState::Suspended, true),
+    ];
+    const MODES: &[SPP] = &[SPP::User, SPP::Supervisor];
+    const FROM_USER: &[bool] = &[true, false];
+
+    for &(state, is_snapshot_state) in STATES {
+        for &mode in MODES {
+            for &from_user in FROM_USER {
+                let mut t = make_thread(state, mode);
+                t.pc.store(0xDEAD, Ordering::Release);
+                t.frame.regs[10] = 0xAA;
+                t.pid = 9;
+
+                let mut frame = make_frame();
+                frame.regs[10] = 0xBB;
+                frame.asid = 0;
+
+                trap::update_trap_frame(&mut t, 0x2000, &mut frame, from_user);
+
+                // asid is always set (even when gate rejects) — post-trap
+                // kernel work on this hart depends on it.
+                assert_eq!(
+                    frame.asid, 9,
+                    "asid must be written unconditionally (state={state:?}, mode={mode:?}, from_user={from_user})"
+                );
+
+                let gate_passes = (mode == SPP::User) == from_user;
+                let expected_snapshot = gate_passes && is_snapshot_state;
+
+                if expected_snapshot {
+                    assert_eq!(
+                        t.pc.load(Ordering::Acquire), 0x2000,
+                        "pc should advance (state={state:?}, mode={mode:?}, from_user={from_user})"
+                    );
+                    assert_eq!(
+                        t.frame.regs[10], 0xBB,
+                        "frame should snapshot (state={state:?}, mode={mode:?}, from_user={from_user})"
+                    );
+                } else {
+                    assert_eq!(
+                        t.pc.load(Ordering::Acquire), 0xDEAD,
+                        "pc must NOT move (state={state:?}, mode={mode:?}, from_user={from_user})"
+                    );
+                    assert_eq!(
+                        t.frame.regs[10], 0xAA,
+                        "frame must NOT be overwritten (state={state:?}, mode={mode:?}, from_user={from_user})"
+                    );
+                }
+            }
+        }
+    }
 }

@@ -33,19 +33,31 @@ impl<'a> HartView<'a> {
     /// Publish `thread` as this hart's current thread. Release-orders the
     /// store so the target hart observes the assignment after the prior
     /// `thread.state = Assigned` write.
-    pub fn assign(&self, thread: &Thread) {
-        self.current
-            .store(thread as *const Thread as *mut (), Ordering::Release);
+    ///
+    /// Takes `*mut Thread` (not `&mut`) on purpose: the pointer must
+    /// survive the scheduler's per-call borrow scope so the remote hart
+    /// can safely dereference it later. A `&mut` reborrow would push a
+    /// Stacked Borrows tag that gets popped on scope exit, leaving the
+    /// stored raw ptr with dangling provenance — miri catches this.
+    pub fn assign(&self, thread: *mut Thread) {
+        self.current.store(thread as *mut (), Ordering::Release);
     }
 }
 
-/// Source of runnable threads. Each call returns a distinct `&mut Thread`
-/// (or `None` when the queue is empty). The trait takes `&mut self` so the
-/// returned reference's lifetime is bounded by the borrow — callers can't
-/// hold two threads at once, which mirrors how the real Orbit scheduler
-/// pops its queue.
+/// Source of runnable threads. Each call returns a distinct `*mut Thread`
+/// (or `None` when the queue is empty). Raw pointer on purpose: the
+/// scheduler owns the underlying storage (Vec / Box / queue) and hands
+/// out pointers with provenance derived from that storage, not from a
+/// transient `&mut` reborrow. See [`HartView::assign`] for the aliasing
+/// rationale.
 pub trait Scheduler {
-    fn next_runnable(&mut self) -> Option<&mut Thread>;
+    /// # Safety contract
+    ///
+    /// Repeated calls must return pointers to *distinct* threads (no
+    /// aliasing). The caller (assign_threads) dereferences each pointer
+    /// to mutate thread fields before publishing it; concurrent returns
+    /// of the same pointer would race.
+    fn next_runnable(&mut self) -> Option<*mut Thread>;
 }
 
 /// Distribute runnable threads across idle harts.
@@ -77,20 +89,30 @@ pub fn assign_threads<'a, H, S, I>(
             continue;
         }
         let Some(t) = sched.next_runnable() else { return };
-        assign_thread_to(&hart, t);
+        // SAFETY: Scheduler contract guarantees `t` is a distinct,
+        // non-aliased pointer; we hold no other reference to this
+        // thread for the duration of the deref.
+        unsafe { assign_thread_to(&hart, t) };
         hw.wake_hart(hart.hart_id);
     }
 
     if let Some(t) = sched.next_runnable() {
-        assign_thread_to(self_view, t);
+        // SAFETY: as above.
+        unsafe { assign_thread_to(self_view, t) };
     }
 }
 
 #[inline]
-fn assign_thread_to(view: &HartView, thread: &mut Thread) {
-    thread.ticks = thread.ticks.wrapping_add(1);
-    thread
-        .state
-        .store(ThreadState::Assigned as usize, Ordering::Release);
+unsafe fn assign_thread_to(view: &HartView, thread: *mut Thread) {
+    // Raw-pointer writes keep the pointer's provenance rooted in the
+    // scheduler's owning storage. A `&mut Thread` reborrow here would
+    // pop its tag on scope exit and invalidate the raw ptr stored in
+    // `view.current` — see `HartView::assign` docs.
+    unsafe {
+        (*thread).ticks = (*thread).ticks.wrapping_add(1);
+        (*thread)
+            .state
+            .store(ThreadState::Assigned as usize, Ordering::Release);
+    }
     view.assign(thread);
 }

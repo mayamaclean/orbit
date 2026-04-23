@@ -1606,9 +1606,13 @@ impl Orbit {
 }
 
 impl orbit_core::sched::Scheduler for Orbit {
-    fn next_runnable(&mut self) -> Option<&mut Thread> {
-        self.get_runnable_thread()
-            .map(|pt| unsafe { pt.0.as_mut_unchecked() })
+    fn next_runnable(&mut self) -> Option<*mut Thread> {
+        // PThread wraps a raw ptr sourced from the thread registry (Box
+        // allocations); returning it directly keeps provenance rooted
+        // at that allocation — no `&mut` reborrow whose tag would be
+        // popped on return (which would dangle the ptr stored in the
+        // target hart's `current` slot).
+        self.get_runnable_thread().map(|pt| pt.0)
     }
 }
 

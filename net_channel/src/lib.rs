@@ -722,3 +722,538 @@ impl NetChannel {
         self.tx().avail.load(Ordering::Acquire)
     }
 }
+
+#[cfg(test)]
+extern crate std;
+
+#[cfg(test)]
+mod vol_slice_tests {
+    use super::{VolSlice, VolSliceMut};
+    use std::boxed::Box;
+    use std::vec::Vec;
+
+    // miri extern — intentional test leaks register themselves as roots
+    // so the leak checker accepts them without `-Zmiri-ignore-leaks`.
+    #[cfg(miri)]
+    unsafe extern "Rust" {
+        fn miri_static_root(ptr: *const u8);
+    }
+    #[cfg(miri)]
+    unsafe fn register_root(ptr: *const u8) {
+        unsafe { miri_static_root(ptr); }
+    }
+    #[cfg(not(miri))]
+    unsafe fn register_root(_ptr: *const u8) {}
+
+    // Helper: leak a heap buffer of `len` bytes initialized with a
+    // ramp (0, 1, 2, ...). Using the heap keeps pointer provenance
+    // clean for miri — stack arrays have stricter reborrow rules in
+    // some compiler versions.
+    fn leaked_ramp(len: usize) -> *mut u8 {
+        let v: Vec<u8> = (0..len).map(|i| (i & 0xFF) as u8).collect();
+        let boxed = v.into_boxed_slice();
+        let ptr = Box::into_raw(boxed) as *mut u8;
+        // `Vec::new().into_boxed_slice()` yields a dangling sentinel, not
+        // a real allocation; only register real allocations with miri.
+        if len > 0 {
+            unsafe { register_root(ptr as *const u8); }
+        }
+        ptr
+    }
+
+    // ---- VolSliceMut basics ----
+
+    #[test]
+    fn volslice_mut_len_and_is_empty() {
+        let ptr = leaked_ramp(10);
+        let m = unsafe { VolSliceMut::from_raw_parts(ptr, 10) };
+        assert_eq!(m.len(), 10);
+        assert!(!m.is_empty());
+
+        let ptr2 = leaked_ramp(0);
+        let empty = unsafe { VolSliceMut::from_raw_parts(ptr2, 0) };
+        assert_eq!(empty.len(), 0);
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn volslice_mut_copy_from_slice_truncates_to_self_len() {
+        let ptr = leaked_ramp(4);
+        let m = unsafe { VolSliceMut::from_raw_parts(ptr, 4) };
+        // Source longer than self → truncates to 4.
+        let written = m.copy_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]);
+        assert_eq!(written, 4);
+        for i in 0..4 {
+            assert_eq!(m.get(i), [0xAA, 0xBB, 0xCC, 0xDD][i]);
+        }
+    }
+
+    #[test]
+    fn volslice_mut_copy_from_slice_truncates_to_src_len() {
+        let ptr = leaked_ramp(10);
+        let m = unsafe { VolSliceMut::from_raw_parts(ptr, 10) };
+        // Source shorter than self → truncates to 3. Tail bytes untouched.
+        let written = m.copy_from_slice(&[1, 2, 3]);
+        assert_eq!(written, 3);
+        assert_eq!(m.get(0), 1);
+        assert_eq!(m.get(1), 2);
+        assert_eq!(m.get(2), 3);
+        // Index 3 retains the ramp initialization byte.
+        assert_eq!(m.get(3), 3);
+    }
+
+    #[test]
+    fn volslice_mut_set_get_roundtrip() {
+        let ptr = leaked_ramp(4);
+        let m = unsafe { VolSliceMut::from_raw_parts(ptr, 4) };
+        m.set(0, 0x11);
+        m.set(3, 0x44);
+        assert_eq!(m.get(0), 0x11);
+        assert_eq!(m.get(3), 0x44);
+    }
+
+    #[test]
+    fn volslice_mut_checked_variants_return_none_on_oob() {
+        let ptr = leaked_ramp(2);
+        let m = unsafe { VolSliceMut::from_raw_parts(ptr, 2) };
+        assert!(m.get_checked(2).is_none());
+        assert!(m.set_checked(2, 0).is_none());
+        assert_eq!(m.set_checked(0, 7), Some(()));
+        assert_eq!(m.get_checked(0), Some(7));
+    }
+
+    #[test]
+    #[should_panic(expected = "out of bounds")]
+    fn volslice_mut_get_oob_panics() {
+        let ptr = leaked_ramp(2);
+        let m = unsafe { VolSliceMut::from_raw_parts(ptr, 2) };
+        let _ = m.get(5);
+    }
+
+    #[test]
+    #[should_panic(expected = "out of bounds")]
+    fn volslice_mut_set_oob_panics() {
+        let ptr = leaked_ramp(2);
+        let m = unsafe { VolSliceMut::from_raw_parts(ptr, 2) };
+        m.set(2, 0);
+    }
+
+    // ---- VolSliceMut::sub + as_readonly ----
+
+    #[test]
+    fn volslice_mut_sub_in_bounds() {
+        let ptr = leaked_ramp(8);
+        let m = unsafe { VolSliceMut::from_raw_parts(ptr, 8) };
+        let s = m.sub(2, 6);
+        assert_eq!(s.len(), 4);
+        // Ramp: bytes [0,1,2,3,4,5,6,7]; sub [2..6] = [2,3,4,5].
+        for i in 0..4 {
+            assert_eq!(s.get(i), (i + 2) as u8);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "end")]
+    fn volslice_mut_sub_end_oob_panics() {
+        let ptr = leaked_ramp(4);
+        let m = unsafe { VolSliceMut::from_raw_parts(ptr, 4) };
+        let _ = m.sub(0, 5);
+    }
+
+    #[test]
+    #[should_panic(expected = "start")]
+    fn volslice_mut_sub_start_after_end_panics() {
+        let ptr = leaked_ramp(4);
+        let m = unsafe { VolSliceMut::from_raw_parts(ptr, 4) };
+        let _ = m.sub(3, 2);
+    }
+
+    #[test]
+    fn volslice_mut_as_readonly_preserves_len() {
+        let ptr = leaked_ramp(5);
+        let m = unsafe { VolSliceMut::from_raw_parts(ptr, 5) };
+        let ro = m.as_readonly();
+        assert_eq!(ro.len(), 5);
+        // Ramp byte at index 2 = 2.
+        assert_eq!(ro.get(2), 2);
+    }
+
+    // ---- VolSlice ----
+
+    #[test]
+    fn volslice_copy_to_slice_truncates_to_self_len() {
+        let ptr = leaked_ramp(4);
+        let s = unsafe { VolSlice::from_raw_parts(ptr, 4) };
+        let mut dst = [0u8; 10];
+        let n = s.copy_to_slice(&mut dst);
+        assert_eq!(n, 4);
+        assert_eq!(&dst[..4], &[0, 1, 2, 3]);
+        assert_eq!(&dst[4..], &[0u8; 6]); // tail untouched
+    }
+
+    #[test]
+    fn volslice_copy_to_slice_truncates_to_dst_len() {
+        let ptr = leaked_ramp(10);
+        let s = unsafe { VolSlice::from_raw_parts(ptr, 10) };
+        let mut dst = [0u8; 3];
+        let n = s.copy_to_slice(&mut dst);
+        assert_eq!(n, 3);
+        assert_eq!(dst, [0, 1, 2]);
+    }
+
+    #[test]
+    fn volslice_checked_get_returns_none_on_oob() {
+        let ptr = leaked_ramp(3);
+        let s = unsafe { VolSlice::from_raw_parts(ptr, 3) };
+        assert_eq!(s.get_checked(0), Some(0));
+        assert_eq!(s.get_checked(2), Some(2));
+        assert!(s.get_checked(3).is_none());
+        assert!(s.get_checked(999).is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "out of bounds")]
+    fn volslice_get_oob_panics() {
+        let ptr = leaked_ramp(2);
+        let s = unsafe { VolSlice::from_raw_parts(ptr, 2) };
+        let _ = s.get(2);
+    }
+}
+
+#[cfg(test)]
+mod netchannel_layout_tests {
+    //! Tests for `NetChannel::init` + the header/ring layout.
+    //!
+    //! # Known miri caveat
+    //!
+    //! `NetChannel`'s accessor methods (`tx`, `rx`, `rings`, `anchor`,
+    //! `desired_state`, `current_state`) cast `self: &NetChannel` to
+    //! `*const u8` and then `.add(offset)` to reach well past the 8-byte
+    //! struct footprint into the surrounding region. That pointer
+    //! arithmetic is legal, but the dereference is UB under Stacked
+    //! Borrows: the cast-derived ptr has SharedReadOnly provenance for
+    //! only `sizeof(NetChannel)` bytes, not the full region.
+    //!
+    //! In practice the code works — nothing else reborrows against the
+    //! narrow region, and the hardware doesn't track provenance — but
+    //! strictly speaking it's UB. Fixing it properly would turn
+    //! `NetChannel` into a DST `{ queue_len: usize, _rest: [u8] }` or
+    //! move all accessors onto raw pointers taking the region base. Out
+    //! of scope for the initial test sweep.
+    //!
+    //! Accessor-path tests are gated off under miri; the raw-access
+    //! tests below directly read fields via offsets from the
+    //! allocation-rooted base pointer and DO run under miri.
+
+    use super::*;
+    use std::alloc::{Layout, alloc_zeroed, dealloc};
+
+    struct OwnedRegion {
+        base: *mut u8,
+        layout: Layout,
+    }
+
+    impl OwnedRegion {
+        fn new(size: usize) -> Self {
+            let layout = Layout::from_size_align(size, 4096).unwrap();
+            let base = unsafe { alloc_zeroed(layout) };
+            assert!(!base.is_null(), "alloc_zeroed returned null");
+            // SAFETY: NetChannel::init reads/writes the whole region.
+            unsafe { NetChannel::init(base, size) };
+            Self { base, layout }
+        }
+        fn nc(&self) -> &NetChannel {
+            unsafe { &*(self.base as *const NetChannel) }
+        }
+    }
+
+    impl Drop for OwnedRegion {
+        fn drop(&mut self) {
+            unsafe { dealloc(self.base, self.layout) };
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // uses NetChannel accessors — see module docs
+    fn init_stamps_queue_len_and_capacities() {
+        let region = OwnedRegion::new(NC_MIN_REGION_SIZE);
+        let nc = region.nc();
+        assert_eq!(nc.queue_len(), NetChannel::queue_len_for(NC_MIN_REGION_SIZE));
+        assert_eq!(nc.tx().capacity(), NetChannel::capacity_for(NC_MIN_REGION_SIZE));
+        assert_eq!(nc.rx().capacity(), NetChannel::capacity_for(NC_MIN_REGION_SIZE));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn rings_return_buffers_of_expected_capacity() {
+        let region = OwnedRegion::new(NC_MIN_REGION_SIZE);
+        let nc = region.nc();
+        let cap = NetChannel::capacity_for(NC_MIN_REGION_SIZE);
+        let (tx, rx) = nc.rings();
+        assert_eq!(tx.len(), cap);
+        assert_eq!(rx.len(), cap);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn rings_tx_and_rx_do_not_overlap() {
+        let region = OwnedRegion::new(NC_MIN_REGION_SIZE);
+        let nc = region.nc();
+        let (tx, rx) = nc.rings();
+        let tx_start = tx.as_ptr() as usize;
+        let tx_end = tx_start + tx.len();
+        let rx_start = rx.as_ptr() as usize;
+        let rx_end = rx_start + rx.len();
+        assert!(
+            tx_end <= rx_start || rx_end <= tx_start,
+            "tx [{tx_start:#x}..{tx_end:#x}] and rx [{rx_start:#x}..{rx_end:#x}] overlap"
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn rings_are_within_allocated_region() {
+        let region = OwnedRegion::new(NC_MIN_REGION_SIZE);
+        let nc = region.nc();
+        let base = region.base as usize;
+        let end = base + NC_MIN_REGION_SIZE;
+        let (tx, rx) = nc.rings();
+        let tx_start = tx.as_ptr() as usize;
+        let rx_end = rx.as_ptr() as usize + rx.len();
+        assert!(base <= tx_start && rx_end <= end,
+            "rings escape region: base={base:#x} end={end:#x} tx_start={tx_start:#x} rx_end={rx_end:#x}");
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn rings_are_writable_and_readable() {
+        // Exercises raw-pointer derefs through the slice handle end to
+        // end — miri validates each access against the region's
+        // provenance.
+        let region = OwnedRegion::new(NC_MIN_REGION_SIZE);
+        let nc = region.nc();
+        let (tx, rx) = nc.rings();
+
+        tx[0] = 0xAA;
+        tx[tx.len() - 1] = 0xBB;
+        rx[0] = 0xCC;
+        rx[rx.len() - 1] = 0xDD;
+
+        assert_eq!(tx[0], 0xAA);
+        assert_eq!(tx[tx.len() - 1], 0xBB);
+        assert_eq!(rx[0], 0xCC);
+        assert_eq!(rx[rx.len() - 1], 0xDD);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn tx_rx_offsets_match_headers() {
+        // tx lives at NC_TX_OFF; rx lives at NC_TX_OFF + queue_len.
+        // Verify the fixed-offset accessors against the raw base.
+        let region = OwnedRegion::new(NC_MIN_REGION_SIZE);
+        let nc = region.nc();
+        let base = region.base as usize;
+        let tx = nc.tx() as *const _ as usize;
+        let rx = nc.rx() as *const _ as usize;
+        assert_eq!(tx - base, NC_TX_OFF);
+        assert_eq!(rx - base, NC_TX_OFF + nc.queue_len());
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn desired_and_current_states_sit_at_fixed_offsets() {
+        let region = OwnedRegion::new(NC_MIN_REGION_SIZE);
+        let nc = region.nc();
+        let base = region.base as usize;
+        let desired = nc.desired_state() as *const _ as usize;
+        let current = nc.current_state() as *const _ as usize;
+        assert_eq!(desired - base, NC_DESIRED_OFF);
+        assert_eq!(current - base, NC_CURRENT_OFF);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn rings_len_is_zero_or_more_always() {
+        // Grid over several valid region sizes.
+        for &sz in &[NC_MIN_REGION_SIZE, 8192, 16384, NC_MAX_REGION_SIZE] {
+            let region = OwnedRegion::new(sz);
+            let (tx, rx) = region.nc().rings();
+            let cap = NetChannel::capacity_for(sz);
+            assert_eq!(tx.len(), cap);
+            assert_eq!(rx.len(), cap);
+        }
+    }
+
+    // ---- Raw-access tests ----
+    // Read fields via offsets from the allocation-rooted base pointer.
+    // Stay miri-clean because provenance comes from `region.base` (the
+    // alloc_zeroed return), not from a narrow `&NetChannel` reborrow.
+
+    #[test]
+    fn raw_queue_len_written_at_offset_zero() {
+        let region = OwnedRegion::new(NC_MIN_REGION_SIZE);
+        let written = unsafe { *(region.base as *const usize) };
+        assert_eq!(written, NetChannel::queue_len_for(NC_MIN_REGION_SIZE));
+    }
+
+    #[test]
+    fn raw_tx_capacity_written_at_nc_tx_off_plus_capacity_field() {
+        let region = OwnedRegion::new(NC_MIN_REGION_SIZE);
+        let cap_field = core::mem::offset_of!(NetChannelQueue, capacity);
+        let tx_cap_addr = unsafe { region.base.add(NC_TX_OFF + cap_field) as *const usize };
+        let tx_cap = unsafe { *tx_cap_addr };
+        assert_eq!(tx_cap, NetChannel::capacity_for(NC_MIN_REGION_SIZE));
+    }
+
+    #[test]
+    fn raw_rx_capacity_written_at_nc_tx_off_plus_queue_len() {
+        let region = OwnedRegion::new(NC_MIN_REGION_SIZE);
+        let queue_len = NetChannel::queue_len_for(NC_MIN_REGION_SIZE);
+        let cap_field = core::mem::offset_of!(NetChannelQueue, capacity);
+        let rx_cap_addr =
+            unsafe { region.base.add(NC_TX_OFF + queue_len + cap_field) as *const usize };
+        let rx_cap = unsafe { *rx_cap_addr };
+        assert_eq!(rx_cap, NetChannel::capacity_for(NC_MIN_REGION_SIZE));
+    }
+
+    #[test]
+    fn raw_region_is_fully_writable() {
+        // Walk every byte. Provenance from one alloc_zeroed covers the
+        // entire region — miri validates each access.
+        let region = OwnedRegion::new(NC_MIN_REGION_SIZE);
+        for off in 0..NC_MIN_REGION_SIZE {
+            unsafe { region.base.add(off).write(0xA5); }
+        }
+        for off in 0..NC_MIN_REGION_SIZE {
+            assert_eq!(unsafe { *region.base.add(off) }, 0xA5);
+        }
+    }
+}
+
+#[cfg(test)]
+mod region_sizing_tests {
+    use super::*;
+
+    // ---- normalize_region_size ----
+
+    #[test]
+    fn zero_is_rejected() {
+        assert_eq!(NetChannel::normalize_region_size(0), None);
+    }
+
+    #[test]
+    fn min_requested_returns_min() {
+        assert_eq!(
+            NetChannel::normalize_region_size(NC_MIN_REGION_SIZE),
+            Some(NC_MIN_REGION_SIZE)
+        );
+    }
+
+    #[test]
+    fn max_requested_returns_max() {
+        assert_eq!(
+            NetChannel::normalize_region_size(NC_MAX_REGION_SIZE),
+            Some(NC_MAX_REGION_SIZE)
+        );
+    }
+
+    #[test]
+    fn below_min_clamps_up_to_min() {
+        assert_eq!(
+            NetChannel::normalize_region_size(1),
+            Some(NC_MIN_REGION_SIZE)
+        );
+        assert_eq!(
+            NetChannel::normalize_region_size(NC_MIN_REGION_SIZE - 1),
+            Some(NC_MIN_REGION_SIZE)
+        );
+    }
+
+    #[test]
+    fn above_max_clamps_down_to_max() {
+        assert_eq!(
+            NetChannel::normalize_region_size(NC_MAX_REGION_SIZE + 1),
+            Some(NC_MAX_REGION_SIZE)
+        );
+        assert_eq!(
+            NetChannel::normalize_region_size(usize::MAX),
+            Some(NC_MAX_REGION_SIZE)
+        );
+    }
+
+    #[test]
+    fn mid_range_rounds_up_to_page() {
+        // 8192 + 1 should round to 12288 (still in [min, max])
+        assert_eq!(
+            NetChannel::normalize_region_size(8193),
+            Some(12288)
+        );
+        // Already page-aligned passes through.
+        assert_eq!(
+            NetChannel::normalize_region_size(8192),
+            Some(8192)
+        );
+    }
+
+    #[test]
+    fn result_is_always_page_aligned() {
+        for &req in &[1usize, 100, 4095, 4096, 5000, 8192, 100_000] {
+            let r = NetChannel::normalize_region_size(req).unwrap();
+            assert_eq!(r % 4096, 0, "normalized size for {req} should be page-aligned, got {r}");
+            assert!(r >= NC_MIN_REGION_SIZE && r <= NC_MAX_REGION_SIZE);
+        }
+    }
+
+    // ---- queue_len_for ----
+
+    #[test]
+    fn queue_len_is_nc_queue_aligned() {
+        let align = core::mem::align_of::<NetChannelQueue>();
+        for &r in &[NC_MIN_REGION_SIZE, 8192, 16384, NC_MAX_REGION_SIZE] {
+            assert_eq!(
+                NetChannel::queue_len_for(r) % align,
+                0,
+                "queue_len_for({r}) must be aligned to align_of::<NetChannelQueue>() = {align}"
+            );
+        }
+    }
+
+    #[test]
+    fn queue_len_leaves_room_for_both_halves() {
+        for &r in &[NC_MIN_REGION_SIZE, 8192, 16384, NC_MAX_REGION_SIZE] {
+            let q = NetChannel::queue_len_for(r);
+            // tx + rx (each q) + header (NC_TX_OFF) must fit within r.
+            assert!(NC_TX_OFF + 2 * q <= r, "tx+rx overrun region at size {r}");
+        }
+    }
+
+    // ---- capacity_for ----
+
+    #[test]
+    fn capacity_equals_queue_len_minus_header() {
+        for &r in &[NC_MIN_REGION_SIZE, 8192, NC_MAX_REGION_SIZE] {
+            let q = NetChannel::queue_len_for(r);
+            let c = NetChannel::capacity_for(r);
+            // capacity = queue_len - size_of::<NetChannelQueue>() + 1
+            assert_eq!(
+                c,
+                q - core::mem::size_of::<NetChannelQueue>() + 1,
+                "capacity_for({r}) should equal queue_len - header + 1"
+            );
+        }
+    }
+
+    #[test]
+    fn capacity_grows_with_region_size() {
+        let c_min = NetChannel::capacity_for(NC_MIN_REGION_SIZE);
+        let c_max = NetChannel::capacity_for(NC_MAX_REGION_SIZE);
+        assert!(c_min < c_max, "larger region → larger per-ring capacity");
+    }
+
+    #[test]
+    fn min_region_has_positive_capacity() {
+        // If this fires, NC_MIN_REGION_SIZE is too small for the header
+        // + one usable byte — the channel would be useless at the floor.
+        assert!(NetChannel::capacity_for(NC_MIN_REGION_SIZE) > 0);
+    }
+}

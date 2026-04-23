@@ -22,7 +22,12 @@ use riscv::register::sstatus::SPP;
 /// `enter_hart_context_asm`). In that case `epc` points into kernel
 /// `.text` and saving it as `thread.pc` would break `sret` on resume —
 /// see [docs/trap-mode-guard.md](../../docs/trap-mode-guard.md).
-pub fn update_trap_frame(thread: &Thread, epc: usize, frame: &mut TrapFrame, from_user: bool) {
+pub fn update_trap_frame(
+    thread: &mut Thread,
+    epc: usize,
+    frame: &mut TrapFrame,
+    from_user: bool,
+) {
     frame.asid = thread.pid as usize;
 
     let trap_was_in_thread = (thread.mode == SPP::User) == from_user;
@@ -35,10 +40,11 @@ pub fn update_trap_frame(thread: &Thread, epc: usize, frame: &mut TrapFrame, fro
         || state == ThreadState::Suspended as usize
         || state == ThreadState::Blocking as usize
     {
-        unsafe {
-            let frame_ptr = thread.frame as *const TrapFrame as *mut TrapFrame;
-            core::ptr::copy_nonoverlapping(frame as *const _, frame_ptr, 1);
-        }
+        // Mutable access through the Thread owner so we satisfy Stacked
+        // Borrows: writing through `thread.frame as *const ... as *mut`
+        // when `thread: &Thread` is UB (the reborrow was SharedReadOnly
+        // but we write through it).
+        *thread.frame = *frame;
         thread.pc.store(epc, Ordering::Release);
     }
 }

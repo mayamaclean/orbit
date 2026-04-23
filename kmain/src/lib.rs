@@ -191,6 +191,12 @@ pub struct SocketReq {
     pending_tx_ack: bool,
 }
 
+impl orbit_core::net::RevocableConn for SocketReq {
+    fn is_revoked(&self) -> bool {
+        self.netchan.is_revoked()
+    }
+}
+
 #[repr(align(64))]
 pub struct NetPackage {
     phy: Option<E1000>,
@@ -309,34 +315,17 @@ pub extern "C" fn k_net(device: *mut NetPackage) {
             }
         }
 
-        while let Some(handle) = socket_deletions.dequeue() {
-            // Defensive: the revoked-flag prune below may have already
-            // removed this handle via close_handle's indirect path. If
-            // user_conns doesn't know about it, smoltcp's `sockets`
-            // doesn't either, and `sockets.remove` panics on an absent
-            // handle. Tie the two removals together.
-            if user_conns.remove(&handle).is_some() {
-                sockets.remove(handle);
-            }
-        }
+        orbit_core::net::drain_socket_deletions(
+            &mut user_conns,
+            || socket_deletions.dequeue(),
+            |h| { sockets.remove(h); },
+        );
 
-        // Prune any user_conns whose channel has been revoked — today
-        // that means close_handle fired kernel-side, flipping the flag
-        // and dropping the manager's Arc. Without this loop, k_net
-        // keeps polling a dead channel and holding the last clone of
-        // the backing, so neither the smoltcp socket state nor the
-        // Shared frame ever gets released until the process itself
-        // exits. Collect-then-remove to sidestep the mut-borrow
-        // conflict on user_conns.
-        user_conns.iter()
-            .for_each(|(h, req)| {
-                req.netchan.is_revoked().then(|| user_revocations.push(*h));
-            });
-
-        for h in user_revocations.drain(..) {
-            let _ = user_conns.remove(&h);
-            sockets.remove(h);
-        }
+        orbit_core::net::prune_revoked_conns(
+            &mut user_conns,
+            &mut user_revocations,
+            |h| { sockets.remove(h); },
+        );
 
         for (sock_handle, req) in user_conns.iter_mut() {
             if let Some(nc) = req.netchan.try_as_ref() {
@@ -355,10 +344,11 @@ pub extern "C" fn k_net(device: *mut NetPackage) {
             }
         }
 
-        for h in user_revocations.drain(..) {
-            let _ = user_conns.remove(&h);
-            sockets.remove(h);
-        }
+        orbit_core::net::prune_revoked_conns(
+            &mut user_conns,
+            &mut user_revocations,
+            |h| { sockets.remove(h); },
+        );
         
         let default_wake = now + 100_000;
         let wake_time = iface.poll_at(timestamp, &mut sockets)
@@ -474,7 +464,7 @@ pub fn update_thread_and_trap_frame(
 ) {
     let cptr = hart_context.current.load(Ordering::Acquire);
     if cptr == null_mut() { return; }
-    let thread: &Thread = unsafe { (cptr as *const Thread).as_ref_unchecked() };
+    let thread: &mut Thread = unsafe { (cptr as *mut Thread).as_mut_unchecked() };
     orbit_core::trap::update_trap_frame(thread, epc, frame, from_user);
 }
 
@@ -485,10 +475,10 @@ pub fn handle_serial_print(epc: usize, hart_context: &'static HartContext, frame
 }
 
 /// Shared dispatch shim for syscall handlers whose body lives in
-/// `orbit_core::syscall`. Resolves the current thread, invokes `body`, then
-/// applies the [`orbit_core::SyscallOutcome`] — writing the return register,
-/// snapshotting the frame into `thread.frame`, and invoking
-/// `exit_thread_with_state` on yield.
+/// `orbit_core::syscall`. Resolves the current thread, invokes `body`,
+/// then delegates frame/pc commit to
+/// [`orbit_core::apply_syscall_outcome`] so kmain and the host tests
+/// share one implementation of the outcome contract.
 fn dispatch_syscall<F>(
     epc: usize,
     hart_context: &'static HartContext,
@@ -505,19 +495,10 @@ fn dispatch_syscall<F>(
         }
         let thread = (current as *mut Thread).as_mut_unchecked();
 
-        match body(thread, frame) {
-            orbit_core::SyscallOutcome::Return { ret } => {
-                frame.regs[10] = ret as usize;
-            }
-            orbit_core::SyscallOutcome::Yield { state, ret } => {
-                if let Some(r) = ret {
-                    frame.regs[10] = r as usize;
-                }
-                let frame_ptr = thread.frame as *const TrapFrame as usize as *mut TrapFrame;
-                core::ptr::copy_nonoverlapping(frame as *const _, frame_ptr, 1);
-                thread.pc.store(epc + 4, Ordering::Release);
-                exit_thread_with_state(state);
-            }
+        let outcome = body(thread, frame);
+        match orbit_core::apply_syscall_outcome(outcome, thread, frame, epc) {
+            orbit_core::ShimAction::Resume => {}
+            orbit_core::ShimAction::Yield(state) => exit_thread_with_state(state),
         }
     }
 }

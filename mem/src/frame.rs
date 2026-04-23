@@ -15,7 +15,7 @@ use alloc::collections::BTreeSet;
 ///
 /// Create a frame allocator and add some frames to it:
 /// ```
-/// use buddy_system_allocator::*;
+/// use mem::frame::FrameAllocator;
 /// // Notice that the max order is `ORDER - 1`.
 /// let mut frame = FrameAllocator::<33>::new();
 /// assert!(frame.alloc(1).is_none());
@@ -170,5 +170,119 @@ impl<const ORDER: usize> FrameAllocator<ORDER> {
         }
 
         self.allocated -= size;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_allocator_returns_none() {
+        let mut fa = FrameAllocator::<10>::new();
+        assert!(fa.alloc(1).is_none());
+        assert!(fa.alloc(8).is_none());
+        assert_eq!(fa.total, 0);
+        assert_eq!(fa.allocated, 0);
+    }
+
+    #[test]
+    fn add_frame_updates_total() {
+        let mut fa = FrameAllocator::<10>::new();
+        fa.add_frame(0, 8);
+        assert_eq!(fa.total, 8);
+        assert_eq!(fa.allocated, 0);
+    }
+
+    #[test]
+    fn alloc_round_trip_dealloc_restores_availability() {
+        let mut fa = FrameAllocator::<10>::new();
+        fa.add_frame(0, 8);
+
+        let a = fa.alloc(1).unwrap();
+        assert_eq!(fa.allocated, 1);
+
+        fa.dealloc(a, 1);
+        assert_eq!(fa.allocated, 0);
+
+        // Can alloc again.
+        let b = fa.alloc(1).unwrap();
+        assert_eq!(fa.allocated, 1);
+        fa.dealloc(b, 1);
+    }
+
+    #[test]
+    fn alloc_count_rounds_up_to_power_of_two() {
+        let mut fa = FrameAllocator::<10>::new();
+        fa.add_frame(0, 16);
+        // Request 3 → rounds to 4, consuming 4 frames.
+        let _ = fa.alloc(3).unwrap();
+        assert_eq!(fa.allocated, 4);
+    }
+
+    #[test]
+    fn alloc_aligned_satisfies_alignment() {
+        use core::alloc::Layout;
+        let mut fa = FrameAllocator::<20>::new();
+        fa.add_frame(0, 1024);
+
+        let layout = Layout::from_size_align(3, 16).unwrap();
+        let a = fa.alloc_aligned(layout).unwrap();
+        // The returned frame number is aligned to max(size.next_power_of_two, align) = 16.
+        assert_eq!(a % 16, 0);
+    }
+
+    #[test]
+    fn exhaust_then_dealloc_all_restores_initial() {
+        let mut fa = FrameAllocator::<10>::new();
+        fa.add_frame(0, 8);
+
+        let mut allocations = alloc::vec::Vec::new();
+        while let Some(a) = fa.alloc(1) {
+            allocations.push(a);
+        }
+        assert_eq!(allocations.len(), 8, "should exhaust the 8-frame range");
+        assert_eq!(fa.allocated, 8);
+        assert!(fa.alloc(1).is_none());
+
+        for a in allocations {
+            fa.dealloc(a, 1);
+        }
+        assert_eq!(fa.allocated, 0);
+
+        // Whole range should be available again.
+        let big = fa.alloc(8).unwrap();
+        assert_eq!(fa.allocated, 8);
+        fa.dealloc(big, 8);
+    }
+
+    #[test]
+    fn dealloc_merges_buddies_back_into_larger_class() {
+        // If the merge path works, after freeing two adjacent 1-frame
+        // allocs from a fresh 2-frame range, we should be able to
+        // allocate a 2-frame block.
+        let mut fa = FrameAllocator::<10>::new();
+        fa.add_frame(0, 2);
+
+        let a = fa.alloc(1).unwrap();
+        let b = fa.alloc(1).unwrap();
+        assert!(fa.alloc(1).is_none(), "exhausted");
+
+        fa.dealloc(a, 1);
+        fa.dealloc(b, 1);
+
+        // Both freed + merged → 2-frame alloc should succeed.
+        let two = fa.alloc(2);
+        assert!(two.is_some(), "merged buddies should form a 2-frame class");
+        fa.dealloc(two.unwrap(), 2);
+    }
+
+    #[test]
+    fn insert_range_matches_add_frame() {
+        let mut a = FrameAllocator::<10>::new();
+        a.add_frame(4, 12);
+        let mut b = FrameAllocator::<10>::new();
+        b.insert(4..12);
+        assert_eq!(a.total, b.total);
     }
 }

@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+#
+# Run host-side tests across every testable crate. Defaults to `cargo
+# test`; pass `miri` as the first arg to run `cargo miri test` instead.
+#
+# Crates that aren't host-testable (kmain, bl, umode, device, serial)
+# are excluded — they target riscv64gc-unknown-none-elf and their logic
+# is exercised via the smoke script / QEMU boot.
+#
+# `--all-features` activates feature flags like `mem::alloc` and
+# `net_channel::kernel` so FrameAllocator + kernel-side entry points
+# are covered.
+
+set -euo pipefail
+
+ROOT=$(cd "$(dirname "$0")" && pwd)
+CRATES=(orbit-core orbit-abi mem process net_channel mmu)
+
+note() { printf ">> %s\n" "$*"; }
+
+MODE="${1:-test}"
+case "$MODE" in
+  test) CMD=(cargo test --all-features) ;;
+  miri) CMD=(cargo miri test --all-features) ;;
+  miri-tree)
+    # Tree Borrows is a distinct aliasing model from Stacked Borrows;
+    # running both catches different classes of UB. Worth the extra
+    # wall-clock — ~3× the compile step but similar runtime per test.
+    CMD=(cargo miri test --all-features)
+    export MIRIFLAGS="${MIRIFLAGS:-} -Zmiri-tree-borrows"
+    ;;
+  miri-seeds)
+    # Weak-memory emulation is on by default in miri; what this mode
+    # adds is re-running each test with 16 different scheduler seeds so
+    # we explore different atomic-op interleavings per test. A
+    # Release/Acquire pair that's too permissive (e.g. accidental
+    # Relaxed) will show up as a run that sometimes reads stale data.
+    # Cheap-ish; single-threaded tests just re-run pointlessly.
+    CMD=(cargo miri test --all-features)
+    export MIRIFLAGS="${MIRIFLAGS:-} -Zmiri-many-seeds=0..16"
+    ;;
+  miri-hammer)
+    # Aggressive concurrency fuzzer — targeted at the ONLY multi-
+    # threaded test file we have (assign_threads_concurrent). Running
+    # the full crate sweep with these flags is 95% waste since single-
+    # threaded tests don't benefit from seed or preemption fuzzing.
+    #
+    # Flags:
+    # - many-seeds=0..32 — broad interleaving coverage
+    # - preemption-rate=0.9 — context switch almost every step, surfaces
+    #   races that only appear under dense preemption (e.g. remote hart
+    #   reads "between" two scheduler stores)
+    # - compare-exchange-weak-failure-rate=0.9 — cas_weak fails most
+    #   first attempts, catching code that assumes one-shot success
+    note "miri-hammer: orbit-core/tests/assign_threads_concurrent.rs"
+    (
+      cd "$ROOT/orbit-core" && \
+      MIRIFLAGS="${MIRIFLAGS:-} -Zmiri-many-seeds=0..32 -Zmiri-preemption-rate=0.9 -Zmiri-compare-exchange-weak-failure-rate=0.9" \
+        cargo miri test --quiet --all-features --test assign_threads_concurrent
+    ) || { echo "FAIL: miri-hammer" >&2; exit 1; }
+    note "PASS: miri-hammer"
+    exit 0
+    ;;
+  *)
+    echo "usage: $0 [test|miri|miri-tree|miri-seeds|miri-hammer]  (default: test)" >&2
+    exit 1
+    ;;
+esac
+
+failed=()
+for c in "${CRATES[@]}"; do
+  note "$MODE: $c"
+  if ! ( cd "$ROOT/$c" && "${CMD[@]}" ); then
+    failed+=("$c")
+  fi
+  echo
+done
+
+if [ "${#failed[@]}" -gt 0 ]; then
+  echo "FAIL: ${failed[*]}" >&2
+  exit 1
+fi
+note "PASS: all crates ($MODE)"
