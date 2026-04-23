@@ -85,13 +85,25 @@ fn zero_vaddr_is_megapage_aligned() {
     );
 }
 
-/// Brute 5x5 grid over common boundary values. Catches regressions in
-/// the modular-arithmetic predicates that a hand-picked handful would
-/// miss. The expected geometry is computed by the same predicate a
-/// reader would check mentally, so a symmetric bug in both would still
-/// escape — but sign/off-by-one errors against the constants won't.
+/// 5×5 grid over boundary values, with each expected outcome computed
+/// by hand and inlined as a literal. An independent oracle: a sign /
+/// constant / branch-order bug in `select_mapping_geometry` shows up
+/// as a single mismatched cell, not as table+code agreeing on the
+/// wrong answer.
+///
+/// Legend: M = megapage, P = 4 KiB page, N = misaligned (None).
+/// Rows are vaddr; columns are size.
+///
+/// ```text
+///                size=0(2M)  4K  2M-1(none)  2M  2M+4K(4K)
+/// vaddr=0(2M)        M       P       N       M       P
+///       4K           P       P       N       P       P
+///     2M-1(none)     N       N       N       N       N
+///       2M           M       P       N       M       P
+///     2M+4K(4K)      P       P       N       P       P
+/// ```
 #[test]
-fn alignment_grid_matches_predicate() {
+fn alignment_grid_matches_hand_table() {
     let values = [
         0,
         PAGE_SIZE,
@@ -100,18 +112,25 @@ fn alignment_grid_matches_predicate() {
         MEGAPAGE_SIZE + PAGE_SIZE,
     ];
 
-    for &vaddr in &values {
-        for &size in &values {
-            let expected = if vaddr % MEGAPAGE_SIZE == 0 && size % MEGAPAGE_SIZE == 0 {
-                Some(megapage())
-            } else if vaddr % PAGE_SIZE == 0 && size % PAGE_SIZE == 0 {
-                Some(page())
-            } else {
-                None
-            };
+    // Hand-computed expected outcomes — see the table in the docstring.
+    // None of these are derived from the implementation's predicates.
+    let m = Some(megapage());
+    let p = Some(page());
+    let n = None;
+    let expected: [[Option<MappingGeometry>; 5]; 5] = [
+        // size:    0   4K   2M-1  2M   2M+4K
+        /* 0     */ [m,  p,   n,   m,   p],
+        /* 4K    */ [p,  p,   n,   p,   p],
+        /* 2M-1  */ [n,  n,   n,   n,   n],
+        /* 2M    */ [m,  p,   n,   m,   p],
+        /* 2M+4K */ [p,  p,   n,   p,   p],
+    ];
+
+    for (vi, &vaddr) in values.iter().enumerate() {
+        for (si, &size) in values.iter().enumerate() {
             let got = select_mapping_geometry(vaddr, size);
             assert_eq!(
-                got, expected,
+                got, expected[vi][si],
                 "select_mapping_geometry(vaddr={vaddr:#x}, size={size:#x})"
             );
         }

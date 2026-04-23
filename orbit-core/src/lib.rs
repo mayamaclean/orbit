@@ -41,7 +41,7 @@ pub trait Hardware {
     fn copy_from_user(&mut self, user_va: u64, dst: &mut [u8]);
 
     /// Write user-originated text to the kernel serial console, prefixed
-    /// with the standard `{now_ticks}t USER[{pid}.{tid}] ` tag so user
+    /// with the standard `{now_ticks}t USER[{pid}.{tid}]: ` tag so user
     /// output lines up visually with kernel tracing logs. Impl uses
     /// `core::fmt` via the serial driver; no buffering needed in pure
     /// code. Returns Err on UART failure.

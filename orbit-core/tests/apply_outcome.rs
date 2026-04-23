@@ -183,7 +183,7 @@ fn yield_blocking_still_bumps_pc() {
 // ---- Regression pin: the Return-arm bug ----
 
 #[test]
-fn return_does_NOT_leave_pc_unchanged() {
+fn return_must_bump_pc_past_ecall() {
     // This test fails with the historical bug where the Return branch
     // set frame.regs[10] but skipped both the snapshot and the pc
     // bump. Documented here so a future refactor can't silently
@@ -208,7 +208,7 @@ fn return_does_NOT_leave_pc_unchanged() {
 }
 
 #[test]
-fn return_does_NOT_leave_thread_frame_stale() {
+fn return_must_overwrite_thread_frame_with_ret() {
     // Second half of the bug: without the snapshot, thread.frame still
     // holds whatever was written before the trap, so the user code
     // sees a stale (non-ret) value in a0 on resume.

@@ -86,6 +86,22 @@ fn non_utf8_returns_minus_4() {
 }
 
 #[test]
+fn valid_prefix_then_invalid_byte_returns_minus_4() {
+    // Catches a regression where `from_utf8` gets swapped for
+    // `from_utf8_unchecked` plus a length check — the prefix would
+    // pass any cheap "first byte ASCII" inspection.
+    let t = make_thread(ThreadState::Running, SPP::User);
+    let frame = frame_with(5);
+    let mut hw = FakeHw::default();
+    hw.user_mem.insert(UVA, vec![b'h', b'i', b'!', b'\n', 0xFF]);
+
+    let outcome = syscall::serial_print(&t, &frame, &mut hw);
+
+    assert_eq!(outcome, ready(-4));
+    assert!(hw.user_prints.is_empty(), "no partial write on utf8 failure");
+}
+
+#[test]
 fn serial_failure_returns_minus_5() {
     let t = make_thread(ThreadState::Running, SPP::User);
     let frame = frame_with(3);

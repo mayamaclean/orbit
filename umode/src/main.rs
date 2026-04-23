@@ -126,7 +126,7 @@ fn close_handle(fd: u32) -> isize {
 
 /// Emit a line through the serial-print syscall. Wraps `serial_print`
 /// for string-literal callers; the kernel prepends its standard
-/// `{time}t USER[pid.tid] ` tag via the handler.
+/// `{time}t USER[pid.tid]: ` tag via the handler.
 fn print(s: &str) {
     let _ = serial_print(s.as_ptr() as usize, s.len());
 }

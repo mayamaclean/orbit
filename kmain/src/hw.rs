@@ -39,11 +39,11 @@ impl Hardware for RiscvHardware {
     }
 
     fn serial_write_user(&mut self, pid: u16, tid: u32, text: &str) -> Result<(), ()> {
-        // `{t}t USER[pid.tid] {text}` matches the tracing-subscriber
+        // `{t}t USER[pid.tid]: {text}` matches the tracing-subscriber
         // layout used by kernel info!/debug! lines — keeps user output
         // visually aligned with kernel logs in the smoke/debug streams.
         serial::print!(
-            "{}t USER[{}.{}] {text}",
+            "{}t USER[{}.{}]: {text}",
             riscv::register::time::read64(),
             pid,
             tid
