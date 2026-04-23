@@ -4,7 +4,10 @@
 //! kmain shim to apply.
 
 use device::TrapFrame;
-use process::{CloseHandleReq, MemMapReq, NetChannelCreationReq, Thread, ThreadBlockReason, ThreadState};
+use process::{
+    CloseHandleReq, CreateProcessReq, MemMapReq, NetChannelCreationReq,
+    Thread, ThreadBlockReason, ThreadState,
+};
 
 use crate::{Hardware, PAGE_SIZE, SyscallOutcome};
 
@@ -74,6 +77,22 @@ pub fn close_req(thread: &mut Thread, frame: &TrapFrame) -> SyscallOutcome {
         fd: frame.regs[11] as u32,
     };
     thread.block_reason = ThreadBlockReason::CloseHandle(req);
+    SyscallOutcome::Yield {
+        state: ThreadState::Blocking,
+        ret: None,
+    }
+}
+
+/// `create_process(elf_vaddr, elf_len)` — enter Blocking with a
+/// [`CreateProcessReq`]. The manager copies the ELF out of user memory,
+/// parses it, and spawns the new process; the syscall return written at
+/// unblock time is the new pid on success or a negative errno on failure.
+pub fn create_process_req(thread: &mut Thread, frame: &TrapFrame) -> SyscallOutcome {
+    let req = CreateProcessReq {
+        elf_vaddr: frame.regs[11],
+        elf_len: frame.regs[12],
+    };
+    thread.block_reason = ThreadBlockReason::CreateProcess(req);
     SyscallOutcome::Yield {
         state: ThreadState::Blocking,
         ret: None,

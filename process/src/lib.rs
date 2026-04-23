@@ -46,11 +46,18 @@ pub struct CloseHandleReq {
 }
 
 #[derive(Debug, Clone, Copy)]
+pub struct CreateProcessReq {
+    pub elf_vaddr: usize,
+    pub elf_len: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
 pub enum ThreadBlockReason {
     NotBlocking,
     MemMap(MemMapReq),
     NetChannelCreation(NetChannelCreationReq),
     CloseHandle(CloseHandleReq),
+    CreateProcess(CreateProcessReq),
 }
 
 #[derive(Debug, Clone, Copy)]

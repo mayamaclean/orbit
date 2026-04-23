@@ -18,7 +18,7 @@ use mmu::sv48::{PageTable, PhysAddr, VirtAddr};
 use mmu::{KB, MB, MappingConfig, PAGE_SIZE, PagePermissions, SupervisorTag};
 use net_channel::NetChannel;
 use process::{
-    CloseHandleReq, Frame, MappingKind, MemMapReq, 
+    CloseHandleReq, CreateProcessReq, Frame, MappingKind, MemMapReq,
     NetChannelCreationReq, PThread, PhysBacking, Process,
     Shared, Thread, ThreadBlockReason, ThreadState,
     UserMapping, UserOnly
@@ -57,7 +57,11 @@ pub use memmap::KernelLayout;
 
 // TODO: page unmapping
 
-pub const UMODE_TEST_ELF: &'static [u8] = include_bytes!("../../../umode/target/riscv64gc-unknown-none-elf/release/umode");
+// kmain now embeds orbit-loader as the initial user program. orbit-loader
+// listens on TCP :7777 and spawns further ELFs at runtime via the
+// create_process syscall — so swapping out the payload (e.g. umode
+// variants) no longer requires rebuilding kmain + bl.
+pub const UMODE_TEST_ELF: &'static [u8] = include_bytes!("../../../orbit-loader/target/riscv64gc-unknown-none-elf/release/orbit-loader");
 
 // User address-space layout lives in the canonical orbit_abi::layout module.
 // Re-exported so existing `kernel::USER_TEXT_BASE`-style call sites keep
@@ -345,7 +349,7 @@ impl Orbit {
             page_size: align as u64,
             vaddr: VirtAddr::new(req.vaddr as u64),
             paddr: PhysAddr::new(backing_pa_raw),
-            log: true,
+            log: false,
             supervisor_tag
         };
 
@@ -442,7 +446,7 @@ impl Orbit {
             page_size: PAGE_SIZE as u64,
             vaddr: VirtAddr::new(req.nc_vaddr as u64),
             paddr: frame.raw(),
-            log: true,
+            log: false,
             supervisor_tag: SupervisorTag::SharedRevocable,
         };
 
@@ -552,11 +556,73 @@ impl Orbit {
         thread.frame.regs[10] = 0;
     }
 
+    fn handle_create_process_req<'t>(&mut self, thread: &'t mut Thread, req: CreateProcessReq) {
+        info!("handling create_process req: {req:?}");
+
+        // Dev-loop safety cap. Well above any realistic test ELF but small
+        // enough that a bogus `elf_len` can't drive the kernel into a giant
+        // allocation. Bump when we actually need to.
+        const MAX_ELF_BYTES: usize = 4 * 1024 * 1024;
+
+        if req.elf_len == 0 || req.elf_len > MAX_ELF_BYTES {
+            thread.frame.regs[10] = -1isize as usize;
+            return;
+        }
+
+        let root_table = unsafe {
+            memmap::kernel_root_from_pa(thread.root_table_addr() as u64)
+        };
+
+        // Copy the ELF out page-by-page. UserPageWindow is single-slot, so
+        // we materialize each page in turn and release it before the next.
+        // User pages come from a single contiguous mmap in practice, but
+        // don't assume — translate each page independently.
+        let mut blob: Vec<u8> = Vec::with_capacity(req.elf_len);
+        let mut copied = 0usize;
+        while copied < req.elf_len {
+            let cursor = req.elf_vaddr + copied;
+            let page_base = cursor & !(PAGE_SIZE - 1);
+            let page_off = cursor - page_base;
+            let take = core::cmp::min(PAGE_SIZE - page_off, req.elf_len - copied);
+
+            let pa = match unsafe {
+                mmu::mmap::virt_to_phys(&root_table, VirtAddr::new(page_base as u64))
+            } {
+                Some(p) => p as u64,
+                None => {
+                    error!("create_process: user va 0x{:X} does not translate", page_base);
+                    thread.frame.regs[10] = -2isize as usize;
+                    return;
+                }
+            };
+
+            unsafe {
+                let mut w = user_page::UserPageWindow::map(pa, PAGE_SIZE);
+                let page = w.as_mut_slice();
+                blob.extend_from_slice(&page[page_off..page_off + take]);
+            }
+
+            copied += take;
+        }
+
+        match self.create_new_process(&blob, UPROC_STACK_DEFAULT) {
+            Ok(pid) => {
+                info!("create_process: spawned pid={pid} from {} bytes", blob.len());
+                thread.frame.regs[10] = pid as usize;
+            }
+            Err(()) => {
+                error!("create_process: create_new_process failed");
+                thread.frame.regs[10] = -3isize as usize;
+            }
+        }
+    }
+
     fn handle_block_reason<'t>(&mut self, thread: &'t mut Thread, reason: ThreadBlockReason) {
         match reason {
             ThreadBlockReason::MemMap(req) => self.handle_mmap_req(thread, req),
             ThreadBlockReason::NetChannelCreation(req) => self.handle_nc_create_req(thread, req),
             ThreadBlockReason::CloseHandle(req) => self.handle_close_req(thread, req),
+            ThreadBlockReason::CreateProcess(req) => self.handle_create_process_req(thread, req),
             _ => {}
         }
     }
@@ -1368,7 +1434,7 @@ impl Orbit {
         })
     }
     
-    pub fn create_new_process(&mut self, elf_blob: &[u8], stack_size: u64) -> Result<(), ()> {
+    pub fn create_new_process(&mut self, elf_blob: &[u8], stack_size: u64) -> Result<u16, ()> {
         let (root_pa, root_table) = self.create_new_page_table()?;
         let mut elf = self.load_elf(&root_table, elf_blob)?;
         let pid = self.next_pid();
@@ -1422,7 +1488,7 @@ impl Orbit {
 
         self.threads.insert(tid, PThread(tptr));
 
-        Ok(())
+        Ok(pid)
     }
 
     fn free_backings(&mut self, backings: Vec<PhysBacking>) {
@@ -1525,7 +1591,7 @@ impl Orbit {
                     page_size: PAGE_SIZE as u64,
                     vaddr: VirtAddr::new(vaddr_start),
                     paddr: PhysAddr::new(paddr_start),
-                    log: true,
+                    log: false,
                     supervisor_tag: SupervisorTag::None
                 };
 

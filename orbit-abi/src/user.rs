@@ -180,3 +180,22 @@ pub fn create_netch(
 pub fn close_handle(fd: u32) -> isize {
     unsafe { ecall1(syscall::CLOSE_HANDLE, fd as usize) }
 }
+
+/// Spawn a new process from an in-memory ELF image. `elf_ptr`/`elf_len`
+/// describe a contiguous readable region in the caller's address space;
+/// the kernel copies the bytes out, parses the ELF, and creates a process
+/// whose first thread enters at `e_entry` with the default stack size.
+///
+/// Returns the new process's pid on success, or a negative errno on
+/// failure.
+#[inline]
+pub fn create_process(elf_ptr: *const u8, elf_len: usize) -> Result<u16, isize> {
+    let r = unsafe {
+        ecall2(syscall::CREATE_PROCESS, elf_ptr as usize, elf_len)
+    };
+    if r < 0 {
+        Err(r)
+    } else {
+        Ok(r as u16)
+    }
+}

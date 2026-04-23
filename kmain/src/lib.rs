@@ -523,3 +523,8 @@ pub fn handle_close_req(epc: usize, hart_context: &'static HartContext, frame: &
 pub fn handle_nc_create_req(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
     dispatch_syscall(epc, hart_context, frame, |t, f| orbit_core::syscall::nc_create_req(t, f));
 }
+
+#[unsafe(no_mangle)]
+pub fn handle_create_process_req(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
+    dispatch_syscall(epc, hart_context, frame, |t, f| orbit_core::syscall::create_process_req(t, f));
+}

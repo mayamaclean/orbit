@@ -166,6 +166,10 @@ extern "C" fn s_trap(
                         debug!("orbit handling u mode ecall({syscall})");
                         kmain::handle_close_req(epc, hart_context, frame);
                     }
+                    4099 => {
+                        debug!("orbit handling u mode ecall({syscall})");
+                        kmain::handle_create_process_req(epc, hart_context, frame);
+                    }
                     _ => {
                         debug!("orbit handling u mode ecall({syscall})");
                         kmain::update_thread_and_trap_frame(epc + 4, hart_context, frame, from_user);

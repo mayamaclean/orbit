@@ -11,7 +11,7 @@ use smoltcp::{iface::Interface, wire::IpAddress};
 use smoltcp::socket::tcp::State as TcpState;
 
 #[cfg(feature = "kernel")]
-use tracing::{error, info};
+use tracing::{error};
 
 /// Mutable view into a region of shared memory handed to `send_tcp`'s
 /// closure. Writes go through [`core::ptr::write_volatile`], which
@@ -553,14 +553,14 @@ impl NetChannel {
 
                     #[cfg(feature = "kernel")]
                     {
-                        let increments_len = rx.increments_len();
-                        let avail_len = rx.slices_len();
+                        let _increments_len = rx.increments_len();
+                        let _avail_len = rx.slices_len();
 
-                        let slice = unsafe {
+                        let _slice = unsafe {
                             core::slice::from_raw_parts(rx.buf_ptr(), next_rx.1)
                         };
 
-                        info!("tcp: next_rx={slice:02X?}, increments_len={increments_len}, avail_len={avail_len}");
+                        //info!("tcp: next_rx={slice:02X?}, increments_len={increments_len}, avail_len={avail_len}");
                     }
 
                     core::sync::atomic::fence(Ordering::SeqCst);
@@ -587,13 +587,13 @@ impl NetChannel {
                 let next_tx = socket.get_next_tx();
                 if next_tx.1 > 0 {
                     // SAFETY: kernel is the sole producer of tx.slices.
-                    let r = unsafe { tx.enqueue_slice(next_tx) };
+                    let _r = unsafe { tx.enqueue_slice(next_tx) };
 
                     #[cfg(feature = "kernel")]
                     {
-                        let increments_len = tx.increments_len();
-                        let avail_len = tx.slices_len();
-                        info!("tcp: next_tx={next_tx:08X?}, increments_len={increments_len}, avail_len={avail_len} r={r:08X?}");
+                        let _increments_len = tx.increments_len();
+                        let _avail_len = tx.slices_len();
+                        //info!("tcp: next_tx={next_tx:08X?}, increments_len={increments_len}, avail_len={avail_len} r={r:08X?}");
                     }
 
                     core::sync::atomic::fence(Ordering::SeqCst);
@@ -699,6 +699,20 @@ impl NetChannel {
         desired_state.state_local_port.store(1337, Ordering::Relaxed);
         desired_state.state_addr.store(addr, Ordering::Relaxed);
         desired_state.state.store(1, Ordering::Release);
+
+        Ok(())
+    }
+
+    pub fn listen_tcp(&self, port: u16) -> Result<(), ()> {
+        let current_state = self.current_state();
+        if current_state.state.load(Ordering::Acquire) != 0 {
+            return Err(())
+        }
+
+        let desired_state = self.desired_state();
+
+        desired_state.state_local_port.store(port, Ordering::Relaxed);
+        desired_state.state.store(2, Ordering::Release);
 
         Ok(())
     }

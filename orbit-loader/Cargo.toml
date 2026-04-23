@@ -1,0 +1,10 @@
+[package]
+name = "orbit-loader"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+net_channel = { path = "../net_channel" }
+orbit-abi   = { path = "../orbit-abi" }
+orbit-rt    = { path = "../orbit-rt" }
+minicbor    = { version = "2.2.1", default-features = false, features = ["alloc", "derive"] }

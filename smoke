@@ -135,5 +135,5 @@ note "checking nc received guest payload"
 grep -q 'Hello World!' "$NC_LOG" \
   || die "nc did not receive 'Hello World!' from guest (see $NC_LOG)"
 
-echo $(cat "$QEMU_LOG")
+tail -n 1000 "$QEMU_LOG"
 note "PASS"

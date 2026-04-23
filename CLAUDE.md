@@ -6,15 +6,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Orbit is a RISC-V 64 (`rv64gc`) kernel written in Rust `no_std`, running on `qemu-system-riscv64` with the `virt` machine, 4 harts, 2 GiB RAM, an e1000 NIC, and M/S privilege modes. Target triple is `riscv64gc-unknown-none-elf`; toolchain is pinned in [rust-toolchain.toml](rust-toolchain.toml) to the nightly in the file (nightly-2026-02-21 at time of writing). `-Zbuild-std=core,alloc` is required — do not run `cargo` without it.
 
-There is no top-level `Cargo.toml`. An old/invalid root manifest exists as [asdasdascCargo.toml.nottoml](asdasdascCargo.toml.nottoml) and is intentionally disabled. `cargo` must be invoked from inside one of the individual crate directories. Each of `bl`, `kmain`, `umode` has its own `.cargo/config.toml` carrying the `runner`, `rustflags`, and `build-std` settings.
+There is no top-level `Cargo.toml`. An old/invalid root manifest exists as [asdasdascCargo.toml.nottoml](asdasdascCargo.toml.nottoml) and is intentionally disabled. `cargo` must be invoked from inside one of the individual crate directories. Each of `bl`, `kmain`, `umode`, `orbit-loader` has its own `.cargo/config.toml` carrying the `runner`, `rustflags`, and `build-std` settings.
 
 ## Build and run
 
 Because each upper layer embeds the lower layer's ELF via `include_bytes!`, builds must happen in a specific order:
 
-1. `cd umode && cargo build` — compiles the sample user program. `kmain` embeds `umode/target/riscv64gc-unknown-none-elf/debug/umode` (see [kmain/src/kernel/mod.rs:56](kmain/src/kernel/mod.rs#L56)).
+1. `cd orbit-loader && cargo build --release` — compiles the TCP-listening loader that kmain boots into. `kmain` embeds `orbit-loader/target/riscv64gc-unknown-none-elf/release/orbit-loader` (see [kmain/src/kernel/mod.rs:60](kmain/src/kernel/mod.rs#L60)). Test payloads like `umode` are *not* compiled into the kernel — they're built separately and sent over the wire via [orbit-loader/tools/send-payload.py](orbit-loader/tools/send-payload.py) once the guest is up.
 2. `cd kmain && ./build.sh` — builds the S-mode kernel as PIE with the required link flags (`-pie`, `-Bsymbolic`, `-znotext`, `--no-dynamic-linker`, `--pack-dyn-relocs=none`, `--export-dynamic`). Running `cargo build` directly in `kmain` will NOT produce a usable kernel — use the script, which sets the `RUSTFLAGS` the kernel's self-relocation stub depends on. `bl` embeds `kmain/target/riscv64gc-unknown-none-elf/release/orbit` (see [bl/src/lib.rs:17](bl/src/lib.rs#L17)).
-3. `cd bl && cargo run` — builds the M-mode bootloader (binary name `launch`) and launches QEMU via the runner in [bl/.cargo/config.toml](bl/.cargo/config.toml). The runner also opens `-gdb tcp::1234` and passes `-S` (freeze on entry) so you can attach a debugger before `_start` runs.
+3. `cd bl && cargo run` — builds the M-mode bootloader (binary name `launch`) and launches QEMU via the runner in [bl/.cargo/config.toml](bl/.cargo/config.toml). The runner also opens `-gdb tcp::1234` and passes `-S` (freeze on entry) so you can attach a debugger before `_start` runs. Guest port 7777 is forwarded to host 7777 (`hostfwd`) so `send-payload.py` can reach the loader.
+4. (Optional, per iteration) `cd umode && cargo build && python3 orbit-loader/tools/send-payload.py umode/target/riscv64gc-unknown-none-elf/debug/umode` — rebuild a test payload and ship it to the running guest. Avoids re-linking kmain+bl.
 
 To debug a running QEMU: `./debug <crate> <exec>` — e.g. `./debug bl launch` or `./debug kmain orbit`. This launches `rust-lldb` and issues `gdb-remote localhost:1234` against the chosen release ELF.
 
@@ -30,24 +31,28 @@ Three privilege levels run three separate ELF artifacts, each with its own linke
 
 - **S-mode kernel — [kmain/](kmain/)** (binary `orbit`). Built as a fully relocatable PIE. Linked at low VA `0x1000`; an early trampoline in the naked `_start` in [kmain/src/bin/orbit.rs](kmain/src/bin/orbit.rs) builds a temporary Sv48 table (identity for RAM/MMIO plus `KTEXT_NOMINAL → load_addr` and a `KDMAP_NOMINAL → RAM` direct-map), `csrw satp`, and jumps into the high-half VA. Post-jump `post_trampoline_entry` applies `R_RISCV_RELATIVE` with `slide = ktext_base - LINK_BASE` before any Rust code touches a relocated global, then tail-calls `rust_main`. `rust_main` initializes the linked-list heap (`KHEAP` at its KDMAP VA), frame allocators for page tables (ktables) and general-purpose kernel pages (kpages) — both returning KDMAP VAs via `add_frame_with_va_base` — installs `OrbitLogger`/`OrbitSubscriber`, builds the final Sv48 table via `map_kernel_self` (KTEXT / KDMAP / KMMIO, no identity left), allocates per-hart `HartContext` structs, and `sret`s into `k_smpstart`. `k_smpstart` re-`init_serial`s at `kmmio_uart()` before any print, signals bl (`ecall(4)` then `ecall(1)`), and kicks harts 1..N via KMMIO CLINT MSIPs. Hart 0 then runs `k_manage`; others `k_idle`/WFI. See [kmain/src/kernel/memmap.rs](kmain/src/kernel/memmap.rs) for layout atomics, constants, `KernelLayout`, and `RootTable` helpers.
 
-- **U-mode sample — [umode/](umode/)** linked at `0x2_2000_0000` (`USER_TEXT_BASE`). Currently a hardcoded demo ([umode/src/main.rs](umode/src/main.rs)) that prints to serial, sleeps, `mmap`s a shared region, registers a `NetChannel`, and opens a TCP connection. The kernel creates exactly one process from this ELF in `k_smpstart`.
+- **U-mode boot process — [orbit-loader/](orbit-loader/)** linked at `0x2_2000_0000` (`USER_TEXT_BASE`). The single process kmain spawns from its embedded ELF in `k_smpstart`. Listens on TCP :7777 via a NetChannel in listen mode; each incoming connection delivers a framed CBOR payload (`[u32 LE len][u32 LE !len][cbor {0: elf, 1: name}]`) that the loader hands to `create_process` (syscall 4099). This replaces a build-time `include_bytes!` of a hardcoded sample; rebuilding a test binary no longer requires rebuilding kmain or bl.
+
+- **U-mode sample — [umode/](umode/)** linked at `0x2_2000_0000` (same `USER_TEXT_BASE` — only one user ELF occupies that VA at a time today). A hardcoded demo ([umode/src/main.rs](umode/src/main.rs)) that prints to serial, sleeps, `mmap`s a shared region, registers a NetChannel, and opens a TCP connection. No longer embedded in kmain — now shipped to a running guest via `orbit-loader/tools/send-payload.py`.
 
 ### Syscall ABI
 
-`ecall` with syscall number in `a0`, args in `a1..a4`. Dispatched by the `cause == 8` arm of `s_trap` in [kmain/src/bin/orbit.rs](kmain/src/bin/orbit.rs):
+`ecall` with syscall number in `a0`, args in `a1..a4`. Dispatched by the `cause == 8` arm of `s_trap` in [kmain/src/bin/orbit.rs](kmain/src/bin/orbit.rs). Canonical list in [orbit-abi/src/syscall.rs](orbit-abi/src/syscall.rs):
 
 - `0` — exit (noreturn)
 - `1` — serial_print(ptr, len)
 - `2` — sleep_ms(ms)
 - `4096` — mmap(vaddr, len, perms, share_with_kernel)
-- `4097` — register NetChannel(nc_vaddr, sock_type)
+- `4097` — create_netch(vaddr_hint, region_size, sock_type) → (user_va, fd)
+- `4098` — close_handle(fd)
+- `4099` — create_process(elf_ptr, elf_len) → pid
 
 ### Supporting crates (all under the same workspace)
 
 - [mmu/](mmu/) — Sv48 page tables, `PagePermissions`, `MappingConfig`, `id_map_range`, `map_address_range`, `map_va_range`, `virt_to_phys`. Walkers take `&RootTable<'_>`, which pairs a `&PageTable` with a PA→VA bias so they can follow PPNs (always physical) back into the supervisor's KDMAP view. bl/early-trampoline use `RootTable::identity(...)` (bias 0); kmain uses `memmap::kernel_root(...)` / `kernel_root_from_pa(...)` (bias `= kdmap_base - ram_phys_base`). `alloc` feature wires it up against `alloc::Vec`-backed page pools.
 - [mem/](mem/) — `FrameAllocator`, `round_u64_up`/`down` helpers, `prev_power_of_two`.
 - [device/](device/) — `HartContext` (cache-line-aligned, field offsets are load-bearing — consumed by `asm/trap.S` and `boot.S`), `TrapFrame`, `Stack` (2 MiB), `SysInfo`, DTB walkers (`find_serial_port`, `find_ram`). The trap assembly hard-codes offsets into `HartContext`; changing field order requires updating the `.S` files.
-- [process/](process/) — `Thread`, `Process`, `ThreadState`, block-reason enums (`MemMapReq`, `NetChannelRegistrationReq`).
+- [process/](process/) — `Thread`, `Process`, `ThreadState`, block-reason enum `ThreadBlockReason` with variants `MemMap(MemMapReq)`, `NetChannelCreation(NetChannelCreationReq)`, `CloseHandle(CloseHandleReq)`, `CreateProcess(CreateProcessReq)`. New blocking syscalls add a variant here and a handler arm in `Orbit::handle_block_reason` in kmain.
 - [net_channel/](net_channel/) — shared-memory SPSC queues between user programs and the kernel networking thread. `kernel` feature enables the kernel-side `update_tcp` methods that drive smoltcp sockets. Layout of `NetChannel` / `NetChannelState` / `NetChannelQueue` is part of the user/kernel ABI — do not change field order casually.
 - [serial/](serial/) — `MpUart` wrapping `ns16550a::Uart` with a spinlock; exposes `println!` macro and a global init.
 - [kmain/src/drivers/e1000.rs](kmain/src/drivers/e1000.rs) — PCI-discovered e1000 NIC; ring buffers fed by DMA from kernel pages, integrated with smoltcp via `k_net` (a dedicated kernel thread).

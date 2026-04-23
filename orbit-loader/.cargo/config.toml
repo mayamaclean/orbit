@@ -1,0 +1,18 @@
+[build]
+target = "riscv64gc-unknown-none-elf"
+
+[target.riscv64gc-unknown-none-elf]
+rustflags = [
+  "-Clink-arg=-Tmemory.x",
+  "-Ctarget-feature=+d",
+  "-Ctarget-feature=+f"
+]
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+
+[unstable]
+build-std = ["core", "alloc"]

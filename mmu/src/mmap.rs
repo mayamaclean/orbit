@@ -377,9 +377,14 @@ pub unsafe fn virt_to_phys(root_table: &RootTable<'_>, vaddr: VirtAddr) -> Optio
     // Shift PPN from in-place (bit 10) down and back up to PA (bit 12):
     // net shift by 2 is equivalent to `(pte_raw >> 10) * PAGE_SIZE`.
     let phys_base = (terminal.pte_raw & !crate::sv48::PageTableEntry::STATUS_BITS_MASK) << 2;
-    // 4 KiB-leaf assumption: superpage leaves would need a bigger
-    // offset mask. Orbit has no user superpages today.
-    Some(phys_base as usize + vaddr.page_offset() as usize)
+    // Superpage-aware offset: Sv48 leaves can sit at level 0 (4 KiB, 12-bit
+    // offset), level 1 (2 MiB, 21-bit), or level 2 (1 GiB, 30-bit). Using
+    // `vaddr.page_offset()` (always low 12 bits) silently returned the
+    // start of the superpage for any VA not at offset 0, which bit when
+    // walking user heap pages backed by the 2 MiB arenas orbit-rt claims.
+    let offset_bits = 12u32 + 9 * terminal.level as u32;
+    let offset_mask = (1u64 << offset_bits) - 1;
+    Some((phys_base as usize) + (vaddr.get_raw() & offset_mask) as usize)
 }
 
 /// Walk to the leaf PTE for `vaddr` at `levels` granularity and clear it.
