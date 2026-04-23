@@ -1,0 +1,8 @@
+[package]
+name = "orbit-rt"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+talc      = { version = "5.0.3", default-features = false }
+orbit-abi = { path = "../orbit-abi" }

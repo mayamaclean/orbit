@@ -1466,7 +1466,12 @@ impl Orbit {
             };
 
             unsafe {
-                let layout = Layout::from_size_align_unchecked(segment_data.len(), PAGE_SIZE);
+                // Size the backing by memsz, not filesz: pure-BSS segments
+                // (filesz=0, memsz>0, as emitted once user ELFs grow any
+                // uninitialized statics) need the memsz-sized allocation
+                // even though there's nothing to copy in from the file.
+                let seg_mem_size = core::cmp::max(segment_data.len(), segment.p_memsz as usize);
+                let layout = Layout::from_size_align_unchecked(seg_mem_size, PAGE_SIZE);
                 let seg_pa = match self.user_pages.alloc_pa(layout) {
                     Some(p) => p,
                     None => {
@@ -1496,7 +1501,7 @@ impl Orbit {
 
                 let vaddr_start = round_u64_down(segment.p_vaddr, PAGE_SIZE as u64);
 
-                let segment_aligned_len = round_u64_up(segment_data.len() as u64, PAGE_SIZE as u64);
+                let segment_aligned_len = round_u64_up(seg_mem_size as u64, PAGE_SIZE as u64);
 
                 let paddr_end = paddr_start + segment_aligned_len;
                 let vaddr_end = vaddr_start + segment_aligned_len;

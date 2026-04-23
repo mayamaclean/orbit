@@ -1,128 +1,13 @@
 #![no_std]
 #![no_main]
 
-use core::{arch::asm, panic::PanicInfo, sync::atomic::Ordering};
+extern crate alloc;
+use orbit_rt as _;
+
+use core::{panic::PanicInfo, sync::atomic::Ordering};
 
 use net_channel::NetChannel;
-
-extern "C" fn syscall_arg0_noret(code: usize, arg0: usize) -> ! {
-    unsafe {
-        asm!(
-            "ecall",
-            in("a0") code,
-            in("a1") arg0,
-            options(noreturn)
-        );
-    }
-}
-
-extern "C" fn syscall_arg0(code: usize, arg0: usize) -> isize {
-    let mut r = 0isize;
-    unsafe {
-        asm!(
-            "ecall",
-            in("a0") code,
-            in("a1") arg0,
-            lateout("a0") r
-        );
-    }
-    r
-}
-
-extern "C" fn syscall_arg1(code: usize, arg0: usize, arg1: usize) -> isize {
-    let mut r = 0isize;
-    unsafe {
-        asm!(
-            "ecall",
-            in("a0") code,
-            in("a1") arg0,
-            in("a2") arg1,
-            lateout("a0") r
-        );
-    }
-    r
-}
-
-#[allow(dead_code)]
-extern "C" fn syscall_arg4(code: usize, arg0: usize, arg1: usize, arg2: usize, arg3: usize) -> isize {
-    let mut r = 0isize;
-    unsafe {
-        asm!(
-            "ecall",
-            in("a0") code,
-            in("a1") arg0,
-            in("a2") arg1,
-            in("a3") arg2,
-            in("a4") arg3,
-            lateout("a0") r
-        );
-    }
-    r
-}
-
-/// Two-return variant: primary in a0, secondary in a1. Used by
-/// `create_netch` to hand back both the mapped VA (a0) and the Fd the
-/// kernel assigned (a1) in one trap — avoids needing a user
-/// out-pointer, which the kernel would have to resolve through KDMAP
-/// or a transient page window.
-extern "C" fn syscall_arg4_ret2(code: usize, arg0: usize, arg1: usize, arg2: usize, arg3: usize, fd: &mut u32) -> isize {
-    let mut r0 = 0isize;
-    let mut r1 = 0isize;
-    unsafe {
-        asm!(
-            "ecall",
-            in("a0") code,
-            in("a1") arg0,
-            in("a2") arg1,
-            in("a3") arg2,
-            in("a4") arg3,
-            lateout("a0") r0,
-            lateout("a1") r1,
-        );
-    }
-    
-    if r0 == 0 {
-        *fd = r1 as u32;
-    }
-    r0
-}
-
-fn sleep_ms(ms: usize) -> isize {
-    syscall_arg0(2, ms)
-}
-
-fn serial_print(ptr: usize, len: usize) -> isize {
-    syscall_arg1(1, ptr, len)
-}
-
-#[allow(dead_code)]
-fn mmap(addr: usize, len: usize, permissions: usize, share_with_kernel: bool) -> isize {
-    syscall_arg4(4096, addr, len, permissions, share_with_kernel as usize)
-}
-
-fn exit(code: isize) -> ! {
-    syscall_arg0_noret(0, code as usize)
-}
-
-/// Ask the kernel to allocate a NetChannel region of `region_size` bytes,
-/// map it at `vaddr_hint`, initialize its headers, and register it with
-/// the net thread as a socket of `sock_type`. On success returns
-/// `(user_va, fd)` — the VA the region landed at and the Fd the kernel
-/// assigned (pass this to `close_handle` to tear down the channel).
-/// On failure returns a negative errno.
-fn create_netch(vaddr_hint: usize, region_size: usize, sock_type: usize) -> Result<(usize, u32), ()> {
-    let mut fd = 0;
-    let va = syscall_arg4_ret2(4097, vaddr_hint, region_size, sock_type, 0, &mut fd);
-    if va < 0 { Err(()) } else { Ok((va as usize, fd as u32)) }
-}
-
-/// Release a handle previously returned by `create_netch`. Kernel
-/// revokes the user mapping (future accesses to the old VA fault)
-/// before dropping its strong ref. Returns 0 on success, negative on
-/// error.
-fn close_handle(fd: u32) -> isize {
-    syscall_arg0(4098, fd as usize)
-}
+use orbit_abi::user::{close_handle, create_netch, exit, serial_print, sleep_ms};
 
 /// Emit a line through the serial-print syscall. Wraps `serial_print`
 /// for string-literal callers; the kernel prepends its standard
@@ -142,6 +27,30 @@ fn check(name: &str, got: isize, want: isize) {
         let _ = writeln!(w, "FAIL: {name} want {want} got {got}");
     }
     w.flush();
+}
+
+/// Exercise the orbit-rt heap: first touch forces the talc `Source` to
+/// mmap its first arena; subsequent pushes stay in that arena. Prints
+/// PASS/FAIL for the smoke script to grep.
+fn run_heap_smoke() {
+    use alloc::boxed::Box;
+    use alloc::vec::Vec;
+    use core::fmt::Write;
+
+    let b = Box::new(0xABCDu32);
+    let mut w = SerialWriter::new();
+    let _ = writeln!(w, "heap Box: {:#x} (want 0xabcd)", *b);
+    w.flush();
+
+    let mut v: Vec<u32> = Vec::new();
+    for i in 0..1024 { v.push(i); }
+    let sum: u64 = v.iter().map(|&x| x as u64).sum();
+    let mut w = SerialWriter::new();
+    let _ = writeln!(w, "heap Vec sum: {sum} (want {})", (0u64..1024).sum::<u64>());
+    w.flush();
+
+    check("heap Box value", *b as isize, 0xABCD);
+    check("heap Vec sum",   sum as isize, (0u64..1024).sum::<u64>() as isize);
 }
 
 /// Exercise syscall error paths that QEMU smoke otherwise never hits.
@@ -187,6 +96,8 @@ pub unsafe extern "C" fn _start() -> ! {
     // print to serial
     const TEST: &'static str = "hello world!\n";
     let _ = serial_print(TEST.as_ptr() as usize, TEST.len());
+
+    run_heap_smoke();
 
     run_error_path_tests();
 
@@ -352,5 +263,5 @@ fn panic_time(p: &PanicInfo) -> ! {
     let mut w = SerialWriter::new();
     let _ = writeln!(w, "umode panic: {p}");
     w.flush();
-    syscall_arg0_noret(0, isize::MIN as usize);
+    exit(isize::MIN);
 }

@@ -5,3 +5,5 @@ edition = "2024"
 
 [dependencies]
 net_channel = {path = "../net_channel" }
+orbit-abi   = {path = "../orbit-abi" }
+orbit-rt    = {path = "../orbit-rt" }
