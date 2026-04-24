@@ -30,6 +30,10 @@ pub struct HartContext {
     pub s_trap_addr: u64,       // 584
     pub trap_stack: Stack,      // 592
     pub k_stack: Stack,
+    /// PLIC S-mode context index for this hart. Populated after PLIC
+    /// install; sentinel `u32::MAX` means "no PLIC context assigned".
+    /// Appended past the load-bearing offsets read by `asm/trap.S`.
+    pub plic_s_context: u32,
 }
 
 #[repr(C, align(8))]

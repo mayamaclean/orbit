@@ -1206,6 +1206,10 @@ impl Orbit {
                 self.get_pci_info(node);
                 continue
             }
+            if name.starts_with("plic") {
+                self.setup_plic(&fdt);
+                continue
+            }
 
             /*
             println!("\nexamining {}", name);
@@ -1217,6 +1221,14 @@ impl Orbit {
             for child in node.children() {
                 nodes.push(child);
             }
+        }
+    }
+
+    fn setup_plic(&mut self, fdt: &Fdt<'_>) {
+        let ort = self.root();
+        let mut pages = PageAlloc::FA(self.table_pages.frames_mut());
+        if unsafe { crate::drivers::plic::install(fdt, &ort, &mut pages) }.is_err() {
+            error!("plic install failed");
         }
     }
 

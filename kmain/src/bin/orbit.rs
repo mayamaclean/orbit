@@ -44,10 +44,16 @@ unsafe extern "C" {
 
 fn setup_interrupts() {
     unsafe {
-        riscv::register::sstatus::set_sie();
-        riscv::register::sie::set_stimer();
-        riscv::register::sie::set_ssoft();
+        // Program every sie bit *before* flipping sstatus.SIE on. With
+        // the previous order the first `set_sie()` could be preempted
+        // by a pending STIP, and the timer arm's context-switch to
+        // `k_hart_loop` made the remaining `set_*()` calls unreachable
+        // — sie.SEXT stayed 0 forever, so S-mode external interrupts
+        // never fired.
         riscv::register::sie::set_sext();
+        riscv::register::sie::set_ssoft();
+        riscv::register::sie::set_stimer();
+        riscv::register::sstatus::set_sie();
     }
 }
 
@@ -106,6 +112,12 @@ extern "C" fn s_trap(
 
                     check_context_and_switch();
                 }
+            }
+            // Supervisor external interrupt from the PLIC. Drain all
+            // pending sources on this hart's S-context and return to the
+            // preempted thread — no context switch needed.
+            9 => {
+                kmain::drivers::plic::dispatch(hart_context.plic_s_context);
             }
             c => {
                 error!("unhandled kint {c}");
@@ -234,6 +246,28 @@ pub extern "C" fn k_smpstart() {
         .expect("no test uprocess");
 
     orbit.get_environment_info();
+
+    // Populate each hart_context's PLIC S-mode context index from the
+    // PlicInfo stashed by `drivers::plic::install`. Done here (before
+    // the hart-wake ecall below) so secondary harts see correct values
+    // once they come online.
+    if let Some(info) = kmain::drivers::plic::info() {
+        unsafe {
+            let my_hc = hart_context as *const HartContext as *mut HartContext;
+            let base = my_hc.sub(hart_context.hart_id as usize);
+            for i in 0..orbit.cpu_count {
+                let hc = base.add(i).as_mut_unchecked();
+                hc.plic_s_context = info
+                    .s_contexts
+                    .get(i)
+                    .copied()
+                    .flatten()
+                    .unwrap_or(u32::MAX);
+            }
+        }
+
+        let _ = kmain::drivers::plic::install_uart_rx_smoke();
+    }
 
     unsafe {
         // bl dereferences HART_ROOT in M-mode with no paging, so it must be a
@@ -670,6 +704,10 @@ extern "C" fn rust_main(_hartid: usize, sysinfo: usize, load_addr: u64) -> ! {
             hart_context.tsp =
                 &hart_context.trap_stack.stack_data[hart_context.trap_stack.stack_data.len() - 16]
                 as *const _ as usize;
+            // Sentinel until plic install populates the real S-context in
+            // k_smpstart. Any cause-9 that lands here before then will be
+            // rejected by `plic::dispatch`.
+            hart_context.plic_s_context = u32::MAX;
 
             info!("setting hart context @ {ptr:016X?} to kidle hart{hart}");
         }
