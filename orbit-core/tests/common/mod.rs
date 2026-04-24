@@ -91,6 +91,14 @@ pub struct FakeHw {
     /// Ordered hart ids received by `wake_hart`. Scheduler tests read
     /// this to assert which remotes got IPIs and in what order.
     pub wakes: Vec<u32>,
+
+    /// Accumulated `(pid, bytes)` tuples captured by
+    /// `console_write_user`. Tests inspect this directly.
+    pub console_writes: Vec<(u16, Vec<u8>)>,
+
+    /// If false, `console_write_user` returns `Err(())` — exercises
+    /// the `-7` ring-full path.
+    pub console_ok: bool,
 }
 
 impl Default for FakeHw {
@@ -103,6 +111,8 @@ impl Default for FakeHw {
             user_prints: Vec::new(),
             serial_ok: true,
             wakes: Vec::new(),
+            console_writes: Vec::new(),
+            console_ok: true,
         }
     }
 }
@@ -134,5 +144,13 @@ impl Hardware for FakeHw {
     }
     fn wake_hart(&mut self, hart_id: u32) {
         self.wakes.push(hart_id);
+    }
+    fn console_write_user(&mut self, pid: u16, bytes: &[u8]) -> Result<(), ()> {
+        if self.console_ok {
+            self.console_writes.push((pid, bytes.to_vec()));
+            Ok(())
+        } else {
+            Err(())
+        }
     }
 }

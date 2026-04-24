@@ -6,6 +6,7 @@
 pub const EXIT:            usize = 0;
 pub const SERIAL_PRINT:    usize = 1;
 pub const SLEEP_MS:        usize = 2;
+pub const CONSOLE_WRITE:   usize = 3;
 
 pub const MMAP:            usize = 4096;
 pub const CREATE_NETCH:    usize = 4097;
@@ -18,6 +19,7 @@ pub enum Sysno {
     Exit           = EXIT,
     SerialPrint    = SERIAL_PRINT,
     SleepMs        = SLEEP_MS,
+    ConsoleWrite   = CONSOLE_WRITE,
     Mmap           = MMAP,
     CreateNetch    = CREATE_NETCH,
     CloseHandle    = CLOSE_HANDLE,
@@ -30,6 +32,7 @@ impl Sysno {
             EXIT           => Self::Exit,
             SERIAL_PRINT   => Self::SerialPrint,
             SLEEP_MS       => Self::SleepMs,
+            CONSOLE_WRITE  => Self::ConsoleWrite,
             MMAP           => Self::Mmap,
             CREATE_NETCH   => Self::CreateNetch,
             CLOSE_HANDLE   => Self::CloseHandle,
@@ -48,6 +51,7 @@ mod tests {
         assert_eq!(Sysno::from_usize(EXIT),         Some(Sysno::Exit));
         assert_eq!(Sysno::from_usize(SERIAL_PRINT), Some(Sysno::SerialPrint));
         assert_eq!(Sysno::from_usize(SLEEP_MS),     Some(Sysno::SleepMs));
+        assert_eq!(Sysno::from_usize(CONSOLE_WRITE), Some(Sysno::ConsoleWrite));
         assert_eq!(Sysno::from_usize(MMAP),         Some(Sysno::Mmap));
         assert_eq!(Sysno::from_usize(CREATE_NETCH), Some(Sysno::CreateNetch));
         assert_eq!(Sysno::from_usize(CLOSE_HANDLE), Some(Sysno::CloseHandle));
@@ -56,7 +60,7 @@ mod tests {
 
     #[test]
     fn unknown_returns_none() {
-        assert_eq!(Sysno::from_usize(3), None);
+        assert_eq!(Sysno::from_usize(4), None);
         assert_eq!(Sysno::from_usize(4095), None);
         assert_eq!(Sysno::from_usize(4100), None);
         assert_eq!(Sysno::from_usize(usize::MAX), None);
@@ -67,6 +71,7 @@ mod tests {
         assert_eq!(Sysno::Exit          as usize, EXIT);
         assert_eq!(Sysno::SerialPrint   as usize, SERIAL_PRINT);
         assert_eq!(Sysno::SleepMs       as usize, SLEEP_MS);
+        assert_eq!(Sysno::ConsoleWrite  as usize, CONSOLE_WRITE);
         assert_eq!(Sysno::Mmap          as usize, MMAP);
         assert_eq!(Sysno::CreateNetch   as usize, CREATE_NETCH);
         assert_eq!(Sysno::CloseHandle   as usize, CLOSE_HANDLE);
@@ -80,6 +85,7 @@ mod tests {
         assert_eq!(EXIT, 0);
         assert_eq!(SERIAL_PRINT, 1);
         assert_eq!(SLEEP_MS, 2);
+        assert_eq!(CONSOLE_WRITE, 3);
         assert_eq!(MMAP, 4096);
         assert_eq!(CREATE_NETCH, 4097);
         assert_eq!(CLOSE_HANDLE, 4098);

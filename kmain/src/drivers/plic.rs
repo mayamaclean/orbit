@@ -371,17 +371,15 @@ pub fn plic_register(src: u32, handler: Handler, hart: usize) -> Result<(), ()> 
     Ok(())
 }
 
-/// Smoke test. Registers a UART RX handler on IRQ 10 pinned to hart 0
-/// and writes the ns16550a's IER to enable "received data available"
-/// interrupts. After this, every keystroke typed in the QEMU console
-/// fires exactly one cause-9 trap and the handler logs the byte.
-///
-/// Uses `serial::print_no_crit` in the handler so we never block on
-/// the serial spinlock from trap context — contention with a
-/// concurrent printer would merely interleave bytes, not deadlock.
-pub fn install_uart_rx_smoke() -> Result<(), ()> {
+/// Register the UART-RX → pane-cycle handler on IRQ 10 pinned to hart 0
+/// and configure the ns16550a to raise RX interrupts. After this,
+/// every keystroke typed in the QEMU console fires exactly one
+/// cause-9 trap, drains the byte, and enqueues a `CycleActive`
+/// command onto `k_gpu`'s ring — the visible display source rotates
+/// on the next `k_gpu` wake (≤50 ms).
+pub fn install_uart_rx_cycle() -> Result<(), ()> {
     const UART_RX_IRQ: u32 = 10;
-    plic_register(UART_RX_IRQ, uart_rx_smoke_handler, 0)?;
+    plic_register(UART_RX_IRQ, uart_rx_cycle_handler, 0)?;
 
     // QEMU's ns16550a only asserts its interrupt line when MCR.OUT2 is
     // set AND the FIFO is enabled with a matched RX trigger level. Our
@@ -399,27 +397,22 @@ pub fn install_uart_rx_smoke() -> Result<(), ()> {
         (base as *mut u8).add(4).write_volatile(0x08); // MCR
         (base as *mut u8).add(1).write_volatile(0x01); // IER
     }
-    info!("plic: uart rx smoke armed on IRQ {}", UART_RX_IRQ);
+    info!("plic: uart rx pane-cycle armed on IRQ {}", UART_RX_IRQ);
     Ok(())
 }
 
-fn uart_rx_smoke_handler(src: u32) {
-    // Reading RBR (offset 0) drains the received byte and clears the
-    // UART's RX-ready line; without this the source stays asserted
-    // and we'd re-trap immediately after complete.
+fn uart_rx_cycle_handler(_src: u32) {
+    // Draining RBR (offset 0) clears the UART's RX-ready line; without
+    // this the source stays asserted and we'd re-trap immediately
+    // after complete.
     let rbr = memmap::kmmio_uart() as *const u8;
-    let byte = unsafe { rbr.read_volatile() };
-    let ch = if byte.is_ascii_graphic() || byte == b' ' {
-        byte as char
-    } else {
-        '?'
-    };
-    unsafe {
-        serial::print_no_crit(format_args!(
-            "[plic smoke] src={} rx={:#04x} '{}'\n",
-            src, byte, ch,
-        ));
-    }
+    let _byte = unsafe { rbr.read_volatile() };
+
+    // Push a CycleActive cmd onto the k_gpu ring. Runs in trap
+    // context (SIE=0) — thingbuf push is lock-free, safe here.
+    // If the ring is full we drop the keystroke; at human typing
+    // rates with `k_gpu` waking every ~50 ms this is not a concern.
+    let _ = crate::drivers::k_gpu::push_cycle_active();
 }
 
 /// Drain pending sources on this hart's S-mode context. Invoked from

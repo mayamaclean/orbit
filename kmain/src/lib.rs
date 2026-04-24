@@ -401,7 +401,7 @@ pub extern "C" fn k_net(device: *mut NetPackage) {
             };
 
             let this_thread = {
-                let p = hart_context.current.load(Ordering::Relaxed) as *mut Thread;
+                let p = hart_context.current.load(Ordering::Acquire) as *mut Thread;
                 //serial::println!("net thread on cpu{} t={p:016X?}", hart_context.hart_id);
                 
                 p.as_mut_unchecked()
@@ -481,6 +481,12 @@ pub fn update_thread_and_trap_frame(
 pub fn handle_serial_print(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
     dispatch_syscall(epc, hart_context, frame, |t, f| {
         orbit_core::syscall::serial_print(t, f, &mut crate::hw::RiscvHardware)
+    });
+}
+
+pub fn handle_console_write(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
+    dispatch_syscall(epc, hart_context, frame, |t, f| {
+        orbit_core::syscall::console_write(t, f, &mut crate::hw::RiscvHardware)
     });
 }
 

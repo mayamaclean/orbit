@@ -105,12 +105,12 @@ Is qemu-system-riscv64 on PATH? Did something kill QEMU before it could boot?"
 
 note "checking QEMU serial log markers"
 MARKERS=(
-  'USER\[1\.1\]: hello world!'
-  'USER\[1\.1\]: netchannel created!'
-  'USER\[1\.1\]: tcp connected!'
-  'USER\[1\.1\]: hi!'
-  'USER\[1\.1\]: exit'
-  'USER\[1\.1\]: close_handle ok!'
+  'USER\[1\]: hello world!'
+  'USER\[1\]: netchannel created!'
+  'USER\[1\]: tcp connected!'
+  'USER\[1\]: hi!'
+  'USER\[1\]: exit'
+  'USER\[1\]: close_handle ok!'
   # Syscall error-path assertions run from the umode test harness —
   # each validates a specific kernel return-code branch that the happy
   # path never touches.
@@ -119,6 +119,9 @@ MARKERS=(
   'PASS: serial_print null VA got -2'
   'PASS: serial_print too long got -3'
   'PASS: serial_print non-utf8 got -4'
+  'PASS: console_write null VA got -2'
+  'PASS: console_write too long got -3'
+  'PASS: console_write non-utf8 got 4'
   'PASS: close_handle no registry got -1'
   'PASS: close_handle bogus fd got -2'
   # Sentinel — printed by umode after the last error-path check returns.

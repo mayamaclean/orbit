@@ -190,15 +190,24 @@ pub fn setup_virtio_gpu(
     let (fb_frame, fb_kva) = kernel_pages.alloc_kdmap(fb_layout)?;
     let fb_pa = fb_frame.get_raw();
 
-    // Fill with a dark gray test pattern so we can tell the scanout
-    // is live before the glyph blitter lands.
-    let px_count = (info.width as usize) * (info.height as usize);
-    unsafe {
-        let p = fb_kva.as_mut_ptr::<u32>();
-        for i in 0..px_count {
-            p.add(i).write_volatile(0x00_20_20_20);
-        }
-    }
+    // Prime the framebuffer with a solid dark-gray background plus a
+    // greeting so we can visually confirm the blit path works before
+    // the k_gpu thread + Scrollback land.
+    let fb = unsafe {
+        crate::drivers::fb::FrameBuffer::new(
+            fb_kva.as_ptr::<u8>() as u64,
+            info.width,
+            info.height,
+        )
+    };
+    fb.fill(crate::drivers::fb::DARK_GRAY);
+    fb.blit_text(
+        16,
+        16,
+        "orbit framebuffer online",
+        crate::drivers::fb::WHITE,
+        crate::drivers::fb::DARK_GRAY,
+    );
 
     // Phase 7: tell the device about the resource + scanout + initial
     // contents.

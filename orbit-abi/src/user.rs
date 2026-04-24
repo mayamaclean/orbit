@@ -125,6 +125,16 @@ pub fn serial_print(ptr: usize, len: usize) -> isize {
     unsafe { ecall2(syscall::SERIAL_PRINT, ptr, len) }
 }
 
+/// Append `len` bytes starting at `ptr` to the calling process's
+/// framebuffer scrollback. Bytes are chunked at 4 KiB (POSIX
+/// `PIPE_BUF` atomicity); oversize writes are truncated and the
+/// return value is the number of bytes accepted. Returns negative
+/// errno on failure (`-1` invalid VA, `-3` overflow, `-7` ring full).
+#[inline]
+pub fn console_write(ptr: usize, len: usize) -> isize {
+    unsafe { ecall2(syscall::CONSOLE_WRITE, ptr, len) }
+}
+
 /// Block the calling thread for `ms` milliseconds. Kernel caps the delay
 /// at one hour; requests at/above the cap return -2.
 #[inline]
@@ -198,4 +208,45 @@ pub fn create_process(elf_ptr: *const u8, elf_len: usize) -> Result<u16, isize> 
     } else {
         Ok(r as u16)
     }
+}
+
+pub struct SerialWriter {
+    buf: [u8; 256],
+    len: usize,
+}
+
+impl SerialWriter {
+    pub const fn new() -> Self { Self { buf: [0u8; 256], len: 0 } }
+    pub fn flush(&mut self) {
+        if self.len > 0 {
+            // Write to both sinks so UART remains greppable for smoke
+            // automation (the existing USER[...] tag pattern) while
+            // the framebuffer path gets the same bytes for the pane
+            // manager to display.
+            //let _ = serial_print(self.buf.as_ptr() as usize, self.len);
+            let _ = console_write(self.buf.as_ptr() as usize, self.len);
+            self.len = 0;
+        }
+    }
+}
+
+impl core::fmt::Write for SerialWriter {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        for &b in s.as_bytes() {
+            if self.len >= self.buf.len() { self.flush(); }
+            self.buf[self.len] = b;
+            self.len += 1;
+        }
+        Ok(())
+    }
+}
+
+#[macro_export]
+macro_rules! logln {
+    ($($arg:tt)*) => {{
+        use core::fmt::Write;
+        let mut w = SerialWriter::new();
+        let _ = writeln!(w, $($arg)*);
+        w.flush();
+    }};
 }

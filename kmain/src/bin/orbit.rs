@@ -166,6 +166,9 @@ extern "C" fn s_trap(
                     2 => {
                         kmain::handle_ms_sleep(epc, hart_context, frame);
                     }
+                    3 => {
+                        kmain::handle_console_write(epc, hart_context, frame);
+                    }
                     4096 => {
                         debug!("orbit handling u mode ecall({syscall})");
                         kmain::handle_mmap_req(epc, hart_context, frame);
@@ -266,7 +269,7 @@ pub extern "C" fn k_smpstart() {
             }
         }
 
-        let _ = kmain::drivers::plic::install_uart_rx_smoke();
+        let _ = kmain::drivers::plic::install_uart_rx_cycle();
     }
 
     unsafe {

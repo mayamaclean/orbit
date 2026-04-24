@@ -139,6 +139,38 @@ pub fn serial_print<H: Hardware>(
     }
 }
 
+/// Append `len` user bytes at `regs[11]` to the calling process's
+/// framebuffer scrollback. Chunked at `PAGE_SIZE` (4 KiB atomic
+/// unit, matches POSIX `PIPE_BUF`). Return value is the number of
+/// bytes accepted on success; negative errno on failure.
+///
+/// - `-2` — user VA doesn't translate under the thread's satp
+/// - `-3` — `len == 0` or overflows `PAGE_SIZE`
+/// - `-7` — ring full (EAGAIN), retry after yield
+pub fn console_write<H: Hardware>(
+    thread: &Thread,
+    frame: &TrapFrame,
+    hw: &mut H,
+) -> SyscallOutcome {
+    let user_va = frame.regs[11] as u64;
+    let len = frame.regs[12];
+
+    if len == 0 || len > PAGE_SIZE {
+        return ready(-3);
+    }
+    if !hw.user_va_translates(thread.root_table_addr() as u64, user_va) {
+        return ready(-2);
+    }
+
+    let mut buf = [0u8; PAGE_SIZE];
+    hw.copy_from_user(user_va, &mut buf[..len]);
+
+    match hw.console_write_user(thread.pid, &buf[..len]) {
+        Ok(()) => ready(len as isize),
+        Err(()) => ready(-7),
+    }
+}
+
 #[inline]
 fn ready(ret: isize) -> SyscallOutcome {
     SyscallOutcome::Yield {

@@ -7,14 +7,7 @@ use orbit_rt as _;
 use core::{panic::PanicInfo, sync::atomic::Ordering};
 
 use net_channel::NetChannel;
-use orbit_abi::user::{close_handle, create_netch, exit, serial_print, sleep_ms};
-
-/// Emit a line through the serial-print syscall. Wraps `serial_print`
-/// for string-literal callers; the kernel prepends its standard
-/// `{time}t USER[pid.tid]: ` tag via the handler.
-fn print(s: &str) {
-    let _ = serial_print(s.as_ptr() as usize, s.len());
-}
+use orbit_abi::{logln, user::{close_handle, create_netch, exit, sleep_ms, console_write, serial_print, SerialWriter}};
 
 /// Report a PASS/FAIL line for a single error-path scenario. The smoke
 /// script greps for "PASS: <name>" lines to validate each branch fired.
@@ -56,20 +49,26 @@ fn run_heap_smoke() {
 /// Exercise syscall error paths that QEMU smoke otherwise never hits.
 /// Each check prints a PASS/FAIL marker the smoke script verifies.
 fn run_error_path_tests() {
-    print("=== error path tests ===\n");
+    logln!("=== error path tests ===");
 
     // --- sleep_ms edge cases ---
     // The kernel caps sleep at 60*60*1000 ms. `>=` MAX returns -2.
     check("sleep_ms at cap",    sleep_ms(60 * 60 * 1000),     -2);
     check("sleep_ms above cap", sleep_ms(60 * 60 * 1000 + 1), -2);
 
-    // --- serial_print error paths ---
+    // --- console_write error paths ---
     // NULL-region VA (inside USER_NULL_GUARD_END) never translates → -2.
-    check("serial_print null VA", serial_print(0x1000, 5), -2);
+    check("console_write null VA", console_write(0x1000, 5), -2);
+    check("serial_print null VA", serial_print(0x1000, 5),-2);
 
     // len > PAGE_SIZE rejected with -3 before any memory is touched,
     // so the pointer just needs to be plausible.
     static FILLER: [u8; 16] = [b'x'; 16];
+    check(
+        "console_write too long",
+        console_write(&FILLER as *const u8 as usize, 4097),
+        -3,
+    );
     check(
         "serial_print too long",
         serial_print(&FILLER as *const u8 as usize, 4097),
@@ -78,6 +77,11 @@ fn run_error_path_tests() {
 
     // Non-UTF-8 bytes rejected with -4. 0xFF is never a valid start byte.
     static BAD_UTF8: [u8; 4] = [0xFF, 0xFE, 0xFD, 0xFC];
+    check(
+        "console_write non-utf8",
+        console_write(&BAD_UTF8 as *const u8 as usize, 4),
+        4,
+    );
     check(
         "serial_print non-utf8",
         serial_print(&BAD_UTF8 as *const u8 as usize, 4),
@@ -88,14 +92,13 @@ fn run_error_path_tests() {
     // No process_handles entry for this pid → -1.
     check("close_handle no registry", close_handle(7), -1);
 
-    print("=== error path tests done ===\n");
+    logln!("=== error path tests done ===");
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn _start() -> ! {
     // print to serial
-    const TEST: &'static str = "hello world!\n";
-    let _ = serial_print(TEST.as_ptr() as usize, TEST.len());
+    logln!("hello world!");
 
     run_heap_smoke();
 
@@ -112,14 +115,12 @@ pub unsafe extern "C" fn _start() -> ! {
     let (nc_vaddr, nc_fd) = match create_netch(AHINT, NC_REGION_SIZE, 0) {
         Ok(v) => v,
         Err(_) => {
-            const NO_NC: &'static str = "failed to create netchannel!\n";
-            let _ = serial_print(NO_NC.as_ptr() as usize, NO_NC.len());
+            logln!("failed to create netchannel!");
             exit(-2isize);
         }
     };
 
-    const OK: &'static str = "netchannel created!\n";
-    let _ = serial_print(OK.as_ptr() as usize, OK.len());
+    logln!("netchannel created!");
 
     // Bogus fd AFTER a netchannel has been created — process_handles
     // now has an entry for this pid, but fd 999 isn't in it → -2.
@@ -129,8 +130,7 @@ pub unsafe extern "C" fn _start() -> ! {
     let nc = unsafe { &*(nc_vaddr as *const NetChannel) };
 
     if let Err(_) = nc.connect_tcp(u32::from_be_bytes([192,168,76,2]), 65535) {
-        const NC_NO_CONNECT: &'static str = "bad failed nc tcp connect!\n";
-        let _ = serial_print(NC_NO_CONNECT.as_ptr() as usize, NC_NO_CONNECT.len());
+        logln!("bad failed nc tcp connect!");
 
         // exit call
         exit(-2isize);
@@ -140,13 +140,11 @@ pub unsafe extern "C" fn _start() -> ! {
         let state = nc.current_state().state.load(Ordering::Acquire);
 
         if state > 0 {
-            const TCP_CONNECTED: &'static str = "tcp connected!\n";
-            let _ = serial_print(TCP_CONNECTED.as_ptr() as usize, TCP_CONNECTED.len());
+            logln!("tcp connected!");
             break
         }
         else if state < 0 {
-            const TCP_FAILURE: &'static str = "tcp connect failed!\n";
-            let _ = serial_print(TCP_FAILURE.as_ptr() as usize, TCP_FAILURE.len());
+            logln!("tcp connect failed!");
             break
         }
         else if state == 0 {
@@ -178,7 +176,7 @@ pub unsafe extern "C" fn _start() -> ! {
                 if rx.starts_with(b"exit") {
                     br = true;
                 }
-                serial_print(rx.as_ptr() as usize, rx.len());
+                console_write(rx.as_ptr() as usize, rx.len());
                 rx.len()
             });
 
@@ -197,13 +195,11 @@ pub unsafe extern "C" fn _start() -> ! {
                 // user mapping has been torn down.
                 let cr = close_handle(nc_fd);
                 if cr != 0 {
-                    const CLOSE_FAIL: &'static str = "close_handle failed!\n";
-                    let _ = serial_print(CLOSE_FAIL.as_ptr() as usize, CLOSE_FAIL.len());
+                    logln!("close_handle failed!");
                     exit(cr);
                 }
 
-                const CLOSE_OK: &'static str = "close_handle ok!\n";
-                let _ = serial_print(CLOSE_OK.as_ptr() as usize, CLOSE_OK.len());
+                logln!("close_handle ok!");
 
                 let _ = unsafe {
                     core::ptr::read_volatile(nc as *const _ as *const u8);
@@ -218,43 +214,11 @@ pub unsafe extern "C" fn _start() -> ! {
         let state = nc.current_state().state.load(Ordering::Acquire);
 
         if state <= 0 {
-            const TCP_CONN_FAILURE: &'static str = "tcp connection failed!\n";
-            let _ = serial_print(TCP_CONN_FAILURE.as_ptr() as usize, TCP_CONN_FAILURE.len());
+            logln!("tcp connection failed!");
             break
         }
     }    
     exit(-99);
-}
-
-/// Tiny `fmt::Write` that buffers into a 256-byte stack array and
-/// flushes via the serial-print syscall. Enough to get a panic message
-/// out before exit without any allocator.
-struct SerialWriter {
-    buf: [u8; 256],
-    len: usize,
-}
-
-impl SerialWriter {
-    const fn new() -> Self { Self { buf: [0u8; 256], len: 0 } }
-    fn flush(&mut self) {
-        if self.len > 0 {
-            let _ = serial_print(self.buf.as_ptr() as usize, self.len);
-            self.len = 0;
-        }
-    }
-}
-
-impl core::fmt::Write for SerialWriter {
-    fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        for &b in s.as_bytes() {
-            if self.len >= self.buf.len() {
-                self.flush();
-            }
-            self.buf[self.len] = b;
-            self.len += 1;
-        }
-        Ok(())
-    }
 }
 
 #[panic_handler]

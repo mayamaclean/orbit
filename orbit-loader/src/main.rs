@@ -28,7 +28,7 @@ use core::{panic::PanicInfo, sync::atomic::Ordering};
 
 use minicbor::{Decode, Encode};
 use net_channel::NetChannel;
-use orbit_abi::user::{create_netch, create_process, exit, serial_print, sleep_ms};
+use orbit_abi::{logln, user::{create_netch, create_process, exit, sleep_ms, SerialWriter}};
 
 const LISTEN_PORT: u16 = 7777;
 const NC_VADDR_HINT: usize = 0x2_4000_0000;
@@ -59,15 +59,6 @@ enum LoaderErr {
     ConnClosed(i32),
     Listen,
     Syscall(isize),
-}
-
-macro_rules! logln {
-    ($($arg:tt)*) => {{
-        use core::fmt::Write;
-        let mut w = SerialWriter::new();
-        let _ = writeln!(w, $($arg)*);
-        w.flush();
-    }};
 }
 
 #[unsafe(no_mangle)]
@@ -226,32 +217,6 @@ fn spawn(body_only: &[u8]) -> Result<u16, LoaderErr> {
     match create_process(elf.as_ptr(), elf.len()) {
         Ok(pid) => Ok(pid),
         Err(e)  => Err(LoaderErr::Syscall(e)),
-    }
-}
-
-struct SerialWriter {
-    buf: [u8; 256],
-    len: usize,
-}
-
-impl SerialWriter {
-    const fn new() -> Self { Self { buf: [0u8; 256], len: 0 } }
-    fn flush(&mut self) {
-        if self.len > 0 {
-            let _ = serial_print(self.buf.as_ptr() as usize, self.len);
-            self.len = 0;
-        }
-    }
-}
-
-impl core::fmt::Write for SerialWriter {
-    fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        for &b in s.as_bytes() {
-            if self.len >= self.buf.len() { self.flush(); }
-            self.buf[self.len] = b;
-            self.len += 1;
-        }
-        Ok(())
     }
 }
 

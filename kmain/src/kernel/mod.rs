@@ -775,6 +775,13 @@ impl Orbit {
     fn dealloc_process(&mut self, mut process: Process) {
         let process_root_table_pa = (process.satp.ppn() * PAGE_SIZE) as u64;
 
+        // Release the scrollback source so k_gpu advances `active`
+        // off this pid on the next drain. Paired with the
+        // `push_insert_source` in `create_new_process`.
+        let _ = crate::drivers::k_gpu::push_remove_source(
+            crate::drivers::display::Source::Process(process.pid),
+        );
+
         while let Some(socket_handle) = process.sockets.pop_last() {
             if let Err(e) = self.net_pkg.socket_deletions.enqueue(socket_handle) {
                 error!("failed to queue socket for deletion while deallocating pid{} ({e:?})", process.pid);
@@ -1239,12 +1246,33 @@ impl Orbit {
 
     fn setup_virtio_gpu(&mut self, fdt: &Fdt<'_>) {
         let ort = self.root();
-        let _ = crate::drivers::virtio_gpu_dev::setup_virtio_gpu(
+        let Some(outcome) = crate::drivers::virtio_gpu_dev::setup_virtio_gpu(
             fdt,
             &ort,
             &mut self.table_pages,
             &mut self.kernel_pages,
-        );
+        ) else {
+            return;
+        };
+
+        // Build the Display + GpuPackage, hand ownership to k_gpu.
+        let fb = unsafe {
+            crate::drivers::fb::FrameBuffer::new(
+                outcome.fb_kva,
+                outcome.width,
+                outcome.height,
+            )
+        };
+        let pkg = crate::drivers::k_gpu::GpuPackage {
+            display: crate::drivers::display::Display::new(fb),
+            fb_resource_id: outcome.resource_id,
+        };
+        crate::drivers::k_gpu::install_package(pkg);
+
+        let entrypoint = crate::drivers::k_gpu::k_gpu as *const () as usize;
+        if self.create_kernel_thread(entrypoint, None).is_err() {
+            error!("virtio-gpu: failed to spawn k_gpu thread");
+        }
     }
 
     /// `stack_pa` is the physical base of the user stack. User PT leaves
@@ -1519,6 +1547,15 @@ impl Orbit {
         proc.thread_count = 1;
 
         self.threads.insert(tid, PThread(tptr));
+
+        // Register a scrollback source with k_gpu so the process's
+        // console_write output lands somewhere. If the ring is full
+        // the cmd is dropped — the user_prints path via UART still
+        // works as a fallback. k_gpu picks up the InsertSource cmd
+        // in its drain loop.
+        let _ = crate::drivers::k_gpu::push_insert_source(
+            crate::drivers::display::Source::Process(pid),
+        );
 
         Ok(pid)
     }
