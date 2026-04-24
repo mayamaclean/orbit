@@ -421,7 +421,7 @@ impl<'e> smoltcp::phy::TxToken for E1000TxToken<'e> {
             let rdt = self.bar.add(RDT_REG_ADDR).read_volatile();
             let rdh = self.bar.add(RDH_REG_ADDR).read_volatile();
 
-            info!("e1000: status={:08X?}, icr0={:08X?}, icr1={:08X?}, rdt={rdt:08X?}, rdh={rdh:08X?}", status, icr0, icr1);
+            //info!("e1000: status={:08X?}, icr0={:08X?}, icr1={:08X?}, rdt={rdt:08X?}, rdh={rdh:08X?}", status, icr0, icr1);
         }
         r
     }

@@ -189,6 +189,15 @@ pub struct SocketReq {
     /// Same invariant on the tx side: set on enqueue of a tx slice,
     /// cleared when we drain the user's send-ack increment.
     pending_tx_ack: bool,
+    /// Last `desired_state.state` value the kernel issued a connect /
+    /// listen for. Keeps `update_tcp` level-triggered: if the user's
+    /// intent hasn't changed since we acted on it, we don't re-call
+    /// `socket.connect` / `socket.listen` just because smoltcp
+    /// transitioned back to CLOSED (e.g. RST from a peer with no
+    /// listener). `0` means "no intent pending" — matches the reset
+    /// path, so the existing idle sentinel doubles as the reset
+    /// marker.
+    issued_desired: i32,
 }
 
 impl orbit_core::net::RevocableConn for SocketReq {
@@ -336,6 +345,7 @@ pub extern "C" fn k_net(device: *mut NetPackage) {
                         socket,
                         &mut req.pending_rx_ack,
                         &mut req.pending_tx_ack,
+                        &mut req.issued_desired,
                     );
                 }
             }

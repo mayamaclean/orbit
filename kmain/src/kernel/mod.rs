@@ -62,7 +62,7 @@ pub use memmap::KernelLayout;
 // rebuilds don't drag kmain+bl along. The `smoke` Cargo feature swaps
 // in umode directly so ./smoke can run the automated self-test without
 // a host-side sender (and without the network-ready latency).
-#[cfg(not(feature = "smoke"))]
+#[cfg(not(feature = "smoke"))] 
 pub const UMODE_TEST_ELF: &'static [u8] = include_bytes!("../../../orbit-loader/target/riscv64gc-unknown-none-elf/release/orbit-loader");
 #[cfg(feature = "smoke")]
 pub const UMODE_TEST_ELF: &'static [u8] = include_bytes!("../../../umode/target/riscv64gc-unknown-none-elf/release/umode");
@@ -503,6 +503,7 @@ impl Orbit {
             pid: thread.pid,
             pending_rx_ack: false,
             pending_tx_ack: false,
+            issued_desired: 0,
         };
 
         if let Some(np) = self.net_pkg.socket_reqs.get_mut(get_hart_context().hart_id as usize) {

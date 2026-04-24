@@ -4,10 +4,15 @@ use core::cell::UnsafeCell;
 use core::marker::PhantomData;
 use core::mem::size_of;
 use core::sync::atomic::AtomicUsize;
-use core::{net::Ipv4Addr, sync::atomic::{AtomicI32, AtomicU16, AtomicU32, Ordering}};
+use core::sync::atomic::{AtomicI32, AtomicU16, AtomicU32, Ordering};
 
 use mem::round_usize_up;
+
+#[cfg(feature = "kernel")]
+use core::net::Ipv4Addr;
+#[cfg(feature = "kernel")]
 use smoltcp::{iface::Interface, wire::IpAddress};
+#[cfg(feature = "kernel")]
 use smoltcp::socket::tcp::State as TcpState;
 
 #[cfg(feature = "kernel")]
@@ -261,6 +266,31 @@ impl<T: Copy, const N: usize> SpscQueue<T, N> {
         let tail = self.tail.load(Ordering::Acquire);
         (tail + N - head) % N
     }
+
+    /// Zero the producer-owned index. Used during NetChannel reuse: both
+    /// sides cooperatively reset their own side so the next connection
+    /// starts with empty queues. `head` is left alone — the consumer
+    /// clears it via [`reset_consumer`].
+    ///
+    /// # Safety
+    /// Caller must be the sole producer on this queue, and must guarantee
+    /// the consumer is not actively reading (e.g. TCP socket is closed or
+    /// the channel_state handshake has gated the consumer off).
+    #[inline]
+    pub unsafe fn reset_producer(&self) {
+        self.tail.store(0, Ordering::Release);
+    }
+
+    /// Zero the consumer-owned index. See [`reset_producer`] for the
+    /// cooperative-reset safety requirements.
+    ///
+    /// # Safety
+    /// Caller must be the sole consumer on this queue, and must guarantee
+    /// the producer is not actively writing.
+    #[inline]
+    pub unsafe fn reset_consumer(&self) {
+        self.head.store(0, Ordering::Release);
+    }
 }
 
 /// Fixed header offsets within a NetChannel region. The tx/rx queues follow
@@ -461,6 +491,53 @@ impl NetChannel {
         unsafe { &*(self.anchor().add(NC_TX_OFF + self.queue_len) as *const NetChannelQueue) }
     }
 
+    /// Reset the kernel-owned halves of both rings so the next connection
+    /// on this NetChannel starts clean. Kernel owns: tx.slices producer,
+    /// tx.increments consumer, rx.slices producer, rx.increments consumer.
+    /// `avail` fields are touched here too — both sides mutate them at
+    /// steady state, but during reset the smoltcp socket is aborted and
+    /// userspace is blocked on the state handshake, so kernel can zero
+    /// them unilaterally.
+    ///
+    /// # Safety
+    /// Must be called while the smoltcp socket is aborted and before
+    /// the kernel releases `current_state.state = 0` — otherwise
+    /// userspace may observe stale-then-zero indices out of order.
+    #[cfg(feature = "kernel")]
+    pub unsafe fn reset_kernel_side(&self) {
+        let tx = self.tx();
+        let rx = self.rx();
+        unsafe {
+            tx.slices.reset_producer();
+            tx.increments.reset_consumer();
+            rx.slices.reset_producer();
+            rx.increments.reset_consumer();
+        }
+        tx.avail.store(0, Ordering::Release);
+        rx.avail.store(0, Ordering::Release);
+    }
+
+    /// Reset the user-owned halves of both rings. Mirror of
+    /// [`reset_kernel_side`]; user owns: tx.slices consumer,
+    /// tx.increments producer, rx.slices consumer, rx.increments
+    /// producer.
+    ///
+    /// # Safety
+    /// Must be called after observing `current_state.state == 0` (which
+    /// establishes that the kernel has already done its half) and
+    /// before issuing a fresh `listen_tcp` / `connect_tcp`.
+    #[cfg(not(feature = "kernel"))]
+    pub unsafe fn reset_user_side(&self) {
+        let tx = self.tx();
+        let rx = self.rx();
+        unsafe {
+            tx.slices.reset_consumer();
+            tx.increments.reset_producer();
+            rx.slices.reset_consumer();
+            rx.increments.reset_producer();
+        }
+    }
+
     /// Pump one poll cycle against `socket`. `pending_rx_ack` /
     /// `pending_tx_ack` are kernel-local state (held per socket in
     /// `SocketReq`): each is "a slice is enqueued and we haven't drained
@@ -470,51 +547,94 @@ impl NetChannel {
     /// `get_next_rx` / `get_next_tx` returns the same bytes (smoltcp
     /// hasn't been advanced yet) and we'd stage a duplicate that
     /// deadlocks the queue once the real ack drains.
-    #[cfg_attr(not(feature = "kernel"), allow(unused_variables))]
+    #[cfg(feature = "kernel")]
     pub fn update_tcp(
         &self,
         mut iface: Interface,
         socket: &mut smoltcp::socket::tcp::Socket,
         pending_rx_ack: &mut bool,
         pending_tx_ack: &mut bool,
+        issued_desired: &mut i32,
     ) -> Interface {
         let current_state = self.current_state();
+        let desired_state = self.desired_state();
 
         let channel_state = current_state.state.load(Ordering::Relaxed);
+
+        // Reuse path: userspace has acknowledged the current connection
+        // by dropping desired_state back to 0 while we're still marked
+        // non-idle. Abort the socket, reset our half of the rings, then
+        // release current_state = 0 so userspace can safely reset its
+        // side and issue the next listen/connect. Negative channel_state
+        // (error terminal) is also eligible — reset is how userspace
+        // recovers without tearing down the NetChannel.
+        if channel_state != 0
+            && desired_state.state.load(Ordering::Acquire) == 0
+        {
+            socket.abort();
+            unsafe { self.reset_kernel_side(); }
+            *pending_rx_ack = false;
+            *pending_tx_ack = false;
+            *issued_desired = 0;
+            // Release ordering: every reset store above is visible to a
+            // userspace Acquire-load of current_state.state before it
+            // reads any queue index.
+            current_state.state.store(0, Ordering::Release);
+            return iface;
+        }
+
         if channel_state < 0 {
             return iface
         }
         else if channel_state == 0 {
-            let desired_state = self.desired_state();
-
             let port = desired_state.state_remote_port.load(Ordering::Acquire);
             let addr = desired_state.state_addr.load(Ordering::Acquire);
             let state = desired_state.state.load(Ordering::Acquire);
 
+            // Level-triggered: only issue connect/listen when
+            // `desired_state` changes. Without this, a peer RST drops the
+            // socket back to CLOSED and we'd immediately re-call
+            // `socket.connect` on the next poll, producing a SYN storm
+            // when no one's listening. Userspace re-arms by requesting a
+            // reset (which clears `issued_desired` to 0 above) before
+            // re-writing a fresh desired_state.
             if !socket.get_timeout_status() && socket.state() == TcpState::Closed {
-                match state {
-                    // connect
-                    1 => {
-                        let addr = IpAddress::Ipv4(Ipv4Addr::from_bits(addr));
-                        if let Err(e) = socket.connect(
-                            iface.context(),
-                            (addr, port),
-                            desired_state.state_local_port.load(Ordering::Acquire))
-                        {
-                            #[cfg(feature = "kernel")]
-                            error!("tcp: failed to start connect: {e:?}");
+                if state != *issued_desired {
+                    match state {
+                        // connect
+                        1 => {
+                            let addr = IpAddress::Ipv4(Ipv4Addr::from_bits(addr));
+                            if let Err(e) = socket.connect(
+                                iface.context(),
+                                (addr, port),
+                                desired_state.state_local_port.load(Ordering::Acquire))
+                            {
+                                #[cfg(feature = "kernel")]
+                                error!("tcp: failed to start connect: {e:?}");
+                            }
+                        },
+                        // listen
+                        2 => {
+                            if let Err(e) = socket.listen(desired_state.state_local_port.load(Ordering::Acquire)) {
+                                #[cfg(feature = "kernel")]
+                                error!("tcp: failed to start listen: {e:?}");
+                            }
                         }
-                    },
-                    // listen
-                    2 => {
-                        if let Err(e) = socket.listen(desired_state.state_local_port.load(Ordering::Acquire)) {
-                            #[cfg(feature = "kernel")]
-                            error!("tcp: failed to start listen: {e:?}");
-                        }
+                        _ => ()
                     }
-                    _ => ()
+                    *issued_desired = state;
+                    return iface
+                } else if *issued_desired > 0 {
+                    // We already issued for this intent and smoltcp is
+                    // back at CLOSED without ever reporting is_open().
+                    // That's the terminal failure case — connect got
+                    // RST'd, or the handshake never completed. Surface
+                    // it to userspace so its poll loop breaks instead
+                    // of spinning on state==0 forever. Userspace
+                    // recovers via `request_reset` + re-issue.
+                    current_state.state.store(-1, Ordering::Release);
+                    return iface
                 }
-                return iface
             }
 
             if socket.get_timeout_status() {
@@ -605,6 +725,7 @@ impl NetChannel {
         iface
     }
 
+    #[cfg(not(feature = "kernel"))]
     pub fn send_tcp<F>(&self, f: F) -> Result<usize, isize>
         where F: FnOnce(&VolSliceMut) -> usize
     {
@@ -646,6 +767,7 @@ impl NetChannel {
         Ok(written)
     }
 
+    #[cfg(not(feature = "kernel"))]
     pub fn recv_tcp<F>(&self, f: F) -> Result<usize, isize>
         where F: FnOnce(&VolSlice) -> usize
     {
@@ -687,6 +809,7 @@ impl NetChannel {
         Ok(written)
     }
 
+    #[cfg(not(feature = "kernel"))]
     pub fn connect_tcp(&self, addr: u32, port: u16) -> Result<(), ()> {
         let current_state = self.current_state();
         if current_state.state.load(Ordering::Acquire) != 0 {
@@ -703,6 +826,7 @@ impl NetChannel {
         Ok(())
     }
 
+    #[cfg(not(feature = "kernel"))]
     pub fn listen_tcp(&self, port: u16) -> Result<(), ()> {
         let current_state = self.current_state();
         if current_state.state.load(Ordering::Acquire) != 0 {
@@ -717,6 +841,43 @@ impl NetChannel {
         Ok(())
     }
 
+    /// Begin recycling the NetChannel after the current connection has
+    /// ended (normally, via peer FIN, or via a negative error state).
+    /// Writes `desired_state.state = 0` — the kernel's update_tcp
+    /// observes this, aborts the smoltcp socket, resets its half of the
+    /// rings, and releases `current_state.state = 0`.
+    ///
+    /// This only starts the handshake. Poll `current_state.state` for 0
+    /// (with [`wait_reset`]-style backoff of the caller's choosing), then
+    /// call [`complete_reset`] before issuing a fresh `listen_tcp` /
+    /// `connect_tcp`.
+    ///
+    /// Returns `Err(())` if the channel is already idle — the caller's
+    /// state machine is out of sync.
+    #[cfg(not(feature = "kernel"))]
+    pub fn request_reset(&self) -> Result<(), ()> {
+        if self.current_state().state.load(Ordering::Acquire) == 0 {
+            return Err(());
+        }
+        self.desired_state().state.store(0, Ordering::Release);
+        Ok(())
+    }
+
+    /// Finish the reset handshake started by [`request_reset`]: reset the
+    /// user-owned half of the rings. Caller must have already observed
+    /// `current_state.state == 0`; calling it earlier races the kernel's
+    /// half of the reset.
+    ///
+    /// # Safety
+    /// Caller must be this NetChannel's sole user-side accessor for the
+    /// duration of the call, and must not have any outstanding
+    /// `recv_tcp`/`send_tcp` closures executing.
+    #[cfg(not(feature = "kernel"))]
+    pub unsafe fn complete_reset(&self) {
+        unsafe { self.reset_user_side(); }
+    }
+
+    #[cfg(feature = "kernel")]
     pub fn rings(&self) -> (&'static mut [u8], &'static mut [u8]) {
         let tx = self.tx();
         let rx = self.rx();
@@ -728,10 +889,12 @@ impl NetChannel {
         }
     }
 
+    #[cfg(not(feature = "kernel"))]
     pub fn readable(&self) -> usize {
         self.rx().avail.load(Ordering::Acquire)
     }
 
+    #[cfg(not(feature = "kernel"))]
     pub fn writeable(&self) -> usize {
         self.tx().avail.load(Ordering::Acquire)
     }
@@ -934,7 +1097,10 @@ mod vol_slice_tests {
     }
 }
 
-#[cfg(test)]
+// `rings()` is gated to `feature = "kernel"`. The layout tests poke at
+// ring byte addresses, so they run only when that feature is enabled —
+// i.e. under `cargo test --features kernel`.
+#[cfg(all(test, feature = "kernel"))]
 mod netchannel_layout_tests {
     //! Tests for `NetChannel::init` + the header/ring layout.
     //!
