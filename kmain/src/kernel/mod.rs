@@ -1222,6 +1222,11 @@ impl Orbit {
                 nodes.push(child);
             }
         }
+
+        // Setup virtio-gpu last so PLIC is already installed by the
+        // plic node match above — step 5 of milestone 5 will register
+        // a gpu IRQ handler which depends on that ordering.
+        self.setup_virtio_gpu(&fdt);
     }
 
     fn setup_plic(&mut self, fdt: &Fdt<'_>) {
@@ -1230,6 +1235,16 @@ impl Orbit {
         if unsafe { crate::drivers::plic::install(fdt, &ort, &mut pages) }.is_err() {
             error!("plic install failed");
         }
+    }
+
+    fn setup_virtio_gpu(&mut self, fdt: &Fdt<'_>) {
+        let ort = self.root();
+        let _ = crate::drivers::virtio_gpu_dev::setup_virtio_gpu(
+            fdt,
+            &ort,
+            &mut self.table_pages,
+            &mut self.kernel_pages,
+        );
     }
 
     /// `stack_pa` is the physical base of the user stack. User PT leaves
