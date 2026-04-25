@@ -6,15 +6,16 @@
 //! little-endian RISC-V means the in-memory byte order is `BB GG RR AA`
 //! — pack colors as `0xAA_RR_GG_BB` when writing.
 //!
-//! Glyph blit uses `font8x8`. Each glyph is 8 rows × 8 cols, bit 0 of
-//! each row byte = leftmost pixel.
+//! Glyph blit uses Terminus 8×16. Each glyph is 16 rows × 8 cols, bit
+//! 7 of each row byte = leftmost pixel (MSB-first, BDF/PSF
+//! convention). Indexed by Latin-1 codepoint.
 
-use font8x8::legacy::BASIC_LEGACY;
+use crate::drivers::fonts::terminus::TERMINUS_8X16;
 
 pub const GLYPH_W: u32 = 8;
-pub const GLYPH_H: u32 = 8;
+pub const GLYPH_H: u32 = 16;
 
-/// Pack `(a, r, g, b)` as a BGRA8888 pixel.
+/// Pack `(r, g, b)` as a BGRA8888 pixel with full alpha.
 #[inline]
 pub const fn rgb(r: u8, g: u8, b: u8) -> u32 {
     0xFF_00_00_00 | ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
@@ -55,7 +56,6 @@ impl FrameBuffer {
 
     #[inline]
     unsafe fn put(&self, x: u32, y: u32, color: u32) {
-        // Caller clamps; this does the final bounds check defensively.
         if x >= self.width || y >= self.height {
             return;
         }
@@ -82,37 +82,42 @@ impl FrameBuffer {
         }
     }
 
-    /// Blit one 8×8 glyph at pixel `(x, y)`. Pixels whose bit is set
-    /// in the glyph get `fg`, unset get `bg`.
+    /// Blit one 8×16 glyph at pixel `(x, y)`. Pixels whose bit is set
+    /// in the glyph get `fg`, unset get `bg`. Bit 7 = leftmost pixel.
     #[inline]
-    pub fn blit_glyph(&self, x: u32, y: u32, glyph: &[u8; 8], fg: u32, bg: u32) {
+    pub fn blit_glyph(
+        &self,
+        x: u32,
+        y: u32,
+        glyph: &[u8; GLYPH_H as usize],
+        fg: u32,
+        bg: u32,
+    ) {
         for (row, &byte) in glyph.iter().enumerate() {
             let py = y + row as u32;
             if py >= self.height {
                 break;
             }
-            for col in 0..8u32 {
+            for col in 0..GLYPH_W {
                 let px = x + col;
                 if px >= self.width {
                     break;
                 }
-                // font8x8 stores bit 0 = leftmost pixel.
-                let on = (byte >> col) & 1 != 0;
+                // MSB-first: bit 7 = col 0, bit 0 = col 7.
+                let on = (byte >> (7 - col)) & 1 != 0;
                 unsafe { self.put(px, py, if on { fg } else { bg }); }
             }
         }
     }
 
-    /// Render `text` left-to-right starting at pixel `(x, y)`. Non-ASCII
-    /// bytes fall back to the `0x7F` glyph.
+    /// Render `text` left-to-right starting at pixel `(x, y)`. Bytes
+    /// outside Latin-1 aren't reachable through our `&str` path, but
+    /// unmapped codepoints render as whatever's in the slot (zeros
+    /// for most of U+0080..U+00FF in the Terminus ISO10646-1 subset).
     pub fn blit_text(&self, x: u32, y: u32, text: &str, fg: u32, bg: u32) {
         let mut cx = x;
         for b in text.bytes() {
-            let glyph = if (b as usize) < BASIC_LEGACY.len() {
-                &BASIC_LEGACY[b as usize]
-            } else {
-                &BASIC_LEGACY[0x7F]
-            };
+            let glyph = &TERMINUS_8X16[b as usize];
             self.blit_glyph(cx, y, glyph, fg, bg);
             cx = cx.saturating_add(GLYPH_W);
             if cx >= self.width {
