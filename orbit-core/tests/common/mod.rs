@@ -12,11 +12,8 @@ use riscv::register::satp::Satp;
 use riscv::register::sstatus::SPP;
 
 use orbit_core::{Hardware, PendingWork};
+use process::CompletionHandle;
 
-/// miri extern — marks an allocation as a known root so the leak
-/// checker ignores it. Intentionally leaked test fixtures (our `Thread`
-/// fields are `&'static mut T`, so we can't clean them up without
-/// violating the type) register themselves here.
 #[cfg(miri)]
 unsafe extern "Rust" {
     fn miri_static_root(ptr: *const u8);
@@ -108,6 +105,29 @@ pub struct FakeHw {
     /// If false, `push_pending_work` returns `Err(work)` — exercises
     /// the EAGAIN-on-full-ring path.
     pub pending_work_ok: bool,
+
+    /// Pre-staged stdin payloads keyed by pid. The first
+    /// `read_stdin_drain` call for a pid pops the head entry and
+    /// returns its length (writes are recorded in
+    /// `stdin_drain_writes`). Subsequent calls drain the next entry,
+    /// or return 0 if the queue is empty. Lets tests script
+    /// "first try empty, second try non-empty" race scenarios.
+    pub stdin_ready: BTreeMap<u16, Vec<Vec<u8>>>,
+
+    /// Records of `(pid, user_va, drained)` from `read_stdin_drain`.
+    /// Tests can confirm the SUM-copy was attempted with the right
+    /// destination.
+    pub stdin_drain_writes: Vec<(u16, u64, Vec<u8>)>,
+
+    /// Records of `(pid, handle)` from `park_stdin_reader` calls.
+    pub stdin_parked: Vec<(u16, CompletionHandle)>,
+
+    /// Records of pids passed to `unpark_stdin_reader`.
+    pub stdin_unparked: Vec<u16>,
+
+    /// If false, `park_stdin_reader` returns `false` for all calls
+    /// — exercises the EBUSY path.
+    pub stdin_park_ok: bool,
 }
 
 impl Default for FakeHw {
@@ -124,6 +144,11 @@ impl Default for FakeHw {
             console_ok: true,
             pending_work: Vec::new(),
             pending_work_ok: true,
+            stdin_ready: BTreeMap::new(),
+            stdin_drain_writes: Vec::new(),
+            stdin_parked: Vec::new(),
+            stdin_unparked: Vec::new(),
+            stdin_park_ok: true,
         }
     }
 }
@@ -162,6 +187,36 @@ impl Hardware for FakeHw {
             Ok(())
         } else {
             Err(())
+        }
+    }
+    fn read_stdin_drain(&mut self, pid: u16, user_va: u64, max_len: usize) -> usize {
+        let head = self.stdin_ready.get_mut(&pid).and_then(|q| {
+            if q.is_empty() { None } else { Some(q.remove(0)) }
+        });
+        match head {
+            Some(mut bytes) => {
+                bytes.truncate(max_len);
+                let n = bytes.len();
+                self.stdin_drain_writes.push((pid, user_va, bytes));
+                n
+            }
+            None => 0,
+        }
+    }
+    fn park_stdin_reader(&mut self, pid: u16, handle: CompletionHandle) -> bool {
+        if !self.stdin_park_ok { return false; }
+        self.stdin_parked.push((pid, handle));
+        true
+    }
+    fn unpark_stdin_reader(&mut self, pid: u16) -> bool {
+        self.stdin_unparked.push(pid);
+        // Reflect the reverse of any park: drop the most recent matching
+        // park record so the test sees parked.len() == 0 after a cancel.
+        if let Some(idx) = self.stdin_parked.iter().rposition(|(p, _)| *p == pid) {
+            self.stdin_parked.remove(idx);
+            true
+        } else {
+            false
         }
     }
     fn push_pending_work(&mut self, work: PendingWork) -> Result<(), PendingWork> {

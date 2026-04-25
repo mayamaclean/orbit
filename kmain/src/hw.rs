@@ -3,8 +3,10 @@
 //! Zero-sized; constructed on demand at each syscall entry. Methods route
 //! to the real CSRs / MMIO sites.
 
+use mmu::PAGE_SIZE;
 use mmu::sv48::VirtAddr;
 use orbit_core::{Hardware, PendingWork};
+use process::CompletionHandle;
 
 use crate::UserAccess;
 use crate::kernel::MANAGER_WORK;
@@ -84,5 +86,34 @@ impl Hardware for RiscvHardware {
             }
             Err(_) => Err(work),
         }
+    }
+
+    fn read_stdin_drain(&mut self, pid: u16, user_va: u64, max_len: usize) -> usize {
+        let Some(stdin) = crate::kernel::stdin::get(pid) else { return 0 };
+        // Drain into a kernel-side scratch slice first so the SUM
+        // window only covers the copy step (and so a partial read
+        // doesn't leave the user buffer half-written if the pid
+        // disappears mid-drain — though that can't happen with the
+        // current single-thread-per-process model).
+        let mut scratch = [0u8; PAGE_SIZE];
+        let n = stdin.try_drain(&mut scratch[..max_len]);
+        if n == 0 { return 0; }
+        let guard = UserAccess::enter();
+        unsafe {
+            let dst = guard.slice_mut(user_va, n);
+            dst.copy_from_slice(&scratch[..n]);
+        }
+        drop(guard);
+        n
+    }
+
+    fn park_stdin_reader(&mut self, pid: u16, handle: CompletionHandle) -> bool {
+        let Some(stdin) = crate::kernel::stdin::get(pid) else { return false };
+        stdin.park(handle).is_ok()
+    }
+
+    fn unpark_stdin_reader(&mut self, pid: u16) -> bool {
+        let Some(stdin) = crate::kernel::stdin::get(pid) else { return false };
+        stdin.unpark().is_some()
     }
 }

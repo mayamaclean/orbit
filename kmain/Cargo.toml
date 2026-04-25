@@ -26,6 +26,7 @@ thingbuf = { version = "0.1.6", default-features = false, features = ["static", 
 virtio = { path = "../virtio" }
 virtio_gpu = { path = "../virtio_gpu" }
 virtio_input = { path = "../virtio_input" }
+spin = { version = "0.10", default-features = false, features = ["spin_mutex"] }
 
 [features]
 # Default: kmain embeds orbit-loader and the initial process is the

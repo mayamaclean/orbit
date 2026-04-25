@@ -71,6 +71,25 @@ pub trait Hardware {
     /// ring is full (caller maps to `-EAGAIN`); tests record the push
     /// for assertion.
     fn push_pending_work(&mut self, work: PendingWork) -> Result<(), PendingWork>;
+
+    /// Drain up to `max_len` bytes from `pid`'s stdin ring directly
+    /// into the user buffer at `user_va`, performing the SUM-gated
+    /// copy on the user's satp. Returns the count actually drained
+    /// (0 if the ring is empty or `pid` isn't registered).
+    fn read_stdin_drain(&mut self, pid: u16, user_va: u64, max_len: usize) -> usize;
+
+    /// Park `handle` on `pid`'s stdin slot. Returns `false` if a
+    /// reader was already parked (caller emits EBUSY) or `pid` isn't
+    /// registered. The handle is moved in; on success the impl
+    /// retains the Arc, which `unpark_stdin_reader` (or
+    /// `input::dispatch`'s push-and-signal) later reclaims.
+    fn park_stdin_reader(&mut self, pid: u16, handle: process::CompletionHandle) -> bool;
+
+    /// Cancel a park on `pid`'s stdin slot. Used by the read_stdin
+    /// re-check path when bytes arrive between try_drain and park.
+    /// Returns `true` if there was a parked reader to cancel; the
+    /// impl drops the handle.
+    fn unpark_stdin_reader(&mut self, pid: u16) -> bool;
 }
 
 /// What a pure syscall handler tells the shim to do after it returns.
@@ -93,6 +112,15 @@ pub enum SyscallOutcome {
     /// return to the trap dispatcher without yielding. Used for
     /// synchronous error returns from handlers that don't block.
     Return { ret: isize },
+
+    /// Snapshot frame, *retain* pc at the ecall, yield into `state`.
+    /// On wake the thread re-executes the ecall with its original
+    /// args — used for park-and-retry primitives like `read_stdin`,
+    /// where the signaler doesn't compute a return value (it just
+    /// wakes the reader to retry). a-regs preserved from the trap
+    /// snapshot, so the syscall handler re-enters with identical
+    /// inputs.
+    YieldRetry { state: ThreadState },
 }
 
 /// What the shim should do after [`apply_syscall_outcome`] commits the
@@ -115,10 +143,9 @@ pub enum ShimAction {
 /// `cargo test`, not only when QEMU boots and a thread loops on an
 /// ecall forever.
 ///
-/// Both variants commit the frame snapshot into `thread.frame` and
-/// advance `thread.pc` to `epc + 4`. The variants differ only in what
-/// the shim does next: `Return` falls back through the trap dispatcher,
-/// `Yield` triggers the context-switch asm.
+/// `Return` and `Yield` snapshot the frame and advance pc to `epc+4`.
+/// `YieldRetry` snapshots the frame but leaves pc at `epc` so the
+/// resumed thread re-executes the ecall.
 pub fn apply_syscall_outcome(
     outcome: SyscallOutcome,
     thread: &mut process::Thread,
@@ -133,6 +160,15 @@ pub fn apply_syscall_outcome(
             *thread.frame = *frame;
             thread.pc.store(epc + 4, Ordering::Release);
             ShimAction::Resume
+        }
+        SyscallOutcome::YieldRetry { state } => {
+            // No reg writes — handler relies on a-reg snapshot
+            // matching trap entry so the re-execute sees the
+            // original args. pc stays at epc; the resumed thread
+            // re-enters the ecall and the handler re-runs.
+            *thread.frame = *frame;
+            thread.pc.store(epc, Ordering::Release);
+            ShimAction::Yield(state)
         }
         SyscallOutcome::Yield { state, ret } => {
             if let Some(r) = ret {

@@ -226,3 +226,53 @@ fn return_must_overwrite_thread_frame_with_ret() {
     assert_eq!(t.frame.regs[10], (-2isize) as usize);
     assert_ne!(t.frame.regs[10], 0xDEAD_BEEF);
 }
+
+// ---- YieldRetry ----
+
+#[test]
+fn yield_retry_keeps_pc_at_ecall() {
+    // The whole point of YieldRetry is that the resumed thread re-runs
+    // the ecall instead of stepping past it. Bumping pc here would
+    // turn read_stdin's park-and-retry into a single-shot read that
+    // returns garbage on wake.
+    let mut t = make_thread(ThreadState::Running, SPP::User);
+    t.pc.store(ECALL_EPC, Ordering::Release);
+    let mut f = make_frame();
+
+    let action = apply_syscall_outcome(
+        SyscallOutcome::YieldRetry { state: ThreadState::Blocking },
+        &mut t,
+        &mut f,
+        ECALL_EPC,
+    );
+
+    assert_eq!(action, ShimAction::Yield(ThreadState::Blocking));
+    assert_eq!(t.pc.load(Ordering::Acquire), ECALL_EPC);
+}
+
+#[test]
+fn yield_retry_preserves_a_regs_for_re_execute() {
+    // Args land in a1..a4 (frame.regs[11..15]) for the user's ecall.
+    // Resume must restore them as-of the trap so the re-executed
+    // syscall handler sees identical inputs.
+    let mut t = make_thread(ThreadState::Running, SPP::User);
+    let mut f = make_frame();
+    f.regs[10] = 0x42;     // syscall number
+    f.regs[11] = 0xAAAA;   // arg0
+    f.regs[12] = 0xBBBB;   // arg1
+    f.regs[13] = 0xCCCC;   // arg2
+    f.regs[14] = 0xDDDD;   // arg3
+
+    let _ = apply_syscall_outcome(
+        SyscallOutcome::YieldRetry { state: ThreadState::Blocking },
+        &mut t,
+        &mut f,
+        ECALL_EPC,
+    );
+
+    assert_eq!(t.frame.regs[10], 0x42);
+    assert_eq!(t.frame.regs[11], 0xAAAA);
+    assert_eq!(t.frame.regs[12], 0xBBBB);
+    assert_eq!(t.frame.regs[13], 0xCCCC);
+    assert_eq!(t.frame.regs[14], 0xDDDD);
+}

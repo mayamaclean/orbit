@@ -60,7 +60,7 @@ fn mmap_req_zero_share_flag() {
 #[test]
 fn mmap_req_returns_eagain_when_ring_full() {
     let mut t = make_thread(ThreadState::Running, SPP::User);
-    let mut frame = make_frame();
+    let frame = make_frame();
     let mut hw = FakeHw::default();
     hw.pending_work_ok = false;
 
@@ -136,4 +136,46 @@ fn close_req_truncates_fd_to_u32() {
         PendingWork::CloseHandle { req, .. } => assert_eq!(req.fd, 5),
         other => panic!("unexpected pending work: {other:?}"),
     }
+}
+
+#[test]
+fn create_process_req_marshals_args_and_blocks() {
+    let mut t = make_thread(ThreadState::Running, SPP::User);
+    let mut frame = make_frame();
+    let mut hw = FakeHw::default();
+    frame.regs[11] = 0x2_2000_0000;
+    frame.regs[12] = 0x4000;
+
+    let outcome = syscall::create_process_req(&mut t, &frame, &mut hw);
+
+    assert_eq!(
+        outcome,
+        SyscallOutcome::Yield { state: ThreadState::Blocking, ret: None }
+    );
+    assert!(t.handle.is_some(), "thread should be parked on a handle");
+    assert_eq!(hw.pending_work.len(), 1);
+    match &hw.pending_work[0] {
+        PendingWork::CreateProcess { req, pid, handle, .. } => {
+            assert_eq!(req.elf_vaddr, 0x2_2000_0000);
+            assert_eq!(req.elf_len, 0x4000);
+            assert_eq!(*pid, t.pid);
+            handle.signal(7);
+            assert!(t.handle.as_ref().unwrap().is_signaled());
+        }
+        other => panic!("unexpected pending work: {other:?}"),
+    }
+}
+
+#[test]
+fn create_process_req_returns_eagain_when_ring_full() {
+    let mut t = make_thread(ThreadState::Running, SPP::User);
+    let frame = make_frame();
+    let mut hw = FakeHw::default();
+    hw.pending_work_ok = false;
+
+    let outcome = syscall::create_process_req(&mut t, &frame, &mut hw);
+
+    assert_eq!(outcome, SyscallOutcome::Return { ret: Errno::new(EAGAIN).to_ret() });
+    assert!(t.handle.is_none(), "no parking on push failure");
+    assert!(hw.pending_work.is_empty());
 }

@@ -10,4 +10,5 @@ kernel = []
 smoltcp = { path = "../../smoltcp", default-features = false, features = ["socket-raw", "socket-udp", "socket-tcp", "socket-icmp", "socket-dhcpv4", "socket-dns", "proto-ipv4"] }
 serial = { path = "../serial" }
 mem = { path = "../mem" }
+process = { path = "../process" }
 tracing = { version = "0.1.44", default-features = false, features = [] }

@@ -64,6 +64,23 @@ pub unsafe fn ecall2(code: usize, arg0: usize, arg1: usize) -> isize {
     r
 }
 
+/// Three-argument syscall returning an `isize` in `a0`.
+#[inline]
+pub unsafe fn ecall3(code: usize, arg0: usize, arg1: usize, arg2: usize) -> isize {
+    let r: isize;
+    unsafe {
+        asm!(
+            "ecall",
+            in("a0") code,
+            in("a1") arg0,
+            in("a2") arg1,
+            in("a3") arg2,
+            lateout("a0") r,
+        );
+    }
+    r
+}
+
 /// Four-argument syscall returning an `isize` in `a0`.
 #[inline]
 pub unsafe fn ecall4(code: usize, arg0: usize, arg1: usize, arg2: usize, arg3: usize) -> isize {
@@ -135,6 +152,29 @@ pub fn serial_print(ptr: usize, len: usize) -> Result<usize, Errno> {
 #[inline]
 pub fn console_write(ptr: usize, len: usize) -> Result<usize, Errno> {
     Errno::from_ret(unsafe { ecall2(syscall::CONSOLE_WRITE, ptr, len) })
+}
+
+/// `flags` bit for [`read_stdin`]: return `EAGAIN` immediately when
+/// the ring is empty instead of blocking until a keystroke arrives.
+pub const READ_STDIN_NONBLOCK: usize = 1;
+
+/// Read up to `len` bytes from the calling process's stdin ring into
+/// the buffer at `ptr`. Stdin is fed by the kernel's input
+/// dispatcher when this process is the active framebuffer source.
+///
+/// Returns the byte count drained on success. With `flags == 0` the
+/// call blocks (the kernel parks the thread on a completion handle
+/// and resumes it on the next keystroke); with
+/// `flags & READ_STDIN_NONBLOCK` an empty ring returns `Err(EAGAIN)`.
+///
+/// Other errors:
+/// - `EINVAL` — `len == 0` or `len > 4 KiB`.
+/// - `EFAULT` — `ptr` doesn't translate under the caller's satp.
+/// - `EBUSY`  — another reader is already parked on this process's
+///   stdin (single-reader model violated).
+#[inline]
+pub fn read_stdin(ptr: usize, len: usize, flags: usize) -> Result<usize, Errno> {
+    Errno::from_ret(unsafe { ecall3(syscall::READ_STDIN, ptr, len, flags) })
 }
 
 /// Block the calling thread for `ms` milliseconds. Kernel caps the

@@ -46,6 +46,14 @@ impl UserAccess {
         unsafe { core::slice::from_raw_parts(vaddr as *const u8, len) }
     }
 
+    /// Borrow a writable byte slice at a user VA. Caller must have
+    /// verified the range is mapped user-writable. Lifetime ties the
+    /// slice to this guard so it can't outlive SUM.
+    #[inline]
+    pub unsafe fn slice_mut<'s>(&'s self, vaddr: u64, len: usize) -> &'s mut [u8] {
+        unsafe { core::slice::from_raw_parts_mut(vaddr as *mut u8, len) }
+    }
+
     /// Read a value of type `T` from a user VA. Caller must have verified
     /// the source is mapped and the read is size/alignment-safe.
     #[inline]
@@ -530,6 +538,13 @@ pub fn handle_ms_sleep(epc: usize, hart_context: &'static HartContext, frame: &m
 pub fn handle_mmap_req(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
     dispatch_syscall(epc, hart_context, frame, |t, f| {
         orbit_core::syscall::mmap_req(t, f, &mut crate::hw::RiscvHardware)
+    });
+}
+
+#[unsafe(no_mangle)]
+pub fn handle_read_stdin(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
+    dispatch_syscall(epc, hart_context, frame, |t, f| {
+        orbit_core::syscall::read_stdin(t, f, &mut crate::hw::RiscvHardware)
     });
 }
 

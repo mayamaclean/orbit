@@ -15,7 +15,11 @@ use riscv::register::{satp::Satp, sstatus::SPP};
 use smoltcp::iface::SocketHandle;
 
 pub mod completion;
+pub mod spsc;
+pub mod stdin;
 pub use completion::{AckCounter, CompletionHandle};
+pub use spsc::SpscQueue;
+pub use stdin::ProcessStdin;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(usize)]

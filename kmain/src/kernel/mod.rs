@@ -59,6 +59,7 @@ pub mod orbital_elf;
 pub mod pending_frees;
 pub mod shared_user_ptr;
 pub mod pci;
+pub mod stdin;
 pub mod user_page;
 
 pub use memmap::KernelLayout;
@@ -807,6 +808,14 @@ impl Orbit {
         let _ = crate::drivers::k_gpu::push_remove_source(
             crate::drivers::display::Source::Process(process.pid),
         );
+
+        // Tear down the per-process stdin slot. If a reader is parked
+        // on it, `unregister` signals the handle so the manager-scan
+        // unblocks the thread; the resumed thread re-enters
+        // `read_stdin` and gets ENOENT for the gone pid (in practice
+        // this only fires if a thread parks an instant before the
+        // owning process exits — rare).
+        crate::kernel::stdin::unregister(process.pid);
 
         while let Some(socket_handle) = process.sockets.pop_last() {
             if let Err(e) = self.net_pkg.socket_deletions.enqueue(socket_handle) {
@@ -1593,6 +1602,11 @@ impl Orbit {
         let _ = crate::drivers::k_gpu::push_insert_source(
             crate::drivers::display::Source::Process(pid),
         );
+
+        // Register a per-process stdin slot so input::dispatch has a
+        // place to deliver keystrokes once the process becomes the
+        // active source. Removed by `dealloc_process` on teardown.
+        crate::kernel::stdin::register(pid);
 
         Ok(pid)
     }

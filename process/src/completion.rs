@@ -147,6 +147,26 @@ impl CompletionHandle {
         }
         self.inner.rets[i].load(Ordering::Acquire) as isize
     }
+
+    /// Decompose into a raw `*const CompletionInner`. Caller takes
+    /// ownership of the Arc strong count; pair with [`from_raw`]
+    /// (or `Arc::from_raw`) to reclaim. Used by lock-free parked-
+    /// reader slots that store handles as `AtomicPtr`.
+    pub fn into_raw(self) -> *const CompletionInner {
+        Arc::into_raw(self.inner)
+    }
+
+    /// Reclaim a handle previously emitted by [`into_raw`]. Each
+    /// raw pointer must be reclaimed exactly once.
+    ///
+    /// # Safety
+    /// `raw` must have come from `into_raw` (or `Arc::into_raw` on
+    /// an `Arc<CompletionInner>`) and must not have been reclaimed
+    /// already. The Arc strong count reverts to ownership of the
+    /// returned handle.
+    pub unsafe fn from_raw(raw: *const CompletionInner) -> Self {
+        Self { inner: unsafe { Arc::from_raw(raw) } }
+    }
 }
 
 impl Default for CompletionHandle {

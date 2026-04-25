@@ -125,12 +125,14 @@ impl Display {
     pub fn new(fb: FrameBuffer) -> Self {
         let mut scrollbacks = BTreeMap::new();
         scrollbacks.insert(Source::Kernel, ProcScrollback::new(Source::Kernel));
-        Self {
+        let s = Self {
             fb,
             active: Source::Kernel,
             scrollbacks,
             dirty: true,
-        }
+        };
+        crate::kernel::stdin::set_active(s.active);
+        s
     }
 
     /// Add a new source (new process came up). Idempotent.
@@ -153,6 +155,7 @@ impl Display {
                 .unwrap_or(Source::Kernel);
 
             self.dirty = true;
+            crate::kernel::stdin::set_active(self.active);
         }
     }
 
@@ -188,6 +191,7 @@ impl Display {
         if next != self.active {
             self.active = next;
             self.dirty = true;
+            crate::kernel::stdin::set_active(self.active);
         }
     }
 

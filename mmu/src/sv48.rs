@@ -377,9 +377,21 @@ mod pte_pack_tests {
         // appear in the PTE's permission slot.
         let perm_bits = raw & PageTableEntry::PERMS_MASK;
         assert_eq!(perm_bits, junky & PageTableEntry::PERMS_MASK);
-        // Junk outside PERMS_MASK must not contaminate bits 8..10 (rsw)
-        // or bit 0 (V).
-        assert_eq!(raw & (1 << 0), PageTableEntry::VALID);
+        // Junk outside PERMS_MASK must not contaminate bits 8..10 (rsw).
+        // junky has bits 8..16 set; if pack_leaf OR'd `perms` directly
+        // (rather than `perms & PERMS_MASK`) those would land in rsw.
+        assert_eq!(
+            (raw >> 8) & 0b11,
+            0,
+            "rsw bits must stay zero when caller passed rsw=0"
+        );
+        // No junk above bit 9 either: only PERMS_MASK | V | A | D should be set
+        // when ppn=0 and rsw=0.
+        let allowed = PageTableEntry::PERMS_MASK
+            | PageTableEntry::VALID
+            | PageTableEntry::ACCESSED
+            | PageTableEntry::DIRTY;
+        assert_eq!(raw & !allowed, 0, "no bits outside the allowed set");
     }
 
     #[test]

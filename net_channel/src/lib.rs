@@ -1,10 +1,8 @@
 #![no_std]
 
-use core::cell::UnsafeCell;
 use core::marker::PhantomData;
 use core::mem::size_of;
-use core::sync::atomic::AtomicUsize;
-use core::sync::atomic::{AtomicI32, AtomicU16, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicU16, AtomicU32, AtomicUsize, Ordering};
 
 use mem::round_usize_up;
 
@@ -190,108 +188,11 @@ impl<'a> VolSlice<'a> {
     pub fn as_ptr(&self) -> *const u8 { self.ptr }
 }
 
-/// Fixed-layout single-producer / single-consumer queue. Baked here
-/// (rather than reusing `heapless::spsc`) because:
-///
-/// 1. The layout is part of the user/kernel NetChannel ABI. `heapless`'s
-///    `Queue` is plain `repr(Rust)` — field ordering isn't guaranteed
-///    stable across rustc versions or compilation flags. `#[repr(C)]`
-///    here pins it.
-/// 2. Slot reads/writes go through `read_volatile` / `write_volatile`.
-///    Defensive against any alias-analysis-driven DCE of the slot write
-///    (the bug we hit that sent us down this path).
-///
-/// Capacity is `N - 1` — one slot is always reserved so `head == tail`
-/// unambiguously means empty.
-#[repr(C)]
-pub struct SpscQueue<T: Copy, const N: usize> {
-    /// Consumer-owned: index of next slot to dequeue from.
-    head: AtomicUsize,
-    /// Producer-owned: index of next slot to enqueue into.
-    tail: AtomicUsize,
-    /// Backing ring storage. Raw `UnsafeCell<T>` so the slots can be
-    /// written under `&self` via `.get()` → `*mut T`. Zero-init is a
-    /// valid starting state since `head == tail == 0` marks empty and no
-    /// slot is observed before being written.
-    buffer: [UnsafeCell<T>; N],
-}
-
-// Producer and consumer are on different harts / threads; heads/tails
-// are atomic, slots are synchronized via release/acquire.
-unsafe impl<T: Copy + Send, const N: usize> Sync for SpscQueue<T, N> {}
-
-impl<T: Copy, const N: usize> SpscQueue<T, N> {
-    /// # Safety
-    /// Caller must be the sole producer on this queue.
-    #[inline]
-    pub unsafe fn enqueue(&self, val: T) -> Result<(), T> {
-        let tail = self.tail.load(Ordering::Relaxed);
-        let next = (tail + 1) % N;
-        if next == self.head.load(Ordering::Acquire) {
-            return Err(val);
-        }
-        unsafe { self.buffer[tail].get().write_volatile(val); }
-        self.tail.store(next, Ordering::Release);
-        Ok(())
-    }
-
-    /// # Safety
-    /// Caller must be the sole consumer on this queue.
-    #[inline]
-    pub unsafe fn dequeue(&self) -> Option<T> {
-        let head = self.head.load(Ordering::Relaxed);
-        if head == self.tail.load(Ordering::Acquire) {
-            return None;
-        }
-        let val = unsafe { self.buffer[head].get().read_volatile() };
-        self.head.store((head + 1) % N, Ordering::Release);
-        Some(val)
-    }
-
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.head.load(Ordering::Acquire) == self.tail.load(Ordering::Acquire)
-    }
-
-    #[inline]
-    pub fn is_full(&self) -> bool {
-        let tail = self.tail.load(Ordering::Acquire);
-        let head = self.head.load(Ordering::Acquire);
-        (tail + 1) % N == head
-    }
-
-    #[inline]
-    pub fn len(&self) -> usize {
-        let head = self.head.load(Ordering::Acquire);
-        let tail = self.tail.load(Ordering::Acquire);
-        (tail + N - head) % N
-    }
-
-    /// Zero the producer-owned index. Used during NetChannel reuse: both
-    /// sides cooperatively reset their own side so the next connection
-    /// starts with empty queues. `head` is left alone — the consumer
-    /// clears it via [`reset_consumer`].
-    ///
-    /// # Safety
-    /// Caller must be the sole producer on this queue, and must guarantee
-    /// the consumer is not actively reading (e.g. TCP socket is closed or
-    /// the channel_state handshake has gated the consumer off).
-    #[inline]
-    pub unsafe fn reset_producer(&self) {
-        self.tail.store(0, Ordering::Release);
-    }
-
-    /// Zero the consumer-owned index. See [`reset_producer`] for the
-    /// cooperative-reset safety requirements.
-    ///
-    /// # Safety
-    /// Caller must be the sole consumer on this queue, and must guarantee
-    /// the producer is not actively writing.
-    #[inline]
-    pub unsafe fn reset_consumer(&self) {
-        self.head.store(0, Ordering::Release);
-    }
-}
+// SPSC queue lives in [`process::spsc`] (re-exported below) so other
+// kernel sync paths (e.g. ProcessStdin) can share the implementation.
+// The `#[repr(C)]` layout discipline that NetChannel's ABI relies on
+// is preserved by the `process::SpscQueue` type definition.
+pub use process::SpscQueue;
 
 /// Fixed header offsets within a NetChannel region. The tx/rx queues follow
 /// at `NC_TX_OFF` and `NC_TX_OFF + queue_len` respectively — `queue_len` is

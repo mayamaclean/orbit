@@ -6,7 +6,7 @@
 use device::TrapFrame;
 use process::{CompletionHandle, Thread, ThreadState};
 
-use orbit_abi::errno::{Errno, EAGAIN, EFAULT, EINVAL, EIO};
+use orbit_abi::errno::{Errno, EAGAIN, EBUSY, EFAULT, EINVAL, EIO};
 
 use crate::{
     CloseHandleReq, CreateProcessReq, Hardware, MemMapReq, NetChannelCreationReq,
@@ -234,6 +234,70 @@ pub fn console_write<H: Hardware>(
         Ok(()) => ready(len as isize),
         Err(()) => ready(Errno::new(EAGAIN).to_ret()),
     }
+}
+
+/// Bit set in `read_stdin`'s `flags` arg: return `EAGAIN` instead of
+/// blocking when the ring is empty.
+pub const READ_STDIN_NONBLOCK: usize = 1;
+
+/// `read_stdin(buf, len, flags)` — drain up to `len` bytes of the
+/// caller's stdin ring into `buf`. On non-empty: returns `Ok(n)`
+/// synchronously. On empty + NONBLOCK: returns `Err(EAGAIN)`. On
+/// empty + blocking: parks on a `CompletionHandle` and yields with
+/// `YieldRetry` so the resumed thread re-executes the ecall (and
+/// drains the bytes that woke it).
+///
+/// The park-then-recheck dance closes the race window between
+/// observing an empty ring and storing the handle: if a producer
+/// pushes a byte during that window, the recheck observes it and
+/// the park is cancelled before yielding.
+pub fn read_stdin<H: Hardware>(
+    thread: &mut Thread,
+    frame: &TrapFrame,
+    hw: &mut H,
+) -> SyscallOutcome {
+    let user_va = frame.regs[11] as u64;
+    let user_len = frame.regs[12];
+    let flags = frame.regs[13];
+
+    if user_len == 0 || user_len > PAGE_SIZE {
+        return ready(Errno::new(EINVAL).to_ret());
+    }
+    if !hw.user_va_translates(thread.root_table_addr() as u64, user_va) {
+        return ready(Errno::new(EFAULT).to_ret());
+    }
+
+    // Synchronous drain attempt. On any nonzero count we're done.
+    let n = hw.read_stdin_drain(thread.pid, user_va, user_len);
+    if n > 0 {
+        return ready(n as isize);
+    }
+
+    if flags & READ_STDIN_NONBLOCK != 0 {
+        return ready(Errno::new(EAGAIN).to_ret());
+    }
+
+    // Block path. Allocate a handle, park it on the per-process
+    // slot, then re-check the ring to close the park-vs-signal
+    // window before yielding.
+    let handle = CompletionHandle::new();
+    if !hw.park_stdin_reader(thread.pid, handle.clone()) {
+        return ready(Errno::new(EBUSY).to_ret());
+    }
+
+    // Re-check: a byte that arrived between try_drain and park
+    // would have observed `parked == null` and not signaled. By
+    // re-draining after the park is visible, either we observe the
+    // byte here (cancel the park, return synchronously) or we know
+    // no producer raced us (yield safely).
+    let n2 = hw.read_stdin_drain(thread.pid, user_va, user_len);
+    if n2 > 0 {
+        let _ = hw.unpark_stdin_reader(thread.pid);
+        return ready(n2 as isize);
+    }
+
+    thread.handle = Some(handle);
+    SyscallOutcome::YieldRetry { state: ThreadState::Blocking }
 }
 
 #[inline]

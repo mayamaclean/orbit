@@ -169,6 +169,9 @@ extern "C" fn s_trap(
                     3 => {
                         kmain::handle_console_write(epc, hart_context, frame);
                     }
+                    4 => {
+                        kmain::handle_read_stdin(epc, hart_context, frame);
+                    }
                     4096 => {
                         debug!("orbit handling u mode ecall({syscall})");
                         kmain::handle_mmap_req(epc, hart_context, frame);
