@@ -10,21 +10,17 @@
 //! kdmap-aliased framebuffer and issue further transfer+flush pairs.
 
 use alloc::boxed::Box;
-use alloc::vec::Vec;
 use core::alloc::Layout;
 use core::ptr::null_mut;
 use core::sync::atomic::{AtomicPtr, Ordering};
 
-use dtoolkit::fdt::Fdt;
-use mmu::mmap::{PageAlloc, RootTable};
 use tracing::{error, info};
-use virtio::discovery::{for_each_virtio_mmio, MmioSlot};
-use virtio::mmio::Mmio;
 use virtio::queue::VirtqBacking;
 use virtio_gpu::{Gpu, GpuBacking, ARENA_SIZE, FORMAT_B8G8R8A8_UNORM};
 use virtio_gpu::proto::VIRTIO_GPU_DEVICE_ID;
 
-use crate::kernel::memmap::{self, KernelPages, TablePages};
+use crate::drivers::virtio_probe;
+use crate::kernel::memmap::KernelPages;
 
 // Queue sizing: 64 entries is plenty for gpu ctrl-queue traffic
 // (bursty but never many in-flight at once). Fits in one page with
@@ -77,54 +73,16 @@ pub struct InstallOutcome {
     pub resource_id: u32,
 }
 
-/// Discover the virtio-gpu MMIO slot, install the device, and return
-/// framebuffer coordinates for the caller to integrate into the
-/// display pipeline.
+/// Build a [`Gpu`] over the already-aliased virtio-gpu slot, run boot
+/// init, and return framebuffer coordinates for the caller to
+/// integrate into the display pipeline. Requires
+/// [`virtio_probe::discover`] to have run first.
 pub fn setup_virtio_gpu(
-    fdt: &Fdt<'_>,
-    rt: &RootTable<'_>,
-    table_pages: &mut TablePages,
     kernel_pages: &mut KernelPages,
 ) -> Option<InstallOutcome> {
-    // Phase 1: collect all virtio_mmio slots from the DTB. Two phases
-    // so we can release the ephemeral `&mut table_pages` borrow
-    // between discovery and allocation.
-    let mut slots: Vec<MmioSlot> = Vec::new();
-    for_each_virtio_mmio(fdt, |s| slots.push(s));
-
-    // Phase 2: install KMMIO aliases for each slot and probe for the
-    // gpu device id. Keep the first match.
-    let mut found: Option<(MmioSlot, Mmio)> = None;
-    for slot in &slots {
-        let kva = {
-            let mut pa_alloc = PageAlloc::FA(table_pages.frames_mut());
-            match unsafe {
-                memmap::install_kmmio_alias(
-                    rt,
-                    &mut pa_alloc,
-                    slot.pa_base..slot.pa_base + slot.size,
-                )
-            } {
-                Ok(v) => v,
-                Err(_) => {
-                    error!("virtio-gpu: failed to alias {:#x}", slot.pa_base);
-                    continue;
-                }
-            }
-        };
-        unsafe { riscv::asm::sfence_vma(0, 0); }
-        let mmio = unsafe { Mmio::new(kva) };
-        let (magic, device_id) = unsafe { (mmio.magic(), mmio.device_id()) };
-        info!(
-            "virtio_mmio@{:#x} irq={} magic={:#x} device_id={}",
-            slot.pa_base, slot.irq, magic, device_id,
-        );
-        if device_id == VIRTIO_GPU_DEVICE_ID && found.is_none() {
-            found = Some((*slot, mmio));
-        }
-    }
-
-    let (slot, mmio) = found?;
+    let found = virtio_probe::find(VIRTIO_GPU_DEVICE_ID)?;
+    let slot = found.slot;
+    let mmio = found.mmio;
     info!("virtio-gpu: selected slot @{:#x} irq={}", slot.pa_base, slot.irq);
 
     // Phase 3: allocate ctrl queue page + command arena page.

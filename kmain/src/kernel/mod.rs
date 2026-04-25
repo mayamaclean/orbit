@@ -46,6 +46,7 @@ use crate::{NetPackage, SocketReq};
 
 pub mod context;
 pub mod handle;
+pub mod input;
 pub mod memmap;
 pub mod orbital_elf;
 pub mod pending_frees;
@@ -830,6 +831,10 @@ impl Orbit {
 
         let mut pages = PageAlloc::FA(self.table_pages.frames_mut());
         unsafe {
+            // Detach the shared KMMIO L2 first — `unmap` is recursive and
+            // would otherwise descend into and free the shared subtree,
+            // corrupting every other satp's KMMIO surface.
+            memmap::detach_shared_kmmio_l2(&root_table);
             unmap(&root_table, &mut pages);
             // table_pages now returns typed frames — the walker's
             // `free_page` takes a raw PA directly; the root was allocated
@@ -1230,10 +1235,12 @@ impl Orbit {
             }
         }
 
-        // Setup virtio-gpu last so PLIC is already installed by the
-        // plic node match above — step 5 of milestone 5 will register
-        // a gpu IRQ handler which depends on that ordering.
-        self.setup_virtio_gpu(&fdt);
+        // Setup virtio devices last so PLIC is already installed by
+        // the plic node match above — input registers an IRQ handler
+        // and a future gpu IRQ wake will too.
+        self.discover_virtio(&fdt);
+        self.setup_virtio_gpu();
+        self.setup_virtio_input();
     }
 
     fn setup_plic(&mut self, fdt: &Fdt<'_>) {
@@ -1244,12 +1251,13 @@ impl Orbit {
         }
     }
 
-    fn setup_virtio_gpu(&mut self, fdt: &Fdt<'_>) {
+    fn discover_virtio(&mut self, fdt: &Fdt<'_>) {
         let ort = self.root();
+        crate::drivers::virtio_probe::discover(fdt, &ort, &mut self.table_pages);
+    }
+
+    fn setup_virtio_gpu(&mut self) {
         let Some(outcome) = crate::drivers::virtio_gpu_dev::setup_virtio_gpu(
-            fdt,
-            &ort,
-            &mut self.table_pages,
             &mut self.kernel_pages,
         ) else {
             return;
@@ -1273,6 +1281,10 @@ impl Orbit {
         if self.create_kernel_thread(entrypoint, None).is_err() {
             error!("virtio-gpu: failed to spawn k_gpu thread");
         }
+    }
+
+    fn setup_virtio_input(&mut self) {
+        crate::drivers::virtio_input_dev::setup_virtio_input(&mut self.kernel_pages);
     }
 
     /// `stack_pa` is the physical base of the user stack. User PT leaves
@@ -1686,7 +1698,7 @@ impl Orbit {
 
     fn map_kernel_into(&mut self, root_table: &mmu::mmap::RootTable<'_>) -> Result<(), ()> {
         let mut pages = PageAlloc::FA(self.table_pages.frames_mut());
-        unsafe { memmap::map_kernel_shared(root_table, &mut pages, &self.layout) }
+        unsafe { memmap::map_kernel_shared(root_table, &mut pages, &self.layout, /*is_kernel_root=*/ false) }
     }
 
     fn next_tid(&mut self) -> u32 {

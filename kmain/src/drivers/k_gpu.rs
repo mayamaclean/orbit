@@ -27,7 +27,7 @@ use crate::exit_thread_with_state;
 pub const CMD_BYTES: usize = 4096;
 
 /// Depth of the ring. 8 slots × (4 KiB + small header) ≈ 32 KiB total.
-pub const RING_CAP: usize = 8;
+pub const RING_CAP: usize = 256;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CmdKind {

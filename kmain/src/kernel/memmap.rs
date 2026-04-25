@@ -5,7 +5,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use mem::frame::FrameAllocator;
 use mem::round_u64_up;
 use mmu::mmap::{PageAlloc, RootTable, map_va_range, reserve_va_range, unmap_range, virt_to_phys};
-use mmu::sv48::{PageTable, PhysAddr, VirtAddr};
+use mmu::sv48::{PageTable, PageTableEntry, PhysAddr, VirtAddr};
 use mmu::{MappingConfig, PAGE_SIZE, PagePermissions, SupervisorTag};
 use process::{Frame, Shared, Table, UserOnly};
 use tracing::error;
@@ -461,6 +461,79 @@ fn pool_regions(layout: &KernelLayout) -> [Region; 3] {
 /// Map `pa_range` at an explicit virtual start. Picks gigapage / megapage /
 /// 4 KiB leaves by alignment so pool-scale ranges don't explode into
 /// thousands of PTEs.
+// =========================================================================
+// Shared KMMIO L2 page table.
+//
+// All kernel-side MMIO mappings live under one root-table slot
+// (`vpn3 = (kmmio_base() >> 39) & 0x1FF`, normally 0x1FE for
+// `KMMIO_NOMINAL = 0xFFFF_FFE0_0000_0000`). The L2 page table backing
+// that slot is allocated once during kernel root construction and
+// shared by every other root table — kernel and user — by writing the
+// same PA into their slot. Subsequent `install_kmmio_alias` calls walk
+// the kernel root, materializing L1/L0 inside the shared L2; every
+// satp sees the new leaves automatically because they all reach the
+// same physical L2.
+//
+// Without this sharing, async traps (PLIC IRQs) that arrive while a
+// hart is executing under a user satp would fault on KMMIO loads —
+// `s_trap_vector` does not switch to kernel satp, and the user satp
+// only had the three boot-time fixed slots (UART, CLINT, SSWI), not
+// any of the dynamic arena entries (PCI, e1000, PLIC, virtio MMIO).
+// =========================================================================
+
+static SHARED_KMMIO_L2_PA: AtomicU64 = AtomicU64::new(0);
+
+#[inline]
+fn kmmio_root_slot() -> usize {
+    ((kmmio_base() >> 39) & 0x1FF) as usize
+}
+
+/// Snapshot the L2 PA that the kernel root just allocated for its KMMIO
+/// root slot. Called from `map_kernel_shared(is_kernel_root = true)`
+/// after `map_kernel_high_half` has installed the three fixed KMMIO
+/// leaves, which is what materializes the L2 in the first place.
+unsafe fn cache_shared_kmmio_l2(rt: &RootTable<'_>) {
+    let slot = kmmio_root_slot();
+    let pte = &rt.table.entries[slot];
+    assert!(
+        pte.is_valid() && !pte.is_leaf(),
+        "cache_shared_kmmio_l2: kernel root slot {slot:#x} not a valid table entry",
+    );
+    let l2_pa = pte.ppn() * PAGE_SIZE as u64;
+    SHARED_KMMIO_L2_PA.store(l2_pa, Ordering::Release);
+}
+
+/// Install the cached KMMIO L2 PA into `rt`'s KMMIO root slot. Called
+/// from `map_kernel_shared(is_kernel_root = false)` when building user
+/// satps. Must run after `cache_shared_kmmio_l2` has set the static —
+/// the kernel root is built before any user process exists, so this
+/// holds in normal boot order.
+unsafe fn attach_shared_kmmio_l2(rt: &RootTable<'_>) {
+    let l2_pa = SHARED_KMMIO_L2_PA.load(Ordering::Acquire);
+    assert!(
+        l2_pa != 0,
+        "attach_shared_kmmio_l2: shared L2 not yet cached \
+         (cache_shared_kmmio_l2 must run during kernel root setup)",
+    );
+    let slot = kmmio_root_slot();
+    let ppn = l2_pa / PAGE_SIZE as u64;
+    rt.table.entries[slot].set_raw(PageTableEntry::pack_table(ppn));
+}
+
+/// Drop the KMMIO root-slot pointer from `rt` so a subsequent recursive
+/// unmap doesn't descend into and free the shared subtree. Must be
+/// called immediately before `mmu::mmap::unmap` on a user satp during
+/// process teardown.
+///
+/// Without this, the first process exit silently frees every L1/L0 PT
+/// page hanging off the shared L2 (plus the L2 itself), corrupting
+/// every other satp's KMMIO surface — pre-PLIC IRQs and post-MMIO
+/// loads start derailing as the freed pages get recycled.
+pub unsafe fn detach_shared_kmmio_l2(rt: &RootTable<'_>) {
+    let slot = kmmio_root_slot();
+    rt.table.entries[slot].set_raw(0);
+}
+
 /// Reserve a KMMIO arena slot covering `pa_range` and install RW kernel
 /// leaves at the resulting VA in `rt`. Returns the VA so the caller can
 /// hand it to a driver as `*mut u32` etc. Caller owns the post-install
@@ -515,6 +588,7 @@ unsafe fn map_kernel_high_half(
     rt: &RootTable<'_>,
     pa: &mut PageAlloc,
     layout: &KernelLayout,
+    is_kernel_root: bool,
 ) -> Result<(), ()> {
     unsafe {
         let image_va_base = &_text_start as *const _ as u64;
@@ -530,12 +604,19 @@ unsafe fn map_kernel_high_half(
             let va_start = phys_to_kdmap(PhysAddr::new(r.range.start)).raw();
             map_region_va(rt, pa, va_start, r.range.clone(), r.perms, r.name)?;
         }
-        map_region_va(rt, pa, kmmio_uart(),
-            layout.serial..layout.serial + PAGE_SIZE as u64, KRW, "serial.hh")?;
-        map_region_va(rt, pa, kmmio_clint(),
-            CLINT_MSIP_BASE..CLINT_MSIP_BASE + PAGE_SIZE as u64, KRW, "clint.msip.hh")?;
-        map_region_va(rt, pa, kmmio_sswi(),
-            ACLINT_SSWI_BASE..ACLINT_SSWI_BASE + PAGE_SIZE as u64, KRW, "aclint.sswi.hh")?;
+        // KMMIO fixed slots only land in the kernel root. User satps
+        // attach the same shared L2 below, so they reach these leaves
+        // (and every dynamic arena entry) without doing their own
+        // map_region_va calls — which would conflict with leaves
+        // already installed via the shared L2.
+        if is_kernel_root {
+            map_region_va(rt, pa, kmmio_uart(),
+                layout.serial..layout.serial + PAGE_SIZE as u64, KRW, "serial.hh")?;
+            map_region_va(rt, pa, kmmio_clint(),
+                CLINT_MSIP_BASE..CLINT_MSIP_BASE + PAGE_SIZE as u64, KRW, "clint.msip.hh")?;
+            map_region_va(rt, pa, kmmio_sswi(),
+                ACLINT_SSWI_BASE..ACLINT_SSWI_BASE + PAGE_SIZE as u64, KRW, "aclint.sswi.hh")?;
+        }
     }
     Ok(())
 }
@@ -579,12 +660,23 @@ pub unsafe fn map_kernel_shared(
     rt: &RootTable<'_>,
     pa: &mut PageAlloc,
     layout: &KernelLayout,
+    is_kernel_root: bool,
 ) -> Result<(), ()> {
     unsafe {
         // Kernel ELF, pools, and MMIO all live at high-half VAs. KDMAP covers
         // RAM (so pool_regions doesn't need an identity alias); KMMIO covers
         // device pages.
-        map_kernel_high_half(rt, pa, layout)?;
+        map_kernel_high_half(rt, pa, layout, is_kernel_root)?;
+
+        // Either snapshot the kernel root's KMMIO L2 PA (first time
+        // through, building the kernel root) or install that cached PA
+        // into this user satp's KMMIO root slot. Cf. the SHARED_KMMIO_L2
+        // commentary above.
+        if is_kernel_root {
+            cache_shared_kmmio_l2(rt);
+        } else {
+            attach_shared_kmmio_l2(rt);
+        }
 
         // Pre-materialize KSCRATCH intermediates (down to L0) but leave
         // leaves V=0. UserPageWindow opens a transient leaf PTE here to
@@ -659,7 +751,7 @@ pub unsafe fn map_kernel_self(
     layout: &KernelLayout,
 ) -> Result<(), ()> {
     unsafe {
-        map_kernel_shared(rt, pa, layout)?;
+        map_kernel_shared(rt, pa, layout, /*is_kernel_root=*/ true)?;
         // ktables and dtb only need their KDMAP aliases now — the kernel
         // walks tables through `RootTable`'s PA→VA bias, and the dtb is
         // parsed once via `phys_to_virt`. No identity leg.

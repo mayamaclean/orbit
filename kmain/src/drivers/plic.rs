@@ -295,7 +295,7 @@ pub unsafe fn install(
     let base_kva = unsafe {
         memmap::install_kmmio_alias(rt, pa_alloc, info.pa_base..info.pa_base + info.size)?
     };
-    unsafe { riscv::asm::sfence_vma(0, 0); }
+    riscv::asm::sfence_vma(0, 0);
 
     let plic = unsafe { Plic::new(base_kva, info.ndev) };
 
@@ -379,7 +379,7 @@ pub fn plic_register(src: u32, handler: Handler, hart: usize) -> Result<(), ()> 
 /// on the next `k_gpu` wake (≤50 ms).
 pub fn install_uart_rx_cycle() -> Result<(), ()> {
     const UART_RX_IRQ: u32 = 10;
-    plic_register(UART_RX_IRQ, uart_rx_cycle_handler, 0)?;
+    //plic_register(UART_RX_IRQ, uart_rx_cycle_handler, 0)?;
 
     // QEMU's ns16550a only asserts its interrupt line when MCR.OUT2 is
     // set AND the FIFO is enabled with a matched RX trigger level. Our
@@ -401,6 +401,7 @@ pub fn install_uart_rx_cycle() -> Result<(), ()> {
     Ok(())
 }
 
+#[allow(unused)]
 fn uart_rx_cycle_handler(_src: u32) {
     // Draining RBR (offset 0) clears the UART's RX-ready line; without
     // this the source stays asserted and we'd re-trap immediately

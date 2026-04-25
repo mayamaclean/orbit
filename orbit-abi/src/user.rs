@@ -218,15 +218,28 @@ pub struct SerialWriter {
 impl SerialWriter {
     pub const fn new() -> Self { Self { buf: [0u8; 256], len: 0 } }
     pub fn flush(&mut self) {
-        if self.len > 0 {
-            // Write to both sinks so UART remains greppable for smoke
-            // automation (the existing USER[...] tag pattern) while
-            // the framebuffer path gets the same bytes for the pane
-            // manager to display.
-            //let _ = serial_print(self.buf.as_ptr() as usize, self.len);
-            let _ = console_write(self.buf.as_ptr() as usize, self.len);
-            self.len = 0;
+        if self.len == 0 {
+            return;
         }
+        // The kernel's CONSOLE_RING is small (8 slots, shared with kernel
+        // ktrace). A burst of prints can fill it, in which case
+        // console_write returns -7 (EAGAIN). Yield via sleep_ms(0) and
+        // retry so output isn't silently dropped. Bounded so a
+        // permanently-broken consumer doesn't deadlock the writer.
+        const MAX_RETRIES: usize = 64;
+        let mut attempts = 0;
+        loop {
+            let r = console_write(self.buf.as_ptr() as usize, self.len);
+            if r >= 0 {
+                break;
+            }
+            if r != -7 || attempts >= MAX_RETRIES {
+                break;
+            }
+            attempts += 1;
+            let _ = sleep_ms(0);
+        }
+        self.len = 0;
     }
 }
 

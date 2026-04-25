@@ -114,10 +114,8 @@ fn emit(args: fmt::Arguments<'_>) {
     // Serial is the always-available path. Uses the spinlock'd
     // println-style API; safe from any context that itself isn't
     // already holding the serial lock.
-    unsafe {
-        if let Ok(s) = core::str::from_utf8(bytes) {
-            serial::print!("{}", s);
-        }
+    if let Ok(s) = core::str::from_utf8(bytes) {
+        serial::print!("{}", s);
     }
 
     // Push to the k_gpu ring if it's initialized. Runs lock-free;
