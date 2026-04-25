@@ -18,11 +18,15 @@ use mmu::sv48::{PageTable, PhysAddr, VirtAddr};
 use mmu::{KB, MB, MappingConfig, PAGE_SIZE, PagePermissions, SupervisorTag};
 use net_channel::NetChannel;
 use process::{
-    CloseHandleReq, CreateProcessReq, Frame, MappingKind, MemMapReq,
-    NetChannelCreationReq, PThread, PhysBacking, Process,
-    Shared, Thread, ThreadBlockReason, ThreadState,
+    Frame, MappingKind, PThread, PhysBacking, Process,
+    Shared, Thread, ThreadState,
     UserMapping, UserOnly
 };
+
+use orbit_core::{
+    CloseHandleReq, CreateProcessReq, MemMapReq, NetChannelCreationReq, PendingWork,
+};
+use thingbuf::StaticThingBuf;
 
 use crate::kernel::handle::{Handle, ProcessHandles};
 use crate::kernel::memmap::FrameToKdmap;
@@ -72,6 +76,13 @@ pub const UMODE_TEST_ELF: &'static [u8] = include_bytes!("../../../umode/target/
 // Re-exported so existing `kernel::USER_TEXT_BASE`-style call sites keep
 // working.
 pub use orbit_abi::layout::*;
+
+/// MPSC ring of `PendingWork` entries pushed by blocking-syscall paths
+/// on any hart and drained by whichever hart next holds `MANAGER_LOCK`.
+/// Cap chosen at ~8x current hart count so a steady-state burst of
+/// concurrent blocking syscalls doesn't EAGAIN until something is
+/// genuinely wedged. Default slot is `PendingWork::Empty`.
+pub static MANAGER_WORK: StaticThingBuf<PendingWork, 32> = StaticThingBuf::new();
 
 pub struct Orbit {
     dtb_addr: usize,
@@ -272,7 +283,7 @@ impl Orbit {
             stack,
             state: AtomicUsize::new(ThreadState::Ready as usize),
             wake_time: 0,
-            block_reason: ThreadBlockReason::NotBlocking,
+            handle: None,
             slot: None,
             fault_info: None,
         };
@@ -288,15 +299,14 @@ impl Orbit {
         Ok(())
     }
 
-    fn handle_mmap_req<'t>(&mut self, thread: &'t mut Thread, req: MemMapReq) {
+    fn run_mmap_req(&mut self, req: MemMapReq, pid: u16, root_pa: u64) -> isize {
         info!("handling mmap req {req:08X?}");
-        
+
         let Some(orbit_core::manager::MappingGeometry { align, levels }) =
             orbit_core::manager::select_mapping_geometry(req.vaddr, req.size)
         else {
             error!("failed to select alignment for mmap req: {req:?}");
-            thread.frame.regs[10] = -1isize as usize;
-            return
+            return -1;
         };
 
         let size = req.size;
@@ -305,9 +315,7 @@ impl Orbit {
             Ok(l) => l,
             Err(e) => {
                 error!("failed to create alignment for mmap req: {e:?}");
-                thread.frame.regs[10] = -2isize as usize;
-
-                return
+                return -2;
             }
         };
 
@@ -319,8 +327,7 @@ impl Orbit {
         let (backing_pa_raw, backing) = if req.share_with_kernel {
             let Some(frame) = self.kernel_pages.alloc_pa(layout) else {
                 error!("failed to alloc shared pages for mmap req: {req:?}");
-                thread.frame.regs[10] = -3isize as usize;
-                return
+                return -3;
             };
             // Zero via KDMAP alias.
             unsafe {
@@ -331,8 +338,7 @@ impl Orbit {
         } else {
             let Some(frame) = self.user_pages.alloc_pa(layout) else {
                 error!("failed to alloc user pages for mmap req: {req:?}");
-                thread.frame.regs[10] = -3isize as usize;
-                return
+                return -3;
             };
             // Zero via a transient kernel window — no KDMAP alias exists.
             unsafe {
@@ -362,25 +368,23 @@ impl Orbit {
         let pend = PhysAddr::new(backing_pa_raw + req.size as u64);
 
         unsafe {
-            let root_table = memmap::kernel_root_from_pa(thread.root_table_addr() as u64);
+            let root_table = memmap::kernel_root_from_pa(root_pa);
 
             let mut pages = PageAlloc::FA(self.table_pages.frames_mut());
 
             if let Err(_) = map_address_range(&root_table, &mut pages, &config, vend, pend) {
                 error!("failed to map pages for mmap req: {req:?}");
-                thread.frame.regs[10] = -4isize as usize;
                 self.free_backing(backing);
-                return
+                return -4;
             }
         }
 
-        let owning_process = match self.processes.get_mut(&thread.pid) {
+        let owning_process = match self.processes.get_mut(&pid) {
             Some(proc) => proc,
             None => {
                 error!("failed to add pages to process metadata (no pid): {req:?}");
-                thread.frame.regs[10] = -5isize as usize;
                 self.free_backing(backing);
-                return
+                return -5;
             }
         };
 
@@ -388,12 +392,12 @@ impl Orbit {
 
         core::sync::atomic::fence(Ordering::SeqCst);
 
-        riscv::asm::sfence_vma(thread.pid as usize, 0);
+        riscv::asm::sfence_vma(pid as usize, 0);
         riscv::asm::sfence_vma(0, 0);
 
         info!("fulfilled {req:?}:\n\tpa=0x{backing_pa_raw:016X} {layout:08X?}");
 
-        thread.frame.regs[10] = 0;
+        0
     }
 
     /// Dispatch a single typed free based on the backing's pool variant.
@@ -404,27 +408,27 @@ impl Orbit {
         }
     }
 
-    fn handle_nc_create_req<'t>(&mut self, thread: &'t mut Thread, req: NetChannelCreationReq) {
+    /// Run an enqueued NetChannel creation. Returns `(vaddr, fd)` on
+    /// success — the manager forwards both via `signal_pair`. Negative
+    /// `vaddr` on the error path; `fd` is unused in that case.
+    fn run_nc_create_req(&mut self, req: NetChannelCreationReq, pid: u16, root_pa: u64) -> (isize, isize) {
         info!("handling nc creation req: {req:08X?}");
 
         let Some(region_size) = NetChannel::normalize_region_size(req.region_size) else {
             warn!("nc create: bad region_size {}", req.region_size);
-            thread.frame.regs[10] = -1isize as usize;
-            return
+            return (-1, 0);
         };
 
         if req.nc_vaddr % PAGE_SIZE != 0 {
             warn!("nc create: unaligned user vaddr 0x{:X}", req.nc_vaddr);
-            thread.frame.regs[10] = -1isize as usize;
-            return
+            return (-1, 0);
         }
 
         let layout = match Layout::from_size_align(region_size, PAGE_SIZE) {
             Ok(l) => l,
             Err(e) => {
                 warn!("nc create: bad layout {e:?}");
-                thread.frame.regs[10] = -2isize as usize;
-                return
+                return (-2, 0);
             }
         };
 
@@ -432,8 +436,7 @@ impl Orbit {
         // smoltcp through the KDMAP alias after creation.
         let Some((frame, kva)) = self.kernel_pages.alloc_kdmap(layout) else {
             warn!("nc create: alloc failed for {} bytes", region_size);
-            thread.frame.regs[10] = -3isize as usize;
-            return
+            return (-3, 0);
         };
 
         // Zero then init before the user PTE exists — user never observes a
@@ -459,22 +462,20 @@ impl Orbit {
         let pend = PhysAddr::new(frame.get_raw() + region_size as u64);
 
         unsafe {
-            let root_table = memmap::kernel_root_from_pa(thread.root_table_addr() as u64);
+            let root_table = memmap::kernel_root_from_pa(root_pa);
             let mut pages = PageAlloc::FA(self.table_pages.frames_mut());
 
             if map_address_range(&root_table, &mut pages, &config, vend, pend).is_err() {
                 warn!("nc create: map failed {req:?}");
                 self.kernel_pages.free(frame, layout);
-                thread.frame.regs[10] = -4isize as usize;
-                return
+                return (-4, 0);
             }
         }
 
-        if !self.processes.contains_key(&thread.pid) {
+        if !self.processes.contains_key(&pid) {
             warn!("nc create: no owning process {req:?}");
             self.kernel_pages.free(frame, layout);
-            thread.frame.regs[10] = -5isize as usize;
-            return
+            return (-5, 0);
         }
 
         // Frame ownership moves into the SharedUserPtr's Arc — not into
@@ -482,7 +483,7 @@ impl Orbit {
         // Arc's last drop pushes to `pending_frees`; the manager returns
         // it to `kernel_pages` during cleanup.
         let shared: SharedUserPtr<NetChannel> = SharedUserPtr::new(
-            frame, layout, req.nc_vaddr as u64, region_size, thread.pid);
+            frame, layout, req.nc_vaddr as u64, region_size, pid);
 
         // Register the manager's strong ref and grab the Fd. Return it
         // to the user in a1 alongside the VA in a0 — avoids taking a
@@ -490,18 +491,18 @@ impl Orbit {
         // (Shared-pool only) or a transient UserPageWindow, neither of
         // which is worth the machinery for 4 bytes.
         let fd = self.process_handles
-            .entry(thread.pid)
+            .entry(pid)
             .or_insert_with(ProcessHandles::new)
             .insert(Handle::NetChannel(shared.clone()));
 
         core::sync::atomic::fence(Ordering::SeqCst);
 
-        riscv::asm::sfence_vma(thread.pid as usize, 0);
+        riscv::asm::sfence_vma(pid as usize, 0);
 
         let socket_req = SocketReq {
             netchan: shared,
             nc_type: req.nc_type,
-            pid: thread.pid,
+            pid,
             pending_rx_ack: false,
             pending_tx_ack: false,
             issued_desired: 0,
@@ -510,18 +511,16 @@ impl Orbit {
         if let Some(np) = self.net_pkg.socket_reqs.get_mut(get_hart_context().hart_id as usize) {
             if let Err(e) = np.enqueue(socket_req) {
                 warn!("nc create: failed to queue socket req {e:?}");
-                thread.frame.regs[10] = -6isize as usize;
-                return
+                return (-6, 0);
             }
         }
 
         info!("nc created user_va=0x{:08X} kva=0x{:016X} region={} fd={}",
             req.nc_vaddr, kva.raw(), region_size, fd);
-        thread.frame.regs[10] = req.nc_vaddr;
-        thread.frame.regs[11] = fd as usize;
+        (req.nc_vaddr as isize, fd as isize)
     }
 
-    fn handle_close_req<'t>(&mut self, thread: &'t mut Thread, req: CloseHandleReq) {
+    fn run_close_req(&mut self, req: CloseHandleReq, pid: u16, root_pa: u64) -> isize {
         info!("handling close req: {req:?}");
 
         // Look up the handle, revoke if Shared, then drop the Arc.
@@ -530,26 +529,21 @@ impl Orbit {
         // faults, and `try_as_ref` returns None for future kernel
         // observers — close is safe to race against an in-flight
         // update_tcp on another hart.
-        let Some(ph) = self.process_handles.get_mut(&thread.pid) else {
-            thread.frame.regs[10] = -1isize as usize;
-            return;
+        let Some(ph) = self.process_handles.get_mut(&pid) else {
+            return -1;
         };
         let Some(handle) = ph.remove(req.fd) else {
-            thread.frame.regs[10] = -2isize as usize;
-            return;
+            return -2;
         };
 
-        let root_table = unsafe {
-            memmap::kernel_root_from_pa(thread.root_table_addr() as u64)
-        };
+        let root_table = unsafe { memmap::kernel_root_from_pa(root_pa) };
 
         match &handle {
             Handle::NetChannel(sup) => {
                 if let Err(e) = sup.revoke(&root_table) {
                     warn!("close_handle: revoke failed for fd={} sup={sup:?}: {e:?}",
                         req.fd);
-                    thread.frame.regs[10] = -3isize as usize;
-                    return;
+                    return -3;
                 }
             }
         }
@@ -558,11 +552,10 @@ impl Orbit {
         // still holds a clone the backing survives until its next
         // drop.
         drop(handle);
-
-        thread.frame.regs[10] = 0;
+        0
     }
 
-    fn handle_create_process_req<'t>(&mut self, thread: &'t mut Thread, req: CreateProcessReq) {
+    fn run_create_process_req(&mut self, req: CreateProcessReq, root_pa: u64) -> isize {
         info!("handling create_process req: {req:?}");
 
         // Dev-loop safety cap. Well above any realistic test ELF but small
@@ -571,13 +564,10 @@ impl Orbit {
         const MAX_ELF_BYTES: usize = 4 * 1024 * 1024;
 
         if req.elf_len == 0 || req.elf_len > MAX_ELF_BYTES {
-            thread.frame.regs[10] = -1isize as usize;
-            return;
+            return -1;
         }
 
-        let root_table = unsafe {
-            memmap::kernel_root_from_pa(thread.root_table_addr() as u64)
-        };
+        let root_table = unsafe { memmap::kernel_root_from_pa(root_pa) };
 
         // Copy the ELF out page-by-page. UserPageWindow is single-slot, so
         // we materialize each page in turn and release it before the next.
@@ -597,8 +587,7 @@ impl Orbit {
                 Some(p) => p as u64,
                 None => {
                     error!("create_process: user va 0x{:X} does not translate", page_base);
-                    thread.frame.regs[10] = -2isize as usize;
-                    return;
+                    return -2;
                 }
             };
 
@@ -614,22 +603,42 @@ impl Orbit {
         match self.create_new_process(&blob, UPROC_STACK_DEFAULT) {
             Ok(pid) => {
                 info!("create_process: spawned pid={pid} from {} bytes", blob.len());
-                thread.frame.regs[10] = pid as usize;
+                pid as isize
             }
             Err(()) => {
                 error!("create_process: create_new_process failed");
-                thread.frame.regs[10] = -3isize as usize;
+                -3
             }
         }
     }
 
-    fn handle_block_reason<'t>(&mut self, thread: &'t mut Thread, reason: ThreadBlockReason) {
-        match reason {
-            ThreadBlockReason::MemMap(req) => self.handle_mmap_req(thread, req),
-            ThreadBlockReason::NetChannelCreation(req) => self.handle_nc_create_req(thread, req),
-            ThreadBlockReason::CloseHandle(req) => self.handle_close_req(thread, req),
-            ThreadBlockReason::CreateProcess(req) => self.handle_create_process_req(thread, req),
-            _ => {}
+    /// Drain `MANAGER_WORK`. Each entry is a syscall handler bundled
+    /// with its [`CompletionHandle`]; we run the handler, signal the
+    /// handle with the result, and let the next scheduler scan resume
+    /// the parked thread off `thread.handle.is_signaled()`.
+    pub(crate) fn drain_pending_work(&mut self) {
+        while let Some(mut slot) = MANAGER_WORK.pop_ref() {
+            let work = core::mem::take(&mut *slot);
+            drop(slot);
+            match work {
+                PendingWork::Empty => {}
+                PendingWork::MemMap { req, pid, root_pa, handle } => {
+                    let result = self.run_mmap_req(req, pid, root_pa);
+                    handle.signal(result);
+                }
+                PendingWork::NetChannelCreation { req, pid, root_pa, handle } => {
+                    let (r, e) = self.run_nc_create_req(req, pid, root_pa);
+                    handle.signal_pair(r, e);
+                }
+                PendingWork::CloseHandle { req, pid, root_pa, handle } => {
+                    let result = self.run_close_req(req, pid, root_pa);
+                    handle.signal(result);
+                }
+                PendingWork::CreateProcess { req, root_pa, handle, .. } => {
+                    let result = self.run_create_process_req(req, root_pa);
+                    handle.signal(result);
+                }
+            }
         }
     }
     
@@ -664,17 +673,30 @@ impl Orbit {
                 return Some(PThread(p.0))
             }
             else if state == ThreadState::Blocking as usize {
-                let reason = thread.block_reason;
-                let pt = PThread(p.0);
-
-                self.handle_block_reason(thread, reason);
-
-                info!("unblocked thread{}", thread.tid);
-
-                thread.block_reason = ThreadBlockReason::NotBlocking;
+                // Thread parked on a CompletionHandle; resume it once
+                // the handle is signaled, writing exactly the
+                // a-registers the handler claimed via signal_n(N).
+                // Slots a-regs the handler did not claim retain their
+                // trap-entry snapshot — preserves caller-saved regs
+                // that user code (e.g. orbit-loader) may depend on
+                // surviving across the ecall in practice.
+                let Some(handle) = thread.handle.as_ref() else {
+                    error!("thread{} Blocking with no handle", thread.tid);
+                    continue;
+                };
+                if !handle.is_signaled() {
+                    continue;
+                }
+                let n = handle.ret_count();
+                for i in 0..n {
+                    thread.frame.regs[10 + i] = handle.ret(i) as usize;
+                }
+                let logged = handle.ret(0);
+                thread.handle = None;
+                info!("unblocked thread{} (handle, n={}, a0={})",
+                    thread.tid, n, logged);
                 thread.state.store(ThreadState::Ready as usize, Ordering::Release);
-
-                return Some(pt)
+                return Some(PThread(p.0));
             }
         }
         None
@@ -1500,7 +1522,7 @@ impl Orbit {
             stack,
             state: AtomicUsize::new(ThreadState::Ready as usize),
             wake_time: 0,
-            block_reason: ThreadBlockReason::NotBlocking,
+            handle: None,
             slot: Some(slot),
             fault_info: None,
         })

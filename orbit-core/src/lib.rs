@@ -7,13 +7,20 @@
 
 #![no_std]
 
+extern crate alloc;
+
 use process::ThreadState;
 
 pub mod manager;
 pub mod net;
+pub mod pending_work;
 pub mod sched;
 pub mod syscall;
 pub mod trap;
+
+pub use pending_work::{
+    CloseHandleReq, CreateProcessReq, MemMapReq, NetChannelCreationReq, PendingWork,
+};
 
 /// Page size assumed by pure logic when bounding user-memory ranges. Must
 /// match the walker's leaf granularity on the live target (Sv48 4 KiB).
@@ -58,6 +65,12 @@ pub trait Hardware {
     /// Send an inter-processor interrupt to `hart_id`. Real impl writes
     /// the hart's ACLINT SSWI MSIP; tests record the call.
     fn wake_hart(&mut self, hart_id: u32);
+
+    /// Enqueue `work` onto the manager's work ring. Real impl pushes
+    /// onto a `thingbuf::StaticThingBuf` and returns `Err(work)` if the
+    /// ring is full (caller maps to `-EAGAIN`); tests record the push
+    /// for assertion.
+    fn push_pending_work(&mut self, work: PendingWork) -> Result<(), PendingWork>;
 }
 
 /// What a pure syscall handler tells the shim to do after it returns.

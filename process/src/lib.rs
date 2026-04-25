@@ -14,6 +14,9 @@ use mmu::sv48::PhysAddr;
 use riscv::register::{satp::Satp, sstatus::SPP};
 use smoltcp::iface::SocketHandle;
 
+pub mod completion;
+pub use completion::{AckCounter, CompletionHandle};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(usize)]
 pub enum ThreadState {
@@ -23,41 +26,6 @@ pub enum ThreadState {
     Running   = 3,
     Exited    = 4,
     Suspended = 5
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct MemMapReq {
-    pub vaddr: usize,
-    pub size: usize,
-    pub page_permissions: u64,
-    pub share_with_kernel: bool
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct NetChannelCreationReq {
-    pub nc_vaddr: usize,
-    pub region_size: usize,
-    pub nc_type: usize,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct CloseHandleReq {
-    pub fd: u32,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct CreateProcessReq {
-    pub elf_vaddr: usize,
-    pub elf_len: usize,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum ThreadBlockReason {
-    NotBlocking,
-    MemMap(MemMapReq),
-    NetChannelCreation(NetChannelCreationReq),
-    CloseHandle(CloseHandleReq),
-    CreateProcess(CreateProcessReq),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -259,7 +227,12 @@ pub struct Thread {
     pub stack: &'static mut Stack,
     pub satp: Satp,
     pub mode: SPP,
-    pub block_reason: ThreadBlockReason,
+    /// Wait/signal handle this thread is parked on while
+    /// `state == Blocking`. The manager scans for signaled handles each
+    /// scheduler pass; on a hit it writes `result()` / `extra()` into
+    /// `frame.regs[10]` / `frame.regs[11]`, clears the slot, and marks
+    /// the thread `Ready`.
+    pub handle: Option<CompletionHandle>,
     pub tid: u32,
     pub pid: u16,
     pub ticks: u8,

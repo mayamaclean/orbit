@@ -7,11 +7,11 @@ use std::collections::BTreeMap;
 use std::sync::atomic::AtomicUsize;
 
 use device::{Stack, TrapFrame};
-use process::{Thread, ThreadBlockReason, ThreadState};
+use process::{Thread, ThreadState};
 use riscv::register::satp::Satp;
 use riscv::register::sstatus::SPP;
 
-use orbit_core::Hardware;
+use orbit_core::{Hardware, PendingWork};
 
 /// miri extern — marks an allocation as a known root so the leak
 /// checker ignores it. Intentionally leaked test fixtures (our `Thread`
@@ -51,7 +51,7 @@ pub fn make_thread(state: ThreadState, mode: SPP) -> Thread {
             stack,
             satp: Satp::from_bits(0),
             mode,
-            block_reason: ThreadBlockReason::NotBlocking,
+            handle: None,
             tid: 1,
             pid: 1,
             ticks: 0,
@@ -99,6 +99,15 @@ pub struct FakeHw {
     /// If false, `console_write_user` returns `Err(())` — exercises
     /// the `-7` ring-full path.
     pub console_ok: bool,
+
+    /// Accumulated `PendingWork` entries pushed by syscall handlers
+    /// during a test. Tests inspect this to assert what the manager
+    /// would receive.
+    pub pending_work: Vec<PendingWork>,
+
+    /// If false, `push_pending_work` returns `Err(work)` — exercises
+    /// the EAGAIN-on-full-ring path.
+    pub pending_work_ok: bool,
 }
 
 impl Default for FakeHw {
@@ -113,6 +122,8 @@ impl Default for FakeHw {
             wakes: Vec::new(),
             console_writes: Vec::new(),
             console_ok: true,
+            pending_work: Vec::new(),
+            pending_work_ok: true,
         }
     }
 }
@@ -151,6 +162,14 @@ impl Hardware for FakeHw {
             Ok(())
         } else {
             Err(())
+        }
+    }
+    fn push_pending_work(&mut self, work: PendingWork) -> Result<(), PendingWork> {
+        if self.pending_work_ok {
+            self.pending_work.push(work);
+            Ok(())
+        } else {
+            Err(work)
         }
     }
 }

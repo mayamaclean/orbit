@@ -152,6 +152,7 @@ pub extern "C" fn k_hart_loop() -> ! {
         unsafe { riscv::register::sstatus::clear_sie(); }
         if try_acquire_manager() {
             orbit.cleanup_threads_and_processes();
+            orbit.drain_pending_work();
             orbit.check_net();
             orbit.assign_threads(hart_context);
             release_manager();
@@ -527,20 +528,28 @@ pub fn handle_ms_sleep(epc: usize, hart_context: &'static HartContext, frame: &m
 
 #[unsafe(no_mangle)]
 pub fn handle_mmap_req(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
-    dispatch_syscall(epc, hart_context, frame, |t, f| orbit_core::syscall::mmap_req(t, f));
+    dispatch_syscall(epc, hart_context, frame, |t, f| {
+        orbit_core::syscall::mmap_req(t, f, &mut crate::hw::RiscvHardware)
+    });
 }
 
 #[unsafe(no_mangle)]
 pub fn handle_close_req(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
-    dispatch_syscall(epc, hart_context, frame, |t, f| orbit_core::syscall::close_req(t, f));
+    dispatch_syscall(epc, hart_context, frame, |t, f| {
+        orbit_core::syscall::close_req(t, f, &mut crate::hw::RiscvHardware)
+    });
 }
 
 #[unsafe(no_mangle)]
 pub fn handle_nc_create_req(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
-    dispatch_syscall(epc, hart_context, frame, |t, f| orbit_core::syscall::nc_create_req(t, f));
+    dispatch_syscall(epc, hart_context, frame, |t, f| {
+        orbit_core::syscall::nc_create_req(t, f, &mut crate::hw::RiscvHardware)
+    });
 }
 
 #[unsafe(no_mangle)]
 pub fn handle_create_process_req(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
-    dispatch_syscall(epc, hart_context, frame, |t, f| orbit_core::syscall::create_process_req(t, f));
+    dispatch_syscall(epc, hart_context, frame, |t, f| {
+        orbit_core::syscall::create_process_req(t, f, &mut crate::hw::RiscvHardware)
+    });
 }

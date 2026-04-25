@@ -4,12 +4,12 @@
 //! kmain shim to apply.
 
 use device::TrapFrame;
-use process::{
-    CloseHandleReq, CreateProcessReq, MemMapReq, NetChannelCreationReq,
-    Thread, ThreadBlockReason, ThreadState,
-};
+use process::{CompletionHandle, Thread, ThreadState};
 
-use crate::{Hardware, PAGE_SIZE, SyscallOutcome};
+use crate::{
+    CloseHandleReq, CreateProcessReq, Hardware, MemMapReq, NetChannelCreationReq,
+    PAGE_SIZE, PendingWork, SyscallOutcome,
+};
 
 /// Cap on `sleep_ms(ms)` arguments. Anything at or above this returns -2
 /// without touching thread state.
@@ -36,63 +36,127 @@ pub fn ms_sleep<H: Hardware>(thread: &mut Thread, ms: usize, hw: &H) -> SyscallO
     }
 }
 
-/// `mmap(vaddr, size, perms, share_with_kernel)` — enter Blocking with a
-/// [`MemMapReq`] that the manager consumes on its next pass.
+/// `mmap(vaddr, size, perms, share_with_kernel)` — park the thread on a
+/// fresh [`CompletionHandle`] and push a [`PendingWork::MemMap`] entry
+/// onto the manager's work ring. Whichever hart next holds
+/// `MANAGER_LOCK` runs the page-table mutation and signals the handle;
+/// the next scheduler scan reads the result off the handle into a0 and
+/// resumes the thread.
 ///
-/// Syscall returns are written by the manager at unblock time (the shim
-/// leaves `regs[10]` alone — see [`SyscallOutcome::Yield`] docs).
-pub fn mmap_req(thread: &mut Thread, frame: &TrapFrame) -> SyscallOutcome {
+/// Returns `-7` (EAGAIN) if the work ring is full so the caller can
+/// retry — same convention as `console_write`.
+pub fn mmap_req<H: Hardware>(
+    thread: &mut Thread,
+    frame: &TrapFrame,
+    hw: &mut H,
+) -> SyscallOutcome {
     let req = MemMapReq {
         vaddr: frame.regs[11],
         size: frame.regs[12],
         page_permissions: frame.regs[13] as u64,
         share_with_kernel: frame.regs[14] > 0,
     };
-    thread.block_reason = ThreadBlockReason::MemMap(req);
+    let handle = CompletionHandle::new();
+    let work = PendingWork::MemMap {
+        req,
+        pid: thread.pid,
+        root_pa: thread.root_table_addr() as u64,
+        handle: handle.clone(),
+    };
+    if hw.push_pending_work(work).is_err() {
+        return SyscallOutcome::Return { ret: -7 };
+    }
+    thread.handle = Some(handle);
     SyscallOutcome::Yield {
         state: ThreadState::Blocking,
         ret: None,
     }
 }
 
-/// `create_netch(vaddr_hint, region_size, nc_type)` — enter Blocking with a
-/// [`NetChannelCreationReq`] for the manager.
-pub fn nc_create_req(thread: &mut Thread, frame: &TrapFrame) -> SyscallOutcome {
+/// `create_netch(vaddr_hint, region_size, nc_type)` — park on a handle
+/// and push a [`PendingWork::NetChannelCreation`] entry. Manager runs
+/// the allocation + smoltcp socket setup and signals the handle with
+/// `(vaddr, fd)` via `signal_pair` — those land in `regs[10]` and
+/// `regs[11]` when the thread resumes.
+pub fn nc_create_req<H: Hardware>(
+    thread: &mut Thread,
+    frame: &TrapFrame,
+    hw: &mut H,
+) -> SyscallOutcome {
     let req = NetChannelCreationReq {
         nc_vaddr: frame.regs[11],
         region_size: frame.regs[12],
         nc_type: frame.regs[13],
     };
-    thread.block_reason = ThreadBlockReason::NetChannelCreation(req);
+    let handle = CompletionHandle::new();
+    let work = PendingWork::NetChannelCreation {
+        req,
+        pid: thread.pid,
+        root_pa: thread.root_table_addr() as u64,
+        handle: handle.clone(),
+    };
+    if hw.push_pending_work(work).is_err() {
+        return SyscallOutcome::Return { ret: -7 };
+    }
+    thread.handle = Some(handle);
     SyscallOutcome::Yield {
         state: ThreadState::Blocking,
         ret: None,
     }
 }
 
-/// `close_handle(fd)` — enter Blocking with a [`CloseHandleReq`] for the
-/// manager's handle-registry teardown path.
-pub fn close_req(thread: &mut Thread, frame: &TrapFrame) -> SyscallOutcome {
+/// `close_handle(fd)` — park on a handle and push a
+/// [`PendingWork::CloseHandle`] entry. Manager looks up the fd, revokes
+/// the underlying `SharedUserPtr` if any, drops the Arc, and signals.
+pub fn close_req<H: Hardware>(
+    thread: &mut Thread,
+    frame: &TrapFrame,
+    hw: &mut H,
+) -> SyscallOutcome {
     let req = CloseHandleReq {
         fd: frame.regs[11] as u32,
     };
-    thread.block_reason = ThreadBlockReason::CloseHandle(req);
+    let handle = CompletionHandle::new();
+    let work = PendingWork::CloseHandle {
+        req,
+        pid: thread.pid,
+        root_pa: thread.root_table_addr() as u64,
+        handle: handle.clone(),
+    };
+    if hw.push_pending_work(work).is_err() {
+        return SyscallOutcome::Return { ret: -7 };
+    }
+    thread.handle = Some(handle);
     SyscallOutcome::Yield {
         state: ThreadState::Blocking,
         ret: None,
     }
 }
 
-/// `create_process(elf_vaddr, elf_len)` — enter Blocking with a
-/// [`CreateProcessReq`]. The manager copies the ELF out of user memory,
-/// parses it, and spawns the new process; the syscall return written at
-/// unblock time is the new pid on success or a negative errno on failure.
-pub fn create_process_req(thread: &mut Thread, frame: &TrapFrame) -> SyscallOutcome {
+/// `create_process(elf_vaddr, elf_len)` — park on a handle and push a
+/// [`PendingWork::CreateProcess`] entry. Manager copies the ELF out of
+/// user memory, parses it, spawns the new process, and signals the
+/// handle with the new pid (or a negative errno on failure).
+pub fn create_process_req<H: Hardware>(
+    thread: &mut Thread,
+    frame: &TrapFrame,
+    hw: &mut H,
+) -> SyscallOutcome {
     let req = CreateProcessReq {
         elf_vaddr: frame.regs[11],
         elf_len: frame.regs[12],
     };
-    thread.block_reason = ThreadBlockReason::CreateProcess(req);
+    let handle = CompletionHandle::new();
+    let work = PendingWork::CreateProcess {
+        req,
+        pid: thread.pid,
+        root_pa: thread.root_table_addr() as u64,
+        handle: handle.clone(),
+    };
+    if hw.push_pending_work(work).is_err() {
+        return SyscallOutcome::Return { ret: -7 };
+    }
+    thread.handle = Some(handle);
     SyscallOutcome::Yield {
         state: ThreadState::Blocking,
         ret: None,

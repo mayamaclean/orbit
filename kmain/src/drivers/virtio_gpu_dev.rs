@@ -28,7 +28,7 @@ use crate::kernel::memmap::KernelPages;
 //   desc  = 64 × 16 = 1024 B   → offset 0
 //   avail = 4 + 64×2 + 2 = 134 → rounded to offset 1024 (1 KiB slot)
 //   used  = 4 + 64×8 + 2 = 518 → rounded to offset 2048 (2 KiB slot)
-pub const QUEUE_SIZE: u16 = 64;
+pub const QUEUE_SIZE: u16 = 32;
 pub const QUEUE_PAGE_SIZE: usize = 4096;
 const DESC_OFFSET: u64 = 0;
 const AVAIL_OFFSET: u64 = 1024;

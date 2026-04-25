@@ -4,9 +4,10 @@
 //! to the real CSRs / MMIO sites.
 
 use mmu::sv48::VirtAddr;
-use orbit_core::Hardware;
+use orbit_core::{Hardware, PendingWork};
 
 use crate::UserAccess;
+use crate::kernel::MANAGER_WORK;
 
 pub struct RiscvHardware;
 
@@ -69,6 +70,19 @@ impl Hardware for RiscvHardware {
             Ok(())
         } else {
             Err(())
+        }
+    }
+
+    fn push_pending_work(&mut self, work: PendingWork) -> Result<(), PendingWork> {
+        // thingbuf push_ref returns the slot to write into; we move
+        // `work` in via the `*slot = ...` assignment. Drop releases the
+        // slot back to the queue for the manager to pop.
+        match MANAGER_WORK.push_ref() {
+            Ok(mut slot) => {
+                *slot = work;
+                Ok(())
+            }
+            Err(_) => Err(work),
         }
     }
 }
