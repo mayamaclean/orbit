@@ -51,6 +51,11 @@ impl Scrollback {
     /// Append a chunk of bytes. Splits on `\n`, drops non-printable
     /// bytes (bitmap font is ASCII-only for now), truncates any line
     /// that exceeds [`MAX_LINE_LEN`] until the next `\n` resets.
+    /// Two control bytes are special-cased so the in-tree console can
+    /// drive interactive editing through this same byte path:
+    /// `\x08` (BS) pops the last char from the pending line, and
+    /// `\x0c` (FF) clears both the completed history and the pending
+    /// line for this source.
     pub fn append(&mut self, chunk: &[u8]) {
         for &b in chunk {
             if b == b'\n' {
@@ -59,6 +64,15 @@ impl Scrollback {
                     self.lines.pop_front();
                 }
                 self.lines.push_back(completed);
+                continue;
+            }
+            if b == 0x08 {
+                self.pending.pop();
+                continue;
+            }
+            if b == 0x0c {
+                self.lines.clear();
+                self.pending.clear();
                 continue;
             }
             if self.pending.len() >= MAX_LINE_LEN {

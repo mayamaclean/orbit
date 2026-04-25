@@ -453,12 +453,28 @@ unsafe extern "C" fn early_paging_setup(pt_base: *mut u8, pt_size: usize, load_a
         loop { riscv::asm::wfi(); }
     }
 
-    // High-half kernel image: 2 MiB at KTEXT_NOMINAL -> load_addr. One 2 MiB
-    // window is enough — the kernel is < 1 MiB. VA and PA increment together
-    // so symbol at linked LINK_BASE+X lands at VA KTEXT_NOMINAL + X and PA
-    // load_addr + X, which matches the convention the final satp uses.
+    // High-half kernel image: cover [load_addr, _DYNAMIC_END) at
+    // KTEXT_NOMINAL -> load_addr, rounded up to the next 2 MiB so
+    // `map_va_range` emits megapages. The bootstrap window has to span
+    // the whole loaded image (.text + .rodata + .data + .bss + .dynamic)
+    // because rust_main reads relocated statics and applies relocations
+    // before map_kernel_self installs the permission-correct final
+    // mappings. Permissions stay RWX|G to match the identity range
+    // above; W^X comes in with the post-bootstrap satp.
+    // Sizing is dynamic so the mapping grows automatically as the
+    // embedded user-mode loader (and the console it embeds) get bigger.
     let ktext = kmain::kernel::memmap::KTEXT_NOMINAL;
-    let len = 2u64 * 1024 * 1024;
+    let image_end_pa: u64;
+    unsafe {
+        core::arch::asm!(
+            "lla {out}, _DYNAMIC_END",
+            out = out(reg) image_end_pa,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    const MEGAPAGE: u64 = 2 * 1024 * 1024;
+    let raw = image_end_pa.wrapping_sub(load_addr);
+    let len = (raw + (MEGAPAGE - 1)) & !(MEGAPAGE - 1);
     if unsafe { map_va_range(&root, &mut pages, cfg, ktext, load_addr..(load_addr + len)) }.is_err() {
         loop { riscv::asm::wfi(); }
     }

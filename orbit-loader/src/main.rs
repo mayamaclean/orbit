@@ -40,6 +40,14 @@ const NC_REGION_SIZE: usize = net_channel::NC_MAX_REGION_SIZE;
 const MAX_ELF_BYTES: usize = 4 * 1024 * 1024;
 const POLL_SLEEP_MS: usize = 10;
 
+// In-tree shell — spawned at loader startup so the user has a usable
+// pane on Ctrl+Tab without first having to push a payload over TCP.
+// Mirrors how kmain embeds this loader: build console first, then
+// orbit-loader picks up the latest release ELF.
+const CONSOLE_ELF: &[u8] = include_bytes!(
+    "../../console/target/riscv64gc-unknown-none-elf/release/console"
+);
+
 // `map` (not the derive default `array`) so new optional fields can be
 // added later without breaking existing senders — map entries are keyed
 // by their `#[n(N)]` index, so missing keys are tolerated rather than
@@ -64,6 +72,15 @@ enum LoaderErr {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn _start() -> ! {
+    // Spawn the in-tree console first so a user has a pane to flip to
+    // on Ctrl+Tab while the loader is still negotiating its NetChannel.
+    // Failure here isn't fatal — the loader is still useful for
+    // sending ELFs over TCP without an interactive shell.
+    match create_process(CONSOLE_ELF.as_ptr(), CONSOLE_ELF.len()) {
+        Ok(pid) => logln!("orbit-loader: spawned console pid={pid}"),
+        Err(e)  => logln!("orbit-loader: console spawn failed: {e:?}"),
+    }
+
     logln!("orbit-loader: listening on :{LISTEN_PORT}");
 
     let (nc_vaddr, _nc_fd) = match create_netch(NC_VADDR_HINT, NC_REGION_SIZE, 0) {
