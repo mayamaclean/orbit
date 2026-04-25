@@ -3,6 +3,7 @@ mod common;
 use process::ThreadState;
 use riscv::register::sstatus::SPP;
 
+use orbit_abi::errno::{Errno, EINVAL};
 use orbit_core::{SyscallOutcome, syscall};
 
 use common::{FakeHw, make_thread};
@@ -43,7 +44,7 @@ fn rejects_ms_at_cap() {
 
     let outcome = syscall::ms_sleep(&mut t, syscall::MAX_SLEEP_MS, &hw);
 
-    assert_eq!(outcome, SyscallOutcome::Return { ret: -2 });
+    assert_eq!(outcome, SyscallOutcome::Return { ret: Errno::new(EINVAL).to_ret() });
     assert_eq!(t.wake_time, 0xDEAD);
 }
 
@@ -54,7 +55,7 @@ fn rejects_ms_above_cap() {
 
     let outcome = syscall::ms_sleep(&mut t, syscall::MAX_SLEEP_MS + 1, &hw);
 
-    assert_eq!(outcome, SyscallOutcome::Return { ret: -2 });
+    assert_eq!(outcome, SyscallOutcome::Return { ret: Errno::new(EINVAL).to_ret() });
 }
 
 #[test]

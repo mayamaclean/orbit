@@ -3,6 +3,7 @@ mod common;
 use process::ThreadState;
 use riscv::register::sstatus::SPP;
 
+use orbit_abi::errno::{Errno, EFAULT, EINVAL, EIO};
 use orbit_core::{PAGE_SIZE, SyscallOutcome, syscall};
 
 use common::{FakeHw, make_frame, make_thread};
@@ -41,7 +42,7 @@ fn rejects_len_above_page() {
 
     let outcome = syscall::serial_print(&t, &frame, &mut hw);
 
-    assert_eq!(outcome, ready(-3));
+    assert_eq!(outcome, ready(Errno::new(EINVAL).to_ret()));
     assert!(hw.user_prints.is_empty(), "nothing should be written on reject");
 }
 
@@ -60,19 +61,19 @@ fn accepts_len_exactly_page() {
 }
 
 #[test]
-fn bad_user_va_returns_minus_2() {
+fn bad_user_va_returns_efault() {
     let t = make_thread(ThreadState::Running, SPP::User);
     let frame = frame_with(5);
     let mut hw = FakeHw { translates: false, ..Default::default() };
 
     let outcome = syscall::serial_print(&t, &frame, &mut hw);
 
-    assert_eq!(outcome, ready(-2));
+    assert_eq!(outcome, ready(Errno::new(EFAULT).to_ret()));
     assert!(hw.user_prints.is_empty());
 }
 
 #[test]
-fn non_utf8_returns_minus_4() {
+fn non_utf8_returns_einval() {
     let t = make_thread(ThreadState::Running, SPP::User);
     let frame = frame_with(4);
     let mut hw = FakeHw::default();
@@ -81,12 +82,12 @@ fn non_utf8_returns_minus_4() {
 
     let outcome = syscall::serial_print(&t, &frame, &mut hw);
 
-    assert_eq!(outcome, ready(-4));
+    assert_eq!(outcome, ready(Errno::new(EINVAL).to_ret()));
     assert!(hw.user_prints.is_empty(), "no partial write on utf8 failure");
 }
 
 #[test]
-fn valid_prefix_then_invalid_byte_returns_minus_4() {
+fn valid_prefix_then_invalid_byte_returns_einval() {
     // Catches a regression where `from_utf8` gets swapped for
     // `from_utf8_unchecked` plus a length check — the prefix would
     // pass any cheap "first byte ASCII" inspection.
@@ -97,12 +98,12 @@ fn valid_prefix_then_invalid_byte_returns_minus_4() {
 
     let outcome = syscall::serial_print(&t, &frame, &mut hw);
 
-    assert_eq!(outcome, ready(-4));
+    assert_eq!(outcome, ready(Errno::new(EINVAL).to_ret()));
     assert!(hw.user_prints.is_empty(), "no partial write on utf8 failure");
 }
 
 #[test]
-fn serial_failure_returns_minus_5() {
+fn serial_failure_returns_eio() {
     let t = make_thread(ThreadState::Running, SPP::User);
     let frame = frame_with(3);
     let mut hw = FakeHw { serial_ok: false, ..Default::default() };
@@ -110,7 +111,7 @@ fn serial_failure_returns_minus_5() {
 
     let outcome = syscall::serial_print(&t, &frame, &mut hw);
 
-    assert_eq!(outcome, ready(-5));
+    assert_eq!(outcome, ready(Errno::new(EIO).to_ret()));
 }
 
 #[test]
@@ -128,15 +129,16 @@ fn empty_len_still_succeeds() {
 
 #[test]
 fn check_order_len_before_translate() {
-    // If both are bad, -3 wins (checked first). This is the defense-in-
-    // depth ordering — bound the range before walking page tables.
+    // If both are bad, -EINVAL (length check) wins over -EFAULT
+    // (translate check). Defense-in-depth ordering — bound the range
+    // before walking page tables.
     let t = make_thread(ThreadState::Running, SPP::User);
     let frame = frame_with(PAGE_SIZE + 100);
     let mut hw = FakeHw { translates: false, ..Default::default() };
 
     let outcome = syscall::serial_print(&t, &frame, &mut hw);
 
-    assert_eq!(outcome, ready(-3));
+    assert_eq!(outcome, ready(Errno::new(EINVAL).to_ret()));
 }
 
 #[test]

@@ -7,21 +7,22 @@
 //! failure returns `-(errno as isize)`. Callers use [`Errno::from_ret`] to
 //! split the return value.
 
-pub const EPERM:  i32 =  1;
-pub const ENOENT: i32 =  2;
-pub const ESRCH:  i32 =  3;
-pub const EIO:    i32 =  5;
-pub const EBADF:  i32 =  9;
-pub const EAGAIN: i32 = 11;
-pub const ENOMEM: i32 = 12;
-pub const EACCES: i32 = 13;
-pub const EFAULT: i32 = 14;
-pub const EBUSY:  i32 = 16;
-pub const EEXIST: i32 = 17;
-pub const ENODEV: i32 = 19;
-pub const EINVAL: i32 = 22;
-pub const ENFILE: i32 = 23;
-pub const ENOSYS: i32 = 38;
+pub const EPERM:   i32 =  1;
+pub const ENOENT:  i32 =  2;
+pub const ESRCH:   i32 =  3;
+pub const EIO:     i32 =  5;
+pub const ENOEXEC: i32 =  8;
+pub const EBADF:   i32 =  9;
+pub const EAGAIN:  i32 = 11;
+pub const ENOMEM:  i32 = 12;
+pub const EACCES:  i32 = 13;
+pub const EFAULT:  i32 = 14;
+pub const EBUSY:   i32 = 16;
+pub const EEXIST:  i32 = 17;
+pub const ENODEV:  i32 = 19;
+pub const EINVAL:  i32 = 22;
+pub const ENFILE:  i32 = 23;
+pub const ENOSYS:  i32 = 38;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(transparent)]

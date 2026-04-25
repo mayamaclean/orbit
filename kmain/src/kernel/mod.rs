@@ -23,6 +23,9 @@ use process::{
     UserMapping, UserOnly
 };
 
+use orbit_abi::errno::{
+    Errno, EAGAIN, EBADF, EFAULT, EINVAL, EIO, ENOEXEC, ENOMEM, ESRCH,
+};
 use orbit_core::{
     CloseHandleReq, CreateProcessReq, MemMapReq, NetChannelCreationReq, PendingWork,
 };
@@ -306,7 +309,7 @@ impl Orbit {
             orbit_core::manager::select_mapping_geometry(req.vaddr, req.size)
         else {
             error!("failed to select alignment for mmap req: {req:?}");
-            return -1;
+            return Errno::new(EINVAL).to_ret();
         };
 
         let size = req.size;
@@ -315,7 +318,7 @@ impl Orbit {
             Ok(l) => l,
             Err(e) => {
                 error!("failed to create alignment for mmap req: {e:?}");
-                return -2;
+                return Errno::new(EINVAL).to_ret();
             }
         };
 
@@ -327,7 +330,7 @@ impl Orbit {
         let (backing_pa_raw, backing) = if req.share_with_kernel {
             let Some(frame) = self.kernel_pages.alloc_pa(layout) else {
                 error!("failed to alloc shared pages for mmap req: {req:?}");
-                return -3;
+                return Errno::new(ENOMEM).to_ret();
             };
             // Zero via KDMAP alias.
             unsafe {
@@ -338,7 +341,7 @@ impl Orbit {
         } else {
             let Some(frame) = self.user_pages.alloc_pa(layout) else {
                 error!("failed to alloc user pages for mmap req: {req:?}");
-                return -3;
+                return Errno::new(ENOMEM).to_ret();
             };
             // Zero via a transient kernel window — no KDMAP alias exists.
             unsafe {
@@ -375,7 +378,7 @@ impl Orbit {
             if let Err(_) = map_address_range(&root_table, &mut pages, &config, vend, pend) {
                 error!("failed to map pages for mmap req: {req:?}");
                 self.free_backing(backing);
-                return -4;
+                return Errno::new(ENOMEM).to_ret();
             }
         }
 
@@ -384,7 +387,7 @@ impl Orbit {
             None => {
                 error!("failed to add pages to process metadata (no pid): {req:?}");
                 self.free_backing(backing);
-                return -5;
+                return Errno::new(ESRCH).to_ret();
             }
         };
 
@@ -416,19 +419,19 @@ impl Orbit {
 
         let Some(region_size) = NetChannel::normalize_region_size(req.region_size) else {
             warn!("nc create: bad region_size {}", req.region_size);
-            return (-1, 0);
+            return (Errno::new(EINVAL).to_ret(), 0);
         };
 
         if req.nc_vaddr % PAGE_SIZE != 0 {
             warn!("nc create: unaligned user vaddr 0x{:X}", req.nc_vaddr);
-            return (-1, 0);
+            return (Errno::new(EINVAL).to_ret(), 0);
         }
 
         let layout = match Layout::from_size_align(region_size, PAGE_SIZE) {
             Ok(l) => l,
             Err(e) => {
                 warn!("nc create: bad layout {e:?}");
-                return (-2, 0);
+                return (Errno::new(EINVAL).to_ret(), 0);
             }
         };
 
@@ -436,7 +439,7 @@ impl Orbit {
         // smoltcp through the KDMAP alias after creation.
         let Some((frame, kva)) = self.kernel_pages.alloc_kdmap(layout) else {
             warn!("nc create: alloc failed for {} bytes", region_size);
-            return (-3, 0);
+            return (Errno::new(ENOMEM).to_ret(), 0);
         };
 
         // Zero then init before the user PTE exists — user never observes a
@@ -468,14 +471,14 @@ impl Orbit {
             if map_address_range(&root_table, &mut pages, &config, vend, pend).is_err() {
                 warn!("nc create: map failed {req:?}");
                 self.kernel_pages.free(frame, layout);
-                return (-4, 0);
+                return (Errno::new(ENOMEM).to_ret(), 0);
             }
         }
 
         if !self.processes.contains_key(&pid) {
             warn!("nc create: no owning process {req:?}");
             self.kernel_pages.free(frame, layout);
-            return (-5, 0);
+            return (Errno::new(ESRCH).to_ret(), 0);
         }
 
         // Frame ownership moves into the SharedUserPtr's Arc — not into
@@ -511,7 +514,7 @@ impl Orbit {
         if let Some(np) = self.net_pkg.socket_reqs.get_mut(get_hart_context().hart_id as usize) {
             if let Err(e) = np.enqueue(socket_req) {
                 warn!("nc create: failed to queue socket req {e:?}");
-                return (-6, 0);
+                return (Errno::new(EAGAIN).to_ret(), 0);
             }
         }
 
@@ -530,10 +533,10 @@ impl Orbit {
         // observers — close is safe to race against an in-flight
         // update_tcp on another hart.
         let Some(ph) = self.process_handles.get_mut(&pid) else {
-            return -1;
+            return Errno::new(EBADF).to_ret();
         };
         let Some(handle) = ph.remove(req.fd) else {
-            return -2;
+            return Errno::new(EBADF).to_ret();
         };
 
         let root_table = unsafe { memmap::kernel_root_from_pa(root_pa) };
@@ -543,7 +546,7 @@ impl Orbit {
                 if let Err(e) = sup.revoke(&root_table) {
                     warn!("close_handle: revoke failed for fd={} sup={sup:?}: {e:?}",
                         req.fd);
-                    return -3;
+                    return Errno::new(EIO).to_ret();
                 }
             }
         }
@@ -564,7 +567,7 @@ impl Orbit {
         const MAX_ELF_BYTES: usize = 4 * 1024 * 1024;
 
         if req.elf_len == 0 || req.elf_len > MAX_ELF_BYTES {
-            return -1;
+            return Errno::new(EINVAL).to_ret();
         }
 
         let root_table = unsafe { memmap::kernel_root_from_pa(root_pa) };
@@ -587,7 +590,7 @@ impl Orbit {
                 Some(p) => p as u64,
                 None => {
                     error!("create_process: user va 0x{:X} does not translate", page_base);
-                    return -2;
+                    return Errno::new(EFAULT).to_ret();
                 }
             };
 
@@ -607,7 +610,7 @@ impl Orbit {
             }
             Err(()) => {
                 error!("create_process: create_new_process failed");
-                -3
+                Errno::new(ENOEXEC).to_ret()
             }
         }
     }

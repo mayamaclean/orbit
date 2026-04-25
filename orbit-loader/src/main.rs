@@ -28,6 +28,7 @@ use core::{panic::PanicInfo, sync::atomic::Ordering};
 
 use minicbor::{Decode, Encode};
 use net_channel::NetChannel;
+use orbit_abi::errno::Errno;
 use orbit_abi::{logln, user::{create_netch, create_process, exit, sleep_ms, SerialWriter}};
 
 const LISTEN_PORT: u16 = 7777;
@@ -58,7 +59,7 @@ enum LoaderErr {
     Cbor,
     ConnClosed(i32),
     Listen,
-    Syscall(isize),
+    Syscall(Errno),
 }
 
 #[unsafe(no_mangle)]
@@ -68,7 +69,7 @@ pub unsafe extern "C" fn _start() -> ! {
     let (nc_vaddr, _nc_fd) = match create_netch(NC_VADDR_HINT, NC_REGION_SIZE, 0) {
         Ok(v) => v,
         Err(e) => {
-            logln!("orbit-loader: create_netch failed: {e}");
+            logln!("orbit-loader: create_netch failed: {e:?}");
             exit(-2);
         }
     };
@@ -120,7 +121,7 @@ fn recycle(nc: &NetChannel) -> Result<(), LoaderErr> {
     loop {
         let st = nc.current_state().state.load(Ordering::Acquire);
         if st == 0 { break; }
-        sleep_ms(POLL_SLEEP_MS);
+        let _ = sleep_ms(POLL_SLEEP_MS);
     }
     // SAFETY: we are the sole user-side accessor for this channel and
     // have no outstanding recv_tcp/send_tcp closures in flight.
@@ -133,7 +134,7 @@ fn wait_established(nc: &NetChannel) -> Result<(), LoaderErr> {
         let st = nc.current_state().state.load(Ordering::Acquire);
         if st > 0 { return Ok(()); }
         if st < 0 { return Err(LoaderErr::ConnClosed(st)); }
-        sleep_ms(POLL_SLEEP_MS);
+        let _ = sleep_ms(POLL_SLEEP_MS);
     }
 }
 
@@ -195,7 +196,7 @@ fn drain_once(nc: &NetChannel, out: &mut Vec<u8>) -> Result<(), LoaderErr> {
         }
         let st = nc.current_state().state.load(Ordering::Acquire);
         if st <= 0 { return Err(LoaderErr::ConnClosed(st)); }
-        sleep_ms(POLL_SLEEP_MS);
+        let _ = sleep_ms(POLL_SLEEP_MS);
     }
 }
 
@@ -214,10 +215,7 @@ fn spawn(body_only: &[u8]) -> Result<u16, LoaderErr> {
     ];
     logln!("orbit-loader: spawn ptr={:p} len={} head={:02x?}",
            elf.as_ptr(), elf.len(), head);
-    match create_process(elf.as_ptr(), elf.len()) {
-        Ok(pid) => Ok(pid),
-        Err(e)  => Err(LoaderErr::Syscall(e)),
-    }
+    create_process(elf.as_ptr(), elf.len()).map_err(LoaderErr::Syscall)
 }
 
 #[panic_handler]

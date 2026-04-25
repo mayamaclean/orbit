@@ -3,6 +3,7 @@ mod common;
 use process::ThreadState;
 use riscv::register::sstatus::SPP;
 
+use orbit_abi::errno::{Errno, EAGAIN};
 use orbit_core::{PendingWork, SyscallOutcome, syscall};
 
 use common::{FakeHw, make_frame, make_thread};
@@ -65,7 +66,7 @@ fn mmap_req_returns_eagain_when_ring_full() {
 
     let outcome = syscall::mmap_req(&mut t, &frame, &mut hw);
 
-    assert_eq!(outcome, SyscallOutcome::Return { ret: -7 });
+    assert_eq!(outcome, SyscallOutcome::Return { ret: Errno::new(EAGAIN).to_ret() });
     assert!(t.handle.is_none(), "no parking on push failure");
     assert!(hw.pending_work.is_empty());
 }

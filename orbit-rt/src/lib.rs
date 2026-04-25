@@ -51,8 +51,7 @@ unsafe impl Source for MmapSource {
         let need = layout.size().max(GROWTH_CHUNK).next_multiple_of(4096);
         let va = NEXT_VA.fetch_add(need, Ordering::Relaxed);
 
-        let rc = unsafe { user::mmap(va, need, PERMS_RW_U, false) };
-        if rc < 0 {
+        if unsafe { user::mmap(va, need, PERMS_RW_U, false) }.is_err() {
             return Err(());
         }
 

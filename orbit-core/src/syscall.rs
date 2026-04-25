@@ -6,13 +6,15 @@
 use device::TrapFrame;
 use process::{CompletionHandle, Thread, ThreadState};
 
+use orbit_abi::errno::{Errno, EAGAIN, EFAULT, EINVAL, EIO};
+
 use crate::{
     CloseHandleReq, CreateProcessReq, Hardware, MemMapReq, NetChannelCreationReq,
     PAGE_SIZE, PendingWork, SyscallOutcome,
 };
 
-/// Cap on `sleep_ms(ms)` arguments. Anything at or above this returns -2
-/// without touching thread state.
+/// Cap on `sleep_ms(ms)` arguments. Anything at or above this returns
+/// `-EINVAL` without touching thread state.
 pub const MAX_SLEEP_MS: usize = 60 * 60 * 1000;
 
 /// `sleep_ms(ms)` — block the caller for `ms` milliseconds.
@@ -23,7 +25,7 @@ pub const MAX_SLEEP_MS: usize = 60 * 60 * 1000;
 /// runnable again.
 pub fn ms_sleep<H: Hardware>(thread: &mut Thread, ms: usize, hw: &H) -> SyscallOutcome {
     if ms >= MAX_SLEEP_MS {
-        return SyscallOutcome::Return { ret: -2 };
+        return SyscallOutcome::Return { ret: Errno::new(EINVAL).to_ret() };
     }
 
     let wake_time = (hw.now_ticks() as usize)
@@ -43,8 +45,8 @@ pub fn ms_sleep<H: Hardware>(thread: &mut Thread, ms: usize, hw: &H) -> SyscallO
 /// the next scheduler scan reads the result off the handle into a0 and
 /// resumes the thread.
 ///
-/// Returns `-7` (EAGAIN) if the work ring is full so the caller can
-/// retry — same convention as `console_write`.
+/// Returns `-EAGAIN` if the work ring is full so the caller can retry
+/// — same convention as `console_write`.
 pub fn mmap_req<H: Hardware>(
     thread: &mut Thread,
     frame: &TrapFrame,
@@ -64,7 +66,7 @@ pub fn mmap_req<H: Hardware>(
         handle: handle.clone(),
     };
     if hw.push_pending_work(work).is_err() {
-        return SyscallOutcome::Return { ret: -7 };
+        return SyscallOutcome::Return { ret: Errno::new(EAGAIN).to_ret() };
     }
     thread.handle = Some(handle);
     SyscallOutcome::Yield {
@@ -96,7 +98,7 @@ pub fn nc_create_req<H: Hardware>(
         handle: handle.clone(),
     };
     if hw.push_pending_work(work).is_err() {
-        return SyscallOutcome::Return { ret: -7 };
+        return SyscallOutcome::Return { ret: Errno::new(EAGAIN).to_ret() };
     }
     thread.handle = Some(handle);
     SyscallOutcome::Yield {
@@ -124,7 +126,7 @@ pub fn close_req<H: Hardware>(
         handle: handle.clone(),
     };
     if hw.push_pending_work(work).is_err() {
-        return SyscallOutcome::Return { ret: -7 };
+        return SyscallOutcome::Return { ret: Errno::new(EAGAIN).to_ret() };
     }
     thread.handle = Some(handle);
     SyscallOutcome::Yield {
@@ -154,7 +156,7 @@ pub fn create_process_req<H: Hardware>(
         handle: handle.clone(),
     };
     if hw.push_pending_work(work).is_err() {
-        return SyscallOutcome::Return { ret: -7 };
+        return SyscallOutcome::Return { ret: Errno::new(EAGAIN).to_ret() };
     }
     thread.handle = Some(handle);
     SyscallOutcome::Yield {
@@ -168,11 +170,10 @@ pub fn create_process_req<H: Hardware>(
 /// scheduler decides whether this thread keeps running.
 ///
 /// Return codes:
-/// - `0`  — bytes written
-/// - `-2` — user VA doesn't translate (bad pointer)
-/// - `-3` — `len` exceeds a page
-/// - `-4` — bytes aren't valid UTF-8
-/// - `-5` — serial write failed
+/// - `0`         — bytes written
+/// - `-EFAULT`   — user VA doesn't translate (bad pointer)
+/// - `-EINVAL`   — `len` exceeds a page, or bytes aren't valid UTF-8
+/// - `-EIO`      — serial write failed
 pub fn serial_print<H: Hardware>(
     thread: &Thread,
     frame: &TrapFrame,
@@ -182,11 +183,11 @@ pub fn serial_print<H: Hardware>(
     let len = frame.regs[12];
 
     if len > PAGE_SIZE {
-        return ready(-3);
+        return ready(Errno::new(EINVAL).to_ret());
     }
 
     if !hw.user_va_translates(thread.root_table_addr() as u64, user_va) {
-        return ready(-2);
+        return ready(Errno::new(EFAULT).to_ret());
     }
 
     let mut buf = [0u8; PAGE_SIZE];
@@ -194,12 +195,12 @@ pub fn serial_print<H: Hardware>(
 
     let s = match core::str::from_utf8(&buf[..len]) {
         Ok(s) => s,
-        Err(_) => return ready(-4),
+        Err(_) => return ready(Errno::new(EINVAL).to_ret()),
     };
 
     match hw.serial_write_user(thread.pid, thread.tid, s) {
         Ok(()) => ready(0),
-        Err(()) => ready(-5),
+        Err(()) => ready(Errno::new(EIO).to_ret()),
     }
 }
 
@@ -208,9 +209,9 @@ pub fn serial_print<H: Hardware>(
 /// unit, matches POSIX `PIPE_BUF`). Return value is the number of
 /// bytes accepted on success; negative errno on failure.
 ///
-/// - `-2` — user VA doesn't translate under the thread's satp
-/// - `-3` — `len == 0` or overflows `PAGE_SIZE`
-/// - `-7` — ring full (EAGAIN), retry after yield
+/// - `-EFAULT` — user VA doesn't translate under the thread's satp
+/// - `-EINVAL` — `len == 0` or overflows `PAGE_SIZE`
+/// - `-EAGAIN` — ring full, retry after yield
 pub fn console_write<H: Hardware>(
     thread: &Thread,
     frame: &TrapFrame,
@@ -220,10 +221,10 @@ pub fn console_write<H: Hardware>(
     let len = frame.regs[12];
 
     if len == 0 || len > PAGE_SIZE {
-        return ready(-3);
+        return ready(Errno::new(EINVAL).to_ret());
     }
     if !hw.user_va_translates(thread.root_table_addr() as u64, user_va) {
-        return ready(-2);
+        return ready(Errno::new(EFAULT).to_ret());
     }
 
     let mut buf = [0u8; PAGE_SIZE];
@@ -231,7 +232,7 @@ pub fn console_write<H: Hardware>(
 
     match hw.console_write_user(thread.pid, &buf[..len]) {
         Ok(()) => ready(len as isize),
-        Err(()) => ready(-7),
+        Err(()) => ready(Errno::new(EAGAIN).to_ret()),
     }
 }
 
