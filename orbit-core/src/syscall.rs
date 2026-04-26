@@ -4,14 +4,15 @@
 //! kmain shim to apply.
 
 use device::TrapFrame;
+use mmu::PagePermissions;
 use process::{CompletionHandle, Thread, ThreadState};
 
-use orbit_abi::errno::{Errno, EAGAIN, EBUSY, EFAULT, EINVAL, EIO};
+use orbit_abi::errno::{Errno, EAGAIN, EBUSY, EFAULT, EINVAL, EIO, EPERM};
 use orbit_abi::layout::{user_priv_range_ok, user_range_ok, user_shared_range_ok};
 
 use crate::{
-    CloseHandleReq, CreateProcessReq, Hardware, MemMapReq, NetChannelCreationReq,
-    PAGE_SIZE, PendingWork, SyscallOutcome,
+    CloseHandleReq, CreateProcessReq, CreateThreadReq, Hardware, MemMapReq,
+    NetChannelCreationReq, PAGE_SIZE, PendingWork, SyscallOutcome,
 };
 
 /// Cap on `sleep_ms(ms)` arguments. Anything at or above this returns
@@ -75,6 +76,17 @@ pub fn mmap_req<H: Hardware>(
     if !range_ok {
         return SyscallOutcome::Return { ret: Errno::new(EINVAL).to_ret() };
     }
+
+    // No exec on shared mappings: shared frames keep a long-lived
+    // writable KDMAP alias on the kernel side, so allowing X through
+    // the user alias would set up a W^X violation across the two views
+    // — kernel writes (e.g. net thread RX) would become executable code
+    // in user.
+    let is_exec = (req.page_permissions & PagePermissions::X) != 0;
+    if req.share_with_kernel && is_exec {
+        return SyscallOutcome::Return { ret: Errno::new(EINVAL).to_ret() };
+    }
+
     let handle = CompletionHandle::new();
     let work = PendingWork::MemMap {
         req,
@@ -171,6 +183,8 @@ pub fn create_process_req<H: Hardware>(
     let req = CreateProcessReq {
         elf_vaddr: frame.regs[11],
         elf_len: frame.regs[12],
+        allowed_affinity: frame.regs[13] as u64,
+        affinity: frame.regs[14] as u64,
     };
     // Bound the source range before the manager copies bytes out. The
     // manager's per-page virt_to_phys would refuse a kernel VA today —
@@ -339,6 +353,96 @@ pub fn read_stdin<H: Hardware>(
 
     thread.handle = Some(handle);
     SyscallOutcome::YieldRetry { state: ThreadState::Blocking }
+}
+
+/// `create_thread(entry, allowed_affinity, affinity)` — spawn a sibling
+/// thread in the calling process. Async manager round-trip: the
+/// caller parks on a `CompletionHandle` while the manager allocates the
+/// new thread, sets up its trap frame and stack, and inserts it into
+/// `process.threads`; the handle is signaled with the new tid.
+///
+/// Sanitization happens here, not in the manager:
+/// - `entry` must lie in the calling process's user range (the
+///   broadest reasonable cap — finer-grained "must be inside .text"
+///   would require process-state introspection that the syscall layer
+///   deliberately doesn't have).
+/// - `affinity & !allowed_affinity != 0` → `EINVAL` (well-formed but
+///   structurally inconsistent — the requested initial mask escapes
+///   the requested cap).
+///
+/// The "may not exceed parent's `allowed_affinity`" check happens at
+/// the manager since that's the only place with access to the parent's
+/// thread state. The manager rejects with `-EPERM` and the handle
+/// surfaces the errno via the standard signal_n path.
+pub fn create_thread<H: Hardware>(
+    thread: &mut Thread,
+    frame: &TrapFrame,
+    hw: &mut H,
+) -> SyscallOutcome {
+    let req = CreateThreadReq {
+        entry: frame.regs[11],
+        allowed_affinity: frame.regs[12] as u64,
+        affinity: frame.regs[13] as u64,
+    };
+    if !user_range_ok(req.entry as u64, 1) {
+        return SyscallOutcome::Return { ret: Errno::new(EFAULT).to_ret() };
+    }
+    if req.allowed_affinity != 0
+        && req.affinity != 0
+        && req.affinity & !req.allowed_affinity != 0
+    {
+        return SyscallOutcome::Return { ret: Errno::new(EINVAL).to_ret() };
+    }
+    let handle = CompletionHandle::new();
+    let work = PendingWork::CreateThread {
+        req,
+        pid: thread.pid,
+        parent_allowed: thread.allowed_affinity,
+        handle: handle.clone(),
+    };
+    if hw.push_pending_work(work).is_err() {
+        return SyscallOutcome::Return { ret: Errno::new(EAGAIN).to_ret() };
+    }
+    thread.handle = Some(handle);
+    SyscallOutcome::Yield {
+        state: ThreadState::Blocking,
+        ret: None,
+    }
+}
+
+/// `set_affinity(mask)` — narrow the calling thread's per-hart eligibility.
+///
+/// Validation order matches the docs in `process::Thread`:
+/// 1. `mask == 0` → `EINVAL` (would orphan the thread; the scheduler
+///    would never pick a hart for it).
+/// 2. `mask & !allowed_affinity != 0` → `EPERM` (well-formed value, but
+///    escapes the immutable cap set at thread construction).
+///
+/// On success, stores the new mask with `Release` so the next scheduler
+/// pass sees it. The store doesn't preempt: if the calling thread is
+/// running on a hart no longer in the new mask, it finishes its quantum
+/// and migrates on the next dispatch.
+pub fn set_affinity(thread: &Thread, frame: &TrapFrame) -> SyscallOutcome {
+    let mask = frame.regs[11] as u64;
+    if mask == 0 {
+        return ready(Errno::new(EINVAL).to_ret());
+    }
+    if mask & !thread.allowed_affinity != 0 {
+        return ready(Errno::new(EPERM).to_ret());
+    }
+    thread.affinity.store(mask, core::sync::atomic::Ordering::Release);
+    ready(0)
+}
+
+/// `get_affinity()` — return `(current, allowed)` in `(a0, a1)`. Windows-shape:
+/// the cap is exposed alongside the current mask so userspace can pick a
+/// valid sub-mask without trial-and-error.
+pub fn get_affinity(thread: &Thread) -> SyscallOutcome {
+    let current = thread.affinity.load(core::sync::atomic::Ordering::Acquire);
+    SyscallOutcome::Return2 {
+        ret0: current as isize,
+        ret1: thread.allowed_affinity as isize,
+    }
 }
 
 #[inline]

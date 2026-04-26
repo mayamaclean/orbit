@@ -58,6 +58,14 @@ const CONSOLE_ELF: &[u8] = include_bytes!(
 struct Payload<'a> {
     #[n(0)] #[cbor(with = "minicbor::bytes")] elf: &'a [u8],
     #[b(1)] name: &'a str,
+    /// Optional CPU affinity cap. Sentinel `0` (also the absent-key
+    /// default since minicbor leaves missing primitives at zero) tells
+    /// the kernel to use the all-harts default.
+    #[n(2)] #[cbor(default)] allowed_affinity: u64,
+    /// Optional initial affinity. Sentinel `0` → defaults to whatever
+    /// `allowed_affinity` resolves to. Must be a subset of
+    /// `allowed_affinity` once both are resolved (kernel enforces).
+    #[n(3)] #[cbor(default)] affinity: u64,
 }
 
 #[derive(Debug)]
@@ -76,7 +84,9 @@ pub unsafe extern "C" fn _start() -> ! {
     // on Ctrl+Tab while the loader is still negotiating its NetChannel.
     // Failure here isn't fatal — the loader is still useful for
     // sending ELFs over TCP without an interactive shell.
-    match create_process(CONSOLE_ELF.as_ptr(), CONSOLE_ELF.len()) {
+    // Console gets the all-harts default — passing 0 for both affinity
+    // fields tells the kernel "no preference."
+    match create_process(CONSOLE_ELF.as_ptr(), CONSOLE_ELF.len(), 0, 0) {
         Ok(pid) => logln!("orbit-loader: spawned console pid={pid}"),
         Err(e)  => logln!("orbit-loader: console spawn failed: {e:?}"),
     }
@@ -177,9 +187,16 @@ fn spawn(body_only: &[u8]) -> Result<u16, LoaderErr> {
         elf.get(2).copied().unwrap_or(0),
         elf.get(3).copied().unwrap_or(0),
     ];
-    logln!("orbit-loader: spawn ptr={:p} len={} head={:02x?}",
-           elf.as_ptr(), elf.len(), head);
-    create_process(elf.as_ptr(), elf.len()).map_err(LoaderErr::Syscall)
+    logln!("orbit-loader: spawn ptr={:p} len={} head={:02x?} \
+           allowed_affinity={:#x} affinity={:#x}",
+           elf.as_ptr(), elf.len(), head,
+           payload.allowed_affinity, payload.affinity);
+    create_process(
+        elf.as_ptr(),
+        elf.len(),
+        payload.allowed_affinity,
+        payload.affinity,
+    ).map_err(LoaderErr::Syscall)
 }
 
 #[panic_handler]

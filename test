@@ -59,6 +59,7 @@ case "$MODE" in
     HAMMER_TARGETS=(
       "orbit-core:assign_threads_concurrent"
       "process:stdin"
+      "orbit-core:tlb_shootdown"
     )
     HAMMER_FLAGS="-Zmiri-many-seeds=0..32 -Zmiri-preemption-rate=0.9 -Zmiri-compare-exchange-weak-failure-rate=0.9"
     failed=()

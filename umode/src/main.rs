@@ -5,11 +5,221 @@ extern crate alloc;
 use orbit_rt as _;
 
 use core::panic::PanicInfo;
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
-use orbit_abi::errno::{Errno, EBADF, EFAULT, EINVAL};
+use orbit_abi::errno::{Errno, EBADF, EFAULT, EINVAL, EPERM};
 use orbit_abi::net::SockType;
-use orbit_abi::{logln, user::{close_handle, exit, sleep_ms, console_write, serial_print, SerialWriter}};
+use orbit_abi::{logln, user::{close_handle, create_thread, exit, get_affinity, get_hart_id, set_affinity, sleep_ms, console_write, serial_print, SerialWriter}};
 use orbit_rt::netch::NetCh;
+
+// Worker thread publishes its hart_id here once it starts. `u32::MAX`
+// is the sentinel for "not yet observed." Atomic so the main thread
+// can spin-poll across the cross-hart memory barrier.
+static WORKER_HART: AtomicU32 = AtomicU32::new(u32::MAX);
+
+/// Entry point for the create_thread smoke probe's worker. Single
+/// responsibility: read its own hart id, publish it, exit. No heap
+/// access, no syscalls beyond `get_hart_id` + `exit`, so this thread
+/// has minimal interactions with the rest of the runtime.
+extern "C" fn worker_entry() -> ! {
+    let hart = get_hart_id();
+    WORKER_HART.store(hart, Ordering::Release);
+    exit(0);
+}
+
+// =====================================================================
+// Layer-3 cross-hart TLB-shootdown probe.
+//
+// Two threads in the same process, deliberately pinned to different
+// harts. The setup makes the *cross-hart* path the only way the
+// worker can observe the post-revoke invariant: if the kernel's
+// shootdown machinery is wired correctly, the worker's stale TLB
+// entry on its own hart gets flushed by the broadcast and a post-
+// revoke read faults. If shootdown is broken (e.g., broadcast
+// stubbed out), the worker's TLB still holds the translation and
+// the read silently succeeds — we detect that and FAIL.
+//
+// Choreography:
+//   1. Main opens a NetChannel; its shared region is the SharedUserPtr
+//      whose user PTEs revoke will clear.
+//   2. Main publishes the channel base VA via REVOKED_VA, spawns the
+//      worker pinned to hart 1.
+//   3. Worker reads one byte at REVOKED_VA — warms the hart-1 TLB
+//      with that translation. Sets PHASE=1.
+//   4. Main sees PHASE=1, calls nc.close(). Manager runs the revoke
+//      from whichever hart drains MANAGER_WORK; with main pinned to
+//      hart 0, that's almost always hart 0 (greedy manager). The
+//      revoke clears the user PTEs on the manager's hart and
+//      `crate::kernel::shootdown::broadcast(0, 0)` fans out to every
+//      other hart — including hart 1, which the worker is on.
+//   5. Main sets PHASE=2, signaling worker to retry.
+//   6. Worker re-reads the same VA. With shootdown working, the TLB
+//      is empty for that mapping and the load page-faults; the kernel
+//      kills the worker thread (process keeps running). Without
+//      shootdown, the read returns stale data and the worker sets
+//      WORKER_SURVIVED=1.
+//   7. Main sleeps a settling interval, checks WORKER_SURVIVED.
+// =====================================================================
+
+static SD_VA: AtomicUsize = AtomicUsize::new(0);
+static SD_PHASE: AtomicU32 = AtomicU32::new(0);
+static SD_WORKER_SURVIVED: AtomicU32 = AtomicU32::new(0);
+
+extern "C" fn shootdown_worker_entry() -> ! {
+    // Pre-warm wait can yield freely — TLB doesn't matter yet.
+    while SD_VA.load(Ordering::Acquire) == 0 {
+        let _ = sleep_ms(1);
+    }
+    let va = SD_VA.load(Ordering::Acquire);
+
+    // Pre-revoke read: warm the hart-1 TLB with the translation.
+    // read_volatile so the compiler can't elide it.
+    let _warm = unsafe { core::ptr::read_volatile(va as *const u8) };
+    SD_PHASE.store(1, Ordering::Release);
+
+    // Tight spin (no yield, no syscall) for phase 2. Yielding here
+    // would let the kernel context-switch the worker out and either
+    // sfence hart 1's TLB on the way back in or simply let the entry
+    // age out — either way the post-revoke read would fault for
+    // reasons unrelated to shootdown, and the test would pass for
+    // the wrong reason. The spin keeps hart 1 hot on this thread so
+    // the *only* way the TLB entry leaves is via the shootdown IPI.
+    while SD_PHASE.load(Ordering::Acquire) != 2 {
+        core::hint::spin_loop();
+    }
+
+    // Post-revoke read. With shootdown wired correctly this faults;
+    // the kernel kills this thread mid-load and we never reach the
+    // store below. If we do reach it, the broadcast didn't reach
+    // hart 1's TLB and we report the failure from main.
+    let _stale = unsafe { core::ptr::read_volatile(va as *const u8) };
+    SD_WORKER_SURVIVED.store(1, Ordering::Release);
+    exit(0);
+}
+
+fn run_shootdown_probe() {
+    let (_cur, allowed) = get_affinity();
+    if allowed.count_ones() < 2 {
+        logln!("shootdown probe skipped (only one hart)");
+        return;
+    }
+
+    // Pin main to hart 0 so the manager that runs the revoke is also
+    // hart 0 (greedy-manager picks the idle hart that's holding the
+    // lock; main parks on the close handle, freeing hart 0). Worker
+    // gets hart 1, ensuring the revoke happens on a hart != worker's.
+    let _ = set_affinity(1u64 << 0);
+
+    let nc = match NetCh::open(0, SockType::Tcp) {
+        Ok(n) => n,
+        Err(Errno(e)) => {
+            logln!("FAIL: shootdown probe NetCh::open errno={e}");
+            return;
+        }
+    };
+    let nc_va = nc.channel() as *const _ as usize;
+
+    // Reset state so re-runs (none today, but defensive) start clean.
+    SD_PHASE.store(0, Ordering::Release);
+    SD_WORKER_SURVIVED.store(0, Ordering::Release);
+    SD_VA.store(nc_va, Ordering::Release);
+
+    let target_bit = 1u64 << 1;
+    if let Err(Errno(e)) = create_thread(shootdown_worker_entry, 0, target_bit) {
+        logln!("FAIL: shootdown probe create_thread errno={e}");
+        let _ = nc.close();
+        return;
+    }
+
+    // Wait for worker's pre-revoke read to complete.
+    let mut tries = 0u32;
+    while SD_PHASE.load(Ordering::Acquire) != 1 {
+        if tries >= 100 {
+            logln!("FAIL: shootdown probe worker never warmed TLB");
+            let _ = nc.close();
+            return;
+        }
+        let _ = sleep_ms(10);
+        tries += 1;
+    }
+
+    // Trigger revoke. The orbit-rt drop path also closes, but we want
+    // ordering relative to SD_PHASE so do it explicitly here.
+    if let Err(Errno(e)) = nc.close() {
+        logln!("FAIL: shootdown probe nc.close errno={e}");
+        return;
+    }
+
+    // Tell worker to attempt the post-revoke read.
+    SD_PHASE.store(2, Ordering::Release);
+
+    // Settle. Worker either faults (kernel kills its thread; we never
+    // see SURVIVED=1) or reads stale (sets SURVIVED=1 within a few
+    // syscall round-trips). 200ms is a generous bound for both paths.
+    let _ = sleep_ms(200);
+
+    if SD_WORKER_SURVIVED.load(Ordering::Acquire) == 1 {
+        logln!("FAIL: shootdown probe — worker survived post-revoke read \
+               (cross-hart TLB still cached the translation)");
+    } else {
+        logln!("PASS: shootdown probe — worker faulted on post-revoke read");
+    }
+
+    // Restore main's affinity for the rest of the test flow.
+    let _ = set_affinity(allowed);
+}
+
+/// End-to-end check that `create_thread` (syscall 5000) parks-and-wakes
+/// correctly and that the new thread observes its `affinity` arg. Pins
+/// the worker to hart 1 (always present once `cpu_count >= 2`); the
+/// scheduler's affinity gate must steer it there even though the main
+/// thread is running on a different hart and competing for dispatch.
+fn run_create_thread_probe() {
+    let (_cur, allowed) = get_affinity();
+
+    // Test needs at least 2 harts. Skip silently if cpu_count < 2 — the
+    // assertion would be vacuous and we'd flake against a config we
+    // didn't intend to support yet.
+    let target_bit = 1u64 << 1;
+    if allowed & target_bit == 0 {
+        logln!("create_thread probe skipped (only one hart)");
+        return;
+    }
+
+    WORKER_HART.store(u32::MAX, Ordering::Release);
+
+    // allowed=0 sentinel → manager substitutes parent's allowed mask.
+    // affinity=target_bit pins worker to hart 1 specifically.
+    match create_thread(worker_entry, 0, target_bit) {
+        Ok(tid) => logln!("create_thread: spawned tid={tid}"),
+        Err(Errno(e)) => {
+            logln!("FAIL: create_thread spawn errno={e}");
+            return;
+        }
+    }
+
+    // Bounded poll. Worker runs `get_hart_id + atomic store + exit` — a
+    // few syscalls' worth of work. 1s ceiling is generous; if the
+    // scheduler can't wake the worker in that window, something is
+    // structurally wrong (and the smoke wall-clock cap would catch it
+    // anyway).
+    let mut tries = 0u32;
+    while WORKER_HART.load(Ordering::Acquire) == u32::MAX {
+        if tries >= 100 {
+            logln!("FAIL: create_thread worker never published its hart");
+            return;
+        }
+        let _ = sleep_ms(10);
+        tries += 1;
+    }
+
+    let observed = WORKER_HART.load(Ordering::Acquire);
+    if observed == 1 {
+        logln!("PASS: create_thread worker ran on hart 1 (target_bit=0x{target_bit:x})");
+    } else {
+        logln!("FAIL: create_thread worker ran on hart {observed} (want 1)");
+    }
+}
 
 /// Report a PASS/FAIL line for a single error-path scenario. The smoke
 /// script greps for "PASS: <name>" lines to validate each branch fired.
@@ -127,6 +337,60 @@ fn run_error_path_tests() {
     // No process_handles entry for this pid → EBADF.
     check_err("close_handle no registry", close_handle(7), EBADF);
 
+    // --- affinity ---
+    // Windows-shape: (current, allowed). Out of the box the loader hands
+    // umode the all-harts default, so current == allowed and both have
+    // bits matching the runtime's cpu_count. Smoke just asserts they're
+    // equal and non-zero rather than pinning a specific value (cpu_count
+    // is QEMU-config-dependent).
+    let (cur, allowed) = get_affinity();
+    {
+        use core::fmt::Write;
+        let mut w = SerialWriter::new();
+        if cur != 0 && cur == allowed {
+            let _ = writeln!(w,
+                "PASS: get_affinity initial cur=0x{cur:x} allowed=0x{allowed:x}");
+        } else {
+            let _ = writeln!(w,
+                "FAIL: get_affinity initial cur=0x{cur:x} allowed=0x{allowed:x}");
+        }
+        w.flush();
+    }
+
+    // Empty mask must not orphan the thread.
+    check_err("set_affinity zero", set_affinity(0), EINVAL);
+
+    // Bit outside the allowed cap (one above the highest set bit) must
+    // not be silently masked. allowed has at least one bit set; the
+    // first bit above its high bit is always outside the cap.
+    let outside_bit = allowed
+        .checked_shl((64 - allowed.leading_zeros()) as u32)
+        .unwrap_or(0);
+    if outside_bit != 0 {
+        check_err("set_affinity outside cap", set_affinity(outside_bit), EPERM);
+    }
+
+    // Self-pin to bit 0 (always present; "all-harts" can't be empty).
+    // Then sleep so the scheduler has multiple chances to dispatch — on
+    // a working impl, get_hart_id must return 0 after the wake.
+    let _ = set_affinity(1);
+    let _ = sleep_ms(50);
+    let pinned_to = get_hart_id();
+    {
+        use core::fmt::Write;
+        let mut w = SerialWriter::new();
+        if pinned_to == 0 {
+            let _ = writeln!(w, "PASS: set_affinity pinned to hart 0 (got hart {pinned_to})");
+        } else {
+            let _ = writeln!(w, "FAIL: set_affinity pinned to hart 0 (got hart {pinned_to})");
+        }
+        w.flush();
+    }
+
+    // Restore so the rest of the test runs unconstrained — the
+    // followup TCP sleep/recv loop expects scheduler flexibility.
+    let _ = set_affinity(allowed);
+
     logln!("=== error path tests done ===");
 }
 
@@ -138,6 +402,18 @@ pub unsafe extern "C" fn _start() -> ! {
     run_heap_smoke();
 
     run_error_path_tests();
+
+    // Cross-hart probe — must run after run_error_path_tests, which
+    // restores affinity to all-harts; pinning the main thread first
+    // would force the worker and main onto the same hart and defeat
+    // the point of the test.
+    run_create_thread_probe();
+
+    // §10 layer-3: cross-hart TLB shootdown probe. Pins itself and
+    // restores affinity on the way out. Must run before the TCP
+    // listener flow below opens its real netchannel — they're
+    // sequential users of the per-process NetCh slot.
+    run_shootdown_probe();
 
     let _ = sleep_ms(2000);
 

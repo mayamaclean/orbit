@@ -4,7 +4,7 @@
 
 use std::alloc::{Layout, alloc_zeroed};
 use std::collections::BTreeMap;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicU64, AtomicUsize};
 
 use device::{Stack, TrapFrame};
 use process::{Thread, ThreadState};
@@ -54,6 +54,11 @@ pub fn make_thread(state: ThreadState, mode: SPP) -> Thread {
             ticks: 0,
             slot: None,
             fault_info: None,
+            // Test threads default to "any hart" — affinity-specific
+            // behavior is asserted by tests that mutate the field
+            // directly after construction.
+            allowed_affinity: u64::MAX,
+            affinity: AtomicU64::new(u64::MAX),
         }
     }
 }

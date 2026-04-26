@@ -36,9 +36,34 @@ pub struct CloseHandleReq {
 }
 
 #[derive(Debug, Clone, Copy)]
+pub struct CreateThreadReq {
+    /// User-VA function pointer the new thread enters at. Bound-checked
+    /// against the calling process's private + ELF range at the syscall
+    /// boundary; a kernel-half VA here would be a privilege escalation.
+    pub entry: usize,
+    /// Cap and initial mask for the new thread. Sentinel `0` means
+    /// "inherit the parent's value." Manager validates the resolved
+    /// pair against the parent's `allowed_affinity` so a thread can't
+    /// be created with reach the parent itself doesn't have.
+    pub allowed_affinity: u64,
+    pub affinity: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
 pub struct CreateProcessReq {
     pub elf_vaddr: usize,
     pub elf_len: usize,
+    /// Initial mask handed to the child's first thread. The manager
+    /// substitutes the all-harts default for the sentinel value 0
+    /// (umode passes 0 to mean "no preference"). Must be a subset of
+    /// `allowed_affinity`.
+    pub affinity: u64,
+    /// Immutable upper bound the child's first thread will be
+    /// constructed with. Sentinel 0 means "default to the all-harts
+    /// mask"; the manager sanitizes both fields together so an
+    /// affinity bit that escapes allowed_affinity surfaces as EINVAL
+    /// rather than silently widening the cap.
+    pub allowed_affinity: u64,
 }
 
 /// One slot in the manager's MPSC work ring. Fixed-size by virtue of
@@ -74,6 +99,16 @@ pub enum PendingWork {
         req: CreateProcessReq,
         pid: u16,
         root_pa: u64,
+        handle: CompletionHandle,
+    },
+    CreateThread {
+        req: CreateThreadReq,
+        pid: u16,
+        /// Parent thread's `allowed_affinity` snapshotted at syscall
+        /// time. Manager uses this as the upper bound when resolving
+        /// the new thread's `allowed_affinity`/`affinity` pair, so a
+        /// thread can't widen the family's reach.
+        parent_allowed: u64,
         handle: CompletionHandle,
     },
 }

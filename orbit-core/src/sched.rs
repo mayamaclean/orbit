@@ -12,8 +12,8 @@ use process::{Thread, ThreadState};
 use crate::Hardware;
 
 /// A per-hart view exposing only what the scheduler needs: the hart id
-/// (for IPIs) and a shared-ref to the atomic pointer that names the
-/// thread that hart owns.
+/// (for IPIs and affinity-mask construction) and a shared-ref to the
+/// atomic pointer that names the thread that hart owns.
 ///
 /// Real callers construct one from `&'a HartContext` by borrowing the
 /// `current` field. Tests construct one by borrowing a standalone
@@ -25,6 +25,11 @@ pub struct HartView<'a> {
 }
 
 impl<'a> HartView<'a> {
+    /// Single-bit affinity mask naming this hart. The scheduler uses
+    /// this when asking for the next thread runnable here.
+    #[inline]
+    pub fn affinity_bit(&self) -> u64 { 1u64 << self.hart_id }
+
     /// True if the hart already has a thread assigned.
     pub fn is_busy(&self) -> bool {
         !self.current.load(Ordering::Acquire).is_null()
@@ -50,6 +55,13 @@ impl<'a> HartView<'a> {
 /// out pointers with provenance derived from that storage, not from a
 /// transient `&mut` reborrow. See [`HartView::assign`] for the aliasing
 /// rationale.
+///
+/// The `hart_mask` argument lets the dispatcher request a thread that's
+/// permitted to run on a specific hart (`mask = 1 << hart_id`) — see
+/// the affinity machinery on `process::Thread`. Implementations must
+/// only return threads whose `affinity & hart_mask != 0`. Threads that
+/// don't fit the mask stay queued; a later call with a different mask
+/// may pick them up.
 pub trait Scheduler {
     /// # Safety contract
     ///
@@ -57,7 +69,7 @@ pub trait Scheduler {
     /// aliasing). The caller (assign_threads) dereferences each pointer
     /// to mutate thread fields before publishing it; concurrent returns
     /// of the same pointer would race.
-    fn next_runnable(&mut self) -> Option<*mut Thread>;
+    fn next_runnable(&mut self, hart_mask: u64) -> Option<*mut Thread>;
 }
 
 /// Distribute runnable threads across idle harts.
@@ -88,7 +100,12 @@ pub fn assign_threads<'a, H, S, I>(
         if hart.is_busy() {
             continue;
         }
-        let Some(t) = sched.next_runnable() else { return };
+        // Affinity-aware: ask only for threads permitted on this hart.
+        // A no-match here doesn't end the loop — another hart on the
+        // next iteration may have a wider permitted set, and we don't
+        // want a single restrictive thread sitting at the head of the
+        // ready queue to starve unrelated work.
+        let Some(t) = sched.next_runnable(hart.affinity_bit()) else { continue };
         // SAFETY: Scheduler contract guarantees `t` is a distinct,
         // non-aliased pointer; we hold no other reference to this
         // thread for the duration of the deref.
@@ -96,7 +113,7 @@ pub fn assign_threads<'a, H, S, I>(
         hw.wake_hart(hart.hart_id);
     }
 
-    if let Some(t) = sched.next_runnable() {
+    if let Some(t) = sched.next_runnable(self_view.affinity_bit()) {
         // SAFETY: as above.
         unsafe { assign_thread_to(self_view, t) };
     }

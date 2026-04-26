@@ -200,10 +200,21 @@ impl<T> SharedUserPtr<T> {
             }
 
             pte.set_raw(0);
+            // Local sfence keeps the calling hart consistent during
+            // the walk. Cross-hart fan-out happens in one shot below
+            // — broadcasting per-leaf would multiply the IPI cost by
+            // the region size.
             riscv::asm::sfence_vma(pid as usize, va as usize);
 
             va += PAGE_SIZE as u64;
         }
+
+        // One whole-TLB broadcast covers every leaf we just cleared,
+        // regardless of region size. Receivers do `sfence.vma x0, x0`.
+        // Coarser than necessary but at least once per revoke instead
+        // of once per page; the §10 follow-up to thread per-page
+        // requests through the ring is tracked on the roadmap.
+        crate::kernel::shootdown::broadcast(0, 0);
 
         Ok(())
     }

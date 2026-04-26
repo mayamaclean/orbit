@@ -32,17 +32,23 @@ impl FakeSched {
 }
 
 impl Scheduler for FakeSched {
-    fn next_runnable(&mut self) -> Option<*mut Thread> {
-        let idx = self.next;
-        if idx >= self.threads.len() {
-            return None;
+    fn next_runnable(&mut self, hart_mask: u64) -> Option<*mut Thread> {
+        // Linear scan from `next` for the first thread compatible with
+        // `hart_mask`. Skipping incompatible entries by *not* advancing
+        // `next` past them would leave them re-pickable for the next
+        // call (potentially with a different mask) — match the kernel
+        // impl's "any-thread / first-fit" shape so test expectations
+        // match production behavior.
+        while self.next < self.threads.len() {
+            let idx = self.next;
+            self.next += 1;
+            let aff = self.threads[idx].affinity.load(std::sync::atomic::Ordering::Relaxed);
+            if aff & hart_mask != 0 {
+                // SAFETY: `idx` is in-bounds (loop guard).
+                return Some(unsafe { self.threads.as_mut_ptr().add(idx) });
+            }
         }
-        self.next += 1;
-        // Raw pointer with provenance from the Vec's allocation, not
-        // from a per-element `&mut` reborrow — the pointer must survive
-        // the scope of this call so the remote hart can deref it later.
-        // SAFETY: `idx` is in-bounds (checked above).
-        Some(unsafe { self.threads.as_mut_ptr().add(idx) })
+        None
     }
 }
 

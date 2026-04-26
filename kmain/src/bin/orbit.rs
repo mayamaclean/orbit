@@ -91,6 +91,13 @@ extern "C" fn s_trap(
                     supervisor_clear_ipi(hart_context.hart_id as usize);
                     riscv::register::sip::clear_ssoft();
 
+                    // SSWI is overloaded: it carries scheduler wake-ups
+                    // AND TLB-shootdown drain requests. Drain the
+                    // shootdown ring before the context-switch check
+                    // so any pending invalidations land before the
+                    // resumed thread can reissue a stale-TLB load.
+                    kmain::kernel::shootdown::drain_local();
+
                     kmain::update_thread_and_trap_frame(epc, hart_context, frame, from_user);
 
                     check_context_and_switch();
@@ -172,6 +179,15 @@ extern "C" fn s_trap(
                     4 => {
                         kmain::handle_read_stdin(epc, hart_context, frame);
                     }
+                    5 => {
+                        kmain::handle_set_affinity(epc, hart_context, frame);
+                    }
+                    6 => {
+                        kmain::handle_get_affinity(epc, hart_context, frame);
+                    }
+                    7 => {
+                        kmain::handle_get_hart_id(epc, hart_context, frame);
+                    }
                     4096 => {
                         debug!("orbit handling u mode ecall({syscall})");
                         kmain::handle_mmap_req(epc, hart_context, frame);
@@ -187,6 +203,10 @@ extern "C" fn s_trap(
                     4099 => {
                         debug!("orbit handling u mode ecall({syscall})");
                         kmain::handle_create_process_req(epc, hart_context, frame);
+                    }
+                    5000 => {
+                        debug!("orbit handling u mode ecall({syscall})");
+                        kmain::handle_create_thread(epc, hart_context, frame);
                     }
                     _ => {
                         debug!("orbit handling u mode ecall({syscall})");
@@ -248,7 +268,8 @@ pub extern "C" fn k_smpstart() {
         (hart_context.cscratch as *mut kmain::kernel::Orbit).as_mut_unchecked()
     };
 
-    orbit.create_new_process(kmain::kernel::UMODE_TEST_ELF, kmain::kernel::UPROC_STACK_DEFAULT)
+    let boot_affinity = orbit.all_harts_mask();
+    orbit.create_new_process(kmain::kernel::UMODE_TEST_ELF, kmain::kernel::UPROC_STACK_DEFAULT, boot_affinity, boot_affinity)
         .expect("no test uprocess");
 
     orbit.get_environment_info();
@@ -700,6 +721,11 @@ extern "C" fn rust_main(_hartid: usize, sysinfo: usize, load_addr: u64) -> ! {
         // before the first umode syscall, which is long after this
         // point).
         kmain::kernel::pending_frees::init(cpu_count);
+
+        // Same window: shootdown ring fan-out target count. Must run
+        // before any user PTE modification can fire `broadcast`. The
+        // statics themselves are already pre-initialized.
+        kmain::kernel::shootdown::init(cpu_count as u32);
 
         info!("allocated orbit state @ {:016X?}", &raw const *orbit as usize);
 

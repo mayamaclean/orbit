@@ -10,3 +10,8 @@ process   = { path = "../process" }
 # Used for SPP (privilege-mode enum) in the trap mode-gate. Compiles on
 # host target; we only touch the type, never a CSR.
 riscv     = { version = "0.16.0", features = ["rt"] }
+mmu = { path = "../mmu" }
+# Static MPSC rings — used for per-hart TLB shootdown queues. Same
+# version pinned in kmain so the queue type is shared between the
+# pure-logic protocol and the live kernel impl.
+thingbuf  = { version = "0.1.6", default-features = false, features = ["static", "alloc"] }

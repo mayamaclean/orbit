@@ -5,7 +5,7 @@ extern crate alloc;
 use core::alloc::Layout;
 use core::fmt;
 use core::marker::PhantomData;
-use core::sync::atomic::{AtomicUsize};
+use core::sync::atomic::{AtomicU64, AtomicUsize};
 
 use alloc::collections::{btree_map::BTreeMap, btree_set::BTreeSet};
 use alloc::vec::Vec;
@@ -245,6 +245,16 @@ pub struct Thread {
     /// Set by the trap handler when this thread is killed by a fault.
     /// `None` means the thread exited cleanly (e.g. via the exit syscall).
     pub fault_info: Option<FaultInfo>,
+    /// Immutable upper bound on which harts this thread can ever run on.
+    /// Bit `i` set ⇔ hart `i` permitted. Set at construction; `set_affinity`
+    /// rejects any mask that escapes this bound (Windows-style: a parent
+    /// can fence a child's reach without the child being able to expand).
+    pub allowed_affinity: u64,
+    /// Current per-hart eligibility mask. Initialized to `allowed_affinity`;
+    /// the user may narrow it via the `set_affinity` syscall, but
+    /// `affinity & !allowed_affinity` is always zero. Atomic so the
+    /// scheduler reads it without locking the process table.
+    pub affinity: AtomicU64,
 }
 
 impl Thread {

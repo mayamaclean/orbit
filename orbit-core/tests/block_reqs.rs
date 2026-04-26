@@ -28,7 +28,7 @@ fn mmap_req_shared_marshals_args_and_blocks() {
     let mut hw = FakeHw::default();
     frame.regs[11] = SHARED_VA;
     frame.regs[12] = 4096;
-    frame.regs[13] = 0x1F;
+    frame.regs[13] = 0x17; // V|R|W|U — X (0x8) cleared; shared+exec is rejected
     frame.regs[14] = 1;
 
     let outcome = syscall::mmap_req(&mut t, &frame, &mut hw);
@@ -43,7 +43,7 @@ fn mmap_req_shared_marshals_args_and_blocks() {
         PendingWork::MemMap { req, pid, handle, .. } => {
             assert_eq!(req.vaddr, SHARED_VA);
             assert_eq!(req.size, 4096);
-            assert_eq!(req.page_permissions, 0x1F);
+            assert_eq!(req.page_permissions, 0x17);
             assert!(req.share_with_kernel);
             assert_eq!(*pid, t.pid);
             // Handle on the queue and on the thread are clones of the
@@ -187,6 +187,109 @@ fn create_process_req_marshals_args_and_blocks() {
 }
 
 #[test]
+fn create_thread_req_marshals_args_and_blocks() {
+    let mut t = make_thread(ThreadState::Running, SPP::User);
+    t.allowed_affinity = 0xF;
+    let mut frame = make_frame();
+    let mut hw = FakeHw::default();
+    frame.regs[11] = USER_TEXT_BASE as usize + 0x100; // entry inside user text
+    frame.regs[12] = 0xF;                              // allowed_affinity
+    frame.regs[13] = 0x4;                              // affinity (subset of allowed)
+
+    let outcome = syscall::create_thread(&mut t, &frame, &mut hw);
+
+    assert_eq!(
+        outcome,
+        SyscallOutcome::Yield { state: ThreadState::Blocking, ret: None }
+    );
+    assert!(t.handle.is_some(), "thread should be parked on a handle");
+    assert_eq!(hw.pending_work.len(), 1);
+    match &hw.pending_work[0] {
+        PendingWork::CreateThread { req, pid, parent_allowed, handle } => {
+            assert_eq!(req.entry, USER_TEXT_BASE as usize + 0x100);
+            assert_eq!(req.allowed_affinity, 0xF);
+            assert_eq!(req.affinity, 0x4);
+            assert_eq!(*pid, t.pid);
+            assert_eq!(*parent_allowed, 0xF);
+            handle.signal(99);
+            assert!(t.handle.as_ref().unwrap().is_signaled());
+        }
+        other => panic!("unexpected pending work: {other:?}"),
+    }
+}
+
+#[test]
+fn create_thread_req_rejects_kernel_entry() {
+    let mut t = make_thread(ThreadState::Running, SPP::User);
+    let mut frame = make_frame();
+    let mut hw = FakeHw::default();
+    frame.regs[11] = KERNEL_VA;
+    frame.regs[12] = 0xF;
+    frame.regs[13] = 0x1;
+
+    let outcome = syscall::create_thread(&mut t, &frame, &mut hw);
+
+    assert_eq!(outcome, SyscallOutcome::Return { ret: Errno::new(EFAULT).to_ret() });
+    assert!(t.handle.is_none());
+    assert!(hw.pending_work.is_empty());
+}
+
+#[test]
+fn create_thread_req_rejects_affinity_outside_allowed() {
+    let mut t = make_thread(ThreadState::Running, SPP::User);
+    let mut frame = make_frame();
+    let mut hw = FakeHw::default();
+    frame.regs[11] = USER_TEXT_BASE as usize + 0x100;
+    frame.regs[12] = 0x3;       // allowed = bits 0,1
+    frame.regs[13] = 0x4;       // affinity = bit 2 — outside allowed
+
+    let outcome = syscall::create_thread(&mut t, &frame, &mut hw);
+
+    assert_eq!(outcome, SyscallOutcome::Return { ret: Errno::new(EINVAL).to_ret() });
+    assert!(t.handle.is_none());
+    assert!(hw.pending_work.is_empty());
+}
+
+#[test]
+fn create_thread_req_accepts_zero_sentinel_pair() {
+    // Both 0 → "inherit parent's mask." Sanitization at syscall layer
+    // doesn't know the parent's mask, only the manager does, so the
+    // syscall-side check must accept (0, 0) and let the manager
+    // resolve.
+    let mut t = make_thread(ThreadState::Running, SPP::User);
+    let mut frame = make_frame();
+    let mut hw = FakeHw::default();
+    frame.regs[11] = USER_TEXT_BASE as usize + 0x100;
+    frame.regs[12] = 0;
+    frame.regs[13] = 0;
+
+    let outcome = syscall::create_thread(&mut t, &frame, &mut hw);
+
+    assert_eq!(
+        outcome,
+        SyscallOutcome::Yield { state: ThreadState::Blocking, ret: None }
+    );
+    assert_eq!(hw.pending_work.len(), 1);
+}
+
+#[test]
+fn create_thread_req_returns_eagain_when_ring_full() {
+    let mut t = make_thread(ThreadState::Running, SPP::User);
+    let mut frame = make_frame();
+    let mut hw = FakeHw::default();
+    frame.regs[11] = USER_TEXT_BASE as usize + 0x100;
+    frame.regs[12] = 0xF;
+    frame.regs[13] = 0x1;
+    hw.pending_work_ok = false;
+
+    let outcome = syscall::create_thread(&mut t, &frame, &mut hw);
+
+    assert_eq!(outcome, SyscallOutcome::Return { ret: Errno::new(EAGAIN).to_ret() });
+    assert!(t.handle.is_none());
+    assert!(hw.pending_work.is_empty());
+}
+
+#[test]
 fn create_process_req_returns_eagain_when_ring_full() {
     let mut t = make_thread(ThreadState::Running, SPP::User);
     let mut frame = make_frame();
@@ -282,6 +385,47 @@ fn mmap_req_priv_rejects_shared_vaddr() {
     let outcome = syscall::mmap_req(&mut t, &frame, &mut hw);
 
     assert_rejected_no_work(outcome, &hw, &t, Errno::new(EINVAL).to_ret());
+}
+
+#[test]
+fn mmap_req_shared_rejects_exec_perm() {
+    // Shared frames carry a long-lived writable KDMAP alias on the
+    // kernel side, so allowing X through the user alias would give a
+    // W^X violation across the two views — kernel writes (e.g. net
+    // thread RX) would become executable in user. The syscall layer
+    // must reject before the request reaches the manager work ring.
+    let mut t = make_thread(ThreadState::Running, SPP::User);
+    let mut frame = make_frame();
+    let mut hw = FakeHw::default();
+    frame.regs[11] = SHARED_VA;
+    frame.regs[12] = 4096;
+    frame.regs[13] = 0x8; // PTE X bit
+    frame.regs[14] = 1;   // shared
+
+    let outcome = syscall::mmap_req(&mut t, &frame, &mut hw);
+
+    assert_rejected_no_work(outcome, &hw, &t, Errno::new(EINVAL).to_ret());
+}
+
+#[test]
+fn mmap_req_priv_allows_exec_perm() {
+    // Private mappings have no kernel-side alias, so X is fine — the
+    // shared+exec rejection must not leak into the priv path.
+    let mut t = make_thread(ThreadState::Running, SPP::User);
+    let mut frame = make_frame();
+    let mut hw = FakeHw::default();
+    frame.regs[11] = PRIV_VA;
+    frame.regs[12] = 4096;
+    frame.regs[13] = 0xA; // R|X
+    frame.regs[14] = 0;   // private
+
+    let outcome = syscall::mmap_req(&mut t, &frame, &mut hw);
+
+    assert_eq!(
+        outcome,
+        SyscallOutcome::Yield { state: ThreadState::Blocking, ret: None }
+    );
+    assert_eq!(hw.pending_work.len(), 1);
 }
 
 #[test]

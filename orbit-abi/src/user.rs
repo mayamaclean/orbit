@@ -99,6 +99,23 @@ pub unsafe fn ecall4(code: usize, arg0: usize, arg1: usize, arg2: usize, arg3: u
     r
 }
 
+/// Zero-argument syscall returning a pair of `isize` in `a0, a1`. Used
+/// by `get_affinity` to hand back (current, allowed) in one trap.
+#[inline]
+pub unsafe fn ecall0_ret2(code: usize) -> (isize, isize) {
+    let r0: isize;
+    let r1: isize;
+    unsafe {
+        asm!(
+            "ecall",
+            in("a0") code,
+            lateout("a0") r0,
+            lateout("a1") r1,
+        );
+    }
+    (r0, r1)
+}
+
 /// Four-argument syscall returning a pair of `isize` in `a0, a1`. Used by
 /// create_netch to hand back `(vaddr, fd)` in one trap without a user
 /// out-pointer — the kernel would otherwise have to resolve it through
@@ -228,14 +245,92 @@ pub fn close_handle(fd: u32) -> Result<(), Errno> {
     Errno::from_ret(unsafe { ecall1(syscall::CLOSE_HANDLE, fd as usize) }).map(|_| ())
 }
 
+/// Spawn a sibling thread in the calling process. `entry` is a function
+/// pointer in the caller's address space; the new thread starts there
+/// with a fresh stack and its own trap frame, sharing satp / heap /
+/// open handles with the parent.
+///
+/// `allowed_affinity` and `affinity` follow the same rules as
+/// [`create_process`] — pass `0` for either to mean "default to the
+/// calling thread's allowed mask." `affinity` must be a subset of
+/// `allowed_affinity` once both are resolved.
+///
+/// Returns the new tid on success. Async manager round-trip; the
+/// caller blocks until the manager has wired the thread into the
+/// scheduler.
+#[inline]
+pub fn create_thread(
+    entry: extern "C" fn() -> !,
+    allowed_affinity: u64,
+    affinity: u64,
+) -> Result<u32, Errno> {
+    Errno::from_ret(unsafe { ecall3(
+        syscall::CREATE_THREAD,
+        entry as usize,
+        allowed_affinity as usize,
+        affinity as usize,
+    )})
+        .map(|t| t as u32)
+}
+
+/// Narrow the calling thread's per-hart eligibility mask. The new mask
+/// must be non-zero and a subset of `allowed_affinity` (queryable via
+/// [`get_affinity`]). Returns `Ok(())` on success, `Err(EINVAL)` if
+/// `mask == 0`, `Err(EPERM)` if the mask escapes the cap.
+///
+/// Takes effect on the next scheduler dispatch; doesn't preempt the
+/// caller. If the caller's current hart is no longer in `mask`, it
+/// finishes its quantum there and migrates afterwards.
+#[inline]
+pub fn set_affinity(mask: u64) -> Result<(), Errno> {
+    Errno::from_ret(unsafe { ecall1(syscall::SET_AFFINITY, mask as usize) }).map(|_| ())
+}
+
+/// Return the hart id the caller is currently executing on. Useful for
+/// self-checking after `set_affinity` (next-dispatch confirmation) and
+/// for log markers in multi-hart tests. Cheap — pure read of the
+/// per-hart context from the kernel, no scheduling decisions.
+#[inline]
+pub fn get_hart_id() -> u32 {
+    let r = unsafe { ecall1(syscall::GET_HART_ID, 0) };
+    r as u32
+}
+
+/// Return `(current, allowed)` for the calling thread's affinity mask.
+/// Modeled on Windows's `GetProcessAffinityMask` — the immutable cap is
+/// returned alongside the current value so userspace can pick a valid
+/// sub-mask without trial-and-error.
+#[inline]
+pub fn get_affinity() -> (u64, u64) {
+    let (cur, allowed) = unsafe { ecall0_ret2(syscall::GET_AFFINITY) };
+    (cur as u64, allowed as u64)
+}
+
 /// Spawn a new process from an in-memory ELF image. `elf_ptr`/`elf_len`
 /// describe a contiguous readable region in the caller's address space;
 /// the kernel copies the bytes out, parses the ELF, and creates a
 /// process whose first thread enters at `e_entry` with the default
 /// stack size. Returns the new process's pid on success.
+///
+/// `allowed_affinity` caps the harts the child may ever run on (the
+/// child's `set_affinity` rejects anything outside this mask).
+/// `affinity` is the initial mask the scheduler uses to pick a hart;
+/// it must be a subset of `allowed_affinity`. Pass `0` for either to
+/// mean "default to all harts" — the common case.
 #[inline]
-pub fn create_process(elf_ptr: *const u8, elf_len: usize) -> Result<u16, Errno> {
-    Errno::from_ret(unsafe { ecall2(syscall::CREATE_PROCESS, elf_ptr as usize, elf_len) })
+pub fn create_process(
+    elf_ptr: *const u8,
+    elf_len: usize,
+    allowed_affinity: u64,
+    affinity: u64,
+) -> Result<u16, Errno> {
+    Errno::from_ret(unsafe { ecall4(
+        syscall::CREATE_PROCESS,
+        elf_ptr as usize,
+        elf_len,
+        allowed_affinity as usize,
+        affinity as usize,
+    )})
         .map(|p| p as u16)
 }
 

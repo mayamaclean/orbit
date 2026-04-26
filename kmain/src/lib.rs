@@ -568,3 +568,38 @@ pub fn handle_create_process_req(epc: usize, hart_context: &'static HartContext,
         orbit_core::syscall::create_process_req(t, f, &mut crate::hw::RiscvHardware)
     });
 }
+
+#[unsafe(no_mangle)]
+pub fn handle_create_thread(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
+    dispatch_syscall(epc, hart_context, frame, |t, f| {
+        orbit_core::syscall::create_thread(t, f, &mut crate::hw::RiscvHardware)
+    });
+}
+
+#[unsafe(no_mangle)]
+pub fn handle_set_affinity(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
+    dispatch_syscall(epc, hart_context, frame, |t, f| {
+        orbit_core::syscall::set_affinity(t, f)
+    });
+}
+
+#[unsafe(no_mangle)]
+pub fn handle_get_affinity(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
+    dispatch_syscall(epc, hart_context, frame, |t, _f| {
+        orbit_core::syscall::get_affinity(t)
+    });
+}
+
+/// `get_hart_id()` — return the hart id this syscall is running on.
+/// Lives in kmain (not orbit-core) because the source of truth is the
+/// per-hart `HartContext`, which `Hardware` deliberately doesn't expose
+/// — letting the orbit-core handlers depend on it would couple them to
+/// machine-mode device state. Trivially safe: no thread mutation, no
+/// blocking, no manager work.
+#[unsafe(no_mangle)]
+pub fn handle_get_hart_id(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
+    let hart_id = hart_context.hart_id;
+    dispatch_syscall(epc, hart_context, frame, |_t, _f| {
+        orbit_core::SyscallOutcome::Return { ret: hart_id as isize }
+    });
+}

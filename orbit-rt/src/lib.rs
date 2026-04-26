@@ -45,22 +45,24 @@
 //!
 //! # Locking
 //!
-//! Both the talc cell and [`SharedVa`] use `UnsafeCell` + `unsafe impl
-//! Sync`. Sound because umode is single-threaded today and S-mode trap
-//! entry switches satp before the kernel touches user state, so
-//! concurrent entry can't happen on the live target.
+//! Both the talc heap and [`SharedVa`] are guarded by
+//! `spinning_top::RawSpinlock`. Now that `create_thread` (syscall 5000)
+//! lets a single process span multiple harts, a Vec push on one thread
+//! can race a Box drop on another — concurrent allocator entry is no
+//! longer hypothetical.
 //!
-//! **FIXME(umode-threads):** when umode grows threads (roadmap §7),
-//! every `unsafe impl Sync` in this crate has to be revisited:
+//! Two specific safety requirements the lock alone doesn't cover:
 //!
-//! - `PRIV_HEAP` (`TalcSyncCell`) → `TalcLock<spinning_top::RawSpinlock, _>`
-//! - [`SHARED_VA`] (this crate) → `Mutex<FrameAllocator>` or equivalent
-//! - the `PRIV_NEXT_VA` `AtomicUsize` is already thread-safe but its
-//!   pairing with the talc `claim` call inside `PrivMmapSource::acquire`
-//!   isn't atomic — needs a guard so two threads can't reserve the
-//!   same chunk before either claim runs.
-//!
-//! Grep for `FIXME(umode-threads)` to find the rest.
+//! - **Don't allocate in trap context.** umode doesn't take async
+//!   signals today, but the moment it does, a signal handler that
+//!   allocates while the interrupted thread holds the heap lock
+//!   deadlocks. The kernel's "no allocation in trap context" rule
+//!   applies here too.
+//! - **`PRIV_NEXT_VA` is bumped before the talc claim**, so two
+//!   threads racing through `PrivMmapSource::acquire` get distinct VA
+//!   ranges before either calls `t.claim`. Talc itself serializes the
+//!   claim under the heap lock, so the two ranges land safely in
+//!   distinct arenas.
 
 #![no_std]
 
@@ -69,19 +71,20 @@ extern crate alloc;
 pub mod netch;
 
 use core::alloc::Layout;
-use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+use lock_api::Mutex;
 use mem::frame::FrameAllocator;
 use orbit_abi::{
     errno::{Errno, EINVAL, ENOMEM},
     layout::{PAGE_SIZE, UPROC_PRIV_BASE, UPROC_SHARED_BASE, UPROC_SHARED_END},
     user,
 };
+use spinning_top::RawSpinlock;
 use talc::base::binning::{Binning, DefaultBinning};
 use talc::base::Talc;
-use talc::cell::{TalcCell, TalcSyncCell};
 use talc::source::Source;
+use talc::sync::TalcLock;
 
 // R | W | U bits from mmu::PagePermissions. Kernel expects the raw 5-bit
 // encoding today; the orbit-abi::mmap prot/flags redesign isn't wired up.
@@ -125,18 +128,15 @@ unsafe impl Source for PrivMmapSource {
     }
 }
 
-// SAFETY: TalcSyncCell::new is unsafe because concurrent allocator entry
-// from another thread or an async signal handler is UB. umode is
-// single-threaded; Orbit has no signals; S-mode trap entry switches satp
-// so the kernel cannot re-enter this allocator while a user call is in
-// flight. See crate docs.
-//
-// FIXME(umode-threads): swap for `TalcLock<spinning_top::RawSpinlock, _>`
-// once umode can spawn additional threads (roadmap §7). The same swap
-// must happen on `SHARED_VA` below.
+// Spinlock-guarded talc heap. `create_thread` (syscall 5000) makes
+// concurrent allocator entry from sibling threads a real possibility;
+// `TalcLock` serializes on every `alloc`/`dealloc` so a Vec push on
+// hart A and a Box drop on hart B don't corrupt the same arena. The
+// uncontended path is a single atomic CAS — cheap relative to the talc
+// bookkeeping it guards.
 #[global_allocator]
-static PRIV_HEAP: TalcSyncCell<PrivMmapSource, DefaultBinning> =
-    unsafe { TalcSyncCell::new(TalcCell::new(PrivMmapSource)) };
+static PRIV_HEAP: TalcLock<RawSpinlock, PrivMmapSource, DefaultBinning> =
+    TalcLock::new(PrivMmapSource);
 
 // --- shared VA allocator -------------------------------------------------
 
@@ -172,25 +172,13 @@ struct SharedVaInner {
 /// so the range survives long-running processes that open/close
 /// NetChannels.
 pub struct SharedVa {
-    inner: UnsafeCell<SharedVaInner>,
+    inner: Mutex<RawSpinlock, SharedVaInner>,
 }
-
-// SAFETY: same rationale as PRIV_HEAP — umode is single-threaded today
-// and trap entry switches satp before the kernel touches user state, so
-// concurrent entry into this cell cannot happen on the live target.
-//
-// FIXME(umode-threads): when umode can spawn threads (roadmap §7),
-// wrap the inner in a `Mutex<FrameAllocator>` (or hand-rolled
-// `spinning_top` cell) so concurrent `reserve` calls from multiple
-// threads stop racing through `with`. Grep this crate for
-// `FIXME(umode-threads)` to find every place that needs to change in
-// lockstep.
-unsafe impl Sync for SharedVa {}
 
 impl SharedVa {
     const fn new() -> Self {
         Self {
-            inner: UnsafeCell::new(SharedVaInner {
+            inner: Mutex::new(SharedVaInner {
                 initialized: false,
                 fa: FrameAllocator::new(),
             }),
@@ -200,22 +188,19 @@ impl SharedVa {
     /// Run `f` against the inner allocator, lazy-initializing the free
     /// list on first call. Lazy because `FrameAllocator::insert` isn't
     /// `const`, but `static SHARED_VA` has to be const-constructible.
-    ///
-    /// SAFETY: caller must guarantee no concurrent access — see the
-    /// `unsafe impl Sync` rationale on this type.
-    unsafe fn with<R>(&self, f: impl FnOnce(&mut FrameAllocator<SHARED_ORDER>) -> R) -> R {
-        // SAFETY: caller upholds the no-concurrent-access invariant.
-        let inner = unsafe { &mut *self.inner.get() };
-        if !inner.initialized {
+    /// The closure runs under the spinlock — keep it short and don't
+    /// call back into `SharedVa` (single-threaded reentrancy would
+    /// deadlock).
+    fn with<R>(&self, f: impl FnOnce(&mut FrameAllocator<SHARED_ORDER>) -> R) -> R {
+        let mut g = self.inner.lock();
+        if !g.initialized {
             // Byte-addressed: the buddy tracks the raw VA range
             // [UPROC_SHARED_BASE, UPROC_SHARED_END), same convention as
             // kmain's pool wrappers.
-            inner
-                .fa
-                .insert(UPROC_SHARED_BASE as usize..UPROC_SHARED_END as usize);
-            inner.initialized = true;
+            g.fa.insert(UPROC_SHARED_BASE as usize..UPROC_SHARED_END as usize);
+            g.initialized = true;
         }
-        f(&mut inner.fa)
+        f(&mut g.fa)
     }
 }
 
@@ -261,10 +246,10 @@ impl SharedRegion {
         let align = layout.align().max(PAGE_SIZE_USIZE);
         let aligned = Layout::from_size_align(size, align).map_err(|_| Errno::new(EINVAL))?;
 
-        // SAFETY: see SharedVa Sync rationale. The buddy returns a
-        // byte-address from the [UPROC_SHARED_BASE, UPROC_SHARED_END)
-        // range we seeded; cast straight to a VA.
-        let va = unsafe { SHARED_VA.with(|fa| fa.alloc_aligned(aligned)) }
+        // The buddy returns a byte-address from the
+        // [UPROC_SHARED_BASE, UPROC_SHARED_END) range we seeded; cast
+        // straight to a VA. `with` takes the spinlock internally.
+        let va = SHARED_VA.with(|fa| fa.alloc_aligned(aligned))
             .ok_or(Errno::new(ENOMEM))?;
 
         Ok(Self { va, layout: aligned })
@@ -302,12 +287,10 @@ impl SharedRegion {
 
 impl Drop for SharedRegion {
     fn drop(&mut self) {
-        // SAFETY: see SharedVa Sync rationale. `layout` is the exact
-        // value passed to `alloc_aligned` (we stored it above), which
-        // is what `dealloc_aligned` requires for buddy correctness.
-        unsafe {
-            SHARED_VA.with(|fa| fa.dealloc_aligned(self.va, self.layout));
-        }
+        // `layout` is the exact value passed to `alloc_aligned` (we
+        // stored it above), which is what `dealloc_aligned` requires
+        // for buddy correctness. `with` takes the spinlock internally.
+        SHARED_VA.with(|fa| fa.dealloc_aligned(self.va, self.layout));
     }
 }
 

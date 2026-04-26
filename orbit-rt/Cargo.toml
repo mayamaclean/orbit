@@ -11,6 +11,12 @@ net_channel = { path = "../net_channel" }
 # `alloc` feature pulls in the buddy `FrameAllocator` we use to track
 # user-controlled VAs in the kernel-shared range.
 mem = { path = "../mem", features = ["alloc"] }
+# Used as the RawMutex backing for both the Talc heap (TalcLock) and
+# the SharedVa allocator's interior cell. Now that `create_thread`
+# (syscall 5000) lets a process span multiple harts, both allocators
+# are reachable concurrently and need real locking.
+spinning_top = { version = "0.3", default-features = false }
+lock_api = { version = "0.4", default-features = false }
 
 # build.rs templates the user-app linker script from orbit-abi layout
 # constants so downstream binaries (umode, orbit-loader, console) don't

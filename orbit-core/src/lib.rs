@@ -16,10 +16,11 @@ pub mod net;
 pub mod pending_work;
 pub mod sched;
 pub mod syscall;
+pub mod tlb_shootdown;
 pub mod trap;
 
 pub use pending_work::{
-    CloseHandleReq, CreateProcessReq, MemMapReq, NetChannelCreationReq, PendingWork,
+    CloseHandleReq, CreateProcessReq, CreateThreadReq, MemMapReq, NetChannelCreationReq, PendingWork,
 };
 
 /// Page size assumed by pure logic when bounding user-memory ranges. Must
@@ -113,6 +114,13 @@ pub enum SyscallOutcome {
     /// synchronous error returns from handlers that don't block.
     Return { ret: isize },
 
+    /// Like `Return`, but writes a pair into `regs[10]` and `regs[11]`.
+    /// For synchronous syscalls returning two `isize`s — modelled on
+    /// Windows's `GetProcessAffinityMask` shape (current + allowed in
+    /// one trap). The async two-return path (`create_netch`) goes via
+    /// `Yield + signal_n`, not this variant.
+    Return2 { ret0: isize, ret1: isize },
+
     /// Snapshot frame, *retain* pc at the ecall, yield into `state`.
     /// On wake the thread re-executes the ecall with its original
     /// args — used for park-and-retry primitives like `read_stdin`,
@@ -157,6 +165,13 @@ pub fn apply_syscall_outcome(
     match outcome {
         SyscallOutcome::Return { ret } => {
             frame.regs[10] = ret as usize;
+            *thread.frame = *frame;
+            thread.pc.store(epc + 4, Ordering::Release);
+            ShimAction::Resume
+        }
+        SyscallOutcome::Return2 { ret0, ret1 } => {
+            frame.regs[10] = ret0 as usize;
+            frame.regs[11] = ret1 as usize;
             *thread.frame = *frame;
             thread.pc.store(epc + 4, Ordering::Release);
             ShimAction::Resume

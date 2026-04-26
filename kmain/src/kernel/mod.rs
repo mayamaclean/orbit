@@ -1,5 +1,5 @@
 use core::alloc::Layout;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use core::time::Duration;
 
 use alloc::collections::{btree_map::BTreeMap};
@@ -24,10 +24,11 @@ use process::{
 };
 
 use orbit_abi::errno::{
-    Errno, EAGAIN, EBADF, EFAULT, EINVAL, EIO, ENOEXEC, ENOMEM, ESRCH,
+    Errno, EAGAIN, EBADF, EFAULT, EINVAL, EIO, ENOEXEC, ENOMEM, EPERM, ESRCH,
 };
 use orbit_core::{
-    CloseHandleReq, CreateProcessReq, MemMapReq, NetChannelCreationReq, PendingWork,
+    CloseHandleReq, CreateProcessReq, CreateThreadReq, MemMapReq, NetChannelCreationReq,
+    PendingWork,
 };
 use thingbuf::StaticThingBuf;
 
@@ -59,6 +60,7 @@ pub mod orbital_elf;
 pub mod pending_frees;
 pub mod shared_user_ptr;
 pub mod pci;
+pub mod shootdown;
 pub mod stdin;
 pub mod user_page;
 
@@ -239,6 +241,14 @@ impl Orbit {
         }
     }
 
+    /// Mask covering `[0, cpu_count)`. Used as the default `allowed_affinity`
+    /// for every newly-spawned thread; restricted callers (kthreads pinned
+    /// to a single hart, future capability-style child processes) override
+    /// at construction.
+    pub fn all_harts_mask(&self) -> u64 {
+        if self.cpu_count >= 64 { u64::MAX } else { (1u64 << self.cpu_count) - 1 }
+    }
+
     pub fn create_kernel_thread(&mut self, entrypoint: usize, a0: Option<usize>) -> Result<(), ()> {
         if self.current_process_id == u16::MAX {
             error!("too many processes running to spawn another");
@@ -277,6 +287,7 @@ impl Orbit {
         frame.regs[10] = a0.unwrap_or(0);
         frame.asid = 0;
 
+        let all_harts = self.all_harts_mask();
         let kthread = Thread {
             pc: AtomicUsize::new(entrypoint),
             satp: self.satp,
@@ -290,6 +301,8 @@ impl Orbit {
             handle: None,
             slot: None,
             fault_info: None,
+            allowed_affinity: all_harts,
+            affinity: AtomicU64::new(all_harts),
         };
 
         // TODO: figure out why pin<box<thread>> doesnt work
@@ -398,7 +411,12 @@ impl Orbit {
 
         core::sync::atomic::fence(Ordering::SeqCst);
 
+        // Local single-VA fence handles the manager hart. Cross-hart
+        // broadcast (whole-TLB sentinel via len=0) covers every other
+        // hart that may have cached a negative entry for this newly-
+        // mapped range.
         riscv::asm::sfence_vma(pid as usize, req.vaddr);
+        crate::kernel::shootdown::broadcast(0, 0);
 
         info!("fulfilled {req:?}:\n\tpa=0x{backing_pa_raw:016X} {layout:08X?}");
 
@@ -502,7 +520,10 @@ impl Orbit {
 
         core::sync::atomic::fence(Ordering::SeqCst);
 
+        // Local whole-asid + cross-hart whole-TLB broadcast — same
+        // shape as run_mmap_req's post-install fence.
         riscv::asm::sfence_vma(pid as usize, 0);
+        crate::kernel::shootdown::broadcast(0, 0);
 
         let socket_req = SocketReq {
             netchan: shared,
@@ -560,6 +581,66 @@ impl Orbit {
         0
     }
 
+    fn run_create_thread_req(&mut self, req: CreateThreadReq, pid: u16, parent_allowed: u64) -> isize {
+        info!("handling create_thread req: {req:?} pid={pid} parent_allowed={parent_allowed:#x}");
+
+        let all_harts = self.all_harts_mask();
+        // Resolve sentinels exactly like create_process: 0 → "default."
+        // Default for `allowed_affinity` is the parent's cap (so children
+        // inherit the family reach); default for `affinity` follows the
+        // resolved `allowed_affinity`.
+        let allowed = if req.allowed_affinity == 0 { parent_allowed } else { req.allowed_affinity };
+        let affinity = if req.affinity == 0 { allowed } else { req.affinity };
+
+        // Capability-style check: a thread can't claim reach the parent
+        // doesn't have. Bits-beyond-cpu_count surfaces here too because
+        // parent_allowed is itself a subset of all_harts.
+        if allowed & !parent_allowed != 0 {
+            error!("create_thread: requested allowed={allowed:#x} escapes parent={parent_allowed:#x}");
+            return Errno::new(EPERM).to_ret();
+        }
+        if affinity & !allowed != 0 || affinity == 0 || allowed & !all_harts != 0 {
+            error!("create_thread: affinity={affinity:#x} allowed={allowed:#x} all={all_harts:#x}");
+            return Errno::new(EINVAL).to_ret();
+        }
+
+        if !self.processes.contains_key(&pid) {
+            error!("create_thread: pid{pid} vanished");
+            return Errno::new(ESRCH).to_ret();
+        }
+
+        // Pre-allocation check: reading the captured tid out of the
+        // newly-inserted Thread requires a fresh registry lookup, since
+        // add_new_thread_to_process boxes the Thread internally and only
+        // returns Result<(), ()>. Snapshot the next tid by inspecting
+        // the current max + 1 — close enough for diagnostics; the real
+        // tid is read off the registry below on success.
+        match self.add_new_thread_to_process(
+            pid, req.entry, UPROC_STACK_DEFAULT, allowed, affinity,
+        ) {
+            Ok(()) => {
+                // Find the most-recently-inserted thread for this pid:
+                // the slot allocator is monotonic per process, so the
+                // highest tid in proc.threads is ours.
+                let proc = self.processes.get(&pid).expect("pid present, just checked");
+                let new_tid = match proc.threads.iter().next_back() {
+                    Some(t) => *t,
+                    None => {
+                        error!("create_thread: pid{pid} has no threads after insert");
+                        return Errno::new(EAGAIN).to_ret();
+                    }
+                };
+                info!("create_thread: spawned tid={new_tid} in pid={pid} \
+                    allowed={allowed:#x} affinity={affinity:#x}");
+                new_tid as isize
+            }
+            Err(()) => {
+                error!("create_thread: add_new_thread_to_process failed");
+                Errno::new(ENOMEM).to_ret()
+            }
+        }
+    }
+
     fn run_create_process_req(&mut self, req: CreateProcessReq, root_pa: u64) -> isize {
         info!("handling create_process req: {req:?}");
 
@@ -605,9 +686,26 @@ impl Orbit {
             copied += take;
         }
 
-        match self.create_new_process(&blob, UPROC_STACK_DEFAULT) {
+        // Sentinel 0 → "default" (all harts). Otherwise validate that
+        // the requested affinity is a subset of the requested allowed
+        // mask, and that both fit within the actual cpu_count. Bits
+        // beyond cpu_count mean the caller is naming harts that don't
+        // exist — reject as EINVAL rather than silently masking, so the
+        // caller learns rather than getting a different mask than they
+        // asked for.
+        let all_harts = self.all_harts_mask();
+        let allowed = if req.allowed_affinity == 0 { all_harts } else { req.allowed_affinity };
+        let affinity = if req.affinity == 0 { allowed } else { req.affinity };
+        if allowed & !all_harts != 0 || affinity & !allowed != 0 || affinity == 0 {
+            error!("create_process: affinity validation failed: \
+                allowed={allowed:#x} affinity={affinity:#x} all={all_harts:#x}");
+            return Errno::new(EINVAL).to_ret();
+        }
+
+        match self.create_new_process(&blob, UPROC_STACK_DEFAULT, allowed, affinity) {
             Ok(pid) => {
-                info!("create_process: spawned pid={pid} from {} bytes", blob.len());
+                info!("create_process: spawned pid={pid} from {} bytes \
+                    allowed_affinity={allowed:#x} affinity={affinity:#x}", blob.len());
                 pid as isize
             }
             Err(()) => {
@@ -643,15 +741,30 @@ impl Orbit {
                     let result = self.run_create_process_req(req, root_pa);
                     handle.signal(result);
                 }
+                PendingWork::CreateThread { req, pid, parent_allowed, handle } => {
+                    let result = self.run_create_thread_req(req, pid, parent_allowed);
+                    handle.signal(result);
+                }
             }
         }
     }
     
-    fn get_runnable_thread(&mut self) -> Option<PThread> {
+    fn get_runnable_thread(&mut self, hart_mask: u64) -> Option<PThread> {
         for (_tid, p) in self.threads.iter() {
             let thread: &mut Thread = unsafe {
                 p.0.as_mut_unchecked()
             };
+
+            // Affinity gate: skip threads that aren't permitted on the
+            // hart we're picking for. Read with Relaxed — set_affinity
+            // is the only writer and we tolerate observing a slightly
+            // stale value (worst case: thread waits one more scheduler
+            // pass to migrate). Done before state checks because most
+            // skip cases are state mismatches and we want the cheap
+            // load on the wide arm.
+            if thread.affinity.load(Ordering::Relaxed) & hart_mask == 0 {
+                continue;
+            }
 
             let state = thread.state.load(Ordering::Acquire);
             if state == ThreadState::Ready as usize {
@@ -881,9 +994,10 @@ impl Orbit {
             // Whole-ASID flush before `next_pid` can hand this u16 to a
             // fresh process. The dealloc_thread loop sfenced stack/trap
             // leaves, but ELF / anon / NetCh mappings were only zapped by
-            // `unmap` above. Local-hart only; §10's cross-hart shootdowns
-            // will broaden this to every hart that ever loaded this satp.
+            // `unmap` above. Cross-hart broadcast (whole-TLB sentinel)
+            // catches every hart that ever ran this pid's threads.
             riscv::asm::sfence_vma(process.pid as usize, 0);
+            crate::kernel::shootdown::broadcast(0, 0);
         }
     }
 
@@ -1370,7 +1484,7 @@ impl Orbit {
         }
     }
     
-    pub fn add_new_thread_to_process(&mut self, pid: u16, entrypoint: usize, stack_size: u64) -> Result<(), ()> {
+    pub fn add_new_thread_to_process(&mut self, pid: u16, entrypoint: usize, stack_size: u64, allowed_affinity: u64, affinity: u64) -> Result<(), ()> {
         if !self.processes.contains_key(&pid) {
             return Err(())
         }
@@ -1386,7 +1500,7 @@ impl Orbit {
             memmap::kernel_root_from_pa(addr as u64)
         };
 
-        let thread = match self.create_new_thread(pid, &root_table, entrypoint, slot, stack_size) {
+        let thread = match self.create_new_thread(pid, &root_table, entrypoint, slot, stack_size, allowed_affinity, affinity) {
             Ok(t) => t,
             Err(e) => {
                 self.processes.get_mut(&pid).unwrap().thread_slots.free(slot);
@@ -1420,7 +1534,7 @@ impl Orbit {
         Ok(())
     }
     
-    pub fn create_new_thread(&mut self, pid: u16, root_table: &mmu::mmap::RootTable<'_>, entrypoint: usize, slot: u16, stack_size: u64) -> Result<Thread, ()> {
+    pub fn create_new_thread(&mut self, pid: u16, root_table: &mmu::mmap::RootTable<'_>, entrypoint: usize, slot: u16, stack_size: u64, allowed_affinity: u64, affinity: u64) -> Result<Thread, ()> {
         if !validate_user_stack_size(stack_size) {
             error!("invalid user stack size {stack_size}");
             return Err(())
@@ -1545,10 +1659,12 @@ impl Orbit {
             handle: None,
             slot: Some(slot),
             fault_info: None,
+            allowed_affinity,
+            affinity: AtomicU64::new(affinity),
         })
     }
-    
-    pub fn create_new_process(&mut self, elf_blob: &[u8], stack_size: u64) -> Result<u16, ()> {
+
+    pub fn create_new_process(&mut self, elf_blob: &[u8], stack_size: u64, allowed_affinity: u64, affinity: u64) -> Result<u16, ()> {
         let (root_pa, root_table) = self.create_new_page_table()?;
         let mut elf = self.load_elf(&root_table, elf_blob)?;
         let pid = self.next_pid();
@@ -1571,7 +1687,7 @@ impl Orbit {
         // into proc.maps via self.processes.get_mut.
         self.processes.insert(pid, proc);
 
-        let thread = match self.create_new_thread(pid, &root_table, elf.entrypoint, slot, stack_size) {
+        let thread = match self.create_new_thread(pid, &root_table, elf.entrypoint, slot, stack_size, allowed_affinity, affinity) {
             Ok(t) => t,
             Err(e) => {
                 let _ = self.processes.remove(&pid);
@@ -1805,13 +1921,13 @@ impl Orbit {
 }
 
 impl orbit_core::sched::Scheduler for Orbit {
-    fn next_runnable(&mut self) -> Option<*mut Thread> {
+    fn next_runnable(&mut self, hart_mask: u64) -> Option<*mut Thread> {
         // PThread wraps a raw ptr sourced from the thread registry (Box
         // allocations); returning it directly keeps provenance rooted
         // at that allocation — no `&mut` reborrow whose tag would be
         // popped on return (which would dangle the ptr stored in the
         // target hart's `current` slot).
-        self.get_runnable_thread().map(|pt| pt.0)
+        self.get_runnable_thread(hart_mask).map(|pt| pt.0)
     }
 }
 

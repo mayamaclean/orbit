@@ -51,7 +51,7 @@ impl Drop for OneShotSched {
 }
 
 impl Scheduler for OneShotSched {
-    fn next_runnable(&mut self) -> Option<*mut Thread> {
+    fn next_runnable(&mut self, _hart_mask: u64) -> Option<*mut Thread> {
         if self.handed_out {
             return None;
         }
@@ -137,7 +137,7 @@ fn multiple_remotes_each_observe_their_own_thread() {
         next: usize,
     }
     impl Scheduler for MultiSched {
-        fn next_runnable(&mut self) -> Option<*mut Thread> {
+        fn next_runnable(&mut self, _hart_mask: u64) -> Option<*mut Thread> {
             let i = self.next;
             if i >= self.threads.len() {
                 return None;
