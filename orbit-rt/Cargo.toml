@@ -2,7 +2,18 @@
 name = "orbit-rt"
 version = "0.1.0"
 edition = "2024"
+build = "build.rs"
 
 [dependencies]
 talc      = { version = "5.0.3", default-features = false }
+orbit-abi = { path = "../orbit-abi" }
+net_channel = { path = "../net_channel" }
+# `alloc` feature pulls in the buddy `FrameAllocator` we use to track
+# user-controlled VAs in the kernel-shared range.
+mem = { path = "../mem", features = ["alloc"] }
+
+# build.rs templates the user-app linker script from orbit-abi layout
+# constants so downstream binaries (umode, orbit-loader, console) don't
+# carry their own copy. See build.rs and src/lib.rs.
+[build-dependencies]
 orbit-abi = { path = "../orbit-abi" }

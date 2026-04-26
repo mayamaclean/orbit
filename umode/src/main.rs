@@ -4,11 +4,12 @@
 extern crate alloc;
 use orbit_rt as _;
 
-use core::{panic::PanicInfo, sync::atomic::Ordering};
+use core::panic::PanicInfo;
 
-use net_channel::NetChannel;
 use orbit_abi::errno::{Errno, EBADF, EFAULT, EINVAL};
-use orbit_abi::{logln, user::{close_handle, create_netch, exit, sleep_ms, console_write, serial_print, SerialWriter}};
+use orbit_abi::net::SockType;
+use orbit_abi::{logln, user::{close_handle, exit, sleep_ms, console_write, serial_print, SerialWriter}};
+use orbit_rt::netch::NetCh;
 
 /// Report a PASS/FAIL line for a single error-path scenario. The smoke
 /// script greps for "PASS: <name>" lines to validate each branch fired.
@@ -140,14 +141,12 @@ pub unsafe extern "C" fn _start() -> ! {
 
     let _ = sleep_ms(2000);
 
-    // Ask the kernel to create a NetChannel. The hint is above
-    // USER_TEXT_BASE (0x2_2000_0000) so it can't clip into the stack
-    // region below. The kernel returns the actual VA it picked — today
-    // that's always the hint, but readers should not rely on it.
-    const AHINT: usize = 0x2_4000_0000;
-    const NC_REGION_SIZE: usize = 4096;
-    let (nc_vaddr, nc_fd) = match create_netch(AHINT, NC_REGION_SIZE, 0) {
-        Ok(v) => v,
+    // Open a NetChannel (smallest valid region — capacity=0 hits the
+    // floor at NC_MIN_REGION_SIZE). NetCh reserves a VA in the shared
+    // range from orbit_rt::SHARED_VA, then asks the kernel to install
+    // the mapping at that VA.
+    let nc = match NetCh::open(0, SockType::Tcp) {
+        Ok(n) => n,
         Err(_) => {
             logln!("failed to create netchannel!");
             exit(-2isize);
@@ -161,97 +160,58 @@ pub unsafe extern "C" fn _start() -> ! {
     // (The earlier `no registry` test hit the no-pid-entry branch.)
     check_err("close_handle bogus fd", close_handle(999), EBADF);
 
-    let nc = unsafe { &*(nc_vaddr as *const NetChannel) };
+    if let Err(_) = nc.connect(u32::from_be_bytes([192,168,76,2]), 65535) {
+        logln!("tcp connect failed!");
+        exit(-2isize);
+    }
+    logln!("tcp connected!");
 
-    if let Err(_) = nc.connect_tcp(u32::from_be_bytes([192,168,76,2]), 65535) {
-        logln!("bad failed nc tcp connect!");
-
-        // exit call
+    // Send the greeting once, then drain any reply. The smoke
+    // listener echoes "exit\n" to terminate this loop.
+    if nc.write_all(b"Hello World!\n").is_err() {
+        logln!("tcp write failed!");
         exit(-2isize);
     }
 
+    let mut buf = [0u8; 1024];
     loop {
-        let state = nc.current_state().state.load(Ordering::Acquire);
-
-        if state > 0 {
-            logln!("tcp connected!");
-            break
-        }
-        else if state < 0 {
-            logln!("tcp connect failed!");
-            break
-        }
-        else if state == 0 {
-            // sleep for ms
-            let _ = sleep_ms(10);
+        match nc.read(&mut buf) {
+            Ok(n) if n > 0 => {
+                // console_write before the exit check so the smoke
+                // script can grep the "exit\n" payload off serial —
+                // console_write tee's to serial as `USER[pid]: ...`.
+                let _ = console_write(buf.as_ptr() as usize, n);
+                if buf[..n].starts_with(b"exit") {
+                    break;
+                }
+            }
+            Ok(_) => {
+                // Spurious zero-byte read — back off briefly.
+                let _ = sleep_ms(100);
+            }
+            Err(Errno(e)) if e == orbit_abi::errno::EAGAIN => {
+                let _ = sleep_ms(100);
+            }
+            Err(_) => {
+                logln!("tcp read failed (channel down)");
+                exit(-99);
+            }
         }
     }
 
-    //exit(0);
-
-    let mut written = false;
-    let mut br = false;
-    loop {
-        if !written && nc.writeable() > 0 {
-            let wr = nc.send_tcp(|b| {
-                let msg = b"Hello World!\n";
-                b.copy_from_slice(msg)
-            });
-
-            if let Ok(n) = wr {
-                if n > 0 {
-                    written = true;
-                }
-            }
+    // Close the handle explicitly so we exercise the revoke path from
+    // a live process, not just from teardown. NetCh::close consumes
+    // self → kernel handle is closed and SharedRegion is freed back
+    // to SHARED_VA (so a future NetCh::open can reuse the same VA).
+    match nc.close() {
+        Ok(()) => logln!("close_handle ok!"),
+        Err(Errno(e)) => {
+            logln!("close_handle failed: errno={e}");
+            exit(-(e as isize));
         }
+    }
 
-        if nc.readable() > 0 {
-            let r = nc.recv_tcp(|rx| {
-                if rx.starts_with(b"exit") {
-                    br = true;
-                }
-                let _ = console_write(rx.as_ptr() as usize, rx.len());
-                rx.len()
-            });
-
-            match r {
-                Err(e) if e > -4 => {
-                    // exit call
-                    exit(e);
-                }
-                _ => {}
-            }
-
-            if br {
-                // Close the handle before exit so we exercise the
-                // revoke path from a live process, not just from
-                // teardown. After this returns, `nc` is invalid — the
-                // user mapping has been torn down.
-                if let Err(Errno(e)) = close_handle(nc_fd) {
-                    logln!("close_handle failed: errno={e}");
-                    exit(-(e as isize));
-                }
-
-                logln!("close_handle ok!");
-
-                let _ = unsafe {
-                    core::ptr::read_volatile(nc as *const _ as *const u8);
-                };
-            }
-        }
-        else {
-            // sleep for ms
-            let _ = sleep_ms(100);
-        }
-
-        let state = nc.current_state().state.load(Ordering::Acquire);
-
-        if state <= 0 {
-            logln!("tcp connection failed!");
-            break
-        }
-    }    
-    exit(-99);
+    exit(0);
 }
 
 #[panic_handler]

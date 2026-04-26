@@ -317,11 +317,13 @@ impl NetChannel {
     pub fn normalize_region_size(requested: usize) -> Option<usize> {
         if requested == 0 { return None }
         let clamped = requested.clamp(NC_MIN_REGION_SIZE, NC_MAX_REGION_SIZE);
+
         // Round up to page so each allocation fits cleanly in a whole
         // number of 4 KiB frames.
         let page_up = round_usize_up(clamped, 4096);
         if page_up > NC_MAX_REGION_SIZE { return None }
         if page_up < NC_MIN_REGION_SIZE { return None }
+
         // NC_TX_OFF is 16-aligned; dividing the remainder in half gives a
         // multiple of 8 as long as the region size is, which is already
         // guaranteed by page-rounding.

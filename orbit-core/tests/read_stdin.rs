@@ -164,6 +164,35 @@ fn len_above_page_returns_einval() {
 }
 
 #[test]
+fn rejects_kernel_vaddr() {
+    let mut t = make_thread(ThreadState::Running, SPP::User);
+    t.pid = PID;
+    let mut frame = frame_with(16, 0);
+    frame.regs[11] = 0xFFFF_FFC0_0000_0000;
+    let mut hw = FakeHw::default();
+
+    let outcome = syscall::read_stdin(&mut t, &frame, &mut hw);
+
+    assert_eq!(outcome, ready(Errno::new(EFAULT).to_ret()));
+    assert!(hw.stdin_drain_writes.is_empty(), "no drain on out-of-range va");
+    assert!(hw.stdin_parked.is_empty(), "no park on out-of-range va");
+}
+
+#[test]
+fn rejects_null_guard_vaddr() {
+    let mut t = make_thread(ThreadState::Running, SPP::User);
+    t.pid = PID;
+    let mut frame = frame_with(16, 0);
+    frame.regs[11] = 0x0;
+    let mut hw = FakeHw::default();
+
+    let outcome = syscall::read_stdin(&mut t, &frame, &mut hw);
+
+    assert_eq!(outcome, ready(Errno::new(EFAULT).to_ret()));
+    assert!(hw.stdin_drain_writes.is_empty());
+}
+
+#[test]
 fn yield_retry_keeps_pc_so_resume_re_executes_ecall() {
     // End-to-end with apply_syscall_outcome: the YieldRetry shape
     // produced by read_stdin must keep pc at the ecall (so the

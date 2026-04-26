@@ -7,6 +7,7 @@ use device::TrapFrame;
 use process::{CompletionHandle, Thread, ThreadState};
 
 use orbit_abi::errno::{Errno, EAGAIN, EBUSY, EFAULT, EINVAL, EIO};
+use orbit_abi::layout::{user_priv_range_ok, user_range_ok, user_shared_range_ok};
 
 use crate::{
     CloseHandleReq, CreateProcessReq, Hardware, MemMapReq, NetChannelCreationReq,
@@ -58,6 +59,22 @@ pub fn mmap_req<H: Hardware>(
         page_permissions: frame.regs[13] as u64,
         share_with_kernel: frame.regs[14] > 0,
     };
+    // Sanitize the user-supplied VA range before queueing manager work.
+    // Otherwise umode could request a mapping at any kernel address
+    // (KTEXT/KDMAP/KMMIO/the per-thread TrapFrame region) and the manager
+    // would happily install PTEs on top of it. The check also enforces
+    // the priv/shared split: a private mmap must land in the private
+    // range, a shared mmap in the shared range, so the two pools never
+    // share VAs.
+    let range_ok = if req.share_with_kernel {
+        user_shared_range_ok(req.vaddr as u64, req.size as u64)
+    } else {
+        user_priv_range_ok(req.vaddr as u64, req.size as u64)
+    };
+
+    if !range_ok {
+        return SyscallOutcome::Return { ret: Errno::new(EINVAL).to_ret() };
+    }
     let handle = CompletionHandle::new();
     let work = PendingWork::MemMap {
         req,
@@ -90,6 +107,13 @@ pub fn nc_create_req<H: Hardware>(
         region_size: frame.regs[12],
         nc_type: frame.regs[13],
     };
+    // NetChannels are always shared (the kernel keeps a KDMAP alias to
+    // drive smoltcp). Reject any VA outside the shared range so the
+    // priv/shared split holds: the private heap stays free of regions
+    // with kernel aliases and forced revocation semantics.
+    if !user_shared_range_ok(req.nc_vaddr as u64, req.region_size as u64) {
+        return SyscallOutcome::Return { ret: Errno::new(EINVAL).to_ret() };
+    }
     let handle = CompletionHandle::new();
     let work = PendingWork::NetChannelCreation {
         req,
@@ -148,6 +172,13 @@ pub fn create_process_req<H: Hardware>(
         elf_vaddr: frame.regs[11],
         elf_len: frame.regs[12],
     };
+    // Bound the source range before the manager copies bytes out. The
+    // manager's per-page virt_to_phys would refuse a kernel VA today —
+    // but only because user satps don't carry user PTEs for kernel
+    // mappings. Keep the structural guarantee at the syscall boundary.
+    if !user_range_ok(req.elf_vaddr as u64, req.elf_len as u64) {
+        return SyscallOutcome::Return { ret: Errno::new(EFAULT).to_ret() };
+    }
     let handle = CompletionHandle::new();
     let work = PendingWork::CreateProcess {
         req,
@@ -186,6 +217,10 @@ pub fn serial_print<H: Hardware>(
         return ready(Errno::new(EINVAL).to_ret());
     }
 
+    if !user_range_ok(user_va, len as u64) {
+        return ready(Errno::new(EFAULT).to_ret());
+    }
+
     if !hw.user_va_translates(thread.root_table_addr() as u64, user_va) {
         return ready(Errno::new(EFAULT).to_ret());
     }
@@ -222,6 +257,9 @@ pub fn console_write<H: Hardware>(
 
     if len == 0 || len > PAGE_SIZE {
         return ready(Errno::new(EINVAL).to_ret());
+    }
+    if !user_range_ok(user_va, len as u64) {
+        return ready(Errno::new(EFAULT).to_ret());
     }
     if !hw.user_va_translates(thread.root_table_addr() as u64, user_va) {
         return ready(Errno::new(EFAULT).to_ret());
@@ -262,6 +300,9 @@ pub fn read_stdin<H: Hardware>(
 
     if user_len == 0 || user_len > PAGE_SIZE {
         return ready(Errno::new(EINVAL).to_ret());
+    }
+    if !user_range_ok(user_va, user_len as u64) {
+        return ready(Errno::new(EFAULT).to_ret());
     }
     if !hw.user_va_translates(thread.root_table_addr() as u64, user_va) {
         return ready(Errno::new(EFAULT).to_ret());

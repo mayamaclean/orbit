@@ -35,6 +35,19 @@ Three privilege levels run three separate ELF artifacts, each with its own linke
 
 - **U-mode sample — [umode/](umode/)** linked at `0x2_2000_0000` (same `USER_TEXT_BASE` — only one user ELF occupies that VA at a time today). A hardcoded demo ([umode/src/main.rs](umode/src/main.rs)) that prints to serial, sleeps, `mmap`s a shared region, registers a NetChannel, and opens a TCP connection. No longer embedded in kmain — now shipped to a running guest via `orbit-loader/tools/send-payload.py`.
 
+### U-mode VA layout
+
+Sv48 low half is 128 TiB. The user-mappable space is split between kernel-managed regions (stacks, ELF — installed at process creation, never via `mmap`) and user-controllable regions (priv heap, shared mmap/NetChannels). Constants in [orbit-abi/src/layout.rs](orbit-abi/src/layout.rs):
+
+- `0..0x20_0000` — null guard (2 MiB, megapage-aligned).
+- `UPROC_STACK_BASE = 0x1000_0000` — 256 stack slots, 32 MiB stride, 8 GiB total. Kernel-mapped at thread creation (`map_stack`).
+- `USER_TEXT_BASE = 0x2_2000_0000` — ELF image. Kernel-mapped at process creation.
+- `UPROC_PRIV_BASE = 0x3_0000_0000 .. UPROC_PRIV_END = 0x4000_0000_0000` — user-controlled private range (~64 TiB). `mmap(share_with_kernel=false)` and orbit-rt's `#[global_allocator]` claim from here.
+- `UPROC_SHARED_BASE = 0x4000_0000_0000 .. UPROC_SHARED_END = 0x7E00_0000_0000` — user-controlled shared range (62 TiB). `mmap(share_with_kernel=true)` and `create_netch` (NetChannels) claim from here. orbit-rt's `SHARED_HEAP` is a separate talc cell with its own VA cursor here.
+- `USER_TRAP_FRAME_BASE = 0x7E00_0000_0000` — kernel-private per-thread TrapFrames (S-only, no U bit).
+
+The syscall layer (`orbit-core::syscall`) enforces the priv/shared split at the boundary: `mmap_req` rejects a private mmap aimed at a shared VA (and vice versa), `nc_create_req` rejects any VA outside the shared range, and the buffer-pointer syscalls (`serial_print`, `console_write`, `read_stdin`, `create_process`'s elf_ptr) accept anywhere user-mappable but reject kernel half / null guard / overflow via `user_range_ok`.
+
 ### Syscall ABI
 
 `ecall` with syscall number in `a0`, args in `a1..a4`. Dispatched by the `cause == 8` arm of `s_trap` in [kmain/src/bin/orbit.rs](kmain/src/bin/orbit.rs). Canonical list in [orbit-abi/src/syscall.rs](orbit-abi/src/syscall.rs):
@@ -42,8 +55,10 @@ Three privilege levels run three separate ELF artifacts, each with its own linke
 - `0` — exit (noreturn)
 - `1` — serial_print(ptr, len)
 - `2` — sleep_ms(ms)
-- `4096` — mmap(vaddr, len, perms, share_with_kernel)
-- `4097` — create_netch(vaddr_hint, region_size, sock_type) → (user_va, fd)
+- `3` — console_write(ptr, len)
+- `4` — read_stdin(ptr, len, flags)
+- `4096` — mmap(vaddr, len, perms, share_with_kernel) — vaddr must be in `UPROC_PRIV_BASE..UPROC_PRIV_END` when `share_with_kernel=false`, in `UPROC_SHARED_BASE..UPROC_SHARED_END` when `=true`
+- `4097` — create_netch(vaddr_hint, region_size, sock_type) → (user_va, fd) — vaddr_hint must be in `UPROC_SHARED_BASE..UPROC_SHARED_END`
 - `4098` — close_handle(fd)
 - `4099` — create_process(elf_ptr, elf_len) → pid
 

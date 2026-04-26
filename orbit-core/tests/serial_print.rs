@@ -142,6 +142,38 @@ fn check_order_len_before_translate() {
 }
 
 #[test]
+fn rejects_kernel_vaddr_without_translating() {
+    // VA in the kernel high half. Even if the user satp shadows kernel
+    // mappings, the syscall must reject the address structurally — and
+    // it must do so without consulting the page table (defense in
+    // depth + cheaper rejection).
+    let t = make_thread(ThreadState::Running, SPP::User);
+    let mut frame = make_frame();
+    frame.regs[11] = 0xFFFF_FFC0_0000_0000;
+    frame.regs[12] = 4;
+    let mut hw = FakeHw::default();
+
+    let outcome = syscall::serial_print(&t, &frame, &mut hw);
+
+    assert_eq!(outcome, ready(Errno::new(EFAULT).to_ret()));
+    assert!(hw.user_prints.is_empty());
+}
+
+#[test]
+fn rejects_null_guard_vaddr() {
+    let t = make_thread(ThreadState::Running, SPP::User);
+    let mut frame = make_frame();
+    frame.regs[11] = 0x0;
+    frame.regs[12] = 4;
+    let mut hw = FakeHw::default();
+
+    let outcome = syscall::serial_print(&t, &frame, &mut hw);
+
+    assert_eq!(outcome, ready(Errno::new(EFAULT).to_ret()));
+    assert!(hw.user_prints.is_empty());
+}
+
+#[test]
 fn carries_pid_tid_to_serial() {
     let mut t = make_thread(ThreadState::Running, SPP::User);
     t.pid = 7;

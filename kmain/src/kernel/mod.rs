@@ -333,6 +333,7 @@ impl Orbit {
                 error!("failed to alloc shared pages for mmap req: {req:?}");
                 return Errno::new(ENOMEM).to_ret();
             };
+
             // Zero via KDMAP alias.
             unsafe {
                 let kva = frame.to_kdmap();
@@ -344,6 +345,7 @@ impl Orbit {
                 error!("failed to alloc user pages for mmap req: {req:?}");
                 return Errno::new(ENOMEM).to_ret();
             };
+
             // Zero via a transient kernel window — no KDMAP alias exists.
             unsafe {
                 let mut w = user_page::UserPageWindow::map(frame.get_raw(), layout.size());
@@ -396,8 +398,7 @@ impl Orbit {
 
         core::sync::atomic::fence(Ordering::SeqCst);
 
-        riscv::asm::sfence_vma(pid as usize, 0);
-        riscv::asm::sfence_vma(0, 0);
+        riscv::asm::sfence_vma(pid as usize, req.vaddr);
 
         info!("fulfilled {req:?}:\n\tpa=0x{backing_pa_raw:016X} {layout:08X?}");
 
@@ -876,6 +877,13 @@ impl Orbit {
             self.table_pages.free(
                 Frame::<process::Table>::new(PhysAddr::new(process_root_table_pa)),
                 Self::TABLE_LAYOUT);
+
+            // Whole-ASID flush before `next_pid` can hand this u16 to a
+            // fresh process. The dealloc_thread loop sfenced stack/trap
+            // leaves, but ELF / anon / NetCh mappings were only zapped by
+            // `unmap` above. Local-hart only; §10's cross-hart shootdowns
+            // will broaden this to every hart that ever loaded this satp.
+            riscv::asm::sfence_vma(process.pid as usize, 0);
         }
     }
 
