@@ -90,6 +90,65 @@ pub use orbit_abi::layout::*;
 /// genuinely wedged. Default slot is `PendingWork::Empty`.
 pub static MANAGER_WORK: StaticThingBuf<PendingWork, 32> = StaticThingBuf::new();
 
+/// Targeted "tickle a parked thread" events. Producers: PLIC IRQ
+/// handlers (e.g. e1000 RX → wake k_net), `update_tcp` (slice staged
+/// → wake the NetCh's owner), syscall paths that publish state a
+/// peer might be sleep-polling on. Consumer: the manager drains this
+/// alongside `MANAGER_WORK` and bumps the matching thread's
+/// `wake_time` to 0 so the next scheduler scan dispatches it.
+///
+/// This is *not* the cross-hart IPI mechanism (that's `write_sswi`).
+/// It's a "the runnable predicate just became true; please re-check"
+/// signal — the scheduler still does the actual dispatch.
+///
+/// Default slot is `WakeEvent::None` (the Default impl returns it).
+pub static WAKE_QUEUE: StaticThingBuf<WakeEvent, 64> = StaticThingBuf::new();
+
+/// Targeted wake-up event. See [`WAKE_QUEUE`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WakeEvent {
+    /// Sentinel default — pushed nowhere, drained as a no-op. The
+    /// thingbuf API requires `Default` to mean "empty slot."
+    None,
+    /// Wake every kernel thread (pid=0). Today that's k_net (and
+    /// possibly k_gpu); a finer-grained variant can come later.
+    Net,
+    /// Wake every thread of the given user pid. Coarse but cheap —
+    /// each thread re-checks its own wait predicate on wake and
+    /// re-parks if not actually ready, so over-waking is harmless.
+    Pid(u16),
+    /// Wake a specific thread by tid. Used for future per-session
+    /// owner wake-ups where we know exactly which thread is parked
+    /// on a given NetCh.
+    Tid(u32),
+}
+
+impl Default for WakeEvent {
+    fn default() -> Self { WakeEvent::None }
+}
+
+/// PLIC IRQ handler for e1000 RX/TX events. Wired up in
+/// [`Orbit::setup_igb`] to whichever PLIC source the QEMU virt
+/// PCI swizzle assigns to the device's slot.
+///
+/// Runs in trap context with SIE=0. Two responsibilities:
+///  1. Ack the device's IRQ line by reading ICR. Without this, the
+///     INTx line stays asserted and PLIC re-claims us in a tight
+///     loop in `plic::dispatch`.
+///  2. Push a `WakeEvent::Net` so the manager wakes k_net at the
+///     next scheduler scan instead of waiting up to 10 ms for k_net's
+///     own heartbeat timer.
+///
+/// Drops the wake event silently if `WAKE_QUEUE` is full. Cap is 64;
+/// at e1000 burst rates (~1 IRQ per 1446 B at 1 Gbps = 86k IRQ/s)
+/// the manager will drain faster than we fill, but a temporarily-
+/// stalled manager would just lose redundant wakes — k_net's 10 ms
+/// heartbeat is the safety net.
+pub fn e1000_plic_handler(_src: u32) {
+    let _icr = crate::drivers::e1000::ack_irq_static();
+    let _ = WAKE_QUEUE.push(WakeEvent::Net);
+}
+
 pub struct Orbit {
     dtb_addr: usize,
     _serial_addr: usize,
@@ -148,7 +207,14 @@ impl Orbit {
                     return true
                 }
                 else if thread.state.load(Ordering::Acquire) == ThreadState::Suspended as usize {
-                    if riscv::register::time::read() >= thread.wake_time {
+                    // Wake on either: (a) the thread's own scheduled
+                    // wake_time has elapsed, or (b) the manager has set
+                    // a wake_override reason. Don't *consume* the
+                    // override here — that's `next_runnable`'s job;
+                    // counting Ready threads shouldn't have side
+                    // effects on the bitmask.
+                    let pending = thread.wake_override.load(Ordering::Acquire);
+                    if pending != 0 || riscv::register::time::read() >= thread.wake_time {
                         thread.state.store(ThreadState::Ready as usize, Ordering::Release);
                     }
                     return true
@@ -298,6 +364,8 @@ impl Orbit {
             stack,
             state: AtomicUsize::new(ThreadState::Ready as usize),
             wake_time: 0,
+            wake_override: AtomicU64::new(0),
+            last_wake_reason: AtomicU64::new(0),
             handle: None,
             slot: None,
             fault_info: None,
@@ -713,6 +781,71 @@ impl Orbit {
         }
     }
 
+    /// Drain `WAKE_QUEUE`. Each event names a thread (or set of
+    /// threads) plus a [`wake_reason`] bitmask explaining the cause.
+    /// We OR the bitmask into the matching thread's `wake_override` —
+    /// the scheduler's next `Suspended → Ready` scan will observe the
+    /// non-zero override and dispatch the thread, atomically consuming
+    /// the bits and stashing them in `last_wake_reason` for query.
+    ///
+    /// Producer/consumer split: the parking thread writes `wake_time`,
+    /// producers `fetch_or` into `wake_override`, the scheduler
+    /// `swap(0)` into `last_wake_reason`. No two writers ever touch
+    /// the same field — the parking-thread → manager race that would
+    /// otherwise overwrite a wake signal can't happen.
+    ///
+    /// Coarse over-waking is harmless: each thread re-checks its own
+    /// wait predicate on wake (e.g. `read_some` retries `recv_tcp`)
+    /// and re-parks if not actually ready. So `Pid` waking every
+    /// thread of a process is fine even when only one is parked on
+    /// the NetCh — the others go right back to sleep.
+    pub(crate) fn drain_wakes(&mut self) {
+        while let Some(mut slot) = WAKE_QUEUE.pop_ref() {
+            let event = core::mem::take(&mut *slot);
+            drop(slot);
+            match event {
+                WakeEvent::None => {}
+                WakeEvent::Net => {
+                    // Kernel threads have pid=0. Today that's k_net (and
+                    // possibly k_gpu); waking k_gpu spuriously is fine —
+                    // it'll re-park if it has nothing to do.
+                    self.set_wake_reason_where(
+                        process::wake_reason::TICKLE,
+                        |t| t.pid == 0,
+                    );
+                }
+                WakeEvent::Pid(pid) => {
+                    self.set_wake_reason_where(
+                        process::wake_reason::NET_IO,
+                        |t| t.pid == pid,
+                    );
+                }
+                WakeEvent::Tid(tid) => {
+                    self.set_wake_reason_where(
+                        process::wake_reason::NET_IO,
+                        |t| t.tid == tid,
+                    );
+                }
+            }
+        }
+    }
+
+    /// `fetch_or(reason)` into `wake_override` on every thread matching
+    /// `pred`. Helper for [`drain_wakes`]; `pred` runs against a
+    /// `&Thread` from the global table.
+    fn set_wake_reason_where(&mut self, reason: u64, mut pred: impl FnMut(&Thread) -> bool) {
+        for (_, p) in self.threads.iter() {
+            // SAFETY: `PThread.0` is a raw ptr the registry owns; it
+            // stays valid as long as the entry's in `self.threads`.
+            // We only read `pid`/`tid` and atomic-fetch_or
+            // `wake_override`, both safe under shared access.
+            let thread = unsafe { (p.0 as *mut Thread).as_mut_unchecked() };
+            if pred(thread) {
+                thread.wake_override.fetch_or(reason, Ordering::Release);
+            }
+        }
+    }
+
     /// Drain `MANAGER_WORK`. Each entry is a syscall handler bundled
     /// with its [`CompletionHandle`]; we run the handler, signal the
     /// handle with the result, and let the next scheduler scan resume
@@ -780,8 +913,29 @@ impl Orbit {
             else if state == ThreadState::Suspended as usize {
                 let now = riscv::register::time::read();
 
-                if now < thread.wake_time {
+                // Two ways to wake: scheduled `wake_time` elapsed, or
+                // the manager set a `wake_override` reason bit. The
+                // override is the dispatch consumption point — we
+                // `swap(0)` to atomically take whatever bits were
+                // pending and stash them in `last_wake_reason` for
+                // later query (e.g. a future `get_wake_reason` syscall
+                // from userspace). Concurrent producers between the
+                // load and the swap are fine: their bits are picked
+                // up the next time this thread parks and we get back
+                // here, since `swap` is the only consumer.
+                let pending = thread.wake_override.load(Ordering::Acquire);
+                if pending == 0 && now < thread.wake_time {
                     continue
+                }
+                if pending != 0 {
+                    let consumed = thread.wake_override.swap(0, Ordering::AcqRel);
+                    thread.last_wake_reason.store(consumed, Ordering::Release);
+                } else {
+                    // Plain timer-elapsed wake — no override bits to
+                    // forward, but mark the cause so userspace can
+                    // distinguish "your sleep ran out" from "something
+                    // tickled you" if it cares.
+                    thread.last_wake_reason.store(0, Ordering::Release);
                 }
 
                 thread.state.store(ThreadState::Ready as usize, Ordering::Release);
@@ -1217,6 +1371,32 @@ impl Orbit {
             self.net_pkg.iface = Some(iface);
             self.net_pkg.phy = Some(e1000);
             self.net_pkg.socket_reqs = socket_reqs;
+
+            // Publish a stable pointer to the e1000 so the PLIC handler
+            // can ack ICR from trap context. The Some(E1000) lives
+            // inside `self.net_pkg.phy`, which lives inside the heap-
+            // allocated Orbit — pointer is stable for the kernel's
+            // lifetime.
+            if let Some(phy_ref) = self.net_pkg.phy.as_mut() {
+                let raw = phy_ref as *mut E1000;
+                crate::drivers::e1000::E1000_DEVICE.store(raw, Ordering::Release);
+            }
+
+            // Wire e1000 INTx → PLIC → push WakeEvent::Net so k_net
+            // wakes the moment a packet lands instead of waiting up to
+            // 10 ms for the heartbeat. QEMU virt swizzles PCI INTA on
+            // slot N to PLIC source `32 + (N % 4)` (see the `pci@..`
+            // node's `interrupt-map` in the DTS). Most e1000s sit on
+            // pin INTA, so we use pin=1 and just compute by slot.
+            let slot = (device.address >> 15) & 0x1F;
+            let plic_irq = 32 + (slot as u32 % 4);
+            if let Err(()) = crate::drivers::plic::plic_register(
+                plic_irq, e1000_plic_handler, 0,
+            ) {
+                error!("e1000: plic_register failed for irq {}", plic_irq);
+            } else {
+                info!("e1000: PLIC IRQ {} → wake k_net", plic_irq);
+            }
 
             let entrypoint = crate::k_net as *const () as usize;
             let a0 = (&mut self.net_pkg) as *mut NetPackage;
@@ -1774,6 +1954,8 @@ impl Orbit {
             stack,
             state: AtomicUsize::new(ThreadState::Ready as usize),
             wake_time: 0,
+            wake_override: AtomicU64::new(0),
+            last_wake_reason: AtomicU64::new(0),
             handle: None,
             slot: Some(slot),
             fault_info: None,

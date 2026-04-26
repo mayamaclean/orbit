@@ -21,6 +21,32 @@ pub use completion::{AckCounter, CompletionHandle};
 pub use spsc::SpscQueue;
 pub use stdin::ProcessStdin;
 
+/// Reason-flag bits for [`Thread::wake_override`]. Producers `fetch_or`
+/// a flag to mark "wake this thread now and report this cause." The
+/// scheduler atomically `swap(0)` the union of pending bits at dispatch
+/// time and forwards them to userspace so a woken thread can tell why
+/// it was scheduled.
+///
+/// Layout is intentionally a bitmask (not an enum) so multiple wake
+/// reasons that arrive between dispatches collapse into a single wake
+/// with all the causes the thread needs to know about.
+pub mod wake_reason {
+    /// Manager-driven generic tickle. Today: WAKE_QUEUE drains for
+    /// "you should re-check your park condition." Future: housekeeping
+    /// signals like "your process group changed."
+    pub const TICKLE: u64 = 1 << 0;
+    /// Network I/O is ready: the kernel staged a fresh rx slice for
+    /// this thread's NetCh, or drained tx and there's room. Set by
+    /// `update_tcp` when its [`UpdateOutcome`] reports user-visible
+    /// ring progress.
+    pub const NET_IO: u64 = 1 << 1;
+    /// External device interrupt the thread had asked to wait on
+    /// (future use — e.g. file descriptors backed by virtio events).
+    pub const DEVICE_IO: u64 = 1 << 2;
+    /// POSIX-style signal delivery (future use).
+    pub const SIGNAL: u64 = 1 << 3;
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(usize)]
 pub enum ThreadState {
@@ -226,7 +252,35 @@ impl UserMapping {
 pub struct Thread {
     pub pc: AtomicUsize,
     pub state: AtomicUsize,
+    /// Thread's own scheduled park time. The thread itself is the sole
+    /// writer (set on park; the kernel scheduler reads but never
+    /// writes here). Non-atomic because of that single-writer
+    /// invariant — concurrent reads of an aligned `usize` on RV64
+    /// are safe under the current ABI, and the field's value is
+    /// only consulted in the `Suspended → Ready` transition where
+    /// the `state` field's release-store fences any prior write.
     pub wake_time: usize,
+    /// Pending wake reasons as a bitmask of [`wake_reason`] flags.
+    ///
+    /// `0` = no pending wake. Any non-zero bit-pattern is "wake this
+    /// thread now, regardless of `wake_time`" — and the bits encode
+    /// *why*. Producers (PLIC IRQ → WAKE_QUEUE drain, ring-staging,
+    /// syscall paths) `fetch_or` their reason bit. The scheduler
+    /// `swap(0)` to atomically consume the union of pending reasons
+    /// when it transitions the thread `Suspended → Ready`, and stashes
+    /// the consumed bitmask in [`last_wake_reason`] for later query.
+    ///
+    /// The split keeps the parking-thread → manager race off the
+    /// critical path: the parking thread writes `wake_time` only,
+    /// producers write `wake_override` only, the two writers touch
+    /// disjoint fields and never overwrite each other's signals.
+    pub wake_override: AtomicU64,
+    /// Bitmask of [`wake_reason`] flags consumed at the most recent
+    /// `Suspended → Ready` transition. The scheduler writes this when
+    /// it `swap(0)`s [`wake_override`]; userspace can query via a
+    /// future syscall to learn what woke it (I/O, signal, timer-cap,
+    /// etc.). Kept off the trap frame so we don't clobber user a-regs.
+    pub last_wake_reason: AtomicU64,
     pub frame: &'static mut TrapFrame,
     pub stack: &'static mut Stack,
     pub satp: Satp,

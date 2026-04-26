@@ -44,6 +44,8 @@ pub fn make_thread(state: ThreadState, mode: SPP) -> Thread {
             pc: AtomicUsize::new(0),
             state: AtomicUsize::new(state as usize),
             wake_time: 0,
+            wake_override: AtomicU64::new(0),
+            last_wake_reason: AtomicU64::new(0),
             frame,
             stack,
             satp: Satp::from_bits(0),

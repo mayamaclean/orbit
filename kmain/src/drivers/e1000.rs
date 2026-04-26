@@ -1,4 +1,4 @@
-use core::{mem::size_of};
+use core::{mem::size_of, ptr::null_mut, sync::atomic::{AtomicPtr, Ordering}};
 
 use mem::{round_usize_up};
 use mmu::PAGE_SIZE;
@@ -6,6 +6,34 @@ use smoltcp::phy::{Checksum, DeviceCapabilities, Medium};
 use tracing::{info, warn, error};
 
 use crate::kernel::memmap::KdmapVa;
+
+/// Stable pointer to the live [`E1000`] for the PLIC IRQ handler.
+/// Set once by [`setup_igb`](crate::kernel::Orbit::setup_igb) right
+/// after the device has been initialized; null until then. Read from
+/// trap context by [`ack_irq_static`] — only MMIO reads are issued
+/// through this pointer, so concurrent access from the k_net thread's
+/// own `read_interrupt_status` calls is safe (the device serializes
+/// reads to ICR atomically at the hardware level).
+pub static E1000_DEVICE: AtomicPtr<E1000> = AtomicPtr::new(null_mut());
+
+/// Ack the e1000's IRQ from a context that doesn't own a `&mut E1000`
+/// (PLIC handler in trap context). Reads ICR through the static
+/// pointer published by `setup_igb`; the read clears the device's
+/// IRQ assertion line so PLIC won't re-dispatch us in a tight loop.
+/// Returns the raw ICR bits we observed (or 0 if the device pointer
+/// hasn't been published yet — only happens in the boot window
+/// before setup_igb completes).
+pub fn ack_irq_static() -> u32 {
+    let ptr = E1000_DEVICE.load(Ordering::Acquire);
+    if ptr.is_null() {
+        return 0;
+    }
+    // SAFETY: setup_igb writes a stable pointer (E1000 lives inside
+    // the heap-allocated Orbit's net_pkg.phy slot). The only operation
+    // we do through it is a single MMIO volatile read; no struct-state
+    // mutation, no aliasing of Rust references.
+    unsafe { (*ptr).bar.add(ICR_REG_ADDR).read_volatile() }
+}
 
 /// DMA descriptors take physical addresses; ring buffers live in the
 /// `Shared` pool (KDMAP alias), so we go KDMAP VA → PhysAddr at the

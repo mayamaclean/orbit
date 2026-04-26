@@ -161,6 +161,10 @@ pub extern "C" fn k_hart_loop() -> ! {
         if try_acquire_manager() {
             orbit.cleanup_threads_and_processes();
             orbit.drain_pending_work();
+            // Drain wake events *before* assign_threads so any thread
+            // whose wake_time was just bumped to 0 is observed Ready
+            // by the next scheduler scan in this same critical section.
+            orbit.drain_wakes();
             orbit.check_net();
             orbit.assign_threads(hart_context);
             release_manager();
@@ -287,7 +291,6 @@ pub extern "C" fn k_net(device: *mut NetPackage) {
     let mut user_conns: BTreeMap<smoltcp::iface::SocketHandle, SocketReq> = BTreeMap::new();
     let mut user_revocations: Vec<SocketHandle> = Vec::new();
 
-    let mut next_poll = 0;
     loop {
         unsafe {
             riscv::register::sstatus::clear_sie();
@@ -299,25 +302,33 @@ pub extern "C" fn k_net(device: *mut NetPackage) {
             now as i64 / 10
         );
 
-        if now >= next_poll || phy.read_interrupt_status() > 0 {
-            unsafe {
-                core::arch::asm!("fence iorw, iorw");
-            }
-            
-            while iface.poll(timestamp, &mut phy, &mut sockets) != PollResult::None {
-                now = riscv::register::time::read();
-                timestamp = smoltcp::time::Instant::from_micros(
-                    now as i64 / 10
-                );
+        // Always run iface.poll on every wake. The previous
+        // `now >= next_poll || phy.read_interrupt_status() > 0` gate
+        // was an optimization to skip iface.poll when nothing's
+        // pending — but with the e1000 PLIC handler now acking ICR
+        // *before* k_net runs, `read_interrupt_status` would return 0
+        // even on an IRQ-driven wake, and we'd wrongly skip the poll
+        // we were just woken up to do. iface.poll returns None
+        // immediately when there's nothing to do, so unconditional
+        // polling is cheap; the timer-elapsed/IRQ-pending checks only
+        // saved a function call.
+        unsafe {
+            core::arch::asm!("fence iorw, iorw");
+        }
 
-                if let Some(event) = sockets.get_mut::<dhcpv4::Socket>(dhcp_handle).poll() {
-                    iface = handle_dhcp_event(iface, event);
-                }
-            }
+        while iface.poll(timestamp, &mut phy, &mut sockets) != PollResult::None {
+            now = riscv::register::time::read();
+            timestamp = smoltcp::time::Instant::from_micros(
+                now as i64 / 10
+            );
 
-            unsafe {
-                core::arch::asm!("fence iorw, iorw");
+            if let Some(event) = sockets.get_mut::<dhcpv4::Socket>(dhcp_handle).poll() {
+                iface = handle_dhcp_event(iface, event);
             }
+        }
+
+        unsafe {
+            core::arch::asm!("fence iorw, iorw");
         }
 
         orbit_core::net::drain_socket_deletions(
@@ -359,8 +370,6 @@ pub extern "C" fn k_net(device: *mut NetPackage) {
         let wake_time = iface.poll_at(timestamp, &mut sockets)
             .map(|i| i.total_micros() as usize * 10)
             .unwrap_or(default_wake);
-
-        next_poll = core::cmp::min(default_wake, wake_time);
 
         for q in socket_reqs.iter_mut() {
             while let Some(mut req) = q.dequeue() {
@@ -405,8 +414,6 @@ pub extern "C" fn k_net(device: *mut NetPackage) {
                     }
 
                     user_conns.insert(handle, req);
-
-                    next_poll = 0;
 
                     if let Err(assoc) = socket_associations.enqueue((req_pid as usize, handle)) {
                         error!("net: was unable to inform manager of socket association {assoc:?}");
