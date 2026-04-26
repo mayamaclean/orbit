@@ -545,7 +545,16 @@ impl NetChannel {
                 return iface
             }
 
-            if socket.is_open() {
+            // Only flip user-visible state to "connected" once the
+            // handshake actually completes. `is_open()` returns true for
+            // SynSent / SynReceived / Listen — flipping there would tell
+            // the user we're connected before the peer has acked our SYN
+            // (or, for listen, before any peer has even arrived). Gate on
+            // may_send/may_recv, which are true exactly for the post-
+            // handshake states (Established + the close-states, so we
+            // still surface "connected" if the peer FINs immediately
+            // after sending data).
+            if socket.may_send() || socket.may_recv() {
                 current_state.state.store(state, Ordering::Release);
             }
         }

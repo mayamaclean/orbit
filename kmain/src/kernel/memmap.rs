@@ -213,7 +213,7 @@ pub const KSCRATCH_NOMINAL: u64 = 0xFFFF_FFF0_0000_0000;
 
 // Transient per-window view into a user_pages backing for setup-time writes.
 // Single slot, serialized by the Orbit lock; size bounded to cover the
-// largest allocation we window in one shot (UPROC_STACK_MAX, 30 MiB, rounded
+// largest allocation we window in one shot (UPROC_STACK_MAX, 28 MiB, rounded
 // up to a megapage multiple).
 pub const KSCRATCH_SIZE: u64 = 32 * mmu::MB;
 

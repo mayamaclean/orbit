@@ -19,6 +19,7 @@
 #![no_main]
 
 extern crate alloc;
+use orbit_abi::user::sleep_ms;
 use orbit_rt as _;
 
 use alloc::string::String;
@@ -91,7 +92,9 @@ pub unsafe extern "C" fn _start() -> ! {
         Err(e)  => logln!("orbit-loader: console spawn failed: {e:?}"),
     }
 
-    logln!("orbit-loader: listening on :{LISTEN_PORT}");
+    if let Err(e) = sleep_ms(2000) {
+        exit(e.to_ret())
+    }
 
     let nc = match NetCh::open(RING_CAPACITY, SockType::Tcp) {
         Ok(n) => n,
@@ -100,6 +103,8 @@ pub unsafe extern "C" fn _start() -> ! {
             exit(-2);
         }
     };
+
+    logln!("orbit-loader: listening on :{LISTEN_PORT}");
 
     loop {
         match accept_and_load(&nc) {

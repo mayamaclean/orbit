@@ -39,6 +39,7 @@ PHDRS
   data PT_LOAD;
   bss PT_LOAD;
   rodata PT_LOAD;
+  tls PT_TLS;
 }}
 
 SECTIONS
@@ -62,6 +63,32 @@ SECTIONS
     *(.sdata .sdata.*) *(.data .data.*)
     PROVIDE(_data_end = .);
   }} >RAM AT>RAM :data
+
+  /* TLS template — variant-I model. .tdata is in both :data (loaded
+     for the static-image case) and :tls (so the linker emits PT_TLS
+     covering it); .tbss is only in :tls (zero-init, no file backing).
+     The kernel reads PT_TLS at ELF load and snapshots p_filesz bytes
+     onto the Process for per-thread copy-init. Binaries with no
+     `#[thread_local]` end up with empty .tdata/.tbss → PT_TLS with
+     p_memsz=0, and thread-create skips the TLS mapping entirely.
+
+     Placed *immediately after* .data — same :data PHDR — so the
+     `data` PT_LOAD covers a contiguous run [.data .tdata) without
+     spanning the .bss segment that follows. PT_TLS p_vaddr lands
+     mid-page in practice; the kernel reads the segment data via
+     elf.segment_data() (file-relative) so page alignment doesn't
+     matter for the snapshot. */
+  .tdata : ALIGN(8) {{
+    PROVIDE(_tdata_start = .);
+    *(.tdata .tdata.*)
+    PROVIDE(_tdata_end = .);
+  }} >RAM AT>RAM :data :tls
+
+  .tbss (NOLOAD) : ALIGN(8) {{
+    PROVIDE(_tbss_start = .);
+    *(.tbss .tbss.*) *(.tcommon)
+    PROVIDE(_tbss_end = .);
+  }} >RAM AT>RAM :tls
 
   .bss : ALIGN(4096) {{
     PROVIDE(_bss_start = .);

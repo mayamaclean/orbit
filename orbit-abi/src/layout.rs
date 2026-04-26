@@ -39,18 +39,40 @@ pub const LARGE_PAGE: u64 = 2 * 1024 * 1024;
 /// page tables don't pay for the guard.
 pub const USER_NULL_GUARD_END: u64 = LARGE_PAGE;
 
-/// Per-thread stack region. 256 slots * 32 MiB stride = 8 GiB total —
-/// chosen so the whole stack region fits below [`USER_TEXT_BASE`]
-/// (8.5 GiB). Each slot holds a stack sized per-thread (2..=30 MiB,
-/// multiples of 2 MiB), anchored at the high end of the slot; the
-/// remainder is an unmapped guard.
+/// Per-thread state region. 256 slots * 32 MiB stride = 8 GiB total —
+/// chosen so the whole region fits below [`USER_TEXT_BASE`] (8.5 GiB).
+/// Per-slot layout, low → high:
+///
+///   [stack ≤ 28 MiB at slot bottom] [unmapped gap]
+///   [TLS reservation 2 MiB] [guard 2 MiB at slot top]
+///
+/// Stack is anchored at `slot_base + stack_size` (sp init) and grows
+/// *down* toward `slot_base`. A stack overflow falls *below* the slot
+/// — into the previous slot's guard (slot N>0) or into the unmapped
+/// span between the null guard and `UPROC_STACK_BASE` (slot 0).
+/// Either way it faults clean. The guard at slot N's top therefore
+/// catches slot N+1's overflow; slot 0's guard exists for uniformity
+/// and is never the overflow target of anything.
+///
+/// TLS lives just below the guard, isolated from the stack — overflow
+/// grows away from it. Reservation is fixed at `UPROC_TLS_MAX`; only
+/// `round_up(p_memsz, PAGE_SIZE)` pages are actually mapped, so
+/// binaries with no `#[thread_local]` pay zero PA cost. See
+/// [docs/user-thread-region.md](../../docs/user-thread-region.md).
 pub const UPROC_STACK_BASE:    u64 = 0x1000_0000;
 pub const UPROC_STACK_STRIDE:  u64 = 16 * LARGE_PAGE;
 pub const UPROC_STACK_GRAIN:   u64 = LARGE_PAGE;
 pub const UPROC_STACK_MIN:     u64 = UPROC_STACK_GRAIN;
-/// One grain reserved for the guard at the low end of each slot.
-pub const UPROC_STACK_MAX:     u64 = UPROC_STACK_STRIDE - UPROC_STACK_GRAIN;
+/// One grain reserved for the guard, one for the TLS reservation —
+/// both at the slot top. Stack occupies the low remainder.
+pub const UPROC_STACK_MAX:     u64 = UPROC_STACK_STRIDE - 2 * UPROC_STACK_GRAIN;
 pub const UPROC_STACK_DEFAULT: u64 = UPROC_STACK_GRAIN;
+/// Per-slot TLS reservation immediately below the guard. Hardcoded to
+/// one `UPROC_STACK_GRAIN` so [`validate_user_stack_size`] doesn't need
+/// to consult the per-process `tls_memsz` — stack sizing stays
+/// independent of actual TLS size. ELF load rejects any binary whose
+/// PT_TLS `p_memsz` exceeds this value.
+pub const UPROC_TLS_MAX:       u64 = UPROC_STACK_GRAIN;
 
 pub const fn user_stack_slot_base(slot: u16) -> u64 {
     UPROC_STACK_BASE + (slot as u64) * UPROC_STACK_STRIDE
@@ -60,17 +82,44 @@ pub const fn user_stack_slot_top(slot: u16) -> u64 {
     user_stack_slot_base(slot) + UPROC_STACK_STRIDE
 }
 
-/// Low end of the writable stack; stack grows down from `user_stack_slot_top`.
-pub const fn user_stack_vaddr(slot: u16, stack_size: u64) -> u64 {
-    user_stack_slot_top(slot) - stack_size
-}
-
-pub const fn user_stack_guard_vaddr(slot: u16) -> u64 {
+/// Low end of the writable stack mapping. Stack grows *down* from
+/// `slot_base + stack_size` toward this address; an overflow goes
+/// past it into the previous slot's guard (or unmapped void for
+/// slot 0). `stack_size` is unused by the math today (stack is
+/// anchored at `slot_base`) but kept in the signature for symmetry
+/// with `user_stack_guard_size` and to avoid touching every caller.
+pub const fn user_stack_vaddr(slot: u16, _stack_size: u64) -> u64 {
     user_stack_slot_base(slot)
 }
 
-pub const fn user_stack_guard_size(stack_size: u64) -> u64 {
-    UPROC_STACK_STRIDE - stack_size
+/// Initial stack pointer for the thread — high end of the stack
+/// mapping, 16-byte aligned (RISC-V ABI).
+pub const fn user_stack_sp_init(slot: u16, stack_size: u64) -> u64 {
+    let top = user_stack_slot_base(slot) + stack_size;
+    (top - 16) & !0xF
+}
+
+/// Low end of the guard region. Sits at the slot's top so a stack
+/// overflow from slot N+1 (which falls below slot N+1's `slot_base =
+/// this slot's top`) lands here.
+pub const fn user_stack_guard_vaddr(slot: u16) -> u64 {
+    user_stack_slot_top(slot) - UPROC_STACK_GRAIN
+}
+
+/// Guard size is now fixed at one `UPROC_STACK_GRAIN`; the rest of the
+/// slot's "tail" above the stack belongs to TLS. Argument retained so
+/// existing callers compile unchanged.
+pub const fn user_stack_guard_size(_stack_size: u64) -> u64 {
+    UPROC_STACK_GRAIN
+}
+
+/// Low end of the per-thread TLS reservation. `tp` is set to this VA
+/// at thread create; static `#[thread_local]` accesses are
+/// `tp + offset` (RISC-V variant-I model — no TCB header). Sits
+/// immediately below the guard, isolated from the stack — overflow
+/// grows away from TLS.
+pub const fn user_tls_vaddr(slot: u16) -> u64 {
+    user_stack_slot_top(slot) - 2 * UPROC_STACK_GRAIN
 }
 
 pub const fn validate_user_stack_size(size: u64) -> bool {
@@ -169,11 +218,10 @@ mod tests {
     // ---- layout constants ----
 
     #[test]
-    fn stack_max_leaves_room_for_guard() {
-        // A max-size stack still leaves one `UPROC_STACK_GRAIN` for a
-        // low-end guard — if this changes, users can stack-overflow into
-        // the next slot.
-        assert_eq!(UPROC_STACK_MAX + UPROC_STACK_GRAIN, UPROC_STACK_STRIDE);
+    fn stack_max_leaves_room_for_tls_and_guard() {
+        // Per-slot tail above the stack: one `GRAIN` for the TLS
+        // reservation, one for the guard. Stack max is the rest.
+        assert_eq!(UPROC_STACK_MAX + UPROC_TLS_MAX + UPROC_STACK_GRAIN, UPROC_STACK_STRIDE);
     }
 
     #[test]
@@ -221,35 +269,86 @@ mod tests {
     // ---- user_stack_vaddr + guard ----
 
     #[test]
-    fn stack_vaddr_anchors_at_top() {
+    fn stack_anchors_at_slot_base() {
+        // Stack sits at the LOW end of the slot now; sp init is at
+        // `slot_base + stack_size`, growing down toward `slot_base`.
         let slot = 3u16;
         let size = UPROC_STACK_DEFAULT;
-        let top = user_stack_slot_top(slot);
         let stack = user_stack_vaddr(slot, size);
-        assert_eq!(stack + size, top, "stack grows down from slot top");
+        assert_eq!(stack, user_stack_slot_base(slot), "stack low end = slot base");
+        let sp = user_stack_sp_init(slot, size);
+        assert_eq!(sp, (user_stack_slot_base(slot) + size - 16) & !0xF);
     }
 
     #[test]
-    fn stack_and_guard_cover_full_slot_nonoverlapping() {
+    fn stack_overflow_falls_into_previous_slot_guard() {
+        // A page below slot N's stack-low (which is slot_base) should
+        // be inside slot N-1's guard region. This is the cross-slot
+        // overflow-protection invariant.
+        for slot in 1u16..16 {
+            let stack_lo = user_stack_vaddr(slot, UPROC_STACK_DEFAULT);
+            let prev_guard_lo = user_stack_guard_vaddr(slot - 1);
+            let prev_guard_hi = prev_guard_lo + user_stack_guard_size(UPROC_STACK_DEFAULT);
+            let overflow_addr = stack_lo - 1;
+            assert!(
+                overflow_addr >= prev_guard_lo && overflow_addr < prev_guard_hi,
+                "slot {slot} overflow at 0x{overflow_addr:x} should land in slot {} guard \
+                 [0x{prev_guard_lo:x}..0x{prev_guard_hi:x})",
+                slot - 1,
+            );
+        }
+    }
+
+    #[test]
+    fn slot_layout_covers_stack_then_tls_then_guard_at_top() {
         let slot = 5u16;
         let stack_size = UPROC_STACK_DEFAULT;
         let stack_lo = user_stack_vaddr(slot, stack_size);
+        let stack_hi = stack_lo + stack_size;
+        let tls_lo = user_tls_vaddr(slot);
         let guard_lo = user_stack_guard_vaddr(slot);
         let guard_size = user_stack_guard_size(stack_size);
 
-        assert_eq!(guard_lo, user_stack_slot_base(slot));
-        assert_eq!(guard_lo + guard_size, stack_lo, "guard ends where stack starts");
+        assert_eq!(stack_lo, user_stack_slot_base(slot));
+        assert!(stack_hi <= tls_lo, "stack ends at or below TLS reservation");
+        assert_eq!(tls_lo + UPROC_TLS_MAX, guard_lo, "TLS abuts guard");
         assert_eq!(
-            stack_lo + stack_size,
+            guard_lo + guard_size,
             user_stack_slot_top(slot),
-            "stack ends at slot top"
+            "guard ends at slot top"
         );
     }
 
     #[test]
-    fn max_size_stack_has_minimum_guard() {
-        let g = user_stack_guard_size(UPROC_STACK_MAX);
-        assert_eq!(g, UPROC_STACK_GRAIN, "max stack leaves exactly one grain for guard");
+    fn max_size_stack_abuts_tls_reservation() {
+        let stack_lo = user_stack_vaddr(0, UPROC_STACK_MAX);
+        let tls_lo = user_tls_vaddr(0);
+        assert_eq!(
+            stack_lo + UPROC_STACK_MAX,
+            tls_lo,
+            "max-size stack reaches exactly the TLS reservation start (no overlap)",
+        );
+    }
+
+    #[test]
+    fn guard_size_is_one_grain() {
+        // Fixed at one GRAIN regardless of stack size — the rest of
+        // the slot's tail belongs to TLS.
+        assert_eq!(user_stack_guard_size(UPROC_STACK_MIN), UPROC_STACK_GRAIN);
+        assert_eq!(user_stack_guard_size(UPROC_STACK_MAX), UPROC_STACK_GRAIN);
+    }
+
+    #[test]
+    fn tls_vaddr_sits_between_stack_max_and_guard() {
+        let slot = 7u16;
+        let tls = user_tls_vaddr(slot);
+        let guard = user_stack_guard_vaddr(slot);
+        assert_eq!(guard - tls, UPROC_TLS_MAX);
+        assert_eq!(tls + UPROC_TLS_MAX, guard);
+        // And at least UPROC_STACK_MAX below the TLS bottom (the
+        // theoretical max stack high end).
+        let stack_lo = user_stack_vaddr(slot, UPROC_STACK_MAX);
+        assert_eq!(stack_lo + UPROC_STACK_MAX, tls);
     }
 
     // ---- validate_user_stack_size ----
@@ -335,12 +434,12 @@ mod tests {
     }
 
     #[test]
-    fn stack_max_is_30_mib_per_doc() {
+    fn stack_max_is_28_mib_per_doc() {
         // Doc on UPROC_STACK_STRIDE pins the per-thread stack max at
-        // 30 MiB (= STRIDE - one GRAIN guard). Catching divergence here
-        // saves a debugging session when someone adjusts STRIDE
-        // without updating the docs.
-        assert_eq!(UPROC_STACK_MAX, 30 * 1024 * 1024);
+        // 28 MiB (= STRIDE - one TLS reservation - one guard).
+        // Catching divergence here saves a debugging session when
+        // someone adjusts STRIDE without updating the docs.
+        assert_eq!(UPROC_STACK_MAX, 28 * 1024 * 1024);
     }
 
     #[test]

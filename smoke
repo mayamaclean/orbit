@@ -130,6 +130,7 @@ MARKERS=(
   'PASS: set_affinity outside cap got Err\(errno=1\)'
   'PASS: set_affinity pinned to hart 0 \(got hart 0\)'
   'PASS: create_thread worker ran on hart 1'
+  'PASS: TLS isolation'
   'PASS: shootdown probe — worker faulted on post-revoke read'
   # Sentinel — printed by umode after the last error-path check returns.
   # Without this, a panic / early-exit between two PASS markers would only

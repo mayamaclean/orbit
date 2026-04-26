@@ -291,6 +291,22 @@ pub struct Process {
     pub mmap_cursor: u64,
     /// Per-process thread slot allocator.
     pub thread_slots: SlotAlloc,
+
+    /// Static TLS template snapshotted from the binary's `PT_TLS` at
+    /// ELF-load time. `None` means the binary has no TLS (or an empty
+    /// PT_TLS, which the linker still emits) and per-thread create
+    /// skips the TLS allocation. When `Some`:
+    /// - `tls_template` holds the first `tls_filesz = template.len()`
+    ///   bytes of the TLS image (the `.tdata` initial values). Per-thread
+    ///   TLS pages are populated by copying these bytes in; the trailing
+    ///   `tls_memsz - tls_filesz` bytes are implicitly zero.
+    /// - `tls_memsz` is `p_memsz` from PT_TLS (rounded up to PAGE_SIZE
+    ///   when allocating per-thread pages).
+    /// - `tls_align` is `p_align` (RISC-V variant-I: typically 8 or 16;
+    ///   subsumed by the page-aligned per-thread allocation).
+    pub tls_template: Option<Vec<u8>>,
+    pub tls_memsz: usize,
+    pub tls_align: usize,
 }
 
 impl Process {
@@ -306,6 +322,9 @@ impl Process {
             maps: BTreeMap::new(),
             mmap_cursor: 0,
             thread_slots: SlotAlloc::new(),
+            tls_template: None,
+            tls_memsz: 0,
+            tls_align: 0,
         }
     }
 

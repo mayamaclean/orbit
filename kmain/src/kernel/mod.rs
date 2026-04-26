@@ -872,6 +872,7 @@ impl Orbit {
                                     unsafe {
                                         let _ = unmap_page(&root_table, VirtAddr::new(v), 3);
                                         riscv::asm::sfence_vma(pid as usize, v as usize);
+                                        crate::kernel::shootdown::broadcast(0, 0);
                                     }
                                 }
                             }
@@ -879,6 +880,7 @@ impl Orbit {
                                 unsafe {
                                     let _ = unmap_page(&root_table, VirtAddr::new(m.vaddr), 4);
                                     riscv::asm::sfence_vma(pid as usize, m.vaddr as usize);
+                                    crate::kernel::shootdown::broadcast(0, 0);
                                 }
                             }
                             MappingKind::Guard { .. } => {
@@ -886,9 +888,14 @@ impl Orbit {
                                 // entry needs clearing below.
                             }
                             MappingKind::Tls { .. } => {
-                                // TODO: unmap TLS leaves once TLS is wired up.
-                                // Backing (if any) is still freed by the tail
-                                // of this loop, but leaves would leak.
+                                // One 2 MiB megapage at level 3 — same
+                                // shape as the Stack arm. Backing freed
+                                // by the tail of this loop.
+                                unsafe {
+                                    let _ = unmap_page(&root_table, VirtAddr::new(m.vaddr), 3);
+                                    riscv::asm::sfence_vma(pid as usize, m.vaddr as usize);
+                                }
+                                crate::kernel::shootdown::broadcast(0, 0);
                             }
                             // mappings_for_slot filters on MappingKind::slot(),
                             // which only returns Some for the arms above.
@@ -1588,10 +1595,105 @@ impl Orbit {
             return Err(())
         }
 
+        // Per-thread TLS — only when the binary's PT_TLS had memsz > 0.
+        // Snapshot the template + sizes out of the Process now so we
+        // can drop the borrow before touching the allocators.
+        //
+        // Allocation matches the stack convention: one 2-MiB-aligned
+        // megapage covering the full UPROC_TLS_MAX reservation,
+        // installed as a single L1 leaf. Trades up to ~2 MiB of
+        // physical-per-thread for one PTE instead of up to 512 (and
+        // a single-shot teardown). For umode's typical TLS (a few
+        // bytes of `#[thread_local]`) the waste is real but bounded
+        // and the code stays uniform with the stack mapping.
+        let (tls_template, tls_memsz) = match self.processes.get(&pid) {
+            Some(p) if p.tls_memsz > 0 => (p.tls_template.clone(), p.tls_memsz),
+            _                          => (None, 0),
+        };
+        let tls_vaddr = user_tls_vaddr(slot);
+        let tls_backing: Option<(Frame<UserOnly>, Layout)> = if tls_memsz > 0 {
+            let layout = match Layout::from_size_align(
+                UPROC_TLS_MAX as usize,
+                UPROC_STACK_GRAIN as usize,
+            ) {
+                Ok(l) => l,
+                Err(e) => {
+                    self.user_pages.free(stack_frame, stack_layout);
+                    self.kernel_pages.free(tf_frame, Self::THREAD_TRAP_FRAME_LAYOUT);
+                    self.table_pages.free(root_frame, Self::TABLE_LAYOUT);
+                    error!("bad TLS layout: {e:?}");
+                    return Err(());
+                }
+            };
+            let frame = match self.user_pages.alloc_pa(layout) {
+                Some(f) => f,
+                None => {
+                    self.user_pages.free(stack_frame, stack_layout);
+                    self.kernel_pages.free(tf_frame, Self::THREAD_TRAP_FRAME_LAYOUT);
+                    self.table_pages.free(root_frame, Self::TABLE_LAYOUT);
+                    error!("failed to alloc TLS megapage");
+                    return Err(());
+                }
+            };
+            // Zero the whole megapage (page may have been returned by
+            // a previous process), then overwrite the leading filesz
+            // bytes with the .tdata template — the trailing memsz -
+            // filesz bytes are .tbss (already zero) and the megapage
+            // tail above memsz is unused but kept zero for hygiene.
+            unsafe {
+                let mut w = user_page::UserPageWindow::map(frame.get_raw(), layout.size());
+                let buf = w.as_mut_slice();
+                buf.fill(0);
+                if let Some(template) = tls_template.as_ref() {
+                    let copy_len = core::cmp::min(template.len(), buf.len());
+                    buf[..copy_len].copy_from_slice(&template[..copy_len]);
+                }
+            }
+            // One L1 leaf at user_tls_vaddr(slot). R|W|U;
+            // SupervisorTag::None — TLS isn't shared, doesn't get
+            // revoked. levels=3 + page_size=UPROC_STACK_GRAIN matches
+            // map_stack's shape so unmap symmetry is one call.
+            let mut pages = PageAlloc::FA(self.table_pages.frames_mut());
+            let cfg = MappingConfig {
+                permissions: (PagePermissions::U | PagePermissions::R | PagePermissions::W) as u64,
+                levels: 3,
+                page_size: UPROC_STACK_GRAIN,
+                vaddr: VirtAddr::new(tls_vaddr),
+                paddr: PhysAddr::new(frame.get_raw()),
+                log: false,
+                supervisor_tag: SupervisorTag::None,
+            };
+            let map_result = unsafe {
+                map_address_range(
+                    root_table,
+                    &mut pages,
+                    &cfg,
+                    VirtAddr::new(tls_vaddr + layout.size() as u64),
+                    PhysAddr::new(frame.get_raw() + layout.size() as u64),
+                )
+            };
+            if map_result.is_err() {
+                self.user_pages.free(frame, layout);
+                self.user_pages.free(stack_frame, stack_layout);
+                self.kernel_pages.free(tf_frame, Self::THREAD_TRAP_FRAME_LAYOUT);
+                self.table_pages.free(root_frame, Self::TABLE_LAYOUT);
+                error!("failed to map TLS into process");
+                return Err(());
+            }
+            Some((frame, layout))
+        } else {
+            None
+        };
+
         if let Some(proc) = self.processes.get_mut(&pid) {
-            // Reserved vaddr range below the stack. No leaves — a fault inside
-            // here is a stack overflow, which the page-fault path will turn
-            // into a thread kill once it consults proc.maps.
+            // Reserved vaddr range at slot top. No leaves — a fault inside
+            // here is a stack overflow from slot N+1 (whose stack low end
+            // is exactly this slot's top), which the page-fault path
+            // turns into a thread kill once it consults proc.maps.
+            // Slot 0's guard sits at slot top too; nothing overflows
+            // into it (slot 0's own overflow falls below UPROC_STACK_BASE
+            // into the unmapped span there) but the entry is still
+            // recorded for layout uniformity.
             proc.insert_mapping(UserMapping {
                 vaddr:   guard_vaddr,
                 len:     guard_size,
@@ -1613,6 +1715,15 @@ impl Orbit {
                 backing: Some(PhysBacking::Shared { frame: tf_frame, layout: Self::THREAD_TRAP_FRAME_LAYOUT }),
                 kind:    MappingKind::TrapFrame { slot },
             });
+            if let Some((frame, layout)) = tls_backing {
+                proc.insert_mapping(UserMapping {
+                    vaddr:   tls_vaddr,
+                    len:     layout.size() as u64,
+                    perms:   (PagePermissions::U | PagePermissions::R | PagePermissions::W) as u64,
+                    backing: Some(PhysBacking::User { frame, layout }),
+                    kind:    MappingKind::Tls { slot },
+                });
+            }
         }
 
         let tid = self.next_tid();
@@ -1642,9 +1753,18 @@ impl Orbit {
 
         frame.regs[1] = entrypoint;
         frame.regs[2] = (stack_vaddr + stack_size - 16) as usize;
+        // tp = x4 = regs[4]. (regs[3] is gp — RISC-V's global pointer,
+        // not the thread pointer.) Variant-I model: tp points at the
+        // start of the static TLS block. Set unconditionally to
+        // user_tls_vaddr(slot); if the binary has no TLS the
+        // reservation stays unmapped and any access faults clean.
+        frame.regs[4] = tls_vaddr as usize;
         frame.asid = pid as usize;
 
-        info!("ventry={:016X?},vsp=0x{:016X?},rpt_pa={:016X?}", entrypoint, frame.regs[2], root_frame.get_raw());
+        info!(
+            "ventry={:016X?},vsp=0x{:016X?},vtp=0x{:016X?},rpt_pa={:016X?}",
+            entrypoint, frame.regs[2], frame.regs[4], root_frame.get_raw(),
+        );
 
         Ok(Thread {
             pc: AtomicUsize::new(entrypoint),
@@ -1681,6 +1801,14 @@ impl Orbit {
         // returns them to user_pages on teardown — previously dropped on the
         // floor here.
         proc.heap_pages.append(&mut elf.segments);
+
+        // Stash the PT_TLS template (if any) so per-thread create can
+        // copy-init the TLS block without re-walking the user PT.
+        if let Some(t) = elf.tls.take() {
+            proc.tls_template = Some(t.template);
+            proc.tls_memsz = t.memsz;
+            proc.tls_align = t.align;
+        }
 
         // Insert the Process before creating the thread so create_new_thread
         // can record per-thread UserMappings (TrapFrame, eventually Stack/TLS)
@@ -1853,9 +1981,62 @@ impl Orbit {
                 }
             }
         }
+        // PT_TLS — captured AFTER PT_LOAD because the TLS template's
+        // initial bytes (.tdata) live inside the same file image we
+        // just walked. Snapshot from `elf.segment_data` (kernel-side
+        // file bytes), not via the user satp — keeps the snapshot
+        // independent of the user mapping's permissions and saves a
+        // PT walk per thread create. Only one PT_TLS allowed per ELF.
+        let mut tls: Option<orbital_elf::TlsTemplate> = None;
+        for segment in segments.iter() {
+            if segment.p_type != elf::abi::PT_TLS {
+                continue;
+            }
+            if segment.p_memsz == 0 {
+                // Empty PT_TLS — emitted by the linker even when the
+                // binary has no `#[thread_local]`. Treat as "no TLS"
+                // so thread create skips the allocation.
+                continue;
+            }
+            if segment.p_memsz > UPROC_TLS_MAX {
+                error!(
+                    "elf PT_TLS p_memsz=0x{:X} exceeds UPROC_TLS_MAX=0x{:X}",
+                    segment.p_memsz, UPROC_TLS_MAX,
+                );
+                self.free_backings(segment_allocations);
+                return Err(());
+            }
+            if tls.is_some() {
+                error!("elf has more than one PT_TLS segment");
+                self.free_backings(segment_allocations);
+                return Err(());
+            }
+            let template_bytes = match elf.segment_data(&segment) {
+                Ok(s) => s,
+                Err(e) => {
+                    error!("error reading PT_TLS segment data: {e:?}");
+                    self.free_backings(segment_allocations);
+                    return Err(());
+                }
+            };
+            // template_bytes.len() == p_filesz (the file image of the
+            // segment). The trailing `p_memsz - p_filesz` bytes are
+            // implicit zeros and never stored.
+            tls = Some(orbital_elf::TlsTemplate {
+                template: template_bytes.to_vec(),
+                memsz: segment.p_memsz as usize,
+                align: segment.p_align as usize,
+            });
+            info!(
+                "elf PT_TLS: filesz=0x{:X} memsz=0x{:X} align=0x{:X}",
+                segment.p_filesz, segment.p_memsz, segment.p_align,
+            );
+        }
+
         Ok(orbital_elf::ElfInfo {
             entrypoint: elf.ehdr.e_entry as usize,
-            segments: segment_allocations
+            segments: segment_allocations,
+            tls,
         })
     }
 

@@ -1,9 +1,11 @@
 #![no_std]
 #![no_main]
+#![feature(thread_local)]
 
 extern crate alloc;
 use orbit_rt as _;
 
+use core::cell::Cell;
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
@@ -11,6 +13,110 @@ use orbit_abi::errno::{Errno, EBADF, EFAULT, EINVAL, EPERM};
 use orbit_abi::net::SockType;
 use orbit_abi::{logln, user::{close_handle, create_thread, exit, get_affinity, get_hart_id, set_affinity, sleep_ms, console_write, serial_print, SerialWriter}};
 use orbit_rt::netch::NetCh;
+
+// =====================================================================
+// §11 TLS isolation probe.
+//
+// Two `#[thread_local]` statics — one zero-init (lands in .tbss), one
+// initialized to a sentinel value (lands in .tdata). Each thread sees
+// its own copy: the per-thread TLS block is allocated and copy-init'd
+// from the binary's PT_TLS template at create_thread time; tp points
+// at it. `MY_TICK` (Cell) lets each thread bump a private counter to
+// confirm writes don't bleed across threads.
+// =====================================================================
+
+#[thread_local]
+static TLS_SENTINEL: Cell<u32> = Cell::new(0xC0FFEEu32);
+
+#[thread_local]
+static MY_TICK: Cell<u32> = Cell::new(0);
+
+// Communication out of the worker thread back to main, in shared
+// process memory (NOT thread-local). Main reads these to confirm the
+// worker observed the .tdata template and the writes were isolated.
+static TLS_WORKER_SEEN_INIT: AtomicU32 = AtomicU32::new(0);
+static TLS_WORKER_FINAL_TICK: AtomicU32 = AtomicU32::new(0);
+static TLS_WORKER_DONE: AtomicU32 = AtomicU32::new(0);
+
+extern "C" fn tls_worker_entry() -> ! {
+    // First read of TLS_SENTINEL — should be the .tdata initial value
+    // (0xC0FFEE) the kernel copied in from the PT_TLS template, not
+    // the value main wrote on its own copy.
+    TLS_WORKER_SEEN_INIT.store(TLS_SENTINEL.get(), Ordering::Release);
+
+    // Bump a private tick a few times. If TLS isn't isolated, this
+    // would race main's tick on the same memory.
+    for i in 1..=5u32 {
+        MY_TICK.set(i);
+    }
+    TLS_WORKER_FINAL_TICK.store(MY_TICK.get(), Ordering::Release);
+
+    TLS_WORKER_DONE.store(1, Ordering::Release);
+    exit(0);
+}
+
+fn run_tls_isolation_probe() {
+    let (_cur, allowed) = get_affinity();
+    if allowed.count_ones() < 2 {
+        logln!("TLS isolation probe skipped (only one hart)");
+        return;
+    }
+
+    // Main: write a distinct value into TLS_SENTINEL (overwrites the
+    // .tdata initial value on this thread's copy only). Bump MY_TICK
+    // to a different cadence than the worker.
+    TLS_SENTINEL.set(0xDEAD_BEEFu32);
+    for i in 100..=110u32 {
+        MY_TICK.set(i);
+    }
+
+    // Spawn worker pinned to hart 1 — same shape as the create_thread
+    // probe above. allowed=0 sentinel inherits parent's mask.
+    let target_bit = 1u64 << 1;
+    TLS_WORKER_DONE.store(0, Ordering::Release);
+    if let Err(Errno(e)) = create_thread(tls_worker_entry, 0, target_bit) {
+        logln!("FAIL: TLS probe create_thread errno={e}");
+        return;
+    }
+
+    // Wait for worker to publish results.
+    let mut tries = 0u32;
+    while TLS_WORKER_DONE.load(Ordering::Acquire) == 0 {
+        if tries >= 100 {
+            logln!("FAIL: TLS probe worker didn't finish");
+            return;
+        }
+        let _ = sleep_ms(10);
+        tries += 1;
+    }
+
+    let worker_init = TLS_WORKER_SEEN_INIT.load(Ordering::Acquire);
+    let worker_tick = TLS_WORKER_FINAL_TICK.load(Ordering::Acquire);
+    let main_sentinel = TLS_SENTINEL.get();
+    let main_tick = MY_TICK.get();
+
+    let mut ok = true;
+    if worker_init != 0xC0FFEE {
+        logln!("FAIL: TLS probe worker saw 0x{worker_init:x} (want 0xc0ffee — main's write should not have been visible)");
+        ok = false;
+    }
+    if worker_tick != 5 {
+        logln!("FAIL: TLS probe worker tick = {worker_tick} (want 5)");
+        ok = false;
+    }
+    if main_sentinel != 0xDEAD_BEEF {
+        logln!("FAIL: TLS probe main sentinel = 0x{main_sentinel:x} (want 0xdeadbeef — worker overwrote main's TLS)");
+        ok = false;
+    }
+    if main_tick != 110 {
+        logln!("FAIL: TLS probe main tick = {main_tick} (want 110)");
+        ok = false;
+    }
+
+    if ok {
+        logln!("PASS: TLS isolation — main(sentinel=0x{main_sentinel:x},tick={main_tick}) worker(init=0x{worker_init:x},tick={worker_tick})");
+    }
+}
 
 // Worker thread publishes its hart_id here once it starts. `u32::MAX`
 // is the sentinel for "not yet observed." Atomic so the main thread
@@ -408,6 +514,11 @@ pub unsafe extern "C" fn _start() -> ! {
     // would force the worker and main onto the same hart and defeat
     // the point of the test.
     run_create_thread_probe();
+
+    // §11 TLS isolation — verifies #[thread_local] statics are
+    // per-thread (each thread sees its own copy). Must run before
+    // the shootdown probe pins main to hart 0.
+    run_tls_isolation_probe();
 
     // §10 layer-3: cross-hart TLB shootdown probe. Pins itself and
     // restores affinity on the way out. Must run before the TCP

@@ -40,7 +40,7 @@ Three privilege levels run three separate ELF artifacts, each with its own linke
 Sv48 low half is 128 TiB. The user-mappable space is split between kernel-managed regions (stacks, ELF — installed at process creation, never via `mmap`) and user-controllable regions (priv heap, shared mmap/NetChannels). Constants in [orbit-abi/src/layout.rs](orbit-abi/src/layout.rs):
 
 - `0..0x20_0000` — null guard (2 MiB, megapage-aligned).
-- `UPROC_STACK_BASE = 0x1000_0000` — 256 stack slots, 32 MiB stride, 8 GiB total. Kernel-mapped at thread creation (`map_stack`).
+- `UPROC_STACK_BASE = 0x1000_0000` — 256 per-thread slots, 32 MiB stride, 8 GiB total. Each slot holds `[stack at slot bottom (≤ 28 MiB)] [unmapped gap] [TLS reservation 2 MiB] [guard 2 MiB at slot top]`. Stack grows down; overflow falls into the previous slot's guard (or the unmapped span below `UPROC_STACK_BASE` for slot 0). Kernel-mapped at thread creation. See [docs/user-thread-region.md](docs/user-thread-region.md).
 - `USER_TEXT_BASE = 0x2_2000_0000` — ELF image. Kernel-mapped at process creation.
 - `UPROC_PRIV_BASE = 0x3_0000_0000 .. UPROC_PRIV_END = 0x4000_0000_0000` — user-controlled private range (~64 TiB). `mmap(share_with_kernel=false)` and orbit-rt's `#[global_allocator]` claim from here.
 - `UPROC_SHARED_BASE = 0x4000_0000_0000 .. UPROC_SHARED_END = 0x7E00_0000_0000` — user-controlled shared range (62 TiB). `mmap(share_with_kernel=true)` and `create_netch` (NetChannels) claim from here. orbit-rt's `SHARED_HEAP` is a separate talc cell with its own VA cursor here.
