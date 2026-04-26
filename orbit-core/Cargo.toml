@@ -4,9 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-device    = { path = "../device" }
-orbit-abi = { path = "../orbit-abi" }
-process   = { path = "../process" }
+device      = { path = "../device" }
+net_channel = { path = "../net_channel" }
+orbit-abi   = { path = "../orbit-abi" }
+process     = { path = "../process" }
 # Used for SPP (privilege-mode enum) in the trap mode-gate. Compiles on
 # host target; we only touch the type, never a CSR.
 riscv     = { version = "0.16.0", features = ["rt"] }

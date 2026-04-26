@@ -12,6 +12,7 @@ use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use orbit_abi::errno::{Errno, EBADF, EFAULT, EINVAL, EPERM};
 use orbit_abi::net::SockType;
 use orbit_abi::{logln, user::{close_handle, create_thread, exit, get_affinity, get_hart_id, set_affinity, sleep_ms, console_write, serial_print, SerialWriter}};
+use net_channel::BindSpec;
 use orbit_rt::netch::NetCh;
 
 // =====================================================================
@@ -216,7 +217,15 @@ fn run_shootdown_probe() {
     // gets hart 1, ensuring the revoke happens on a hart != worker's.
     let _ = set_affinity(1u64 << 0);
 
-    let nc = match NetCh::open(0, SockType::Tcp) {
+    // The shootdown probe only needs a SharedUserPtr<NetChannel> to
+    // revoke; it never moves data over TCP. Pick a binding the kernel
+    // can wire up cheaply but that won't talk to anyone — ClientOneShot
+    // sits in `FreshIdle` until the user engages, and we never do.
+    let nc = match NetCh::open(
+        0,
+        SockType::Tcp,
+        BindSpec::ClientOneShot { addr: 0x0100_007F, port: 1 },
+    ) {
         Ok(n) => n,
         Err(Errno(e)) => {
             logln!("FAIL: shootdown probe NetCh::open errno={e}");
@@ -528,11 +537,17 @@ pub unsafe extern "C" fn _start() -> ! {
 
     let _ = sleep_ms(2000);
 
-    // Open a NetChannel (smallest valid region — capacity=0 hits the
-    // floor at NC_MIN_REGION_SIZE). NetCh reserves a VA in the shared
-    // range from orbit_rt::SHARED_VA, then asks the kernel to install
-    // the mapping at that VA.
-    let nc = match NetCh::open(0, SockType::Tcp) {
+    // Open a NetChannel as a one-shot client to the smoke listener.
+    // The kernel latches the BindSpec at create time and waits for us
+    // to engage before dialing — `next_session` does both.
+    let nc = match NetCh::open(
+        0,
+        SockType::Tcp,
+        BindSpec::ClientOneShot {
+            addr: u32::from_be_bytes([192, 168, 76, 2]),
+            port: 65535,
+        },
+    ) {
         Ok(n) => n,
         Err(_) => {
             logln!("failed to create netchannel!");
@@ -547,22 +562,25 @@ pub unsafe extern "C" fn _start() -> ! {
     // (The earlier `no registry` test hit the no-pid-entry branch.)
     check_err("close_handle bogus fd", close_handle(999), EBADF);
 
-    if let Err(_) = nc.connect(u32::from_be_bytes([192,168,76,2]), 65535) {
-        logln!("tcp connect failed!");
-        exit(-2isize);
-    }
+    let session = match nc.next_session() {
+        Ok(s) => s,
+        Err(_) => {
+            logln!("tcp connect failed!");
+            exit(-2isize);
+        }
+    };
     logln!("tcp connected!");
 
     // Send the greeting once, then drain any reply. The smoke
     // listener echoes "exit\n" to terminate this loop.
-    if nc.write_all(b"Hello World!\n").is_err() {
+    if session.write_all(b"Hello World!\n").is_err() {
         logln!("tcp write failed!");
         exit(-2isize);
     }
 
     let mut buf = [0u8; 1024];
     loop {
-        match nc.read(&mut buf) {
+        match session.read(&mut buf) {
             Ok(n) if n > 0 => {
                 // console_write before the exit check so the smoke
                 // script can grep the "exit\n" payload off serial —
@@ -585,6 +603,7 @@ pub unsafe extern "C" fn _start() -> ! {
             }
         }
     }
+    drop(session);
 
     // Close the handle explicitly so we exercise the revoke path from
     // a live process, not just from teardown. NetCh::close consumes

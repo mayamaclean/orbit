@@ -13,6 +13,7 @@
 //! the thread and a signaler somewhere — no work-queue entry, no
 //! manager involvement.
 
+use net_channel::BindSpec;
 use process::CompletionHandle;
 
 #[derive(Debug, Clone, Copy)]
@@ -28,6 +29,12 @@ pub struct NetChannelCreationReq {
     pub nc_vaddr: usize,
     pub region_size: usize,
     pub nc_type: usize,
+    /// Sticky binding the kernel latches at channel creation. Sent
+    /// packed in the syscall's a4 register (see [`BindSpec::pack`]) and
+    /// validated/unpacked at the syscall boundary; the manager threads
+    /// it into `SocketReq::ctx` and never reads it again from shared
+    /// memory.
+    pub bind: BindSpec,
 }
 
 #[derive(Debug, Clone, Copy)]

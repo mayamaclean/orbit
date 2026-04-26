@@ -529,9 +529,7 @@ impl Orbit {
             netchan: shared,
             nc_type: req.nc_type,
             pid,
-            pending_rx_ack: false,
-            pending_tx_ack: false,
-            issued_desired: 0,
+            ctx: net_channel::ChannelCtx::new(req.bind),
         };
 
         if let Some(np) = self.net_pkg.socket_reqs.get_mut(get_hart_context().hart_id as usize) {

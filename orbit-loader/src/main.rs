@@ -27,11 +27,11 @@ use alloc::vec::Vec;
 use core::panic::PanicInfo;
 
 use minicbor::{Decode, Encode};
-use net_channel::{NetChannel, NC_MAX_REGION_SIZE};
+use net_channel::{BindSpec, NetChannel, NC_MAX_REGION_SIZE};
 use orbit_abi::errno::Errno;
 use orbit_abi::net::SockType;
 use orbit_abi::{logln, user::{create_process, exit, SerialWriter}};
-use orbit_rt::netch::NetCh;
+use orbit_rt::netch::{NetCh, Session};
 
 const LISTEN_PORT: u16 = 7777;
 /// Size the rings to the maximum the kernel will allocate, so a large
@@ -96,7 +96,16 @@ pub unsafe extern "C" fn _start() -> ! {
         exit(e.to_ret())
     }
 
-    let nc = match NetCh::open(RING_CAPACITY, SockType::Tcp) {
+    // ServerRetain: the kernel keeps `socket.listen(LISTEN_PORT)` armed
+    // continuously across sessions. We just engage on `next_session`,
+    // drain the payload, and disengage on `Session` drop — the kernel
+    // re-arms the listen as part of its recycle, so back-to-back peers
+    // never race a closed-window.
+    let nc = match NetCh::open(
+        RING_CAPACITY,
+        SockType::Tcp,
+        BindSpec::ServerRetain { port: LISTEN_PORT },
+    ) {
         Ok(n) => n,
         Err(e) => {
             logln!("orbit-loader: NetCh::open failed: {e:?}");
@@ -111,24 +120,17 @@ pub unsafe extern "C" fn _start() -> ! {
             Ok((pid, name)) => logln!("orbit-loader: spawned pid={pid} name={name:?}"),
             Err(e)          => logln!("orbit-loader: iteration failed: {e:?}"),
         }
-
-        // Recycle the channel before re-listening. NetCh::reset drives
-        // the full handshake (request → wait for kernel to drop
-        // current_state to 0 → finish by clearing our half).
-        if let Err(e) = nc.reset() {
-            // EBUSY here means the channel was already idle (e.g.,
-            // listen failed before the connection established) — fine,
-            // a bad listen will re-surface next pass.
-            logln!("orbit-loader: reset skipped: {e:?}");
-        }
+        // Session is dropped at end of accept_and_load — disengagement
+        // and kernel-side relisten happen there.
     }
 }
 
 /// One listen-accept-recv-spawn cycle on an already-opened NetCh.
+/// Holds a [`Session`] for the duration; dropping it on return signals
+/// the kernel to recycle into a fresh listen for the next iteration.
 fn accept_and_load(nc: &NetCh) -> Result<(u16, String), LoaderErr> {
-    nc.listen(LISTEN_PORT).map_err(LoaderErr::NetCh)?;
-
-    let (payload_bytes, name) = recv_payload(nc)?;
+    let session = nc.next_session().map_err(LoaderErr::NetCh)?;
+    let (payload_bytes, name) = recv_payload(&session)?;
     let pid = spawn(&payload_bytes)?;
     Ok((pid, name))
 }
@@ -136,12 +138,12 @@ fn accept_and_load(nc: &NetCh) -> Result<(u16, String), LoaderErr> {
 /// Read the full framed message into a heap Vec. Returns (buf, name)
 /// where `buf` is the trimmed CBOR body and `name` is decoded from it.
 /// The returned bytes are handed verbatim to the kernel.
-fn recv_payload(nc: &NetCh) -> Result<(Vec<u8>, String), LoaderErr> {
+fn recv_payload(s: &Session<'_>) -> Result<(Vec<u8>, String), LoaderErr> {
     let mut scratch: Vec<u8> = Vec::new();
 
     // Fill enough for the 8-byte header.
     while scratch.len() < 8 {
-        drain_some(nc, &mut scratch)?;
+        drain_some(s, &mut scratch)?;
     }
 
     let len = u32::from_le_bytes([scratch[0], scratch[1], scratch[2], scratch[3]]);
@@ -152,7 +154,7 @@ fn recv_payload(nc: &NetCh) -> Result<(Vec<u8>, String), LoaderErr> {
     let total = 8 + len as usize;
     scratch.reserve(total.saturating_sub(scratch.len()));
     while scratch.len() < total {
-        drain_some(nc, &mut scratch)?;
+        drain_some(s, &mut scratch)?;
     }
 
     let body = &scratch[8..total];
@@ -169,12 +171,12 @@ fn recv_payload(nc: &NetCh) -> Result<(Vec<u8>, String), LoaderErr> {
     Ok((body_only, name))
 }
 
-/// Pull at least one byte from the channel into `out` (blocking via
-/// NetCh::read_some, which sleeps the hart until the ring has data
+/// Pull at least one byte from the session into `out` (blocking via
+/// `Session::read_some`, which sleeps the hart until the ring has data
 /// or the channel breaks).
-fn drain_some(nc: &NetCh, out: &mut Vec<u8>) -> Result<(), LoaderErr> {
-    let mut tmp = [0u8; 4096];
-    let n = nc.read_some(&mut tmp).map_err(LoaderErr::NetCh)?;
+fn drain_some(s: &Session<'_>, out: &mut Vec<u8>) -> Result<(), LoaderErr> {
+    let mut tmp = [0u8; 128 * 1024];
+    let n = s.read_some(&mut tmp).map_err(LoaderErr::NetCh)?;
     out.extend_from_slice(&tmp[..n]);
     Ok(())
 }

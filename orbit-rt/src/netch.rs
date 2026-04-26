@@ -1,39 +1,44 @@
-//! NetChannel wrapper.
+//! NetChannel wrapper: declarative bindings + iterator-style sessions.
 //!
-//! Wraps the create_netch / listen_tcp / connect_tcp / send_tcp /
-//! recv_tcp / close_handle dance behind a single owning handle.
-//! Reservation of the VA hint goes through [`SharedRegion`] (in the
-//! crate root) so the same shared-VA pool is shared with direct
-//! `shared_mmap` callers — no double-mapping, no leaked frames when a
-//! NetChannel closes.
+//! The kernel-side reconciler (in [`net_channel::NetChannel::update_tcp`])
+//! treats the binding as a sticky desired-state controller: server-mode
+//! channels stay in `Listen` continuously across sessions; client-retain
+//! channels keep `(addr, port)` connected with capped-exponential
+//! reconnect; one-shot variants do exactly one cycle and then go
+//! terminal. The binding is set once at [`NetCh::open`] and never
+//! mutates after.
 //!
-//! State machine the wrapper drives, mirroring `current_state.state`
-//! in the shared region:
+//! Per-session lifecycle is driven by a single shared-memory flag —
+//! [`NetChannelDesired::engaged`] — that the wrapper toggles on
+//! [`NetCh::next_session`] entry and [`Session`] drop. The kernel
+//! observes the `1 → 0` edge and recycles the smoltcp socket; for
+//! retain bindings, recycle immediately re-arms the listen / reconnect.
 //!
-//! ```text
-//!         [Idle (state == 0)]
-//!         /                  \
-//!  start_connect          start_listen
-//!     ↓                       ↓
-//!  desired_state=1         desired_state=2
-//!     ↓                       ↓
-//!  (kernel acks)            (peer connects)
-//!     ↓                       ↓
-//!     └─→ [Connected (state > 0)] ←─┘
-//!                  ↓
-//!              reset()
-//!                  ↓
-//!         [Idle] (ready for fresh start_*)
+//! ```ignore
+//! // server: re-listens automatically across peer sessions
+//! let nc = NetCh::open(
+//!     RING_CAPACITY, SockType::Tcp,
+//!     BindSpec::ServerRetain { port: 7777 })?;
+//!
+//! loop {
+//!     let s = nc.next_session()?;
+//!     handle(&s);                  // read/write through `s`
+//!     // dropping `s` disengages → kernel recycles, re-listens
+//! }
 //! ```
 //!
-//! Negative `current_state.state` values are sticky — the kernel signals
-//! a connection failure by writing a negative value, and the next
-//! `read`/`write` returns `EIO`. Recovery is `reset()` → fresh
-//! `start_listen`/`start_connect`.
+//! Single-thread accessor. `NetCh` has no internal thread sync (matches
+//! the rest of orbit-rt today); the [`AtomicBool`] in `in_session` only
+//! guards against accidental nested-session entry, not against true
+//! cross-thread races. Grep `FIXME(umode-threads)` for the wider issue.
 
-use core::{alloc::Layout, ptr::NonNull};
+extern crate alloc;
 
-use net_channel::{NetChannel, NC_MAX_REGION_SIZE, NC_MIN_REGION_SIZE};
+use core::{alloc::Layout, ptr::NonNull, sync::atomic::{AtomicBool, Ordering}};
+
+use alloc::vec::Vec;
+
+use net_channel::{BindSpec, NetChannel, NC_MAX_REGION_SIZE, NC_MIN_REGION_SIZE};
 use orbit_abi::{
     Errno, Fd,
     errno::{EAGAIN, EBUSY, EINVAL, EIO},
@@ -44,10 +49,10 @@ use orbit_abi::{
 
 use crate::SharedRegion;
 
-/// Default poll cadence for the blocking `connect`/`listen`/`reset`
-/// helpers. Matches orbit-loader's existing `POLL_SLEEP_MS`. Callers
-/// that want a different cadence can fall back to the non-blocking
-/// `start_*` variants and poll [`NetCh::state`] themselves.
+/// Default poll cadence for the blocking `next_session` / `Session::drop`
+/// helpers. Matches orbit-loader's prior `POLL_SLEEP_MS`. Callers that
+/// want a different cadence can poll the underlying state byte directly
+/// via [`NetCh::current_state`].
 pub const DEFAULT_POLL_MS: usize = 10;
 
 /// Owning handle over a NetChannel: VA reservation + kernel handle. On
@@ -55,33 +60,42 @@ pub const DEFAULT_POLL_MS: usize = 10;
 /// to [`crate::SHARED_VA`] so the range can be reused by a future
 /// NetChannel or shared mmap.
 ///
-/// Single-thread accessor: like the rest of orbit-rt, NetCh has no
-/// internal locking — sound on single-threaded umode, needs revisiting
-/// when umode grows threads (grep `FIXME(umode-threads)`).
+/// The binding is sticky for the life of the channel — there is no
+/// rebind path. To switch from listening to dialing (or vice versa),
+/// [`close`](Self::close) the channel and open a new one with the
+/// desired [`BindSpec`].
 pub struct NetCh {
     /// `None` iff the channel has been explicitly closed via
     /// [`NetCh::close`]. The wrapper is otherwise invariant: a live
-    /// NetCh always has a live region and matching kernel handle.
+    /// NetCh always has a live region, matching kernel handle, and
+    /// fixed binding spec.
     region: Option<SharedRegion>,
     descriptor: Fd,
     base: NonNull<NetChannel>,
+    /// Set while a [`Session`] guard is alive. Prevents nested
+    /// [`next_session`](Self::next_session) calls from racing each other
+    /// — single-threaded today, defense in depth for tomorrow.
+    in_session: AtomicBool,
 }
 
 impl NetCh {
     /// Open a NetChannel sized to hold at least `desired_ring_capacity`
-    /// payload bytes per direction, of the given `sock_type`.
+    /// payload bytes per direction, of the given `sock_type`, with the
+    /// given sticky binding `spec`.
     ///
     /// Picks a region size that satisfies the request (rounded up to a
     /// page or a megapage as appropriate), reserves a VA hint inside
     /// `UPROC_SHARED_BASE..UPROC_SHARED_END` from [`crate::SHARED_VA`],
     /// and asks the kernel to install the NetChannel mapping at that
-    /// VA. Returns `EINVAL` if `desired_ring_capacity` exceeds the
-    /// per-NetChannel cap, `ENOMEM` if the shared range is exhausted,
-    /// or whatever the create_netch syscall returns.
-    pub fn open(desired_ring_capacity: usize, sock_type: SockType) -> Result<Self, Errno> {
-        // Pick the smallest region size whose per-ring capacity covers
-        // the request, then round up to the page or megapage boundary
-        // so the VA reservation hits a clean alignment for the kernel.
+    /// VA *and* latch `spec` into its reconciler context. Returns
+    /// `EINVAL` if `desired_ring_capacity` exceeds the per-NetChannel
+    /// cap or `spec` was malformed, `ENOMEM` if the shared range is
+    /// exhausted, or whatever the create_netch syscall returns.
+    pub fn open(
+        desired_ring_capacity: usize,
+        sock_type: SockType,
+        spec: BindSpec,
+    ) -> Result<Self, Errno> {
         let region_size =
             pick_region_size(desired_ring_capacity).ok_or(Errno::new(EINVAL))?;
         let align = if region_size >= LARGE_PAGE as usize {
@@ -94,23 +108,20 @@ impl NetCh {
         let region = SharedRegion::reserve(layout)?;
         let vaddr_hint = region.va();
 
-        // create_netch returns the VA the kernel actually mapped at
-        // (today always the hint, but the ABI doesn't require it).
-        // Bail if it diverges so we don't end up with our hint reserved
-        // but the mapping somewhere else.
-        let (mapped_va, descriptor) = create_netch(vaddr_hint, region_size, sock_type as usize)?;
+        let (mapped_va, descriptor) = create_netch(
+            vaddr_hint, region_size, sock_type as usize, spec.pack(),
+        )?;
         if mapped_va != vaddr_hint {
             // Best-effort cleanup: tell the kernel to drop the mapping it
             // just installed elsewhere, then let `region` drop and return
-            // the VA reservation. Either failure (close or drop) leaves
-            // the process in a recoverable state.
+            // the VA reservation.
             let _ = close_handle(descriptor);
             return Err(Errno::new(EIO));
         }
 
         // SAFETY: the kernel installed a NetChannel at `vaddr_hint`,
-        // initialized via NetChannel::init, and the VA is in our
-        // address space — same satp as everything else in this thread.
+        // initialized via NetChannel::init, and the VA is in our address
+        // space — same satp as everything else in this thread.
         let base = NonNull::new(vaddr_hint as *mut NetChannel)
             .expect("create_netch returned non-null VA");
 
@@ -118,6 +129,7 @@ impl NetCh {
             region: Some(region),
             descriptor,
             base,
+            in_session: AtomicBool::new(false),
         })
     }
 
@@ -125,11 +137,9 @@ impl NetCh {
     /// channel has already been [`close`d](Self::close).
     pub fn channel(&self) -> &NetChannel {
         debug_assert!(self.region.is_some(), "NetCh used after close");
-        // SAFETY: `base` was validated at open and the kernel mapping
+        // SAFETY: `base` was validated at open; the kernel mapping
         // stays live until close_handle. `region.is_some()` is the
-        // wrapper's tombstone for "kernel handle still live"; callers
-        // that bypass the debug_assert in release builds get UB, which
-        // is what the panic in `unwrap` would catch in debug.
+        // wrapper's tombstone for "kernel handle still live."
         unsafe { self.base.as_ref() }
     }
 
@@ -139,27 +149,22 @@ impl NetCh {
         self.descriptor
     }
 
-    // ---- state inspection ------------------------------------------------
-
-    /// Raw `current_state.state`. `0` is idle, positive is connected,
-    /// negative is a sticky error signaled by the kernel.
-    pub fn state(&self) -> i32 {
+    /// Raw `current.state`. `0` is idle (server: kernel listening; client
+    /// retain: between reconnects), `1` is in-flight, `2` is an active
+    /// session, negative is a sticky terminal failure. Mostly useful for
+    /// diagnostics — normal callers go through [`next_session`].
+    pub fn current_state(&self) -> i32 {
         self.channel()
-            .current_state()
+            .current()
             .state
-            .load(core::sync::atomic::Ordering::Acquire)
+            .load(Ordering::Acquire)
     }
 
-    pub fn is_connected(&self) -> bool {
-        self.state() > 0
-    }
-
-    pub fn is_idle(&self) -> bool {
-        self.state() == 0
-    }
-
-    pub fn is_failed(&self) -> bool {
-        self.state() < 0
+    /// Sticky cause from [`current_state`](Self::current_state) when it
+    /// returns negative, otherwise `0`. Values are the `EBIND_*`
+    /// constants in [`net_channel`].
+    pub fn fail_cause(&self) -> i32 {
+        self.channel().current().fail_cause.load(Ordering::Acquire)
     }
 
     pub fn readable(&self) -> usize {
@@ -170,150 +175,39 @@ impl NetCh {
         self.channel().writeable()
     }
 
-    // ---- non-blocking state transitions ---------------------------------
-
-    /// Move from idle → connecting. Returns `EBUSY` if the channel is
-    /// not idle (already connecting/connected/in error). Non-blocking;
-    /// poll [`Self::state`] until it goes positive (connected) or
-    /// negative (failed), or use [`Self::connect`] for a blocking
-    /// variant.
-    pub fn start_connect(&self, addr: u32, port: u16) -> Result<(), Errno> {
-        self.channel()
-            .connect_tcp(addr, port)
-            .map_err(|()| Errno::new(EBUSY))
-    }
-
-    /// Move from idle → listening. Same blocking semantics as
-    /// [`Self::start_connect`].
-    pub fn start_listen(&self, port: u16) -> Result<(), Errno> {
-        self.channel()
-            .listen_tcp(port)
-            .map_err(|()| Errno::new(EBUSY))
-    }
-
-    // ---- blocking helpers ------------------------------------------------
-
-    /// Connect to `(addr, port)` and block until the kernel reports
-    /// success or failure. `EIO` on negative `current_state.state`.
-    pub fn connect(&self, addr: u32, port: u16) -> Result<(), Errno> {
-        self.start_connect(addr, port)?;
-        self.wait_for_link()
-    }
-
-    /// Listen on `port` and block until a peer connects. `EIO` on
-    /// negative `current_state.state`.
-    pub fn listen(&self, port: u16) -> Result<(), Errno> {
-        self.start_listen(port)?;
-        self.wait_for_link()
-    }
-
-    fn wait_for_link(&self) -> Result<(), Errno> {
+    /// Block until the kernel reports an active session (`current.state
+    /// >= 2`), then return a guard the caller reads/writes through.
+    /// The guard's `Drop` disengages, signalling the kernel to recycle
+    /// the smoltcp socket — for retain bindings, recycle immediately
+    /// re-arms the listen/connect; for one-shot bindings, recycle
+    /// transitions the channel to its terminal state.
+    ///
+    /// Returns `EBUSY` if a [`Session`] from this `NetCh` is already
+    /// alive, `EIO` if the channel is in a sticky-terminal state.
+    pub fn next_session(&self) -> Result<Session<'_>, Errno> {
+        if self.in_session.swap(true, Ordering::AcqRel) {
+            return Err(Errno::new(EBUSY));
+        }
+        // Engage *first* so the kernel sees us claiming the upcoming
+        // session before it considers any "no-claimer" recycle path
+        // (the reconciler doesn't actually have such a path today —
+        // recycling is gated on the 1→0 edge — but ordering this way
+        // means future kernel changes can't strand us mid-claim).
+        self.channel().engage();
         loop {
-            let s = self.state();
-            if s > 0 {
-                return Ok(());
+            let s = self.current_state();
+            if s >= 2 {
+                return Ok(Session { nc: self });
             }
             if s < 0 {
+                // Failed before we could claim: release the in-session
+                // guard and surface the error.
+                self.channel().disengage();
+                self.in_session.store(false, Ordering::Release);
                 return Err(Errno::new(EIO));
             }
             sleep_ms(DEFAULT_POLL_MS)?;
         }
-    }
-
-    // ---- I/O -------------------------------------------------------------
-
-    /// Read up to `dst.len()` bytes from the channel into `dst`.
-    /// Non-blocking: returns `Ok(n)` for the bytes copied, `EAGAIN` if
-    /// no data is currently available, `EIO` if the channel is in a
-    /// non-positive state (idle or failed).
-    pub fn read(&self, dst: &mut [u8]) -> Result<usize, Errno> {
-        if !self.is_connected() {
-            return Err(Errno::new(EIO));
-        }
-        self.channel()
-            .recv_tcp(|src| {
-                let n = src.len().min(dst.len());
-                if n == 0 {
-                    return 0;
-                }
-                src.sub(0, n).copy_to_slice(&mut dst[..n])
-            })
-            .map_err(map_io_err)
-    }
-
-    /// Write up to `src.len()` bytes to the channel.  Non-blocking:
-    /// returns `Ok(n)` for the bytes accepted (which may be smaller
-    /// than `src.len()` if the ring is partially full), `EAGAIN` if no
-    /// space is currently available, `EIO` on non-positive state.
-    pub fn write(&self, src: &[u8]) -> Result<usize, Errno> {
-        if !self.is_connected() {
-            return Err(Errno::new(EIO));
-        }
-        self.channel()
-            .send_tcp(|dst| {
-                let n = dst.len().min(src.len());
-                if n == 0 {
-                    return 0;
-                }
-                dst.sub(0, n).copy_from_slice(&src[..n])
-            })
-            .map_err(map_io_err)
-    }
-
-    /// Block until at least one byte transfers (or the channel breaks).
-    /// Convenience over [`Self::read`] for callers that don't have
-    /// their own poll loop. Distinct from `read_exact`-style: returns
-    /// as soon as *any* data is delivered.
-    pub fn read_some(&self, dst: &mut [u8]) -> Result<usize, Errno> {
-        loop {
-            match self.read(dst) {
-                Ok(0) => sleep_ms(DEFAULT_POLL_MS)?,
-                Ok(n) => return Ok(n),
-                Err(Errno(e)) if e == EAGAIN => sleep_ms(DEFAULT_POLL_MS)?,
-                Err(e) => return Err(e),
-            }
-        }
-    }
-
-    /// Block until every byte in `src` is delivered (or the channel
-    /// breaks). `EIO` if the channel transitions to a non-positive
-    /// state mid-flight.
-    pub fn write_all(&self, src: &[u8]) -> Result<(), Errno> {
-        let mut written = 0;
-        while written < src.len() {
-            match self.write(&src[written..]) {
-                Ok(0) => sleep_ms(DEFAULT_POLL_MS)?,
-                Ok(n) => written += n,
-                Err(Errno(e)) if e == EAGAIN => sleep_ms(DEFAULT_POLL_MS)?,
-                Err(e) => return Err(e),
-            }
-        }
-        Ok(())
-    }
-
-    // ---- recycle / teardown ---------------------------------------------
-
-    /// Run the reset handshake so this NetChannel can host a fresh
-    /// `start_listen`/`start_connect`. Blocks until the kernel has
-    /// torn down its half of the rings; callers that want non-blocking
-    /// recycling can drop straight to `request_reset` /
-    /// `complete_reset` on [`Self::channel`].
-    pub fn reset(&self) -> Result<(), Errno> {
-        self.channel()
-            .request_reset()
-            .map_err(|()| Errno::new(EBUSY))?;
-        while self.state() != 0 {
-            sleep_ms(DEFAULT_POLL_MS)?;
-        }
-        // SAFETY: NetCh is `&self`-only; the wrapper's no-thread
-        // invariant means there are no outstanding `recv_tcp`/`send_tcp`
-        // closures on this hart, and umode is single-threaded.
-        // FIXME(umode-threads): callers that share a NetCh across
-        // threads need to gate this on a "no in-flight closures" check.
-        unsafe {
-            self.channel().complete_reset();
-        }
-        Ok(())
     }
 
     /// Close the kernel handle and release the VA reservation.
@@ -329,15 +223,13 @@ impl NetCh {
         if self.region.is_none() {
             return Ok(());
         }
-        // Order matters: close_handle revokes the kernel-installed PTE
-        // *first*, so the VA frames we're about to free can't be
-        // observed under the old mapping by a future SharedVa
-        // consumer.
+        // close_handle revokes the kernel-installed PTE first, so the
+        // VA frames we're about to free can't be observed under the old
+        // mapping by a future SharedVa consumer.
         let result = close_handle(self.descriptor);
-        // Drop region — Drop on SharedRegion returns the frames to
-        // SHARED_VA. Even if close_handle failed (e.g., kernel says
-        // -EBADF because the handle was already torn down by process
-        // teardown), the VA reservation is ours to release.
+        // Even if close_handle failed (e.g. -EBADF because the handle
+        // was already torn down by process teardown), the VA reservation
+        // is ours to release.
         self.region = None;
         result
     }
@@ -351,14 +243,204 @@ impl Drop for NetCh {
     }
 }
 
-/// Map a `send_tcp`/`recv_tcp` negative-i32 return to an [`Errno`]:
-/// `-4` (no slot) and `-5` (increments full) translate to `EAGAIN`;
-/// every other negative value (channel state went non-positive
-/// mid-call) translates to `EIO`.
+/// Active-session guard handed back by [`NetCh::next_session`]. All I/O
+/// goes through this type so the kernel can rely on `desired.engaged`
+/// being a meaningful claim signal — drop the guard to release the
+/// session, and the kernel auto-recycles.
+///
+/// `Session` is a `&NetCh` borrow, not `&mut`, so the underlying NetCh
+/// stays usable for things like `current_state` queries during a
+/// session. The single-session-at-a-time invariant is enforced by the
+/// `NetCh::in_session` flag rather than the borrow checker.
+pub struct Session<'a> {
+    nc: &'a NetCh,
+}
+
+impl<'a> Session<'a> {
+    /// Read up to `dst.len()` bytes from the channel into `dst`.
+    /// Non-blocking: returns `Ok(n)` for the bytes copied, `EAGAIN` if
+    /// no data is currently available, `EIO` if the channel transitions
+    /// to a non-active state.
+    pub fn read(&self, dst: &mut [u8]) -> Result<usize, Errno> {
+        self.nc.channel()
+            .recv_tcp(|src| {
+                let n = src.len().min(dst.len());
+                if n == 0 {
+                    return 0;
+                }
+                src.sub(0, n).copy_to_slice(&mut dst[..n])
+            })
+            .map_err(map_io_err)
+    }
+
+    /// Write up to `src.len()` bytes to the channel. Non-blocking:
+    /// returns `Ok(n)` for the bytes accepted (which may be smaller
+    /// than `src.len()` if the ring is partially full), `EAGAIN` if no
+    /// space is currently available, `EIO` on non-active state.
+    pub fn write(&self, src: &[u8]) -> Result<usize, Errno> {
+        self.nc.channel()
+            .send_tcp(|dst| {
+                let n = dst.len().min(src.len());
+                if n == 0 {
+                    return 0;
+                }
+                dst.sub(0, n).copy_from_slice(&src[..n])
+            })
+            .map_err(map_io_err)
+    }
+
+    /// Block until at least one byte transfers (or the channel breaks).
+    /// Convenience over [`Self::read`] for callers that don't have
+    /// their own poll loop.
+    pub fn read_some(&self, dst: &mut [u8]) -> Result<usize, Errno> {
+        loop {
+            match self.read(dst) {
+                Ok(0) => sleep_ms(DEFAULT_POLL_MS)?,
+                Ok(n) => return Ok(n),
+                Err(Errno(e)) if e == EAGAIN => sleep_ms(DEFAULT_POLL_MS)?,
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Append the next staged slice (up to `cap_bytes`) onto `dst` in
+    /// one `recv_tcp` round-trip. Non-blocking: `Ok(0)` if no slice is
+    /// staged, `EAGAIN` for ring transients, `EIO` on sticky failure.
+    ///
+    /// Drains slice-at-a-time rather than chunk-at-a-time — the kernel
+    /// stages a slice covering the entire contiguous run of fresh rx
+    /// data (potentially tens of KiB). Bounded only by `cap_bytes` so a
+    /// huge staged slice can't OOM the consumer.
+    ///
+    /// Why not `Session::read`-into-a-`Vec` (resize first, then read)?
+    /// `read` clamps to `dst.len()` which the caller fixed up-front.
+    /// Slice-granularity drain needs the closure to see `src.len()` and
+    /// size the destination accordingly — that's what this method does.
+    pub fn read_into_vec(
+        &self,
+        dst: &mut Vec<u8>,
+        cap_bytes: usize,
+    ) -> Result<usize, Errno> {
+        self.nc.channel()
+            .recv_tcp(|src| {
+                let n = src.len().min(cap_bytes);
+                if n == 0 {
+                    return 0;
+                }
+                let start = dst.len();
+                // resize zeroes the appended region; copy_to_slice
+                // overwrites it. The double-write is one extra memset
+                // — cheap relative to the avoided round-trips.
+                dst.resize(start + n, 0);
+                src.sub(0, n).copy_to_slice(&mut dst[start..start + n])
+            })
+            .map_err(map_io_err)
+    }
+
+    /// Block until at least one byte is appended to `dst` (or the
+    /// channel breaks). Convenience over [`Self::read_into_vec`] for
+    /// drain-everything callers like the loader.
+    pub fn read_into_vec_some(
+        &self,
+        dst: &mut Vec<u8>,
+        cap_bytes: usize,
+    ) -> Result<usize, Errno> {
+        loop {
+            match self.read_into_vec(dst, cap_bytes) {
+                Ok(0) => sleep_ms(DEFAULT_POLL_MS)?,
+                Ok(n) => return Ok(n),
+                Err(Errno(e)) if e == EAGAIN => sleep_ms(DEFAULT_POLL_MS)?,
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Block until every byte in `src` is delivered (or the channel
+    /// breaks).
+    pub fn write_all(&self, src: &[u8]) -> Result<(), Errno> {
+        let mut written = 0;
+        while written < src.len() {
+            match self.write(&src[written..]) {
+                Ok(0) => sleep_ms(DEFAULT_POLL_MS)?,
+                Ok(n) => written += n,
+                Err(Errno(e)) if e == EAGAIN => sleep_ms(DEFAULT_POLL_MS)?,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
+    /// Peer's IPv4 address, populated by the kernel when the session
+    /// became active. For server bindings: whoever connected. For
+    /// client bindings: redundant with the bind params, exposed for
+    /// symmetry.
+    pub fn peer_addr(&self) -> u32 {
+        self.nc.channel().current().peer_addr.load(Ordering::Acquire)
+    }
+
+    /// Peer's TCP port (paired with [`peer_addr`](Self::peer_addr)).
+    pub fn peer_port(&self) -> u16 {
+        self.nc.channel().current().peer_port.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for Session<'_> {
+    fn drop(&mut self) {
+        // Signal disengagement; the kernel reconciler picks up the
+        // 1→0 edge on its next poll and starts recycling. Wait for
+        // the kernel to acknowledge by transitioning *out of state
+        // 2* — for ServerRetain the kernel goes 2 → 1 (re-listening
+        // immediately), for ClientRetain 2 → 0 (idle, awaiting next
+        // engage), for one-shot 2 → -1 (terminal). All of these
+        // mean "kernel has aborted the smoltcp socket and reset its
+        // ring halves," which is what we need before reset_user_side
+        // can run safely.
+        //
+        // Cap the wait at ~100 polls (~1s at DEFAULT_POLL_MS=10) so
+        // a wedged kernel can't hang the drop indefinitely.
+        let nc = self.nc;
+        nc.channel().disengage();
+
+        for _ in 0..100 {
+            if nc.current_state() != 2 {
+                break;
+            }
+            // Drop can't propagate `?`; ignore EINTR-equivalent errors
+            // from sleep_ms — kernel cap means it's bounded.
+            let _ = sleep_ms(DEFAULT_POLL_MS);
+        }
+
+        // SAFETY: `Session` owned exclusive access to the rings while
+        // it was alive, and the state-out-of-2 wait above observed
+        // the kernel's recycle. Kernel has reset_kernel_side'd in the
+        // disengage edge handler before flipping state away from 2.
+        unsafe { nc.channel().reset_user_side(); }
+
+        nc.in_session.store(false, Ordering::Release);
+    }
+}
+
+/// Map a `send_tcp`/`recv_tcp` non-success return to an [`Errno`].
+///
+/// `-4` / `-5` are ring-internal transients (no staged slice, or the
+/// increment ring is full) — caller retries.
+///
+/// `0` / `1` are *channel-state* transients — the channel was idle or
+/// in-flight when we sampled `current.state`. The single-thread
+/// invariant inside one process means an in-flight read can't normally
+/// observe a 2→0 (recycle) or 2→1 (server-retain re-listen) edge — but
+/// reserving these to EAGAIN keeps the wrapper correct under future
+/// cross-thread use, and matches the right semantic: "transient, retry"
+/// vs. "dead, give up." Without this, a benign mid-flight transition
+/// from a recycle path would terminate `read_some`/`write_all` with
+/// EIO instead of waiting it out.
+///
+/// Sticky-negative (anything else) is the real-failure path → EIO.
 fn map_io_err(e: isize) -> Errno {
     match e {
         -4 | -5 => Errno::new(EAGAIN),
-        _ => Errno::new(EIO),
+        0 | 1   => Errno::new(EAGAIN),
+        _       => Errno::new(EIO),
     }
 }
 
@@ -366,9 +448,6 @@ fn map_io_err(e: isize) -> Errno {
 /// capacity is at least `desired`. Returns `None` if `desired` exceeds
 /// the cap derived from [`NC_MAX_REGION_SIZE`].
 fn pick_region_size(desired: usize) -> Option<usize> {
-    // Two break points: one if a single page suffices (the floor), one
-    // if a megapage is required (capacity scales linearly with region
-    // size minus the fixed header).
     let min_capacity = NetChannel::capacity_for(NC_MIN_REGION_SIZE);
     if desired <= min_capacity {
         return Some(NC_MIN_REGION_SIZE);
@@ -377,10 +456,6 @@ fn pick_region_size(desired: usize) -> Option<usize> {
     if desired > max_capacity {
         return None;
     }
-    // capacity_for is monotonic in region size; normalize_region_size
-    // rounds up to a page. Pick a region roughly 2x the requested
-    // capacity (capacity is roughly half the region after the fixed
-    // header) and let normalize_region_size align it.
     let approx = desired.saturating_mul(2).next_multiple_of(PAGE_SIZE as usize);
     NetChannel::normalize_region_size(approx)
 }

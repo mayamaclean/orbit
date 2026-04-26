@@ -180,7 +180,7 @@ pub extern "C" fn k_hart_loop() -> ! {
 }
 
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct SocketReq {
     /// Refcounted handle on the NetChannel. Cloned from the registry when
     /// the manager enqueues the request; k_net drops its clone when the
@@ -188,25 +188,12 @@ pub struct SocketReq {
     netchan: SharedUserPtr<NetChannel>,
     nc_type: usize,
     pid: u16,
-    /// "A slice is enqueued on rx.slices and we haven't yet drained the
-    /// matching increment." Set when `update_tcp` enqueues an rx slice,
-    /// cleared when it drains an increment. Gates re-enqueue so we don't
-    /// race with the user's dequeue→f→increment sequence and deposit a
-    /// duplicate slice pointing at bytes smoltcp hasn't been told are
-    /// consumed yet.
-    pending_rx_ack: bool,
-    /// Same invariant on the tx side: set on enqueue of a tx slice,
-    /// cleared when we drain the user's send-ack increment.
-    pending_tx_ack: bool,
-    /// Last `desired_state.state` value the kernel issued a connect /
-    /// listen for. Keeps `update_tcp` level-triggered: if the user's
-    /// intent hasn't changed since we acted on it, we don't re-call
-    /// `socket.connect` / `socket.listen` just because smoltcp
-    /// transitioned back to CLOSED (e.g. RST from a peer with no
-    /// listener). `0` means "no intent pending" — matches the reset
-    /// path, so the existing idle sentinel doubles as the reset
-    /// marker.
-    issued_desired: i32,
+    /// Reconciler state: latched binding (sticky from create-time),
+    /// current phase, ring-ack flags, retain backoff. Threaded into
+    /// `NetChannel::update_tcp` each poll; the netchannel impl never
+    /// reads from shared memory for the binding params, only for the
+    /// per-session `engaged` flag.
+    ctx: net_channel::ChannelCtx,
 }
 
 impl orbit_core::net::RevocableConn for SocketReq {
@@ -345,17 +332,16 @@ pub extern "C" fn k_net(device: *mut NetPackage) {
             |h| { sockets.remove(h); },
         );
 
+        // ChannelCtx wants microseconds matching the iface clock — the
+        // iface is fed `Instant::from_micros(now / 10)` so the same
+        // unit applies here. Keep the shift in one place.
+        let now_us = (now / 10) as u64;
+
         for (sock_handle, req) in user_conns.iter_mut() {
             if let Some(nc) = req.netchan.try_as_ref() {
                 if req.nc_type == 0 {
                     let socket = sockets.get_mut::<smoltcp::socket::tcp::Socket>(*sock_handle);
-                    iface = nc.update_tcp(
-                        iface,
-                        socket,
-                        &mut req.pending_rx_ack,
-                        &mut req.pending_tx_ack,
-                        &mut req.issued_desired,
-                    );
+                    iface = nc.update_tcp(iface, socket, &mut req.ctx, now_us);
                 }
             }
             else {
@@ -374,10 +360,10 @@ pub extern "C" fn k_net(device: *mut NetPackage) {
             .map(|i| i.total_micros() as usize * 10)
             .unwrap_or(default_wake);
 
-        next_poll = wake_time;
+        next_poll = core::cmp::min(default_wake, wake_time);
 
         for q in socket_reqs.iter_mut() {
-            while let Some(req) = q.dequeue() {
+            while let Some(mut req) = q.dequeue() {
                 info!("net: processing req {req:?}");
 
                 if req.nc_type == 0 {
@@ -389,10 +375,35 @@ pub extern "C" fn k_net(device: *mut NetPackage) {
                     let tx_buffer = RingBuffer::new(txr);
                     let rx_buffer = RingBuffer::new(rxr);
 
-                    let sock = smoltcp::socket::tcp::Socket::new(rx_buffer, tx_buffer);
+                    let mut sock = smoltcp::socket::tcp::Socket::new(rx_buffer, tx_buffer);
+                    // Keep-alive: smoltcp emits an ACK with current
+                    // window after this interval of socket-level
+                    // silence. Doubles as the window-update piggyback
+                    // we need when peer has stalled mid-burst (drained
+                    // rx buffer, no new data → smoltcp's window_to_update
+                    // heuristic doesn't fire on its own, peer parks on
+                    // RTO backoff). 100 ms is short enough to nudge peer
+                    // before its RTO doubles to noticeable territory,
+                    // long enough to not flood normal traffic with
+                    // probes (steady-state ACKs reset the timer anyway).
+                    sock.set_keep_alive(Some(smoltcp::time::Duration::from_millis(100)));
                     let handle = sockets.add(sock);
 
                     info!("net: created tcp socket: {handle:?}");
+
+                    // Arm the smoltcp socket *now*, in the same iteration
+                    // we created it, so the very next `iface.poll` sees
+                    // a Listening (or SynSent) socket — not a freshly-
+                    // CLOSED one. Without this, any SYN that lands
+                    // between this iteration's poll and the next
+                    // iteration's update_tcp call gets RST'd. That's
+                    // the "first few attempts at connecting fail" race
+                    // — closed-window of one iface poll.
+                    if let Some(nc) = req.netchan.try_as_ref() {
+                        let socket = sockets.get_mut::<smoltcp::socket::tcp::Socket>(handle);
+                        iface = nc.update_tcp(iface, socket, &mut req.ctx, now_us);
+                    }
+
                     user_conns.insert(handle, req);
 
                     next_poll = 0;

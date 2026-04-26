@@ -14,6 +14,7 @@ use crate::{
     CloseHandleReq, CreateProcessReq, CreateThreadReq, Hardware, MemMapReq,
     NetChannelCreationReq, PAGE_SIZE, PendingWork, SyscallOutcome,
 };
+use net_channel::BindSpec;
 
 /// Cap on `sleep_ms(ms)` arguments. Anything at or above this returns
 /// `-EINVAL` without touching thread state.
@@ -114,10 +115,18 @@ pub fn nc_create_req<H: Hardware>(
     frame: &TrapFrame,
     hw: &mut H,
 ) -> SyscallOutcome {
+    // BindSpec is packed into a4 by the user-side wrapper. Reject
+    // garbage at the boundary so the manager's run_nc_create_req can
+    // assume well-formed input.
+    let bind = match BindSpec::unpack(frame.regs[14]) {
+        Some(b) => b,
+        None => return SyscallOutcome::Return { ret: Errno::new(EINVAL).to_ret() },
+    };
     let req = NetChannelCreationReq {
         nc_vaddr: frame.regs[11],
         region_size: frame.regs[12],
         nc_type: frame.regs[13],
+        bind,
     };
     // NetChannels are always shared (the kernel keeps a KDMAP alias to
     // drive smoltcp). Reject any VA outside the shared range so the

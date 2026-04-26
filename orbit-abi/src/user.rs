@@ -222,17 +222,23 @@ pub unsafe fn mmap(hint_va: usize, len: usize, perms: usize, share_with_kernel: 
 }
 
 /// Create a NetChannel region of `region_size` bytes at `vaddr_hint`,
-/// as a socket of `sock_type`. On success returns `Ok((user_va, fd))`
-/// — the VA the region landed at and the Fd the kernel assigned (pass
-/// to [`close_handle`] to tear the channel down).
+/// as a socket of `sock_type`. `bind_spec` is the `BindSpec::pack()`
+/// representation of the sticky binding the kernel will latch for this
+/// channel — the kernel rejects malformed packings at the syscall
+/// boundary, so the wrapper just forwards the bits.
+///
+/// On success returns `Ok((user_va, fd))` — the VA the region landed at
+/// and the Fd the kernel assigned (pass to [`close_handle`] to tear the
+/// channel down).
 #[inline]
 pub fn create_netch(
     vaddr_hint: usize,
     region_size: usize,
     sock_type: usize,
+    bind_spec: usize,
 ) -> Result<(usize, u32), Errno> {
     let (r0, r1) = unsafe {
-        ecall4_ret2(syscall::CREATE_NETCH, vaddr_hint, region_size, sock_type, 0)
+        ecall4_ret2(syscall::CREATE_NETCH, vaddr_hint, region_size, sock_type, bind_spec)
     };
     Errno::from_ret(r0).map(|va| (va, r1 as u32))
 }

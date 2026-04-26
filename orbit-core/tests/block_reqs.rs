@@ -99,6 +99,8 @@ fn nc_create_req_marshals_args_and_blocks() {
     frame.regs[11] = SHARED_VA;
     frame.regs[12] = 4096;
     frame.regs[13] = 0;
+    let bind = net_channel::BindSpec::ServerRetain { port: 7777 };
+    frame.regs[14] = bind.pack();
 
     let outcome = syscall::nc_create_req(&mut t, &frame, &mut hw);
 
@@ -112,10 +114,34 @@ fn nc_create_req_marshals_args_and_blocks() {
             assert_eq!(req.nc_vaddr, SHARED_VA);
             assert_eq!(req.region_size, 4096);
             assert_eq!(req.nc_type, 0);
+            assert_eq!(req.bind, bind);
             assert_eq!(*pid, t.pid);
         }
         other => panic!("unexpected pending work: {other:?}"),
     }
+}
+
+#[test]
+fn nc_create_req_rejects_malformed_bind_spec() {
+    // Mode tag 0 (or any unknown value) in the packed BindSpec must be
+    // rejected at the syscall boundary so the manager never sees a
+    // bogus `req.bind`.
+    let mut t = make_thread(ThreadState::Running, SPP::User);
+    let mut frame = make_frame();
+    let mut hw = FakeHw::default();
+    frame.regs[11] = SHARED_VA;
+    frame.regs[12] = 4096;
+    frame.regs[13] = 0;
+    frame.regs[14] = 0;  // mode 0 = invalid
+
+    let outcome = syscall::nc_create_req(&mut t, &frame, &mut hw);
+
+    assert_eq!(
+        outcome,
+        SyscallOutcome::Return { ret: Errno::new(EINVAL).to_ret() }
+    );
+    assert!(t.handle.is_none());
+    assert!(hw.pending_work.is_empty());
 }
 
 #[test]
