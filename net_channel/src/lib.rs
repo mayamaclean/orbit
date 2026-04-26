@@ -442,6 +442,38 @@ impl ChannelCtx {
     }
 }
 
+/// User-visible side effects of a single [`NetChannel::update_tcp`]
+/// poll. The kernel net loop reads this to decide whether the
+/// channel's owner thread should be woken now (via the kernel's
+/// `WAKE_QUEUE`) instead of waiting for the user thread's own poll
+/// cadence. `#[must_use]` catches the "called update_tcp and forgot
+/// to act on the outcome" mistake at compile time — the kind of
+/// thing that costs a week of mystery latency.
+#[cfg(feature = "kernel")]
+#[must_use]
+#[derive(Default, Clone, Copy, Debug)]
+pub struct UpdateOutcome {
+    /// `current.state` was written to a new value (Listening→Active,
+    /// recycle, Failed, etc.). User threads parked on `next_session`
+    /// or `wait_for_link` care about this.
+    pub session_state_changed: bool,
+    /// User-visible ring state moved: a fresh rx slice was staged
+    /// (user can read more), or a tx increment was drained / tx
+    /// avail grew (user's blocked write has space). User threads
+    /// in `read_some` / `write_all`'s sleep loops care.
+    pub ring_progress: bool,
+}
+
+#[cfg(feature = "kernel")]
+impl UpdateOutcome {
+    /// True if the owner thread should be woken (i.e. the kernel
+    /// observed something it would otherwise have spin-polled for
+    /// at the user-side `sleep_ms` cadence).
+    pub fn should_wake_user(self) -> bool {
+        self.session_state_changed || self.ring_progress
+    }
+}
+
 /// Capped exponential backoff for client-retain reconnects. Doubles per
 /// failure starting at 100 ms, caps at 30 s.
 #[cfg(feature = "kernel")]
@@ -732,9 +764,10 @@ impl NetChannel {
         socket: &mut smoltcp::socket::tcp::Socket,
         ctx: &mut ChannelCtx,
         now_us: u64,
-    ) -> Interface {
+    ) -> (Interface, UpdateOutcome) {
         let cur = self.current();
         let des = self.desired();
+        let mut outcome = UpdateOutcome::default();
 
         let engaged = des.engaged.load(Ordering::Acquire) != 0;
         let was_engaged = ctx.last_engaged;
@@ -750,7 +783,7 @@ impl NetChannel {
         // Sticky terminal: nothing the reconciler does can leave Failed
         // until the channel itself is torn down.
         if matches!(ctx.phase, Phase::Failed) {
-            return iface;
+            return (iface, outcome);
         }
 
         // ── Disengage edge: user just released the session ──────────────
@@ -775,31 +808,33 @@ impl NetChannel {
                         error!("tcp: re-listen({port}) failed after recycle: {e:?}");
                         cur.fail_cause.store(EBIND_LISTEN as i32, Ordering::Release);
                         cur.state.store(-1, Ordering::Release);
+                        outcome.session_state_changed = true;
                         ctx.phase = Phase::Failed;
-                        return iface;
+                        return (iface, outcome);
                     }
                     info!("netch[ServerRetain port={port}]: re-armed listen, phase=Listening state=1");
                     ctx.phase = Phase::Listening;
                     cur.state.store(1, Ordering::Release);
+                    outcome.session_state_changed = true;
                 }
                 BindSpec::ClientRetain { .. } => {
-                    // Loop back to FreshIdle; the client-retain arm
-                    // below schedules the next dial subject to backoff.
                     info!("netch[{:?}]: phase=FreshIdle (retain re-dial pending)", ctx.bind);
                     ctx.phase = Phase::FreshIdle;
                     ctx.backoff_ms = 0;
                     ctx.next_attempt_at_us = 0;
                     cur.state.store(0, Ordering::Release);
+                    outcome.session_state_changed = true;
                 }
                 BindSpec::ServerOneShot { .. } | BindSpec::ClientOneShot { .. } => {
                     info!("netch[{:?}]: one-shot done, phase=Failed", ctx.bind);
                     cur.fail_cause.store(EBIND_DONE as i32, Ordering::Release);
                     cur.state.store(-1, Ordering::Release);
+                    outcome.session_state_changed = true;
                     ctx.phase = Phase::Failed;
-                    return iface;
+                    return (iface, outcome);
                 }
             }
-            return iface;
+            return (iface, outcome);
         }
 
         // ── First poll for this binding: arm the smoltcp side ──────────
@@ -810,12 +845,14 @@ impl NetChannel {
                         error!("tcp: listen({port}) failed at bind: {e:?}");
                         cur.fail_cause.store(EBIND_LISTEN as i32, Ordering::Release);
                         cur.state.store(-1, Ordering::Release);
+                        outcome.session_state_changed = true;
                         ctx.phase = Phase::Failed;
-                        return iface;
+                        return (iface, outcome);
                     }
                     info!("netch[{:?}]: armed listen({port}), phase=Listening state=1", ctx.bind);
                     ctx.phase = Phase::Listening;
                     cur.state.store(1, Ordering::Release);
+                    outcome.session_state_changed = true;
                 }
                 BindSpec::ClientRetain { addr, port } => {
                     if now_us >= ctx.next_attempt_at_us {
@@ -823,27 +860,27 @@ impl NetChannel {
                             info!("netch[ClientRetain addr={addr:#x} port={port}]: dialed, phase=Connecting state=1");
                             ctx.phase = Phase::Connecting;
                             cur.state.store(1, Ordering::Release);
+                            outcome.session_state_changed = true;
                         } else {
                             schedule_retry(ctx, now_us);
                             info!("netch[ClientRetain addr={addr:#x} port={port}]: dial failed, retry in {}ms", ctx.backoff_ms);
                         }
                     }
-                    // else: silently waiting for backoff timer
                 }
                 BindSpec::ClientOneShot { addr, port } => {
-                    // Wait until the user engages before dialing; that's
-                    // the cue that they're ready to handle the result.
                     if engaged {
                         if try_connect(&mut iface, socket, addr, port).is_ok() {
                             info!("netch[ClientOneShot addr={addr:#x} port={port}]: dialed, phase=Connecting state=1");
                             ctx.phase = Phase::Connecting;
                             cur.state.store(1, Ordering::Release);
+                            outcome.session_state_changed = true;
                         } else {
                             error!("netch[ClientOneShot addr={addr:#x} port={port}]: dial failed at bind, phase=Failed");
                             cur.fail_cause.store(EBIND_CONNECT as i32, Ordering::Release);
                             cur.state.store(-1, Ordering::Release);
+                            outcome.session_state_changed = true;
                             ctx.phase = Phase::Failed;
-                            return iface;
+                            return (iface, outcome);
                         }
                     }
                 }
@@ -861,6 +898,7 @@ impl NetChannel {
                   ctx.bind, pa, pp, socket.state());
             ctx.phase = Phase::Active;
             cur.state.store(2, Ordering::Release);
+            outcome.session_state_changed = true;
         }
 
         // ── Connecting: handshake done OR fell back to Closed (RST) ────
@@ -875,22 +913,25 @@ impl NetChannel {
                 ctx.backoff_ms = 0;
                 ctx.next_attempt_at_us = 0;
                 cur.state.store(2, Ordering::Release);
+                outcome.session_state_changed = true;
             } else if socket.state() == TcpState::Closed {
                 match ctx.bind {
                     BindSpec::ClientOneShot { .. } => {
                         info!("netch[{:?}]: connect failed (RST/timeout), phase=Failed", ctx.bind);
                         cur.fail_cause.store(EBIND_CONNECT as i32, Ordering::Release);
                         cur.state.store(-1, Ordering::Release);
+                        outcome.session_state_changed = true;
                         ctx.phase = Phase::Failed;
-                        return iface;
+                        return (iface, outcome);
                     }
                     BindSpec::ClientRetain { .. } => {
                         ctx.phase = Phase::FreshIdle;
                         schedule_retry(ctx, now_us);
                         cur.state.store(0, Ordering::Release);
+                        outcome.session_state_changed = true;
                         info!("netch[{:?}]: connect failed, retry in {}ms", ctx.bind, ctx.backoff_ms);
                     }
-                    _ => {} // server bindings can't be in Connecting
+                    _ => {}
                 }
             }
         }
@@ -907,8 +948,9 @@ impl NetChannel {
                         error!("tcp: failed recv: {e:?}");
                         cur.fail_cause.store(EBIND_IO as i32, Ordering::Release);
                         cur.state.store(-1, Ordering::Release);
+                        outcome.session_state_changed = true;
                         ctx.phase = Phase::Failed;
-                        return iface;
+                        return (iface, outcome);
                     }
                     ctx.pending_rx_ack = false;
                 }
@@ -921,6 +963,9 @@ impl NetChannel {
                         core::sync::atomic::fence(Ordering::SeqCst);
                         rx.avail.store(next_rx.1, Ordering::Release);
                         ctx.pending_rx_ack = true;
+                        // New rx slice is visible to the user — anyone
+                        // parked in `read_some` should run.
+                        outcome.ring_progress = true;
                     }
                 }
             }
@@ -932,8 +977,9 @@ impl NetChannel {
                         error!("tcp: failed send: {e:?}");
                         cur.fail_cause.store(EBIND_IO as i32, Ordering::Release);
                         cur.state.store(-1, Ordering::Release);
+                        outcome.session_state_changed = true;
                         ctx.phase = Phase::Failed;
-                        return iface;
+                        return (iface, outcome);
                     }
                     ctx.pending_tx_ack = false;
                 }
@@ -946,12 +992,15 @@ impl NetChannel {
                         core::sync::atomic::fence(Ordering::SeqCst);
                         tx.avail.store(next_tx.1, Ordering::Release);
                         ctx.pending_tx_ack = true;
+                        // Fresh tx slice = user has writeable space —
+                        // anyone parked in `write_all` should run.
+                        outcome.ring_progress = true;
                     }
                 }
             }
         }
 
-        iface
+        (iface, outcome)
     }
 
     #[cfg(not(feature = "kernel"))]

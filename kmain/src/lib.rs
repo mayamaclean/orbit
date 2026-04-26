@@ -352,7 +352,23 @@ pub extern "C" fn k_net(device: *mut NetPackage) {
             if let Some(nc) = req.netchan.try_as_ref() {
                 if req.nc_type == 0 {
                     let socket = sockets.get_mut::<smoltcp::socket::tcp::Socket>(*sock_handle);
-                    iface = nc.update_tcp(iface, socket, &mut req.ctx, now_us);
+                    let (iface_back, outcome) =
+                        nc.update_tcp(iface, socket, &mut req.ctx, now_us);
+                    iface = iface_back;
+                    // If the user-visible state of the channel just
+                    // changed (state byte moved, fresh rx slice staged,
+                    // tx slice freed), push a WakeEvent so the manager
+                    // wakes the owner thread now instead of letting it
+                    // miss the change and spin on its own sleep cadence.
+                    // `Pid` is coarse — wakes every thread of the
+                    // process — but cheap and correct (each thread re-
+                    // checks its park condition and re-sleeps if not
+                    // actually ready).
+                    if outcome.should_wake_user() {
+                        let _ = crate::kernel::WAKE_QUEUE.push(
+                            crate::kernel::WakeEvent::Pid(req.pid),
+                        );
+                    }
                 }
             }
             else {
@@ -410,7 +426,17 @@ pub extern "C" fn k_net(device: *mut NetPackage) {
                     // — closed-window of one iface poll.
                     if let Some(nc) = req.netchan.try_as_ref() {
                         let socket = sockets.get_mut::<smoltcp::socket::tcp::Socket>(handle);
-                        iface = nc.update_tcp(iface, socket, &mut req.ctx, now_us);
+                        let (iface_back, outcome) =
+                            nc.update_tcp(iface, socket, &mut req.ctx, now_us);
+                        iface = iface_back;
+                        // First-poll arm typically writes state=1
+                        // (Listening / SynSent) — wake the owner that
+                        // may already be parked on `next_session`.
+                        if outcome.should_wake_user() {
+                            let _ = crate::kernel::WAKE_QUEUE.push(
+                                crate::kernel::WakeEvent::Pid(req.pid),
+                            );
+                        }
                     }
 
                     user_conns.insert(handle, req);
