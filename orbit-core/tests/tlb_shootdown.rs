@@ -45,7 +45,7 @@ fn single_target_push_drain_ack_roundtrip() {
         let mut hw = FakeHw::default();
         tlb_shootdown(
             1,
-            core::iter::once((2u32, &RING)),
+            core::iter::once((2, &RING)),
             0x4000_0000,
             4096,
             &mut hw,
@@ -75,7 +75,7 @@ fn multi_target_each_acks_once() {
 
     let h = thread::spawn(|| {
         let mut hw = FakeHw::default();
-        let targets = [(0u32, &R0), (1u32, &R1), (2u32, &R2)];
+        let targets = [(0, &R0), (1, &R1), (2, &R2)];
         let r = tlb_shootdown(3, targets, 0xc0de_0000, 0x1000, &mut hw);
         (r, hw.wakes)
     });
@@ -122,7 +122,7 @@ fn ring_full_returns_failed_count_after_other_acks() {
     // and only block on the open one.
     let h = thread::spawn(|| {
         let mut hw = FakeHw::default();
-        let targets = [(7u32, &FULL_RING), (8u32, &OPEN_RING)];
+        let targets = [(7, &FULL_RING), (8, &OPEN_RING)];
         tlb_shootdown(2, targets, 0x9000_0000, 0x1000, &mut hw)
     });
 
@@ -177,7 +177,7 @@ fn concurrent_senders_one_target() {
                 loop {
                     let r = tlb_shootdown(
                         1,
-                        core::iter::once((0u32, &TARGET)),
+                        core::iter::once((0, &TARGET)),
                         va,
                         4096,
                         &mut hw,
@@ -250,7 +250,7 @@ fn one_sender_concurrent_drainers() {
             .collect();
 
         let mut hw = FakeHw::default();
-        let targets = [(0u32, &R0), (1u32, &R1), (2u32, &R2), (3u32, &R3)];
+        let targets = [(0, &R0), (1, &R1), (2, &R2), (3, &R3)];
         let result = tlb_shootdown(4, targets, va, 4096, &mut hw);
         assert_eq!(result, Ok(()));
 

@@ -17,6 +17,8 @@ pub const CREATE_NETCH:    usize = 4097;
 pub const CLOSE_HANDLE:    usize = 4098;
 pub const CREATE_PROCESS:  usize = 4099;
 pub const NC_YIELD:        usize = 4100;
+pub const QUERY_STATS:         usize = 4101;
+pub const QUERY_SYSCALL_STATS: usize = 4102;
 
 // 5000+ — multi-thread / SMP control plane. Numbered out of the 4096
 // block so the categorical split is obvious in dispatch tables and so
@@ -40,6 +42,8 @@ pub enum Sysno {
     CloseHandle    = CLOSE_HANDLE,
     CreateProcess  = CREATE_PROCESS,
     NcYield        = NC_YIELD,
+    QueryStats        = QUERY_STATS,
+    QuerySyscallStats = QUERY_SYSCALL_STATS,
     CreateThread   = CREATE_THREAD,
 }
 
@@ -59,10 +63,44 @@ impl Sysno {
             CLOSE_HANDLE   => Self::CloseHandle,
             CREATE_PROCESS => Self::CreateProcess,
             NC_YIELD       => Self::NcYield,
+            QUERY_STATS         => Self::QueryStats,
+            QUERY_SYSCALL_STATS => Self::QuerySyscallStats,
             CREATE_THREAD  => Self::CreateThread,
             _              => return None,
         })
     }
+
+    /// Stable, dense ordinal for stats tables. Tied to the order of
+    /// `match` arms below — append-only, never reorder. The raw
+    /// syscall-number space is sparse (0-7, 4096-4102, 5000) so we
+    /// can't use it as an array index.
+    pub const fn ordinal(self) -> usize {
+        match self {
+            Self::Exit              => 0,
+            Self::SerialPrint       => 1,
+            Self::SleepMs           => 2,
+            Self::ConsoleWrite      => 3,
+            Self::ReadStdin         => 4,
+            Self::SetAffinity       => 5,
+            Self::GetAffinity       => 6,
+            Self::GetHartId         => 7,
+            Self::Mmap              => 8,
+            Self::CreateNetch       => 9,
+            Self::CloseHandle       => 10,
+            Self::CreateProcess     => 11,
+            Self::NcYield           => 12,
+            Self::QueryStats        => 13,
+            Self::QuerySyscallStats => 14,
+            Self::CreateThread      => 15,
+        }
+    }
+
+    /// Number of distinct ordinals returned by [`Self::ordinal`]. Pinned
+    /// so the per-syscall stats table size is part of the ABI; bump
+    /// when adding a `Sysno` variant. Older userland with a smaller
+    /// COUNT reads a prefix of the kernel's table; newer userland with
+    /// a larger COUNT treats the kernel's missing slots as zero.
+    pub const COUNT: usize = 16;
 }
 
 #[cfg(test)]
@@ -84,6 +122,8 @@ mod tests {
         assert_eq!(Sysno::from_usize(CLOSE_HANDLE), Some(Sysno::CloseHandle));
         assert_eq!(Sysno::from_usize(CREATE_PROCESS), Some(Sysno::CreateProcess));
         assert_eq!(Sysno::from_usize(NC_YIELD),       Some(Sysno::NcYield));
+        assert_eq!(Sysno::from_usize(QUERY_STATS),         Some(Sysno::QueryStats));
+        assert_eq!(Sysno::from_usize(QUERY_SYSCALL_STATS), Some(Sysno::QuerySyscallStats));
         assert_eq!(Sysno::from_usize(CREATE_THREAD),  Some(Sysno::CreateThread));
     }
 
@@ -91,7 +131,7 @@ mod tests {
     fn unknown_returns_none() {
         assert_eq!(Sysno::from_usize(8), None);
         assert_eq!(Sysno::from_usize(4095), None);
-        assert_eq!(Sysno::from_usize(4101), None);
+        assert_eq!(Sysno::from_usize(4103), None);
         assert_eq!(Sysno::from_usize(4999), None);
         assert_eq!(Sysno::from_usize(5001), None);
         assert_eq!(Sysno::from_usize(usize::MAX), None);
@@ -111,8 +151,10 @@ mod tests {
         assert_eq!(Sysno::CreateNetch   as usize, CREATE_NETCH);
         assert_eq!(Sysno::CloseHandle   as usize, CLOSE_HANDLE);
         assert_eq!(Sysno::CreateProcess as usize, CREATE_PROCESS);
-        assert_eq!(Sysno::NcYield       as usize, NC_YIELD);
-        assert_eq!(Sysno::CreateThread  as usize, CREATE_THREAD);
+        assert_eq!(Sysno::NcYield           as usize, NC_YIELD);
+        assert_eq!(Sysno::QueryStats        as usize, QUERY_STATS);
+        assert_eq!(Sysno::QuerySyscallStats as usize, QUERY_SYSCALL_STATS);
+        assert_eq!(Sysno::CreateThread      as usize, CREATE_THREAD);
     }
 
     #[test]
@@ -132,5 +174,31 @@ mod tests {
         assert_eq!(CLOSE_HANDLE, 4098);
         assert_eq!(CREATE_PROCESS, 4099);
         assert_eq!(NC_YIELD, 4100);
+        assert_eq!(QUERY_STATS, 4101);
+        assert_eq!(QUERY_SYSCALL_STATS, 4102);
+        assert_eq!(CREATE_THREAD, 5000);
+    }
+
+    #[test]
+    fn ordinals_are_dense_and_unique() {
+        // Iterate every variant via from_usize so we can't forget to
+        // update the test when adding a Sysno.
+        let all = [
+            Sysno::Exit, Sysno::SerialPrint, Sysno::SleepMs,
+            Sysno::ConsoleWrite, Sysno::ReadStdin, Sysno::SetAffinity,
+            Sysno::GetAffinity, Sysno::GetHartId, Sysno::Mmap,
+            Sysno::CreateNetch, Sysno::CloseHandle, Sysno::CreateProcess,
+            Sysno::NcYield, Sysno::QueryStats, Sysno::QuerySyscallStats,
+            Sysno::CreateThread,
+        ];
+        assert_eq!(all.len(), Sysno::COUNT);
+        let mut seen = [false; Sysno::COUNT];
+        for s in all {
+            let o = s.ordinal();
+            assert!(o < Sysno::COUNT, "ordinal {} >= COUNT {}", o, Sysno::COUNT);
+            assert!(!seen[o], "ordinal {} repeated", o);
+            seen[o] = true;
+        }
+        assert!(seen.iter().all(|x| *x), "ordinal range has gaps");
     }
 }

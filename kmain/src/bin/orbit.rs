@@ -243,6 +243,9 @@ extern "C" fn s_trap(
                     4100 => {
                         kmain::handle_nc_yield(epc, hart_context, frame);
                     }
+                    4101 => {
+                        kmain::handle_query_stats(epc, hart_context, frame);
+                    }
                     5000 => {
                         debug!("orbit handling u mode ecall({syscall})");
                         kmain::handle_create_thread(epc, hart_context, frame);

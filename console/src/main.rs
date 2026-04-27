@@ -27,8 +27,9 @@ use core::panic::PanicInfo;
 
 use orbit_abi::{
     logln,
-    user::{console_write, exit, read_stdin, sleep_ms, SerialWriter},
+    user::{console_write, exit, query_stats, read_stdin, sleep_ms, SerialWriter},
 };
+use core::fmt::Write;
 
 const PROMPT: &[u8] = b"console$ ";
 
@@ -111,6 +112,95 @@ impl LineEditor {
     }
 }
 
+/// Snapshot the kernel's view of this process and dump it in a
+/// `top`-ish two-column format. Time fields are displayed even when
+/// the kernel returns 0 — Phase 2 wires the per-hart bucket state
+/// machine that populates them.
+fn stats_cmd() {
+    let stats = match query_stats() {
+        Ok(s) => s,
+        Err(e) => {
+            let mut w = LineWriter::new();
+            let _ = writeln!(w, "stats: query_stats failed (errno {})", e.0);
+            w.flush();
+            return;
+        }
+    };
+
+    // 10 MHz `time` CSR on qemu-virt — divide by 10_000 for ms.
+    let ms = |ticks: u64| ticks / 10_000;
+
+    let mut w = LineWriter::new();
+    let _ = writeln!(w, "process:");
+    let _ = writeln!(w, "  pid              {}", stats.pid);
+    let _ = writeln!(w, "  threads          {}", stats.thread_count);
+    let _ = writeln!(w, "  cpu_ms           {}", ms(stats.cpu_ticks));
+    let _ = writeln!(w, "  syscall_ms       {}", ms(stats.syscall_ticks));
+    let _ = writeln!(w, "  syscalls         {}", stats.syscalls);
+    let _ = writeln!(w, "  ctx_switches     {}", stats.context_switches);
+    let _ = writeln!(w, "  resident         {}", HumanBytes(stats.resident_bytes));
+    let _ = writeln!(w, "  heap             {}", HumanBytes(stats.heap_bytes));
+    let _ = writeln!(w, "kernel pools:");
+    let _ = writeln!(w, "  kpages           {}", HumanBytes(stats.kernel_kpages_bytes));
+    let _ = writeln!(w, "  user_pages       {}", HumanBytes(stats.kernel_user_pages_bytes));
+    let _ = writeln!(w, "  ktables          {}", HumanBytes(stats.kernel_ktables_bytes));
+    let _ = writeln!(w, "  kheap            {}", HumanBytes(stats.kernel_heap_bytes));
+    let _ = writeln!(w, "harts (system-wide):");
+    let _ = writeln!(w, "  user_ms          {}", ms(stats.hart_user_ticks));
+    let _ = writeln!(w, "  kernel_ms        {}", ms(stats.hart_kernel_ticks));
+    let _ = writeln!(w, "  scheduler_ms     {}", ms(stats.hart_scheduler_ticks));
+    let _ = writeln!(w, "  idle_ms          {}", ms(stats.hart_idle_ticks));
+    w.flush();
+}
+
+/// `Display` shim for byte counts. Picks B / KiB / MiB based on the
+/// magnitude — keeps the column width predictable without forcing the
+/// user to count digits.
+struct HumanBytes(u64);
+
+impl core::fmt::Display for HumanBytes {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        const KIB: u64 = 1024;
+        const MIB: u64 = 1024 * 1024;
+        if self.0 >= MIB {
+            write!(f, "{} MiB", self.0 / MIB)
+        } else if self.0 >= KIB {
+            write!(f, "{} KiB", self.0 / KIB)
+        } else {
+            write!(f, "{} B", self.0)
+        }
+    }
+}
+
+/// Line-buffered writer over `write_chunked`. SerialWriter goes through
+/// the kernel serial back-channel; this one writes through the
+/// framebuffer scrollback path that the rest of the console uses.
+struct LineWriter {
+    buf: [u8; 256],
+    len: usize,
+}
+
+impl LineWriter {
+    const fn new() -> Self { Self { buf: [0u8; 256], len: 0 } }
+    fn flush(&mut self) {
+        if self.len > 0 {
+            write_chunked(&self.buf[..self.len]);
+            self.len = 0;
+        }
+    }
+}
+
+impl core::fmt::Write for LineWriter {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        for &b in s.as_bytes() {
+            if self.len == self.buf.len() { self.flush(); }
+            self.buf[self.len] = b;
+            self.len += 1;
+        }
+        Ok(())
+    }
+}
+
 /// Run a single command line (already stripped of its trailing `\n`).
 /// Empty input → no-op (matches dash behavior — re-prompt only).
 fn dispatch(line: &[u8]) {
@@ -128,12 +218,13 @@ fn dispatch(line: &[u8]) {
             write_chunked(b"\n");
         }
         "help" => {
-            write_chunked(b"builtins: echo <text>, help, clear\n");
+            write_chunked(b"builtins: echo <text>, help, clear, stats\n");
         }
         "clear" => {
             // Form-feed: compositor clears this source's scrollback.
             write_chunked(b"\x0c");
         }
+        "stats" => stats_cmd(),
         _ => {
             write_chunked(b"unknown command: ");
             write_chunked(cmd.as_bytes());

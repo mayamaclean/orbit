@@ -94,7 +94,7 @@ pub struct FakeHw {
 
     /// Ordered hart ids received by `wake_hart`. Scheduler tests read
     /// this to assert which remotes got IPIs and in what order.
-    pub wakes: Vec<u32>,
+    pub wakes: Vec<usize>,
 
     /// Accumulated `(pid, bytes)` tuples captured by
     /// `console_write_user`. Tests inspect this directly.
@@ -185,7 +185,7 @@ impl Hardware for FakeHw {
             Err(())
         }
     }
-    fn wake_hart(&mut self, hart_id: u32) {
+    fn wake_hart(&mut self, hart_id: usize) {
         self.wakes.push(hart_id);
     }
     fn console_write_user(&mut self, pid: u16, bytes: &[u8]) -> Result<(), ()> {

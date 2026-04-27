@@ -214,6 +214,58 @@ impl Orbit {
         self.threads.len()
     }
 
+    /// Snapshot per-process and kernel-wide accounting for `pid`.
+    /// Phase 1 covers memory only — time-related fields (cpu_ticks,
+    /// syscall_ticks, hart_*_ticks, context_switches, syscalls) read
+    /// as 0 until the per-hart bucket state machine lands.
+    ///
+    /// Returns `None` if `pid` doesn't name a live process. The caller
+    /// must hold `MANAGER_LOCK` (or accept slightly stale reads) — we
+    /// walk `Process::heap_pages` and `Process::maps`, both of which
+    /// the manager mutates under that lock.
+    pub fn snapshot_process_stats(&self, pid: u16) -> Option<orbit_abi::stats::ProcessStats> {
+        let proc = self.processes.get(&pid)?;
+
+        let heap_bytes: u64 = proc
+            .heap_pages
+            .iter()
+            .map(|b| b.layout().size() as u64)
+            .sum();
+
+        // Resident = sum of mapped (backing != None) VMA lengths.
+        // Guard reservations and bare-VA holes are excluded.
+        let resident_bytes: u64 = proc
+            .maps
+            .values()
+            .filter(|m| m.backing.is_some())
+            .map(|m| m.len)
+            .sum();
+
+        Some(orbit_abi::stats::ProcessStats {
+            size: core::mem::size_of::<orbit_abi::stats::ProcessStats>() as u32,
+            _reserved: 0,
+            pid: proc.pid,
+            thread_count: proc.thread_count,
+            _pad0: 0,
+            cpu_ticks: 0,
+            context_switches: 0,
+            syscalls: 0,
+            resident_bytes,
+            heap_bytes,
+            kernel_kpages_bytes: self.kernel_pages.allocated_bytes() as u64,
+            kernel_user_pages_bytes: self.user_pages.allocated_bytes() as u64,
+            kernel_ktables_bytes: self.table_pages.allocated_bytes() as u64,
+            // Phase 2: KHEAP.lock().used() — kheap is in bin/orbit.rs,
+            // needs a public accessor before this can be filled in.
+            kernel_heap_bytes: 0,
+            syscall_ticks: 0,
+            hart_user_ticks: 0,
+            hart_kernel_ticks: 0,
+            hart_scheduler_ticks: 0,
+            hart_idle_ticks: 0,
+        })
+    }
+
     pub fn runnable_thread_count(&self) -> usize {
         self.threads.iter()
             .filter(|(_, t)| unsafe {

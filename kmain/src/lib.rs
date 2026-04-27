@@ -813,3 +813,90 @@ pub fn handle_get_hart_id(epc: usize, hart_context: &'static HartContext, frame:
         orbit_core::SyscallOutcome::Return { ret: hart_id as isize }
     });
 }
+
+/// `query_stats(buf_ptr, buf_len)` — copy a [`ProcessStats`] snapshot
+/// of the calling process into the user buffer. Returns bytes
+/// written, or a negative errno.
+///
+/// Lives in kmain for the same reason as `get_hart_id`: the data
+/// source is the kernel-side [`Orbit`] struct (process table, frame
+/// allocator stats), which `Hardware` deliberately doesn't surface.
+/// Synchronous — no manager round-trip; we acquire `MANAGER_LOCK`
+/// inline for the duration of the snapshot walk.
+///
+/// [`ProcessStats`]: orbit_abi::stats::ProcessStats
+#[unsafe(no_mangle)]
+pub fn handle_query_stats(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
+    use orbit_abi::errno::{EFAULT, EINVAL, ESRCH};
+    use orbit_abi::layout::user_range_ok;
+    use orbit_abi::stats::{ProcessStats, STATS_MIN_LEN};
+
+    let orbit = unsafe { (hart_context.cscratch as *mut kernel::Orbit).as_mut_unchecked() };
+
+    dispatch_syscall(epc, hart_context, frame, |t, f| {
+        let buf_va = f.regs[11] as u64;
+        let buf_len = f.regs[12];
+
+        if buf_len < STATS_MIN_LEN {
+            return orbit_core::SyscallOutcome::Return {
+                ret: -(EINVAL as isize),
+            };
+        }
+        // Saved-feedback rule: bound-check user VAs at the syscall
+        // boundary before the kernel acts on them.
+        if !user_range_ok(buf_va, buf_len as u64) {
+            return orbit_core::SyscallOutcome::Return {
+                ret: -(EFAULT as isize),
+            };
+        }
+        // ProcessStats fits in a page; walk only the start (matches
+        // serial_print/console_write convention). user_range_ok
+        // already excluded the kernel half and overflow.
+        use orbit_core::Hardware;
+        if !crate::hw::RiscvHardware
+            .user_va_translates(t.root_table_addr() as u64, buf_va)
+        {
+            return orbit_core::SyscallOutcome::Return {
+                ret: -(EFAULT as isize),
+            };
+        }
+
+        // Spin on MANAGER_LOCK so the heap_pages / maps walk doesn't
+        // race the manager mutating them. Brief — manager passes are
+        // <1 ms.
+        while !try_acquire_manager() {
+            core::hint::spin_loop();
+        }
+        let snapshot = orbit.snapshot_process_stats(t.pid);
+        release_manager();
+
+        let stats = match snapshot {
+            Some(s) => s,
+            None => {
+                return orbit_core::SyscallOutcome::Return {
+                    ret: -(ESRCH as isize),
+                };
+            }
+        };
+
+        let native = core::mem::size_of::<ProcessStats>();
+        let to_write = core::cmp::min(native, buf_len);
+
+        // SUM gate the write. `user_va_translates` confirmed the start
+        // page; if `buf_len` straddles a page boundary into an
+        // unmapped follow-on the store faults — same convention as
+        // serial_print's PAGE_SIZE-bounded copy.
+        let guard = UserAccess::enter();
+        unsafe {
+            let dst = guard.slice_mut(buf_va, to_write);
+            let src = core::slice::from_raw_parts(
+                &stats as *const ProcessStats as *const u8,
+                to_write,
+            );
+            dst.copy_from_slice(src);
+        }
+        drop(guard);
+
+        orbit_core::SyscallOutcome::Return { ret: to_write as isize }
+    });
+}

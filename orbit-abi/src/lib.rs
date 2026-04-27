@@ -4,10 +4,14 @@ pub mod errno;
 pub mod layout;
 pub mod mmap;
 pub mod net;
+pub mod stats;
 pub mod syscall;
+pub mod syscall_stats;
 pub mod user;
 
 pub use errno::Errno;
+pub use stats::ProcessStats;
 pub use syscall::Sysno;
+pub use syscall_stats::{SyscallEntry, SyscallStatsHeader};
 
 pub type Fd = u32;

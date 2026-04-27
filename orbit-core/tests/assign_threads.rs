@@ -63,7 +63,7 @@ fn views<'a>(slots: &'a [AtomicPtr<()>]) -> (HartView<'a>, Vec<HartView<'a>>) {
     let remotes = slots[1..]
         .iter()
         .enumerate()
-        .map(|(i, slot)| HartView { hart_id: (i + 1) as u32, current: slot })
+        .map(|(i, slot)| HartView { hart_id: (i + 1), current: slot })
         .collect();
     (self_view, remotes)
 }

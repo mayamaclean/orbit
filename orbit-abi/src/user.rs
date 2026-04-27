@@ -15,7 +15,9 @@
 use core::arch::asm;
 
 use crate::errno::{Errno, EAGAIN};
+use crate::stats::ProcessStats;
 use crate::syscall;
+use crate::syscall_stats::{SyscallEntry, SyscallStatsHeader};
 
 // --- low-level ecall primitives ------------------------------------------
 
@@ -358,6 +360,69 @@ pub fn create_process(
         affinity as usize,
     )})
         .map(|p| p as u16)
+}
+
+/// Snapshot per-process and kernel-wide accounting. The wrapper owns
+/// the buffer so callers don't have to think about ABI sizing — pass
+/// `()`, get a struct back. On a kernel newer than this build,
+/// trailing fields are silently dropped (kernel honours the caller's
+/// smaller buffer); on a kernel older than this build, the local
+/// struct is zero-initialised first so unwritten fields read as 0 and
+/// the `size` prefix tells the caller how many bytes are valid.
+#[inline]
+pub fn query_stats() -> Result<ProcessStats, Errno> {
+    let mut s = ProcessStats::default();
+    let n = unsafe {
+        ecall2(
+            syscall::QUERY_STATS,
+            &mut s as *mut _ as usize,
+            core::mem::size_of::<ProcessStats>(),
+        )
+    };
+    Errno::from_ret(n).map(|_| s)
+}
+
+/// Snapshot the system-wide per-syscall latency table into `buf`.
+/// Returns `(header, entries)` borrowing from `buf`.
+///
+/// `header.count` may be smaller (older kernel) or larger (newer
+/// kernel, but the wrapper-side buffer was too small to hold all
+/// records) than the local [`Sysno::COUNT`](crate::Sysno::COUNT).
+/// Iterate `min(header.count, entries.len())` and look up by
+/// [`Sysno::ordinal`](crate::Sysno::ordinal).
+///
+/// Pass a buffer at least
+/// [`syscall_stats::payload_size()`](crate::syscall_stats::payload_size)
+/// bytes for a complete snapshot.
+#[inline]
+pub fn query_syscall_stats(
+    buf: &mut [u8],
+) -> Result<(SyscallStatsHeader, &[SyscallEntry]), Errno> {
+    let n = unsafe {
+        ecall2(
+            syscall::QUERY_SYSCALL_STATS,
+            buf.as_mut_ptr() as usize,
+            buf.len(),
+        )
+    };
+    let written = Errno::from_ret(n)? as usize;
+    let hdr_size = core::mem::size_of::<SyscallStatsHeader>();
+    if written < hdr_size {
+        return Err(Errno(crate::errno::EINVAL));
+    }
+    // SAFETY: kernel guarantees `written` bytes of valid header+entries
+    // were written into `buf`, and the layout is `#[repr(C)]` with no
+    // padding before the entries array.
+    let hdr = unsafe { core::ptr::read_unaligned(buf.as_ptr() as *const SyscallStatsHeader) };
+    let entries_bytes = written - hdr_size;
+    let entries_len = entries_bytes / core::mem::size_of::<SyscallEntry>();
+    let entries = unsafe {
+        core::slice::from_raw_parts(
+            buf.as_ptr().add(hdr_size) as *const SyscallEntry,
+            entries_len,
+        )
+    };
+    Ok((hdr, entries))
 }
 
 pub struct SerialWriter {

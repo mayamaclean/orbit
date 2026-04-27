@@ -205,7 +205,7 @@ fn no_runnables_leaves_all_slots_null() {
 
     let self_view = HartView { hart_id: 0, current: &slots[0] };
     let remotes: [HartView; 3] = std::array::from_fn(|i| HartView {
-        hart_id: (i + 1) as u32,
+        hart_id: (i + 1),
         current: &slots[i + 1],
     });
     assign_threads(&self_view, remotes, &mut sched, &mut hw);

@@ -126,6 +126,10 @@ impl TablePages {
         &mut self.inner
     }
 
+    /// Bytes outstanding from the buddy allocator. Approximates
+    /// page-table memory in use across all processes.
+    pub fn allocated_bytes(&self) -> usize { self.inner.allocated() }
+    pub fn total_bytes(&self) -> usize { self.inner.total() }
 }
 
 /// Pool of pages that are kernel-accessible (KDMAP alias under every
@@ -161,6 +165,8 @@ impl KernelPages {
         &mut self.inner
     }
 
+    pub fn allocated_bytes(&self) -> usize { self.inner.allocated() }
+    pub fn total_bytes(&self) -> usize { self.inner.total() }
 }
 
 /// Pool of pages that are user-only. No KDMAP alias under the kernel
@@ -186,6 +192,8 @@ impl UserPages {
         self.inner.dealloc_aligned(frame.get_raw() as usize, layout);
     }
 
+    pub fn allocated_bytes(&self) -> usize { self.inner.allocated() }
+    pub fn total_bytes(&self) -> usize { self.inner.total() }
 }
 
 pub const KRX: u64 =

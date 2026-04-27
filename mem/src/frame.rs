@@ -78,6 +78,16 @@ impl<const ORDER: usize> FrameAllocator<ORDER> {
         self.add_frame(range.start, range.end);
     }
 
+    /// Sum of `size` values from every outstanding allocation. Same
+    /// units the caller passed to `add_frame` / `alloc_aligned` —
+    /// kmain wraps these with byte-address ranges, so for kmain users
+    /// this is "bytes outstanding."
+    pub fn allocated(&self) -> usize { self.allocated }
+
+    /// Total capacity added via `add_frame` / `insert`. Same units as
+    /// [`Self::allocated`].
+    pub fn total(&self) -> usize { self.total }
+
     /// Allocate a range of frames from the allocator, returning the first frame of the allocated
     /// range.
     pub fn alloc(&mut self, count: usize) -> Option<usize> {

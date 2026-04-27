@@ -176,7 +176,7 @@ fn multiple_remotes_each_observe_their_own_thread() {
 
         let self_view = HartView { hart_id: 0, current: &self_slot };
         let remotes: [HartView; N] =
-            std::array::from_fn(|i| HartView { hart_id: (i + 1) as u32, current: &slots[i] });
+            std::array::from_fn(|i| HartView { hart_id: (i + 1), current: &slots[i] });
         let mut hw = FakeHw::default();
 
         assign_threads(&self_view, remotes, &mut sched, &mut hw);
