@@ -16,7 +16,7 @@ use kmain::kernel::context::{enter_hart_context, fault_thread};
 use kmain::kernel::memmap::{map_kernel_self, unmap_boot_only_regions};
 use mmu::mmap::PageAlloc;
 use mmu::{PAGE_SIZE, sv48::PageTable};
-use process::{FaultInfo, ThreadState};
+use process::{FaultInfo, Thread, ThreadState};
 use riscv::register::satp::Satp;
 use riscv::{register::{satp::Mode, stvec::{Stvec, TrapMode}}};
 
@@ -136,8 +136,32 @@ extern "C" fn s_trap(
             // Instruction access fault.
             1 | 12 | 13 | 15 => {
                 if !from_user {
-                    panic!("S-mode fault on cpu{}: cause={} epc={:#x} stval={:#x}",
-                        hart_context.hart_id, cause_num, epc, tval);
+                    let kptr = hart_context.kptr.load(Ordering::Relaxed) as usize;
+                    let satp = riscv::register::satp::read().bits();
+                    let sp = frame.regs[2];
+                    let ra = frame.regs[1];
+                    let cur = hart_context.current.load(Ordering::Acquire) as *const Thread;
+                    if !cur.is_null() {
+                        let t: &Thread = unsafe { cur.as_ref_unchecked() };
+                        let pc = t.pc.load(Ordering::Acquire);
+                        let state = t.state.load(Ordering::Acquire);
+                        let wake_reason = t.last_wake_reason.load(Ordering::Acquire);
+                        panic!(
+                            "S-mode fault on cpu{}: cause={} epc={:#x} stval={:#x} \
+                             ra={:#x} sp={:#x} satp={:#x} kptr={:#x} \
+                             tid={} pid={} mode={:?} thread.pc={:#x} state={} wake_reason={:#x}",
+                            hart_context.hart_id, cause_num, epc, tval,
+                            ra, sp, satp, kptr,
+                            t.tid, t.pid, t.mode, pc, state, wake_reason,
+                        );
+                    } else {
+                        panic!(
+                            "S-mode fault on cpu{}: cause={} epc={:#x} stval={:#x} \
+                             ra={:#x} sp={:#x} satp={:#x} kptr={:#x} (no current thread)",
+                            hart_context.hart_id, cause_num, epc, tval,
+                            ra, sp, satp, kptr,
+                        );
+                    }
                 }
                 unsafe { fault_thread(FaultInfo { cause: cause_num, epc, stval: tval }); }
             }
@@ -145,11 +169,23 @@ extern "C" fn s_trap(
             3 => {
                 match hart_context.cscratch2 {
                     1 => {
-                        //serial::println!("smode ebreak call");
-
+                        // kthread self-yield (knet, k_gpu). Save the
+                        // trap frame so the next dispatch resumes past
+                        // the ebreak, then park via
+                        // `exit_thread_with_state(Suspended)`. The new
+                        // ordering inside `exit_thread_with_state` is
+                        // load-bearing: it nulls `hart_context.current`
+                        // *before* writing `state=Suspended`, so any
+                        // hart's manager that observes the new state
+                        // (Acquire) is guaranteed to see this hart's
+                        // current=null too. Without that ordering, a
+                        // remote manager's `assign_threads` self_view
+                        // path picked up a still-running kthread and
+                        // caused double-dispatch (knet running on two
+                        // harts simultaneously, smoltcp ring corruption).
                         hart_context.cscratch2 = 0;
                         kmain::update_thread_and_trap_frame(epc, hart_context, frame, from_user);
-                        check_context_and_switch();
+                        unsafe { kmain::kernel::context::exit_thread_with_state(ThreadState::Suspended); }
                     },
                     _ => ()
                 }
@@ -203,6 +239,9 @@ extern "C" fn s_trap(
                     4099 => {
                         debug!("orbit handling u mode ecall({syscall})");
                         kmain::handle_create_process_req(epc, hart_context, frame);
+                    }
+                    4100 => {
+                        kmain::handle_nc_yield(epc, hart_context, frame);
                     }
                     5000 => {
                         debug!("orbit handling u mode ecall({syscall})");
@@ -268,10 +307,6 @@ pub extern "C" fn k_smpstart() {
         (hart_context.cscratch as *mut kmain::kernel::Orbit).as_mut_unchecked()
     };
 
-    let boot_affinity = orbit.all_harts_mask();
-    orbit.create_new_process(kmain::kernel::UMODE_TEST_ELF, kmain::kernel::UPROC_STACK_DEFAULT, boot_affinity, boot_affinity)
-        .expect("no test uprocess");
-
     orbit.get_environment_info();
 
     // Populate each hart_context's PLIC S-mode context index from the
@@ -295,6 +330,10 @@ pub extern "C" fn k_smpstart() {
 
         let _ = kmain::drivers::plic::install_uart_rx_cycle();
     }
+
+    let boot_affinity = orbit.all_harts_mask();
+    orbit.create_new_process(kmain::kernel::UMODE_TEST_ELF, kmain::kernel::UPROC_STACK_DEFAULT, boot_affinity, boot_affinity)
+        .expect("no test uprocess");
 
     unsafe {
         // bl dereferences HART_ROOT in M-mode with no paging, so it must be a
@@ -655,7 +694,7 @@ extern "C" fn rust_main(_hartid: usize, sysinfo: usize, load_addr: u64) -> ! {
 
         log::set_logger(&LOGGER).unwrap();
         log::set_max_level(log::LevelFilter::Info);
-        tracing::subscriber::set_global_default(OrbitSubscriber::new(Level::TRACE))
+        tracing::subscriber::set_global_default(OrbitSubscriber::new(Level::INFO))
             .expect("no tracing");
 
         let mut kernel_tables = kmain::kernel::memmap::TablePages::new();
@@ -725,7 +764,7 @@ extern "C" fn rust_main(_hartid: usize, sysinfo: usize, load_addr: u64) -> ! {
         // Same window: shootdown ring fan-out target count. Must run
         // before any user PTE modification can fire `broadcast`. The
         // statics themselves are already pre-initialized.
-        kmain::kernel::shootdown::init(cpu_count as u32);
+        kmain::kernel::shootdown::init(cpu_count);
 
         info!("allocated orbit state @ {:016X?}", &raw const *orbit as usize);
 

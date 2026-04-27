@@ -176,7 +176,7 @@ fn recv_payload(s: &Session<'_>) -> Result<(Vec<u8>, String), LoaderErr> {
 /// or the channel breaks).
 fn drain_some(s: &Session<'_>, out: &mut Vec<u8>) -> Result<(), LoaderErr> {
     let mut tmp = [0u8; 128 * 1024];
-    let n = s.read_some(&mut tmp).map_err(LoaderErr::NetCh)?;
+    let n = s.read_some_with_poll_timeout(&mut tmp, 100).map_err(LoaderErr::NetCh)?;
     out.extend_from_slice(&tmp[..n]);
     Ok(())
 }

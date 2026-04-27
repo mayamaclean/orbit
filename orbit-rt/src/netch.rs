@@ -44,7 +44,7 @@ use orbit_abi::{
     errno::{EAGAIN, EBUSY, EINVAL, EIO},
     layout::{LARGE_PAGE, PAGE_SIZE},
     net::SockType,
-    user::{close_handle, create_netch, sleep_ms},
+    user::{close_handle, create_netch, nc_yield},
 };
 
 use crate::SharedRegion;
@@ -53,7 +53,7 @@ use crate::SharedRegion;
 /// helpers. Matches orbit-loader's prior `POLL_SLEEP_MS`. Callers that
 /// want a different cadence can poll the underlying state byte directly
 /// via [`NetCh::current_state`].
-pub const DEFAULT_POLL_MS: usize = 10;
+pub const DEFAULT_POLL_MS: usize = 50;
 
 /// Owning handle over a NetChannel: VA reservation + kernel handle. On
 /// drop the kernel handle is closed and the VA reservation is returned
@@ -206,7 +206,11 @@ impl NetCh {
                 self.in_session.store(false, Ordering::Release);
                 return Err(Errno::new(EIO));
             }
-            sleep_ms(DEFAULT_POLL_MS)?;
+            // nc_yield notifies k_net (in case it has work to do —
+            // e.g. drive listen→Established) and parks us for up to
+            // DEFAULT_POLL_MS, returning early on `WakeEvent::Pid`
+            // when our channel state changes.
+            nc_yield(DEFAULT_POLL_MS)?;
         }
     }
 
@@ -295,9 +299,23 @@ impl<'a> Session<'a> {
     pub fn read_some(&self, dst: &mut [u8]) -> Result<usize, Errno> {
         loop {
             match self.read(dst) {
-                Ok(0) => sleep_ms(DEFAULT_POLL_MS)?,
+                Ok(0) => nc_yield(DEFAULT_POLL_MS)?,
                 Ok(n) => return Ok(n),
-                Err(Errno(e)) if e == EAGAIN => sleep_ms(DEFAULT_POLL_MS)?,
+                Err(Errno(e)) if e == EAGAIN => nc_yield(DEFAULT_POLL_MS)?,
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Block until at least one byte transfers (or the channel breaks).
+    /// Convenience over [`Self::read`] for callers that don't have
+    /// their own poll loop.
+    pub fn read_some_with_poll_timeout(&self, dst: &mut [u8], poll_ms: usize) -> Result<usize, Errno> {
+        loop {
+            match self.read(dst) {
+                Ok(0) => nc_yield(poll_ms)?,
+                Ok(n) => return Ok(n),
+                Err(Errno(e)) if e == EAGAIN => nc_yield(poll_ms)?,
                 Err(e) => return Err(e),
             }
         }
@@ -347,9 +365,9 @@ impl<'a> Session<'a> {
     ) -> Result<usize, Errno> {
         loop {
             match self.read_into_vec(dst, cap_bytes) {
-                Ok(0) => sleep_ms(DEFAULT_POLL_MS)?,
+                Ok(0) => nc_yield(DEFAULT_POLL_MS)?,
                 Ok(n) => return Ok(n),
-                Err(Errno(e)) if e == EAGAIN => sleep_ms(DEFAULT_POLL_MS)?,
+                Err(Errno(e)) if e == EAGAIN => nc_yield(DEFAULT_POLL_MS)?,
                 Err(e) => return Err(e),
             }
         }
@@ -361,9 +379,9 @@ impl<'a> Session<'a> {
         let mut written = 0;
         while written < src.len() {
             match self.write(&src[written..]) {
-                Ok(0) => sleep_ms(DEFAULT_POLL_MS)?,
+                Ok(0) => nc_yield(DEFAULT_POLL_MS)?,
                 Ok(n) => written += n,
-                Err(Errno(e)) if e == EAGAIN => sleep_ms(DEFAULT_POLL_MS)?,
+                Err(Errno(e)) if e == EAGAIN => nc_yield(DEFAULT_POLL_MS)?,
                 Err(e) => return Err(e),
             }
         }
@@ -406,8 +424,10 @@ impl Drop for Session<'_> {
                 break;
             }
             // Drop can't propagate `?`; ignore EINTR-equivalent errors
-            // from sleep_ms — kernel cap means it's bounded.
-            let _ = sleep_ms(DEFAULT_POLL_MS);
+            // from nc_yield — kernel cap means it's bounded. The yield
+            // also nudges k_net so the disengage edge gets observed
+            // promptly without waiting for k_net's own heartbeat.
+            let _ = nc_yield(DEFAULT_POLL_MS);
         }
 
         // SAFETY: `Session` owned exclusive access to the rings while

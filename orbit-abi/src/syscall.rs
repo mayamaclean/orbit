@@ -16,6 +16,7 @@ pub const MMAP:            usize = 4096;
 pub const CREATE_NETCH:    usize = 4097;
 pub const CLOSE_HANDLE:    usize = 4098;
 pub const CREATE_PROCESS:  usize = 4099;
+pub const NC_YIELD:        usize = 4100;
 
 // 5000+ — multi-thread / SMP control plane. Numbered out of the 4096
 // block so the categorical split is obvious in dispatch tables and so
@@ -38,6 +39,7 @@ pub enum Sysno {
     CreateNetch    = CREATE_NETCH,
     CloseHandle    = CLOSE_HANDLE,
     CreateProcess  = CREATE_PROCESS,
+    NcYield        = NC_YIELD,
     CreateThread   = CREATE_THREAD,
 }
 
@@ -56,6 +58,7 @@ impl Sysno {
             CREATE_NETCH   => Self::CreateNetch,
             CLOSE_HANDLE   => Self::CloseHandle,
             CREATE_PROCESS => Self::CreateProcess,
+            NC_YIELD       => Self::NcYield,
             CREATE_THREAD  => Self::CreateThread,
             _              => return None,
         })
@@ -80,6 +83,7 @@ mod tests {
         assert_eq!(Sysno::from_usize(CREATE_NETCH), Some(Sysno::CreateNetch));
         assert_eq!(Sysno::from_usize(CLOSE_HANDLE), Some(Sysno::CloseHandle));
         assert_eq!(Sysno::from_usize(CREATE_PROCESS), Some(Sysno::CreateProcess));
+        assert_eq!(Sysno::from_usize(NC_YIELD),       Some(Sysno::NcYield));
         assert_eq!(Sysno::from_usize(CREATE_THREAD),  Some(Sysno::CreateThread));
     }
 
@@ -87,7 +91,7 @@ mod tests {
     fn unknown_returns_none() {
         assert_eq!(Sysno::from_usize(8), None);
         assert_eq!(Sysno::from_usize(4095), None);
-        assert_eq!(Sysno::from_usize(4100), None);
+        assert_eq!(Sysno::from_usize(4101), None);
         assert_eq!(Sysno::from_usize(4999), None);
         assert_eq!(Sysno::from_usize(5001), None);
         assert_eq!(Sysno::from_usize(usize::MAX), None);
@@ -107,6 +111,7 @@ mod tests {
         assert_eq!(Sysno::CreateNetch   as usize, CREATE_NETCH);
         assert_eq!(Sysno::CloseHandle   as usize, CLOSE_HANDLE);
         assert_eq!(Sysno::CreateProcess as usize, CREATE_PROCESS);
+        assert_eq!(Sysno::NcYield       as usize, NC_YIELD);
         assert_eq!(Sysno::CreateThread  as usize, CREATE_THREAD);
     }
 
@@ -126,5 +131,6 @@ mod tests {
         assert_eq!(CREATE_NETCH, 4097);
         assert_eq!(CLOSE_HANDLE, 4098);
         assert_eq!(CREATE_PROCESS, 4099);
+        assert_eq!(NC_YIELD, 4100);
     }
 }

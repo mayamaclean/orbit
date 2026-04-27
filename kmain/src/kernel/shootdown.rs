@@ -17,7 +17,7 @@
 //! its own local `sfence.vma` (typically the same one it was already
 //! doing pre-shootdown).
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use orbit_core::tlb_shootdown::{ShootdownRing, drain_shootdown_ring, tlb_shootdown};
 
@@ -44,12 +44,12 @@ pub static SHOOTDOWN_RINGS: [ShootdownRing; MAX_HARTS] = [
 /// Online hart count, set by [`init`] during boot. Used to bound the
 /// broadcast target iterator. Atomic so [`broadcast`] doesn't need
 /// `&Orbit`. Written once at boot, read on every shootdown.
-static CPU_COUNT: AtomicU32 = AtomicU32::new(0);
+pub static CPU_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// Capture the boot-time online hart count. Must run on hart 0 in
 /// `rust_main` after the DTB walk has resolved the value, *before*
 /// any user PTE modification can fire a broadcast.
-pub fn init(cpu_count: u32) {
+pub fn init(cpu_count: usize) {
     assert!(
         cpu_count as usize <= MAX_HARTS,
         "shootdown::init: cpu_count={} exceeds MAX_HARTS={}",
@@ -81,11 +81,12 @@ pub fn broadcast(va: u64, len: u64) {
     if n <= 1 {
         return;
     }
-    let self_id = get_hart_context().hart_id as u32;
+    let self_id = get_hart_context().hart_id as usize;
     let n_targets = n - 1;
-    let targets = (0u32..n)
+    let targets = (0..n)
         .filter(move |&h| h != self_id)
-        .map(|h| (h, &SHOOTDOWN_RINGS[h as usize]));
+        .map(|h| (h, &SHOOTDOWN_RINGS[h]));
+
     let mut hw = crate::hw::RiscvHardware;
     // Errors are RingFull only — drop them. The orchestrator already
     // ack-decrements failed targets so we don't deadlock; missing
@@ -113,21 +114,20 @@ pub fn drain_local() {
     drain_shootdown_ring(ring, |va, len| {
         // SAFETY: sfence.vma is always safe (it's a fence, not a
         // memory access). The arms differ in scope only.
-        unsafe {
-            if va == 0 && len == 0 {
-                // Sentinel: whole-TLB flush. Equivalent to the
-                // pre-shootdown `sfence_vma(pid, 0)` + `sfence_vma(0, 0)`
-                // pair the senders used to do locally.
-                riscv::asm::sfence_vma(0, 0);
-            } else {
-                // Per-page invalidation across all ASIDs. Slightly
-                // broader than `sfence.vma va, asid` would be, but
-                // the ring entries don't carry asid today and "all
-                // ASIDs" is always correct (per RISC-V Privileged
-                // ISA: rs2=x0 means the fence orders accesses to
-                // all ASIDs).
-                riscv::asm::sfence_vma(0, va as usize);
-            }
+        if va == 0 && len == 0 {
+            // Sentinel: whole-TLB flush. Equivalent to the
+            // pre-shootdown `sfence_vma(pid, 0)` + `sfence_vma(0, 0)`
+            // pair the senders used to do locally.
+            riscv::asm::sfence_vma(0, 0);
+        }
+        else {
+            // Per-page invalidation across all ASIDs. Slightly
+            // broader than `sfence.vma va, asid` would be, but
+            // the ring entries don't carry asid today and "all
+            // ASIDs" is always correct (per RISC-V Privileged
+            // ISA: rs2=x0 means the fence orders accesses to
+            // all ASIDs).
+            riscv::asm::sfence_vma(0, va as usize);
         }
     });
 }

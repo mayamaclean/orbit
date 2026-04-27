@@ -21,7 +21,7 @@
 //! the global allocator is reachable.
 
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicI64, AtomicU8, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicI64, AtomicU8, AtomicUsize, Ordering};
 
 const STATE_PENDING: u8 = 0;
 /// Transient: a signaler CAS-claimed the slot and is mid-write. The
@@ -181,14 +181,14 @@ impl Default for CompletionHandle {
 /// has no consumer.
 #[derive(Clone, Debug)]
 pub struct AckCounter {
-    inner: Arc<AtomicU32>,
+    inner: Arc<AtomicUsize>,
 }
 
 impl AckCounter {
     /// Allocate a counter starting at `n`. `n == 0` is legal (waiter
     /// returns immediately).
-    pub fn new(n: u32) -> Self {
-        Self { inner: Arc::new(AtomicU32::new(n)) }
+    pub fn new(n: usize) -> Self {
+        Self { inner: Arc::new(AtomicUsize::new(n)) }
     }
 
     /// Decrement by one. Saturates at zero — extra decrements are
@@ -211,7 +211,7 @@ impl AckCounter {
     }
 
     /// Snapshot current count. Useful for logging/diagnostics.
-    pub fn load(&self) -> u32 {
+    pub fn load(&self) -> usize {
         self.inner.load(Ordering::Acquire)
     }
 }

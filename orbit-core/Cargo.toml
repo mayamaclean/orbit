@@ -16,3 +16,4 @@ mmu = { path = "../mmu" }
 # version pinned in kmain so the queue type is shared between the
 # pure-logic protocol and the live kernel impl.
 thingbuf  = { version = "0.1.6", default-features = false, features = ["static", "alloc"] }
+tracing = { version = "0.1.44", default-features = false, features = [] }

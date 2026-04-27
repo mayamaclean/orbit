@@ -201,6 +201,26 @@ pub fn sleep_ms(ms: usize) -> Result<(), Errno> {
     Errno::from_ret(unsafe { ecall1(syscall::SLEEP_MS, ms) }).map(|_| ())
 }
 
+/// Push a `WakeEvent::Net` so the kernel net thread wakes immediately
+/// (instead of waiting up to its 10 ms heartbeat) — useful after a
+/// NetCh ring-write where the kernel needs to drain an increment or
+/// stage a slice for us. Then optionally park the caller for up to
+/// `timeout_ms` milliseconds, returning early if the kernel marks the
+/// caller's thread for wake-up first (e.g. via `WakeEvent::Pid` from
+/// `update_tcp`'s `outcome.ring_progress`).
+///
+/// `timeout_ms == 0` skips the park: pure notification, returns
+/// immediately. `timeout_ms > 0` is `sleep_ms(timeout_ms)` with the
+/// notification bundled in. Same one-hour cap as `sleep_ms`.
+///
+/// Replaces the EAGAIN-park-then-syscall-again pattern with a single
+/// syscall that can return as soon as the channel state changes,
+/// avoiding the 10 ms timer-tick floor for request/response workloads.
+#[inline]
+pub fn nc_yield(timeout_ms: usize) -> Result<(), Errno> {
+    Errno::from_ret(unsafe { ecall1(syscall::NC_YIELD, timeout_ms) }).map(|_| ())
+}
+
 /// Ask the kernel for a user-accessible region at `hint_va` of `len`
 /// bytes. `share_with_kernel` selects the backing pool (roadmap §3):
 /// `false` → `user_pages` (no KDMAP alias), `true` → `kernel_pages`.

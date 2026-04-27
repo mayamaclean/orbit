@@ -2,3 +2,4 @@
 **/Cargo.lock
 *.dtb
 *.dts
+*.log

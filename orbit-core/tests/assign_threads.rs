@@ -97,8 +97,11 @@ fn fills_all_idle_harts_remotes_get_ipis_self_does_not() {
 #[test]
 fn busy_remote_is_skipped() {
     let slots = make_slots(4);
-    // Mark hart 2 busy with a bogus non-null pointer.
-    slots[2].store(0xDEAD as *mut (), Ordering::Release);
+    // Mark hart 2 busy with a real heap allocation (miri-friendly under
+    // Tree Borrows; an `0xDEAD` int-to-ptr cast triggers a strict-
+    // provenance warning even though the pointer is never dereferenced).
+    let busy_sentinel = Box::into_raw(Box::new(0u8)) as *mut ();
+    slots[2].store(busy_sentinel, Ordering::Release);
 
     let (self_view, remote_views) = views(&slots);
     let mut sched = FakeSched::with(3);
@@ -106,14 +109,21 @@ fn busy_remote_is_skipped() {
 
     assign_threads(&self_view, remote_views.iter().copied(), &mut sched, &mut hw);
 
-    // Hart 1: assigned. Hart 2: still 0xDEAD. Hart 3: assigned.
+    // Hart 1: assigned. Hart 2: still the busy sentinel (untouched).
+    // Hart 3: assigned.
     assert!(assigned(&slots[1]));
-    assert_eq!(slots[2].load(Ordering::Acquire) as usize, 0xDEAD);
+    assert_eq!(
+        slots[2].load(Ordering::Acquire),
+        busy_sentinel,
+        "is_busy gate must leave hart 2's slot pointer untouched",
+    );
     assert!(assigned(&slots[3]));
     // Self gets the 3rd thread.
     assert!(assigned(&slots[0]));
     // Only harts 1 and 3 received IPIs.
     assert_eq!(hw.wakes, vec![1, 3]);
+
+    unsafe { drop(Box::from_raw(busy_sentinel as *mut u8)) };
 }
 
 #[test]
@@ -171,7 +181,8 @@ fn self_overwrites_own_current_unconditionally() {
     // The live kmain code doesn't gate the self-assignment on is_busy —
     // if self already has a current thread, it's clobbered. Preserve that.
     let slots = make_slots(2); // self + 1 remote
-    slots[0].store(0xBEEF as *mut (), Ordering::Release);
+    let stale_sentinel = Box::into_raw(Box::new(0u8)) as *mut ();
+    slots[0].store(stale_sentinel, Ordering::Release);
 
     let (self_view, remote_views) = views(&slots);
     let mut sched = FakeSched::with(2);
@@ -183,8 +194,13 @@ fn self_overwrites_own_current_unconditionally() {
     assert!(assigned(&slots[1]));
     let self_ptr = slots[0].load(Ordering::Acquire);
     assert!(!self_ptr.is_null());
-    assert_ne!(self_ptr as usize, 0xBEEF, "self's current should have been overwritten");
+    assert_ne!(
+        self_ptr, stale_sentinel,
+        "self's current should have been overwritten",
+    );
     assert_eq!(hw.wakes, vec![1]);
+
+    unsafe { drop(Box::from_raw(stale_sentinel as *mut u8)) };
 }
 
 #[test]

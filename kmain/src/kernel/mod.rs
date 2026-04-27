@@ -39,7 +39,7 @@ use riscv::register::satp::{Mode, Satp};
 use riscv::register::sstatus::SPP;
 use smoltcp::iface::{Config, Interface, SocketHandle};
 use smoltcp::wire::{EthernetAddress};
-use tracing::{error, info, warn};
+use tracing::{error, info, trace, warn};
 
 use crate::drivers::e1000::{
     E1000, E1000Pbuf, RX_RING_BUFS_BYTES,
@@ -136,17 +136,24 @@ impl Default for WakeEvent {
 ///     INTx line stays asserted and PLIC re-claims us in a tight
 ///     loop in `plic::dispatch`.
 ///  2. Push a `WakeEvent::Net` so the manager wakes k_net at the
-///     next scheduler scan instead of waiting up to 10 ms for k_net's
-///     own heartbeat timer.
-///
+///     next scheduler scan
 /// Drops the wake event silently if `WAKE_QUEUE` is full. Cap is 64;
 /// at e1000 burst rates (~1 IRQ per 1446 B at 1 Gbps = 86k IRQ/s)
 /// the manager will drain faster than we fill, but a temporarily-
 /// stalled manager would just lose redundant wakes — k_net's 10 ms
 /// heartbeat is the safety net.
-pub fn e1000_plic_handler(_src: u32) {
-    let _icr = crate::drivers::e1000::ack_irq_static();
-    let _ = WAKE_QUEUE.push(WakeEvent::Net);
+pub fn e1000_plic_handler(src: u32) {
+    let icr = crate::drivers::e1000::ack_irq_static();
+    let pushed = WAKE_QUEUE.push(WakeEvent::Net).is_ok();
+    let hart_id = unsafe {
+        (riscv::register::sscratch::read() as *const HartContext)
+            .as_ref_unchecked()
+            .hart_id
+    };
+    trace!(
+        "e1000 IRQ: cpu{} src={} icr={:#010x} wake_pushed={}",
+        hart_id, src, icr, pushed,
+    );
 }
 
 pub struct Orbit {
@@ -167,6 +174,14 @@ pub struct Orbit {
     user_pages: memmap::UserPages,
 
     net_pkg: NetPackage,
+    /// TID of the k_net kernel thread, set by `setup_igb` once it
+    /// spawns. `None` until then, and during the boot window before
+    /// e1000 PLIC IRQs can fire — `WakeEvent::Net` consumers fall
+    /// back to a coarse "wake all kernel threads" scan in that
+    /// window. Once latched, `WakeEvent::Net` targets exactly this
+    /// tid so unrelated kernel threads (k_gpu) aren't woken
+    /// spuriously by every netch tickle.
+    net_thread_tid: Option<u32>,
     orphaned_sockets: Vec<SocketHandle>,
 
     /// Per-process handle tables. The manager's strong refs on
@@ -248,6 +263,7 @@ impl Orbit {
             current_thread_id: 0,
             processes: BTreeMap::new(),
             threads: BTreeMap::new(),
+            net_thread_tid: None,
             net_pkg: NetPackage {
                 phy: None,
                 iface: None,
@@ -315,12 +331,7 @@ impl Orbit {
         if self.cpu_count >= 64 { u64::MAX } else { (1u64 << self.cpu_count) - 1 }
     }
 
-    pub fn create_kernel_thread(&mut self, entrypoint: usize, a0: Option<usize>) -> Result<(), ()> {
-        if self.current_process_id == u16::MAX {
-            error!("too many processes running to spawn another");
-            return Err(())
-        }
-        
+    pub fn create_kernel_thread(&mut self, entrypoint: usize, a0: Option<usize>) -> Result<u32, ()> {        
         let (stack_frame, stack_kva) = self.allocate_thread_stack()?;
 
         let (_trap_frame_frame, trap_frame_kva) = match self.allocate_trap_frame() {
@@ -381,7 +392,7 @@ impl Orbit {
 
         self.threads.insert(tid, PThread(tptr));
 
-        Ok(())
+        Ok(tid)
     }
 
     fn run_mmap_req(&mut self, req: MemMapReq, pid: u16, root_pa: u64) -> isize {
@@ -806,13 +817,23 @@ impl Orbit {
             match event {
                 WakeEvent::None => {}
                 WakeEvent::Net => {
-                    // Kernel threads have pid=0. Today that's k_net (and
-                    // possibly k_gpu); waking k_gpu spuriously is fine —
-                    // it'll re-park if it has nothing to do.
-                    self.set_wake_reason_where(
-                        process::wake_reason::TICKLE,
-                        |t| t.pid == 0,
-                    );
+                    // Target k_net specifically once `setup_igb` has
+                    // latched its tid. Before then (boot window), fall
+                    // back to a coarse pid=0 scan — by the time
+                    // anything pushes `WakeEvent::Net` for real (PLIC
+                    // IRQ, user nc_yield) the latch has fired, so the
+                    // fallback is just a safety net for self-pushes
+                    // during k_net's own bringup.
+                    match self.net_thread_tid {
+                        Some(tid) => self.set_wake_reason_where(
+                            process::wake_reason::TICKLE,
+                            |t| t.tid == tid,
+                        ),
+                        None => self.set_wake_reason_where(
+                            process::wake_reason::TICKLE,
+                            |t| t.pid == 0,
+                        ),
+                    }
                 }
                 WakeEvent::Pid(pid) => {
                     self.set_wake_reason_where(
@@ -923,19 +944,10 @@ impl Orbit {
                 // load and the swap are fine: their bits are picked
                 // up the next time this thread parks and we get back
                 // here, since `swap` is the only consumer.
-                let pending = thread.wake_override.load(Ordering::Acquire);
+                let pending = thread.wake_override.swap(0, Ordering::AcqRel);
+                thread.last_wake_reason.store(pending, Ordering::Release);
                 if pending == 0 && now < thread.wake_time {
                     continue
-                }
-                if pending != 0 {
-                    let consumed = thread.wake_override.swap(0, Ordering::AcqRel);
-                    thread.last_wake_reason.store(consumed, Ordering::Release);
-                } else {
-                    // Plain timer-elapsed wake — no override bits to
-                    // forward, but mark the cause so userspace can
-                    // distinguish "your sleep ran out" from "something
-                    // tickled you" if it cares.
-                    thread.last_wake_reason.store(0, Ordering::Release);
                 }
 
                 thread.state.store(ThreadState::Ready as usize, Ordering::Release);
@@ -1263,13 +1275,13 @@ impl Orbit {
         let cpu_count = self.cpu_count;
 
         let self_view = HartView {
-            hart_id: context.hart_id as u32,
+            hart_id: context.hart_id as usize,
             current: &context.current,
         };
         let remotes = (0..cpu_count).filter(move |&i| i != self_hart_id).map(move |i| {
             let hc = unsafe { hart_root.add(i).as_ref_unchecked() };
             HartView {
-                hart_id: hc.hart_id as u32,
+                hart_id: hc.hart_id as usize,
                 current: &hc.current,
             }
         });
@@ -1391,7 +1403,7 @@ impl Orbit {
             let slot = (device.address >> 15) & 0x1F;
             let plic_irq = 32 + (slot as u32 % 4);
             if let Err(()) = crate::drivers::plic::plic_register(
-                plic_irq, e1000_plic_handler, 0,
+                plic_irq, e1000_plic_handler, self.cpu_count - 1,
             ) {
                 error!("e1000: plic_register failed for irq {}", plic_irq);
             } else {
@@ -1400,11 +1412,21 @@ impl Orbit {
 
             let entrypoint = crate::k_net as *const () as usize;
             let a0 = (&mut self.net_pkg) as *mut NetPackage;
-            if let Err(_) = self.create_kernel_thread(entrypoint, Some(a0 as usize)) {
-                error!("failed to create knet thread");
-            }
-            else {
-                info!("created knet thread");
+            match self.create_kernel_thread(entrypoint, Some(a0 as usize)) {
+                Ok(tid) => {
+                    info!("created knet thread tid={tid}");
+                    // Latch the tid so `WakeEvent::Net` can target this
+                    // thread specifically. Without this latch the wake
+                    // would fan out to every kernel thread (k_gpu, etc.)
+                    // — harmless to correctness but it pulls k_gpu out
+                    // of its 50 ms park on every netch tickle, wastes
+                    // CPU and worse can interfere with display refresh
+                    // pacing.
+                    self.net_thread_tid = Some(tid);
+                }
+                Err(_) => {
+                    error!("failed to create knet thread");
+                }
             }
 
             /*
@@ -1551,12 +1573,17 @@ impl Orbit {
         let fdt = unsafe { Fdt::from_raw_unchecked(dtb_kva.as_ptr()) };
         let root = fdt.root();
 
+        // Two-phase walk: setup_plic must run before any device that
+        // wants to register a PLIC handler (e1000, virtio-input, …).
+        // The DTB child order isn't guaranteed, so collect PCI nodes
+        // during the traversal and defer them — same pattern virtio
+        // already uses below.
+        let mut pci_nodes: Vec<_> = Vec::new();
         let mut nodes: Vec<_> = root.children().collect();
         while let Some(node) = nodes.pop() {
             let name = node.name();
             if name.starts_with("pci") {
-                // get_pci_info maps PCI config space itself; no satp gymnastics.
-                self.get_pci_info(node);
+                pci_nodes.push(node);
                 continue
             }
             if name.starts_with("plic") {
@@ -1564,21 +1591,15 @@ impl Orbit {
                 continue
             }
 
-            /*
-            println!("\nexamining {}", name);
-            for prop in node.properties() {
-                println!("\t{prop:?}");
-            }
-            */
-
             for child in node.children() {
                 nodes.push(child);
             }
         }
 
-        // Setup virtio devices last so PLIC is already installed by
-        // the plic node match above — input registers an IRQ handler
-        // and a future gpu IRQ wake will too.
+        // PLIC is installed; now devices can register IRQ handlers.
+        for node in pci_nodes {
+            self.get_pci_info(node);
+        }
         self.discover_virtio(&fdt);
         self.setup_virtio_gpu();
         self.setup_virtio_input();

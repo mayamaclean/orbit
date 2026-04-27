@@ -8,6 +8,7 @@
 use core::sync::atomic::{AtomicPtr, Ordering};
 
 use process::{Thread, ThreadState};
+use tracing::error;
 
 use crate::Hardware;
 
@@ -20,7 +21,7 @@ use crate::Hardware;
 /// `AtomicPtr<()>`.
 #[derive(Clone, Copy)]
 pub struct HartView<'a> {
-    pub hart_id: u32,
+    pub hart_id: usize,
     pub current: &'a AtomicPtr<()>,
 }
 
@@ -114,6 +115,26 @@ pub fn assign_threads<'a, H, S, I>(
     }
 
     if let Some(t) = sched.next_runnable(self_view.affinity_bit()) {
+        // Unlike the remote loop, no `is_busy()` gate here — the kmain
+        // caller invariant is that `self_view.current == null` at this
+        // point (k_hart_loop only reaches assign_threads when
+        // hart_has_thread() returned false). If that invariant has been
+        // violated by some path we haven't traced, log it loudly: a
+        // self-view clobber is the *only* way `assign_thread_to` can
+        // overwrite an existing non-null `current` without going
+        // through the gate, and would explain the
+        // "U-ecall arrives with cur=kthread" race.
+        let prev = self_view.current.load(Ordering::Acquire);
+        if !prev.is_null() {
+            // This is a no_std crate, so we go via the `log` facade
+            // (already pulled in by tracing on the kmain side); host
+            // tests won't notice.
+            error!(
+                "assign_threads: self_view (hart{}) clobbering non-null current={:p} \
+                 with thread={:p} — invariant violation",
+                self_view.hart_id, prev, t,
+            );
+        }
         // SAFETY: as above.
         unsafe { assign_thread_to(self_view, t) };
     }

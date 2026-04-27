@@ -276,3 +276,177 @@ fn yield_retry_preserves_a_regs_for_re_execute() {
     assert_eq!(t.frame.regs[13], 0xCCCC);
     assert_eq!(t.frame.regs[14], 0xDDDD);
 }
+
+// ---- Mode/state gate ----
+//
+// These pin down the defense-in-depth gate that prevents a U-mode-ecall
+// commit from landing on the wrong thread when `hart.current` was
+// retargeted between trap entry and `apply_syscall_outcome`. The QEMU
+// repro: orbit-loader's `nc_yield(4100)` ecall lands on cpu2, but
+// `cpu2.current` has been swapped to knet (a Supervisor kthread). Without
+// the gate, `apply_syscall_outcome` would stamp `epc + 4 = 0x22000339c`
+// (a user VA) into `knet.pc`, and the next dispatch sret-s to a user
+// address in S-mode → cause=12 panic. Mirrors the gate philosophy of
+// `trap::update_trap_frame`.
+
+const KTHREAD_PC: usize = 0xFFFF_FFC0_0001_0000;
+
+#[test]
+fn return_refuses_to_commit_to_kthread() {
+    let mut t = make_thread(ThreadState::Running, SPP::Supervisor);
+    t.pc.store(KTHREAD_PC, Ordering::Release);
+    let original_frame = *t.frame;
+    let mut f = make_frame();
+    f.regs[11] = 0xDEAD;
+
+    let action = apply_syscall_outcome(
+        SyscallOutcome::Return { ret: 0 },
+        &mut t,
+        &mut f,
+        ECALL_EPC,
+    );
+
+    // No-op fallback so the trap dispatcher still unwinds, but no writes
+    // to thread.pc/thread.frame.
+    assert_eq!(action, ShimAction::Resume);
+    assert_eq!(t.pc.load(Ordering::Acquire), KTHREAD_PC);
+    assert_eq!(t.frame.regs[11], original_frame.regs[11]);
+}
+
+#[test]
+fn yield_refuses_to_commit_to_kthread() {
+    let mut t = make_thread(ThreadState::Running, SPP::Supervisor);
+    t.pc.store(KTHREAD_PC, Ordering::Release);
+    let mut f = make_frame();
+
+    let action = apply_syscall_outcome(
+        SyscallOutcome::Yield { state: ThreadState::Suspended, ret: Some(0) },
+        &mut t,
+        &mut f,
+        ECALL_EPC,
+    );
+
+    // Crucially NOT Yield(Suspended) — that would null kmain's
+    // hart.current and then long-jump via exit_thread_with_state. We
+    // want the dispatcher to return normally so cleanup happens
+    // elsewhere.
+    assert_eq!(action, ShimAction::Resume);
+    assert_eq!(t.pc.load(Ordering::Acquire), KTHREAD_PC);
+    assert_eq!(
+        t.state.load(Ordering::Acquire),
+        ThreadState::Running as usize,
+    );
+}
+
+#[test]
+fn yield_retry_refuses_to_commit_to_kthread() {
+    let mut t = make_thread(ThreadState::Running, SPP::Supervisor);
+    t.pc.store(KTHREAD_PC, Ordering::Release);
+    let mut f = make_frame();
+
+    let action = apply_syscall_outcome(
+        SyscallOutcome::YieldRetry { state: ThreadState::Blocking },
+        &mut t,
+        &mut f,
+        ECALL_EPC,
+    );
+
+    assert_eq!(action, ShimAction::Resume);
+    assert_eq!(t.pc.load(Ordering::Acquire), KTHREAD_PC);
+}
+
+#[test]
+fn return2_refuses_to_commit_to_kthread() {
+    let mut t = make_thread(ThreadState::Running, SPP::Supervisor);
+    t.pc.store(KTHREAD_PC, Ordering::Release);
+    let mut f = make_frame();
+
+    let action = apply_syscall_outcome(
+        SyscallOutcome::Return2 { ret0: 1, ret1: 2 },
+        &mut t,
+        &mut f,
+        ECALL_EPC,
+    );
+
+    assert_eq!(action, ShimAction::Resume);
+    assert_eq!(t.pc.load(Ordering::Acquire), KTHREAD_PC);
+    // Neither ret0 nor ret1 stamped into the kthread frame.
+    assert_ne!(t.frame.regs[10], 1);
+    assert_ne!(t.frame.regs[11], 2);
+}
+
+#[test]
+fn assigned_user_thread_refuses_to_commit() {
+    // `Assigned` means the manager just installed the thread but
+    // dispatch hasn't started — same logic as the trap-frame gate.
+    // Important specifically because `Assigned` was the state we saw
+    // most often in the QEMU mode-mismatch warnings.
+    let mut t = make_thread(ThreadState::Assigned, SPP::User);
+    let original_pc = 0x2200_0000;
+    t.pc.store(original_pc, Ordering::Release);
+    let mut f = make_frame();
+
+    let _ = apply_syscall_outcome(
+        SyscallOutcome::Return { ret: 0 },
+        &mut t,
+        &mut f,
+        ECALL_EPC,
+    );
+
+    assert_eq!(t.pc.load(Ordering::Acquire), original_pc);
+}
+
+#[test]
+fn ready_user_thread_refuses_to_commit() {
+    let mut t = make_thread(ThreadState::Ready, SPP::User);
+    let original_pc = 0x2200_0000;
+    t.pc.store(original_pc, Ordering::Release);
+    let mut f = make_frame();
+
+    let _ = apply_syscall_outcome(
+        SyscallOutcome::Return { ret: 0 },
+        &mut t,
+        &mut f,
+        ECALL_EPC,
+    );
+
+    assert_eq!(t.pc.load(Ordering::Acquire), original_pc);
+}
+
+#[test]
+fn suspended_user_thread_commits_normally() {
+    // Sanity check that the gate isn't over-tightened — a user thread in
+    // {Running, Suspended, Blocking} is the legitimate trap-saving set,
+    // matching `update_trap_frame`. A `Suspended` user thread can
+    // legitimately be `current` mid-syscall (e.g., the manager just
+    // transitioned it during ms_sleep before `exit_thread_with_state`
+    // ran).
+    let mut t = make_thread(ThreadState::Suspended, SPP::User);
+    t.pc.store(ECALL_EPC, Ordering::Release);
+    let mut f = make_frame();
+
+    let _ = apply_syscall_outcome(
+        SyscallOutcome::Return { ret: 0 },
+        &mut t,
+        &mut f,
+        ECALL_EPC,
+    );
+
+    assert_eq!(t.pc.load(Ordering::Acquire), ECALL_EPC + 4);
+}
+
+#[test]
+fn blocking_user_thread_commits_normally() {
+    let mut t = make_thread(ThreadState::Blocking, SPP::User);
+    t.pc.store(ECALL_EPC, Ordering::Release);
+    let mut f = make_frame();
+
+    let _ = apply_syscall_outcome(
+        SyscallOutcome::Return { ret: 0 },
+        &mut t,
+        &mut f,
+        ECALL_EPC,
+    );
+
+    assert_eq!(t.pc.load(Ordering::Acquire), ECALL_EPC + 4);
+}

@@ -58,6 +58,7 @@ case "$MODE" in
     # is `crate:test_file` (file = name passed to `--test`).
     HAMMER_TARGETS=(
       "orbit-core:assign_threads_concurrent"
+      "orbit-core:dispatch_syscall_race"
       "process:stdin"
       "orbit-core:tlb_shootdown"
     )

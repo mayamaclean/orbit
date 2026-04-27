@@ -54,8 +54,8 @@ impl Hardware for RiscvHardware {
         Ok(())
     }
 
-    fn wake_hart(&mut self, hart_id: u32) {
-        crate::supervisor_wake_hart(hart_id as usize);
+    fn wake_hart(&mut self, hart_id: usize) {
+        crate::supervisor_wake_hart(hart_id);
     }
 
     fn console_write_user(&mut self, pid: u16, bytes: &[u8]) -> Result<(), ()> {

@@ -218,9 +218,13 @@ pub extern "C" fn k_gpu(_a0: usize) {
             this_thread.ticks = 0;
             this_thread.wake_time =
                 (riscv::register::time::read64().wrapping_add(500_000)) as usize;
-            this_thread
-                .state
-                .store(ThreadState::Suspended as usize, Ordering::Release);
+            // Don't set state=Suspended here — the cscratch2=1 trap arm
+            // calls `exit_thread_with_state(Suspended)` after saving
+            // the frame, which nulls `current` first and sets the new
+            // state second. Setting state from this side leaks a window
+            // where another hart's manager observes Suspended while
+            // we still claim `current`, leading to double-dispatch.
+            // Same fix as knet's self-yield in kmain/src/lib.rs.
 
             riscv::register::sstatus::set_sie();
             core::arch::asm!("ebreak", "nop");

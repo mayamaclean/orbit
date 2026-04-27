@@ -110,14 +110,14 @@ pub enum ShootdownErr {
 /// `targets` and pop the entry off its own ring, but that's needless
 /// IPI traffic when the sender is already in supervisor mode).
 pub fn tlb_shootdown<I, H>(
-    n_targets: u32,
+    n_targets: usize,
     targets: I,
     va: u64,
     len: u64,
     hw: &mut H,
 ) -> Result<(), ShootdownErr>
 where
-    I: IntoIterator<Item = (u32, &'static ShootdownRing)>,
+    I: IntoIterator<Item = (usize, &'static ShootdownRing)>,
     H: Hardware,
 {
     if n_targets == 0 {

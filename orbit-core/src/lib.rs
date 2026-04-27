@@ -65,7 +65,7 @@ pub trait Hardware {
 
     /// Send an inter-processor interrupt to `hart_id`. Real impl writes
     /// the hart's ACLINT SSWI MSIP; tests record the call.
-    fn wake_hart(&mut self, hart_id: u32);
+    fn wake_hart(&mut self, hart_id: usize);
 
     /// Enqueue `work` onto the manager's work ring. Real impl pushes
     /// onto a `thingbuf::StaticThingBuf` and returns `Err(work)` if the
@@ -154,6 +154,16 @@ pub enum ShimAction {
 /// `Return` and `Yield` snapshot the frame and advance pc to `epc+4`.
 /// `YieldRetry` snapshots the frame but leaves pc at `epc` so the
 /// resumed thread re-executes the ecall.
+///
+/// **Mode/state gate**: cause=8 traps are by definition U-mode ecalls,
+/// so `thread` should be a User thread in {Running, Suspended, Blocking}.
+/// If a kthread or an Assigned/Ready/Exited thread is passed in, the
+/// commit is skipped (Resume returned, no writes). Mirrors the gate in
+/// [`trap::update_trap_frame`] — if the hart's `current` was retargeted
+/// between trap entry and the apply call, we must not stamp a user epc
+/// onto the wrong thread (the QEMU repro is knet ending up with
+/// `pc=0x22000339c` from an orbit-loader `nc_yield`, then sret-ing into
+/// user text in S-mode).
 pub fn apply_syscall_outcome(
     outcome: SyscallOutcome,
     thread: &mut process::Thread,
@@ -161,6 +171,16 @@ pub fn apply_syscall_outcome(
     epc: usize,
 ) -> ShimAction {
     use core::sync::atomic::Ordering;
+
+    if !commit_allowed(thread) {
+        // Caller-side panics in kmain's dispatch_syscall already catch
+        // mode mismatches; this is the no-op fallback so a test or any
+        // future caller that doesn't pre-check can't corrupt the wrong
+        // thread. Fall through to Resume so the trap dispatcher unwinds
+        // cleanly — the *user* thread that actually ecall'd is on
+        // another hart and will retry on its next park cycle.
+        return ShimAction::Resume;
+    }
 
     match outcome {
         SyscallOutcome::Return { ret } => {
@@ -194,4 +214,26 @@ pub fn apply_syscall_outcome(
             ShimAction::Yield(state)
         }
     }
+}
+
+/// True iff `thread` is in a state where committing a U-mode-ecall
+/// outcome is safe. Mirrors the trap-frame save gate in
+/// [`trap::update_trap_frame`]:
+///   * mode must be User — cause=8 is by definition a U-ecall, so the
+///     thread that produced the trap is a User thread. A Supervisor
+///     thread reaching here means `hart.current` was retargeted mid-trap.
+///   * state must be Running / Suspended / Blocking — a freshly-`Assigned`
+///     thread hasn't actually run yet, and Ready/Exited shouldn't be
+///     observed as `current` in a syscall path.
+fn commit_allowed(thread: &process::Thread) -> bool {
+    use core::sync::atomic::Ordering;
+    use riscv::register::sstatus::SPP;
+
+    if thread.mode != SPP::User {
+        return false;
+    }
+    let state = thread.state.load(Ordering::Acquire);
+    state == process::ThreadState::Running as usize
+        || state == process::ThreadState::Suspended as usize
+        || state == process::ThreadState::Blocking as usize
 }

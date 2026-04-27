@@ -6,7 +6,7 @@ use core::{arch::asm, ptr::null_mut, sync::atomic::{AtomicBool, Ordering}};
 use alloc::{collections::btree_map::BTreeMap, vec::Vec};
 use device::{HartContext, TrapFrame};
 use net_channel::NetChannel;
-use crate::kernel::shared_user_ptr::SharedUserPtr;
+use crate::kernel::{shared_user_ptr::SharedUserPtr, shootdown::CPU_COUNT};
 use process::{Thread, ThreadState};
 use smoltcp::{iface::{PollResult, SocketHandle, SocketSet}, socket::dhcpv4, storage::RingBuffer};
 
@@ -148,15 +148,30 @@ pub extern "C" fn k_hart_loop() -> ! {
     };
 
     loop {
+        // Always start a loop iteration with sstatus.SIE clear. After
+        // WFI returns from a trap, `sret` restores SIE from SPIE —
+        // typically back ON — so without this clear the dispatch path
+        // below would run with async traps live, re-opening the same
+        // race the `arm_hart_timer` (no-SIE) variant was meant to
+        // close. This single clear at the top covers both the dispatch
+        // window and the manager critical section.
+        unsafe { riscv::register::sstatus::clear_sie(); }
+
         if hart_has_thread(hart_context) {
-            setup_hart_timer(1_000_000);
+            // Arm the timer without enabling SIE: `enter_hart_context`
+            // is a one-way trip via sret, and the new thread's SIE
+            // gets restored from SPIE there. Leaving SIE off across
+            // the kernel-side window keeps the dispatch path
+            // uninterruptible by async traps.
+            arm_hart_timer(1_000_000);
             unsafe { enter_hart_context(hart_context); }
         }
 
         // Disable sstatus.SIE around the acquire + critical section. If a
         // trap fired mid-section the handler would long-jump via kptr back
         // to k_hart_loop without releasing MANAGER_LOCK, deadlocking all
-        // harts. setup_hart_timer restores SIE on the way out.
+        // harts. (Already off from the loop-top clear above; redundant
+        // store kept for clarity / defense in depth.)
         unsafe { riscv::register::sstatus::clear_sie(); }
         if try_acquire_manager() {
             orbit.cleanup_threads_and_processes();
@@ -170,11 +185,18 @@ pub extern "C" fn k_hart_loop() -> ! {
             release_manager();
 
             if hart_has_thread(hart_context) {
-                setup_hart_timer(1_000_000);
+                arm_hart_timer(1_000_000);
                 unsafe { enter_hart_context(hart_context); }
             }
         }
 
+        // For the WFI path we *do* want SIE on so async traps fire and
+        // wake us — WFI returns on any pending interrupt regardless of
+        // SIE, but with SIE off the trap handler doesn't run and the
+        // pending IRQ would just stay set until something else picked
+        // it up (like an sret to user-mode, where SIE is irrelevant).
+        // Keeping SIE on here means PLIC handlers / SSWI dispatchers
+        // run promptly while the hart is otherwise idle.
         unsafe {
             riscv::register::sie::set_ssoft();
             setup_hart_timer(100_000);
@@ -382,7 +404,7 @@ pub extern "C" fn k_net(device: *mut NetPackage) {
             |h| { sockets.remove(h); },
         );
         
-        let default_wake = now + 100_000;
+        let default_wake = now + 1_000_000;
         let wake_time = iface.poll_at(timestamp, &mut sockets)
             .map(|i| i.total_micros() as usize * 10)
             .unwrap_or(default_wake);
@@ -463,10 +485,18 @@ pub extern "C" fn k_net(device: *mut NetPackage) {
             hart_context.cscratch2 = 1;
             this_thread.ticks = 0;
             this_thread.wake_time = core::cmp::min(default_wake, wake_time);
-            this_thread.state.store(ThreadState::Suspended as usize, Ordering::Release);
 
             riscv::register::sstatus::clear_sum();
             riscv::register::sstatus::set_sie();
+
+            // State stays Running here on purpose. The cscratch2=1 path
+            // in the s_trap handler runs `exit_thread_with_state(Suspended)`
+            // after saving the frame, which nulls `current` *before*
+            // setting the new state — preventing the manager on another
+            // hart from picking up this thread while we still claim it.
+            // Setting `state = Suspended` from this side first would
+            // open the same race that produced double-dispatch of knet
+            // across harts (see bl/arm_hart_timer_*.log).
 
             asm!("ebreak", "nop");
 
@@ -484,6 +514,26 @@ pub fn setup_hart_timer(cycles: u64) {
 
         let t = riscv::register::time::read64().wrapping_add(cycles);
         // write stimecmp
+        asm!(
+            "csrw 0x14D, {}",
+            in(reg) t
+        );
+    }
+}
+
+/// Like [`setup_hart_timer`] but leaves `sstatus.SIE` alone — for use
+/// on the dispatch path where the caller wants the timer armed but not
+/// async traps delivered until `sret` restores the new thread's
+/// `SPIE → SIE`. Pre-this, k_hart_loop's `setup_hart_timer` enabled
+/// SIE and then `load_thread_into_hart_context_and_jump`'s first line
+/// cleared it; the window between exposed every dispatch to a
+/// timer/SSWI race that the trap-handler mode-gate caught but
+/// log-spammed.
+pub fn arm_hart_timer(cycles: u64) {
+    unsafe {
+        riscv::register::sie::set_stimer();
+
+        let t = riscv::register::time::read64().wrapping_add(cycles);
         asm!(
             "csrw 0x14D, {}",
             in(reg) t
@@ -528,6 +578,33 @@ pub fn update_thread_and_trap_frame(
     let cptr = hart_context.current.load(Ordering::Acquire);
     if cptr == null_mut() { return; }
     let thread: &mut Thread = unsafe { (cptr as *mut Thread).as_mut_unchecked() };
+
+    // Watchdog: if the trap's from_user disagrees with the current
+    // thread's mode, the hart's `current` was retargeted between when
+    // the trap fired and when we got here. The mode-gate in
+    // `update_trap_frame` skips the save in that case, so we don't
+    // corrupt thread.pc.
+    //
+    // An `Assigned` thread is the benign case: `assign_threads`
+    // transitions Ready → Assigned and writes the ptr into a hart's
+    // `current` slot before the dispatch runs. If that hart was
+    // still in S-mode (e.g., WFI inside k_hart_loop), the SSWI/timer
+    // that delivers the wake naturally fires with from_user=false.
+    // No actual bug — suppress to keep the watchdog signal
+    // meaningful. Any other state with a mismatch is a real
+    // scheduling anomaly worth logging.
+    let thread_in_user_mode = thread.mode == riscv::register::sstatus::SPP::User;
+    if thread_in_user_mode != from_user
+        && thread.state.load(Ordering::Acquire) != ThreadState::Assigned as usize
+    {
+        tracing::warn!(
+            "trap mode mismatch on cpu{}: tid={} mode={:?} state={} from_user={} epc={:#x} — \
+             scheduler retargeted current mid-trap?",
+            hart_context.hart_id, thread.tid, thread.mode,
+            thread.state.load(Ordering::Acquire), from_user, epc,
+        );
+    }
+
     orbit_core::trap::update_trap_frame(thread, epc, frame, from_user);
 }
 
@@ -563,6 +640,67 @@ fn dispatch_syscall<F>(
             return;
         }
         let thread = (current as *mut Thread).as_mut_unchecked();
+
+        // U-mode-only path: cause=8 traps are by definition from U-mode,
+        // so `current` should be a User thread. If it's a kthread,
+        // dispatch_syscall would happily overwrite its pc with epc+4 in
+        // apply_syscall_outcome and we'd later sret to a user VA in
+        // S-mode — exactly the cause=12 panic we hit before. Refuse to
+        // commit, dump every adjacent hart's `current` so we can
+        // correlate (the actual user thread is presumably assigned
+        // somewhere else right now), and fall through. The
+        // `apply_syscall_outcome` gate is also a no-op on a kthread, so
+        // even if we did reach it nothing would corrupt — we just want
+        // the diagnostic out.
+        if thread.mode != riscv::register::sstatus::SPP::User {
+            // Walk the HartContext array so we can print every hart's
+            // current ptr alongside the offending one. This is the
+            // diagnostic that pins down where the racy User thread
+            // actually landed.
+            let hart_root = {
+                (riscv::register::sscratch::read() as *const HartContext)
+                    .sub(hart_context.hart_id as usize)
+            };
+            tracing::error!(
+                "dispatch_syscall mode mismatch — cpu{} epc={:#x} a0={:#x} \
+                 cur=tid={} pid={} mode={:?} state={} thread.pc={:#x} \
+                 last_wake_reason={:#x}",
+                hart_context.hart_id, epc, frame.regs[10],
+                thread.tid, thread.pid, thread.mode,
+                thread.state.load(Ordering::Acquire),
+                thread.pc.load(Ordering::Acquire),
+                thread.last_wake_reason.load(Ordering::Acquire),
+            );
+            // Hart count isn't readily available here (Orbit owns it
+            // via cscratch); 4 covers the QEMU virt config we ship.
+            for i in 0..(CPU_COUNT.load(Ordering::Relaxed)) {
+                let hc = hart_root.add(i).as_ref_unchecked();
+                let cur = hc.current.load(Ordering::Acquire) as *mut Thread;
+                if cur.is_null() {
+                    tracing::error!("  cpu{}: cur=<null>", i);
+                } else {
+                    let t = cur.as_ref_unchecked();
+                    tracing::error!(
+                        "  cpu{}: cur=tid={} pid={} mode={:?} state={} pc={:#x}",
+                        i, t.tid, t.pid, t.mode,
+                        t.state.load(Ordering::Acquire),
+                        t.pc.load(Ordering::Acquire),
+                    );
+                }
+            }
+            // Halt now: returning from here lets the trap path call
+            // check_context_and_switch on the wrong thread, which
+            // transitions knet Running → Ready and the next manager
+            // pass re-dispatches it from its corrupted frame. We saw
+            // that cascade produce `net: pkg@<garbage>` / `net: no phy`
+            // in arm_hart_timer_*.log. Halting preserves the dump
+            // above as the last forensic state.
+            panic!(
+                "dispatch_syscall on cpu{}: cur tid={} mode={:?} (expected User) — \
+                 a kthread is current during a U-mode ecall (epc={:#x})",
+                hart_context.hart_id, thread.tid, thread.mode, epc,
+            );
+        }
 
         let outcome = body(thread, frame);
         match orbit_core::apply_syscall_outcome(outcome, thread, frame, epc) {
@@ -603,6 +741,34 @@ pub fn handle_close_req(epc: usize, hart_context: &'static HartContext, frame: &
 pub fn handle_nc_create_req(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
     dispatch_syscall(epc, hart_context, frame, |t, f| {
         orbit_core::syscall::nc_create_req(t, f, &mut crate::hw::RiscvHardware)
+    });
+}
+
+/// `nc_yield(timeout_ms)` — push a kernel `WakeEvent::Net` so k_net
+/// processes whatever the caller just queued in a NetCh ring, then
+/// optionally park the caller for up to `timeout_ms` (capped via
+/// `ms_sleep`'s existing one-hour ceiling). The park returns early
+/// when the manager bumps this thread's `wake_override` (e.g. via
+/// `update_tcp`'s `outcome.ring_progress` writing
+/// `WakeEvent::Pid(self.pid)` after staging a fresh slice). With
+/// phases 2 + 3 in place, this is the syscall that closes the
+/// "user-side `sleep_ms(10)` floor" — request/response round trips
+/// drop from ~20 ms (one timer tick on each side) to scheduler
+/// dispatch latency.
+///
+/// `timeout_ms == 0`: pure notification, no park; returns
+/// immediately. Useful as a "fire and forget" wake from a path that
+/// doesn't itself want to sleep.
+#[unsafe(no_mangle)]
+pub fn handle_nc_yield(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
+    dispatch_syscall(epc, hart_context, frame, |t, f| {
+        let _ = crate::kernel::WAKE_QUEUE.push(crate::kernel::WakeEvent::Net);
+        let timeout_ms = f.regs[11];
+        if timeout_ms == 0 {
+            orbit_core::SyscallOutcome::Return { ret: 0 }
+        } else {
+            orbit_core::syscall::ms_sleep(t, timeout_ms, &crate::hw::RiscvHardware)
+        }
     });
 }
 
