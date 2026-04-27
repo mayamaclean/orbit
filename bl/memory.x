@@ -34,6 +34,18 @@ PHDRS
 
 SECTIONS
 {
+  /* Stack at the BOTTOM of RAM, ahead of any loaded sections. SP grows
+     down from `_stack_end` toward `_stack_start = ORIGIN(RAM)`; an
+     overflow walks past 0x80000000 into qemu-virt MMIO/unmapped and
+     traps with an instruction-/load-access fault. Previously the stack
+     sat above .data/.bss and overflows silently chewed through
+     statics — exactly the failure mode that wiped `serial::SERIAL`
+     when kmain grew enough to push BSS into the page-table slot. */
+  . = ORIGIN(RAM);
+  PROVIDE(_stack_start = .);
+  . = . + 0x80000;            /* 512 KiB stack region */
+  PROVIDE(_stack_end = .);
+
   .text : ALIGN(4096) {
     PROVIDE(_text_start = .);
     *(.text.init) *(.text .text.*)
@@ -56,14 +68,23 @@ SECTIONS
 
   .data : ALIGN(4096) {
     PROVIDE(_data_start = .);
-    *(.sdata .sdata.*) 
+    *(.sdata .sdata.*)
     *(.data .data.*)
     PROVIDE(_data_end = .);
   } >RAM AT>RAM :data
 
+  /* Page-table pool: 128 KiB after all loaded sections, capped well
+     below `TRAP_FRAME_ADDR` (0x80800000). Self-locating so kmain
+     growth doesn't push it into anything else. */
   . = ALIGN(4096);
-  PROVIDE(_stack_start = .);
-  PROVIDE(_stack_end = _stack_start + 0x80000);
+  PROVIDE(_id_map_tables = .);
+
   PROVIDE(_memory_start = ORIGIN(RAM));
   PROVIDE(_memory_end = ORIGIN(RAM) + LENGTH(RAM));
 }
+
+/* Page-table pool stays clear of the M-mode trap frames at 0x80800000.
+   If kmain ever grows enough to push `_id_map_tables` past
+   `0x80800000 - 128 KiB`, the link fails loudly. */
+ASSERT(_id_map_tables + 0x20000 <= 0x80800000,
+       "bl page-table pool collides with TRAP_FRAME_ADDR — kmain too large?")

@@ -1,6 +1,6 @@
 #![no_std]
 
-use core::{fmt::Debug, sync::atomic::{AtomicPtr, AtomicUsize}};
+use core::{fmt::Debug, sync::atomic::{AtomicPtr, AtomicU8, AtomicU64, AtomicUsize}};
 use dtoolkit::{Node, Property, fdt::{Fdt, FdtNode}};
 use riscv::register::satp::Satp;
 
@@ -34,6 +34,24 @@ pub struct HartContext {
     /// install; sentinel `u32::MAX` means "no PLIC context assigned".
     /// Appended past the load-bearing offsets read by `asm/trap.S`.
     pub plic_s_context: u32,
+
+    // ─── per-hart bucket accounting (kmain::kernel::accounting) ─────
+    /// Which bucket this hart's wall time is currently being credited
+    /// to. Owning hart only writes; foreign harts never read. Stored
+    /// as the discriminant of [`kmain::kernel::accounting::HartBucket`]
+    /// (private to that module — kept as `AtomicU8` here to avoid a
+    /// cross-crate enum dep into device).
+    pub current_bucket: AtomicU8,
+    /// `time` CSR snapshot when [`current_bucket`] was last assigned.
+    /// Owning hart only writes; foreign harts never read.
+    pub bucket_enter_tick: AtomicU64,
+    /// Cumulative ticks credited to each bucket. Foreign harts read
+    /// these via `query_stats` (relaxed atomic loads — torn-read-safe
+    /// on RV64, ordering doesn't matter for stats).
+    pub user_ticks: AtomicU64,
+    pub kernel_ticks: AtomicU64,
+    pub scheduler_ticks: AtomicU64,
+    pub idle_ticks: AtomicU64,
 }
 
 #[repr(C, align(8))]

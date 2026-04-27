@@ -216,7 +216,7 @@ extern "C" fn kinit(hartid: usize, dtb_addr: usize) {
             println!("KELF=0x{:016X?}..{:016X?}", bl::KERNEL_ELF.as_ptr() as usize, bl::KERNEL_ELF.as_ptr() as usize + bl::KERNEL_ELF_LEN);
 
             const MAX_ID_TABLES: usize = 32;
-            let page_table_start= bl::ID_MAP_TABLES as usize;
+            let page_table_start = bl::id_map_tables();
             let mut ptv = PageTableVec::new(page_table_start, 4096 * MAX_ID_TABLES);
             let mut pages = mmap::PageAlloc::PTV(&mut ptv);
             let root_pa = pages.allocate_page_table().unwrap();
@@ -255,7 +255,7 @@ extern "C" fn kinit(hartid: usize, dtb_addr: usize) {
 
             bl::ID_MAP_ADDR.store(root_ref as *const _ as u64, Ordering::Release);
 
-            println!("PTABLES=0x{:016X}..0x{:016X}", bl::ID_MAP_TABLES, bl::ID_MAP_TABLES + ptv.current_tables_size());
+            println!("PTABLES=0x{:016X}..0x{:016X}", page_table_start, page_table_start + ptv.current_tables_size());
 
             bl::kmain_enter(addr, dtb_addr as usize);
         }

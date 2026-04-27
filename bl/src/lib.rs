@@ -12,6 +12,7 @@ use riscv::register::mstatus::SPP;
 
 unsafe extern "C" {
     unsafe static KERNEL_STACK_END: u64;
+    unsafe static KERNEL_ID_MAP_TABLES: u64;
 }
 
 pub const KERNEL_ELF: &'static [u8] = include_bytes!("../../kmain/target/riscv64gc-unknown-none-elf/release/orbit");
@@ -19,7 +20,21 @@ pub const KERNEL_ELF_LEN: usize = KERNEL_ELF.len();
 
 pub const TRAP_FRAME_ADDR: usize = 0x80800000;
 pub const TRAP_FRAMES: *mut TrapFrame = 0x80800000 as *mut _;
-pub const ID_MAP_TABLES: usize = TRAP_FRAME_ADDR- (2 * MB as usize);
+
+/// Start of the page-table pool, placed by the linker right after
+/// `.bss`/`.data` (see [`memory.x`](../../memory.x)). With the stack
+/// region now at the bottom of RAM, this is the natural spot to host
+/// 128 KiB of page tables — far from the stack, far from the loaded
+/// sections, and bounded above by `TRAP_FRAME_ADDR`. The linker
+/// `ASSERT` in `memory.x` enforces the upper bound at link time.
+///
+/// Was previously a fixed `TRAP_FRAME_ADDR - 2 MiB` constant, which
+/// silently broke when kmain grew enough to push `serial::SERIAL`
+/// into that slot. Now self-locates with the rest of the layout.
+#[inline]
+pub fn id_map_tables() -> usize {
+    unsafe { KERNEL_ID_MAP_TABLES as usize }
+}
 
 pub static ID_MAP_ADDR: AtomicU64 = AtomicU64::new(0);
 pub static SYSINFO: SysInfo = SysInfo {

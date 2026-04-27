@@ -52,6 +52,7 @@ use crate::kernel::context::get_hart_context;
 use crate::kernel::pci::PciDevice;
 use crate::{NetPackage, SocketReq};
 
+pub mod accounting;
 pub mod context;
 pub mod handle;
 pub mod input;
@@ -241,28 +242,61 @@ impl Orbit {
             .map(|m| m.len)
             .sum();
 
+        // Per-thread accumulator sums. `process.threads` holds tids;
+        // each maps via `self.threads` to a `PThread` (raw ptr to a
+        // Box-leaked Thread). Foreign-hart reads are racy but
+        // tear-safe via the per-field atomics.
+        let mut cpu_ticks: u64 = 0;
+        let mut context_switches: u64 = 0;
+        let mut syscalls: u64 = 0;
+        let mut syscall_ticks: u64 = 0;
+        for tid in &proc.threads {
+            if let Some(pt) = self.threads.get(tid) {
+                let t: &Thread = unsafe { (pt.0 as *const Thread).as_ref_unchecked() };
+                cpu_ticks = cpu_ticks
+                    .wrapping_add(t.cpu_ticks_total.load(Ordering::Relaxed));
+                context_switches = context_switches
+                    .wrapping_add(t.context_switches.load(Ordering::Relaxed));
+                syscalls = syscalls
+                    .wrapping_add(t.syscall_count.load(Ordering::Relaxed));
+                syscall_ticks = syscall_ticks
+                    .wrapping_add(t.syscall_ticks.load(Ordering::Relaxed));
+            }
+        }
+
+        // System-wide hart-bucket sums (every hart contributes).
+        use crate::kernel::accounting::sum_hart_counter;
+        let hart_user_ticks =
+            sum_hart_counter(|h| h.user_ticks.load(Ordering::Relaxed));
+        let hart_kernel_ticks =
+            sum_hart_counter(|h| h.kernel_ticks.load(Ordering::Relaxed));
+        let hart_scheduler_ticks =
+            sum_hart_counter(|h| h.scheduler_ticks.load(Ordering::Relaxed));
+        let hart_idle_ticks =
+            sum_hart_counter(|h| h.idle_ticks.load(Ordering::Relaxed));
+
         Some(orbit_abi::stats::ProcessStats {
             size: core::mem::size_of::<orbit_abi::stats::ProcessStats>() as u32,
             _reserved: 0,
             pid: proc.pid,
             thread_count: proc.thread_count,
             _pad0: 0,
-            cpu_ticks: 0,
-            context_switches: 0,
-            syscalls: 0,
+            cpu_ticks,
+            context_switches,
+            syscalls,
             resident_bytes,
             heap_bytes,
             kernel_kpages_bytes: self.kernel_pages.allocated_bytes() as u64,
             kernel_user_pages_bytes: self.user_pages.allocated_bytes() as u64,
             kernel_ktables_bytes: self.table_pages.allocated_bytes() as u64,
-            // Phase 2: KHEAP.lock().used() — kheap is in bin/orbit.rs,
-            // needs a public accessor before this can be filled in.
+            // KHEAP usage requires intercepting `#[global_allocator]`
+            // — orthogonal to time accounting, deferred.
             kernel_heap_bytes: 0,
-            syscall_ticks: 0,
-            hart_user_ticks: 0,
-            hart_kernel_ticks: 0,
-            hart_scheduler_ticks: 0,
-            hart_idle_ticks: 0,
+            syscall_ticks,
+            hart_user_ticks,
+            hart_kernel_ticks,
+            hart_scheduler_ticks,
+            hart_idle_ticks,
         })
     }
 
@@ -434,6 +468,10 @@ impl Orbit {
             fault_info: None,
             allowed_affinity: all_harts,
             affinity: AtomicU64::new(all_harts),
+            cpu_ticks_total: AtomicU64::new(0),
+            context_switches: AtomicU64::new(0),
+            syscall_count: AtomicU64::new(0),
+            syscall_ticks: AtomicU64::new(0),
         };
 
         // TODO: figure out why pin<box<thread>> doesnt work
@@ -2034,6 +2072,10 @@ impl Orbit {
             fault_info: None,
             allowed_affinity,
             affinity: AtomicU64::new(affinity),
+            cpu_ticks_total: AtomicU64::new(0),
+            context_switches: AtomicU64::new(0),
+            syscall_count: AtomicU64::new(0),
+            syscall_ticks: AtomicU64::new(0),
         })
     }
 

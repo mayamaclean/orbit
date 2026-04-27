@@ -174,6 +174,12 @@ pub extern "C" fn k_hart_loop() -> ! {
         // store kept for clarity / defense in depth.)
         unsafe { riscv::register::sstatus::clear_sie(); }
         if try_acquire_manager() {
+            // Bucket hook 4: enter scheduler critical section.
+            crate::kernel::accounting::switch_bucket(
+                hart_context,
+                crate::kernel::accounting::HartBucket::Scheduler,
+            );
+
             orbit.cleanup_threads_and_processes();
             orbit.drain_pending_work();
             // Drain wake events *before* assign_threads so any thread
@@ -182,6 +188,14 @@ pub extern "C" fn k_hart_loop() -> ! {
             orbit.drain_wakes();
             orbit.check_net();
             orbit.assign_threads(hart_context);
+
+            // Bucket hook 5: leave scheduler critical section. Switch
+            // *before* release so the next acquirer's snapshot doesn't
+            // race a still-Scheduler bucket on this hart.
+            crate::kernel::accounting::switch_bucket(
+                hart_context,
+                crate::kernel::accounting::HartBucket::Kernel,
+            );
             release_manager();
 
             if hart_has_thread(hart_context) {
@@ -200,6 +214,13 @@ pub extern "C" fn k_hart_loop() -> ! {
         unsafe {
             riscv::register::sie::set_ssoft();
             setup_hart_timer(100_000);
+
+            // Bucket hook 3: drop into idle. Bracketed automatically
+            // on wake by the s_trap entry hook (→ Kernel).
+            crate::kernel::accounting::switch_bucket(
+                hart_context,
+                crate::kernel::accounting::HartBucket::Idle,
+            );
             riscv::asm::wfi();
         }
     }
@@ -898,5 +919,104 @@ pub fn handle_query_stats(epc: usize, hart_context: &'static HartContext, frame:
         drop(guard);
 
         orbit_core::SyscallOutcome::Return { ret: to_write as isize }
+    });
+}
+
+/// `query_syscall_stats(buf_ptr, buf_len)` — copy the system-wide
+/// per-syscall latency table into the user buffer. Layout matches
+/// [`SyscallStatsHeader`] + N × [`SyscallEntry`] where N is the
+/// kernel's `Sysno::COUNT`. Returns bytes written, or a negative errno.
+///
+/// [`SyscallStatsHeader`]: orbit_abi::syscall_stats::SyscallStatsHeader
+/// [`SyscallEntry`]: orbit_abi::syscall_stats::SyscallEntry
+#[unsafe(no_mangle)]
+pub fn handle_query_syscall_stats(
+    epc: usize,
+    hart_context: &'static HartContext,
+    frame: &mut TrapFrame,
+) {
+    use core::sync::atomic::Ordering;
+    use orbit_abi::Sysno;
+    use orbit_abi::errno::{EFAULT, EINVAL};
+    use orbit_abi::layout::user_range_ok;
+    use orbit_abi::syscall_stats::{
+        SyscallEntry, SyscallStatsHeader, SYSCALL_STATS_MIN_LEN,
+    };
+
+    dispatch_syscall(epc, hart_context, frame, |t, f| {
+        let buf_va = f.regs[11] as u64;
+        let buf_len = f.regs[12];
+
+        if buf_len < SYSCALL_STATS_MIN_LEN {
+            return orbit_core::SyscallOutcome::Return {
+                ret: -(EINVAL as isize),
+            };
+        }
+        if !user_range_ok(buf_va, buf_len as u64) {
+            return orbit_core::SyscallOutcome::Return {
+                ret: -(EFAULT as isize),
+            };
+        }
+        use orbit_core::Hardware;
+        if !crate::hw::RiscvHardware
+            .user_va_translates(t.root_table_addr() as u64, buf_va)
+        {
+            return orbit_core::SyscallOutcome::Return {
+                ret: -(EFAULT as isize),
+            };
+        }
+
+        // Native payload size = header + COUNT entries. Caller's
+        // buffer may be smaller (older userland with smaller COUNT)
+        // or larger (newer); we honor whichever is smaller and rely
+        // on the header.count field to tell the reader how many
+        // entries are valid.
+        let hdr_size = core::mem::size_of::<SyscallStatsHeader>();
+        let entry_size = core::mem::size_of::<SyscallEntry>();
+        let native = hdr_size + Sysno::COUNT * entry_size;
+        let to_write = core::cmp::min(native, buf_len);
+        // How many full entries fit after the header? (Truncate the
+        // tail rather than write a partial entry.)
+        let entries_capacity = if to_write >= hdr_size {
+            (to_write - hdr_size) / entry_size
+        } else {
+            0
+        };
+        let entries_to_write = core::cmp::min(entries_capacity, Sysno::COUNT);
+
+        let guard = UserAccess::enter();
+        unsafe {
+            // Header.
+            let hdr = SyscallStatsHeader {
+                size: (hdr_size + entries_to_write * entry_size) as u32,
+                count: entries_to_write as u32,
+            };
+            let hdr_dst = guard.slice_mut(buf_va, hdr_size);
+            hdr_dst.copy_from_slice(core::slice::from_raw_parts(
+                &hdr as *const _ as *const u8,
+                hdr_size,
+            ));
+            // Entries: read each slot and write it directly. Using a
+            // stack scratch keeps the SUM window tight.
+            for i in 0..entries_to_write {
+                let slot = &crate::kernel::accounting::SYSCALL_STATS[i];
+                let entry = SyscallEntry {
+                    count: slot.count.load(Ordering::Relaxed),
+                    total_ticks: slot.total_ticks.load(Ordering::Relaxed),
+                };
+                let dst = guard.slice_mut(
+                    buf_va + (hdr_size + i * entry_size) as u64,
+                    entry_size,
+                );
+                dst.copy_from_slice(core::slice::from_raw_parts(
+                    &entry as *const _ as *const u8,
+                    entry_size,
+                ));
+            }
+        }
+        drop(guard);
+
+        let written = hdr_size + entries_to_write * entry_size;
+        orbit_core::SyscallOutcome::Return { ret: written as isize }
     });
 }

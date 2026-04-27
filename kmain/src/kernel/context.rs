@@ -45,7 +45,7 @@ unsafe extern "C" {
     unsafe fn enter_hart_kcontext_asm(trap_frame: *const ()) -> !;
 }
 
-pub unsafe fn load_thread_into_hart_context_and_jump(_context: &'static HartContext, thread: &'static Thread) -> ! {
+pub unsafe fn load_thread_into_hart_context_and_jump(context: &'static HartContext, thread: &'static Thread) -> ! {
     unsafe {
         // No S-mode interrupts across the register-load → sret window. Without
         // this, a stimer/SSWI landing inside enter_hart_context_asm would
@@ -98,8 +98,24 @@ pub unsafe fn load_thread_into_hart_context_and_jump(_context: &'static HartCont
 
         //serial::println!("cpu{} marking thread{} as running", context.hart_id, thread.tid);
         thread.state.store(ThreadState::Running as usize, Ordering::Release);
+        // Per-thread context-switch tally: every Ready→Running dispatch
+        // (user or kernel thread) is one switch from this thread's
+        // perspective. Foreign-hart reads via `query_stats` go through
+        // the same atomic.
+        thread.context_switches.fetch_add(1, Ordering::Relaxed);
 
         if thread.mode == SPP::User {
+            // Bucket hook 2: sret to user. Switch right before the
+            // asm so trap-prologue ticks remain in Kernel and the
+            // first cycle in user code starts the User bucket.
+            // Kernel-thread (Supervisor) sret stays in Kernel — these
+            // threads are kernel code that just happens to run in a
+            // dedicated context.
+            crate::kernel::accounting::switch_bucket(
+                context,
+                crate::kernel::accounting::HartBucket::User,
+            );
+
             // The kernel-vaddr frame ptr is unreachable after the satp switch,
             // so we hand the asm the user-side mapping at slot's vaddr instead.
             let slot = thread.slot

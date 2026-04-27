@@ -71,6 +71,16 @@ extern "C" fn s_trap(
         (riscv::register::sscratch::read() as *mut HartContext).as_mut_unchecked()
     };
 
+    // Bucket hook 1: trap entry. Whatever bucket the hart was in
+    // (User on a syscall/timer from user-mode, Idle if a wfi just woke
+    // up, Kernel for nested S-mode traps) gets credited; future ticks
+    // through this trap land in Kernel until we sret back or drop into
+    // the manager / wfi.
+    kmain::kernel::accounting::switch_bucket(
+        hart_context,
+        kmain::kernel::accounting::HartBucket::Kernel,
+    );
+
     let cause_num = cause & 0xfff;
 	let mut return_pc = epc;
     let is_async = {
@@ -194,6 +204,14 @@ extern "C" fn s_trap(
             }
             8 => {
                 let syscall = frame.regs[10];
+                // Bracket the dispatch for per-syscall + per-thread
+                // service-time accounting. Only handlers that *return*
+                // (non-blocking, non-exit) reach `record_syscall`
+                // below; blocking/exit paths long-jump out via
+                // `exit_thread_with_state` and are excluded — that's
+                // the right semantic since "service time" stops when
+                // the handler hands control back to the trap path.
+                let syscall_start_ticks = riscv::register::time::read64();
                 match syscall {
                     // exit
                     0 => {
@@ -246,6 +264,9 @@ extern "C" fn s_trap(
                     4101 => {
                         kmain::handle_query_stats(epc, hart_context, frame);
                     }
+                    4102 => {
+                        kmain::handle_query_syscall_stats(epc, hart_context, frame);
+                    }
                     5000 => {
                         debug!("orbit handling u mode ecall({syscall})");
                         kmain::handle_create_thread(epc, hart_context, frame);
@@ -254,6 +275,18 @@ extern "C" fn s_trap(
                         debug!("orbit handling u mode ecall({syscall})");
                         kmain::update_thread_and_trap_frame(epc + 4, hart_context, frame, from_user);
                     }
+                }
+                // Close the bracket: handlers that returned hit this;
+                // long-jumping ones (exit, blocking SyscallOutcome)
+                // skipped past it. `current` may be null if the
+                // syscall path nulled it (shouldn't happen on
+                // non-yielding paths, but check defensively).
+                let cur = hart_context.current.load(Ordering::Acquire);
+                if !cur.is_null() {
+                    let t = unsafe { (cur as *const Thread).as_ref_unchecked() };
+                    kmain::kernel::accounting::record_syscall(
+                        syscall, t, syscall_start_ticks,
+                    );
                 }
                 check_context_and_switch();
             }
@@ -286,6 +319,16 @@ extern "C" fn k_harthello() {
         riscv::register::stvec::write(Stvec::new(s_trap_addr, TrapMode::Direct));
 
         setup_interrupts();
+
+        // Bucket hook 6: hart bringup. Stamp `bucket_enter_tick`
+        // with a real `now()` so the first `switch_bucket` computes
+        // a sane elapsed instead of crediting ~all of system uptime
+        // to whichever bucket fires first. Boot prologue between
+        // power-on and this point is unaccounted (deliberate).
+        kmain::kernel::accounting::init_hart_bucket(
+            hart_context,
+            kmain::kernel::accounting::HartBucket::Kernel,
+        );
 
         enter_hart_context(hart_context);
     }
@@ -798,6 +841,21 @@ extern "C" fn rust_main(_hartid: usize, sysinfo: usize, load_addr: u64) -> ! {
             // k_smpstart. Any cause-9 that lands here before then will be
             // rejected by `plic::dispatch`.
             hart_context.plic_s_context = u32::MAX;
+
+            // Bucket accounting starts in the Kernel bucket. The
+            // bucket_enter_tick is set to zero here and re-stamped to
+            // `now()` in `k_harthello` just before control reaches
+            // user-mode/idle for the first time, so the boot prologue
+            // doesn't get charged to anything.
+            hart_context.current_bucket.store(
+                kmain::kernel::accounting::HartBucket::Kernel as u8,
+                Ordering::Relaxed,
+            );
+            hart_context.bucket_enter_tick.store(0, Ordering::Relaxed);
+            hart_context.user_ticks.store(0, Ordering::Relaxed);
+            hart_context.kernel_ticks.store(0, Ordering::Relaxed);
+            hart_context.scheduler_ticks.store(0, Ordering::Relaxed);
+            hart_context.idle_ticks.store(0, Ordering::Relaxed);
 
             info!("setting hart context @ {ptr:016X?} to kidle hart{hart}");
         }

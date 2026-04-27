@@ -309,6 +309,21 @@ pub struct Thread {
     /// `affinity & !allowed_affinity` is always zero. Atomic so the
     /// scheduler reads it without locking the process table.
     pub affinity: AtomicU64,
+
+    // ─── per-thread accounting (read by query_stats from any hart) ──
+    /// Cumulative user-mode CPU time in `time` CSR ticks. Credited at
+    /// each User → ¬User hart-bucket transition by the owning hart;
+    /// foreign-hart reads (stats snapshot) are racy but tear-safe on
+    /// RV64 via the atomic. Phase 2.
+    pub cpu_ticks_total: AtomicU64,
+    /// Times this thread transitioned into Running. Incremented by the
+    /// scheduler on dispatch; foreign-hart reads as above.
+    pub context_switches: AtomicU64,
+    /// Syscalls dispatched against this thread.
+    pub syscall_count: AtomicU64,
+    /// Cumulative kernel service ticks across this thread's syscalls
+    /// (excludes time spent parked on a `ThreadBlockReason`).
+    pub syscall_ticks: AtomicU64,
 }
 
 impl Thread {
