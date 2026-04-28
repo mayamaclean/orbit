@@ -22,6 +22,8 @@ use alloc::collections::BTreeMap;
 
 use net_channel::NetChannel;
 
+use crate::kernel::fs::Filesystem;
+use crate::kernel::fs::Inode;
 use crate::kernel::shared_user_ptr::SharedUserPtr;
 
 /// Opaque per-process resource identifier. Not a hart-global value —
@@ -34,6 +36,17 @@ pub type Fd = u32;
 /// hands back the resulting Fd.
 pub enum Handle {
     NetChannel(SharedUserPtr<NetChannel>),
+    File(OpenFile),
+}
+
+/// FS-side per-fd state. Single mounted filesystem today, so
+/// `fs` is a static reference; multi-mount would replace it with a
+/// per-mount index.
+pub struct OpenFile {
+    pub fs: &'static dyn Filesystem,
+    pub inode: Inode,
+    /// Auto-advanced by `fs_read` (one sector per call in v1).
+    pub offset: u64,
 }
 
 /// Per-process handle table + next-ID counter. Owned by `Orbit`, keyed
@@ -63,6 +76,10 @@ impl ProcessHandles {
 
     pub fn get(&self, fd: Fd) -> Option<&Handle> {
         self.table.get(&fd)
+    }
+
+    pub fn get_mut(&mut self, fd: Fd) -> Option<&mut Handle> {
+        self.table.get_mut(&fd)
     }
 
     pub fn remove(&mut self, fd: Fd) -> Option<Handle> {

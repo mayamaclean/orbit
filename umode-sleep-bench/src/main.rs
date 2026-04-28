@@ -26,7 +26,7 @@ use orbit_rt as _;
 use core::fmt::Write;
 use core::panic::PanicInfo;
 
-use orbit_abi::{logln, user::{exit, get_micros, sleep_ms, SerialWriter}};
+use orbit_abi::{logln, user::{exit, get_micros, sleep_ms, ConsoleWriter}};
 
 /// Sleep durations to characterize, in milliseconds. 1ms is the
 /// classic "sub-heartbeat" case; 10/100ms are above the heartbeat
@@ -105,7 +105,7 @@ fn run_sweep(target_ms: usize) -> Stats {
 }
 
 fn print_stats(target_ms: usize, s: &Stats) {
-    let mut w = SerialWriter::new();
+    let mut w = ConsoleWriter::new();
     let _ = write!(
         w,
         "SLEEP target_ms={} n={} under={} min_us={} mean_us={} max_us={} buckets=[",
@@ -140,7 +140,7 @@ pub unsafe extern "C" fn _start() -> ! {
 
 #[panic_handler]
 fn panic_time(p: &PanicInfo) -> ! {
-    let mut w = SerialWriter::new();
+    let mut w = ConsoleWriter::new();
     let _ = writeln!(w, "umode-sleep-bench panic: {p}");
     w.flush();
     exit(isize::MIN);

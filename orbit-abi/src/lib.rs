@@ -1,6 +1,7 @@
 #![no_std]
 
 pub mod errno;
+pub mod fs;
 pub mod layout;
 pub mod mmap;
 pub mod net;

@@ -47,6 +47,10 @@ note "building bl (release)"
 BL_BIN="$ROOT/bl/target/riscv64gc-unknown-none-elf/release/launch"
 [ -x "$BL_BIN" ] || die "bl binary missing at $BL_BIN"
 
+note "building disk.img from rootfs/"
+"$ROOT/tools/build-disk.sh" >/dev/null
+[ -s "$ROOT/disk.img" ] || die "disk.img missing at $ROOT/disk.img"
+
 # --- pre-flight: is port 65535 free? ---
 # A stale nc from a prior failed run will squat on the port and make the
 # new listener fail silently, after which the guest's SYN gets RST and
@@ -90,6 +94,9 @@ timeout "$QEMU_TIMEOUT" qemu-system-riscv64 \
   -nographic -bios none -serial mon:stdio \
   -netdev user,id=orbit0,net=192.168.76.0/24,dhcpstart=192.168.76.9 \
   -device e1000,netdev=orbit0 \
+  -global virtio-mmio.force-legacy=off \
+  -drive file="$ROOT/disk.img",format=raw,if=none,id=hd0,readonly=on,file.locking=off \
+  -device virtio-blk-device,drive=hd0 \
   -kernel "$BL_BIN" \
   </dev/null >"$QEMU_LOG" 2>&1 || true
 
@@ -105,6 +112,37 @@ Is qemu-system-riscv64 on PATH? Did something kill QEMU before it could boot?"
 
 note "checking QEMU serial log markers"
 MARKERS=(
+  # virtio-blk discovered on the bus (device_id=2 = block). Pure
+  # transport-layer check; no driver attached yet (12a).
+  'virtio_mmio@.* device_id=2'
+  # virtio-blk synchronous read of LBA 0 — proves device + queue +
+  # arena work end-to-end. First 2 bytes "2e2f" = "./", the first
+  # entry in the ustar archive (the rootfs root directory).
+  'virtio-blk: sync read ok lba=0 first8=2e2f'
+  # tarfs eager-mount walked the whole archive without a parse error.
+  'tarfs: mounted [1-9][0-9]* entries'
+  # Path normalization (./README → /README) and the bin subdirectory
+  # entry (path-with-subdir, plus directory typeflag) both land.
+  'tarfs: .* path=/README'
+  'tarfs: .* path=/bin'
+  'tarfs: .* path=/bin/hello.txt'
+  # §12d FS syscalls — open/read/stat/close against the mounted tarfs.
+  'PASS: fs_stat /README size=217'
+  'PASS: fs_stat /bin dir'
+  'PASS: fs_open /bin/hello.txt fd='
+  'PASS: fs_read /bin/hello.txt n=26 matches'
+  'PASS: fs_read past EOF returns 0'
+  'PASS: fs close /bin/hello.txt fd='
+  'PASS: fs_open missing got Err\(errno=2\)'
+  '=== fs smoke done ==='
+  # §12e exec — read /bin/hello off the disk, hand to create_process,
+  # child prints its own marker.
+  'PASS: exec_smoke fs_stat /bin/hello size='
+  'PASS: exec_smoke read [0-9]+ bytes from /bin/hello'
+  'PASS: exec_smoke ELF magic present'
+  'PASS: exec_smoke create_process pid='
+  'USER\[2\.[0-9]+\]: hello from /bin/hello'
+  '=== exec smoke done ==='
   'USER\[1\]: hello world!'
   'USER\[1\]: netchannel created!'
   'USER\[1\]: tcp connected!'

@@ -57,6 +57,40 @@ pub struct CreateThreadReq {
 }
 
 #[derive(Debug, Clone, Copy)]
+pub struct FsOpenReq {
+    /// User VA of the path string.
+    pub path_vaddr: usize,
+    /// Length in bytes (no NUL). Capped at [`MAX_FS_PATH_LEN`] at the
+    /// syscall boundary.
+    pub path_len: usize,
+    /// `OPEN_*` flag bits. v1 kernel ignores these (tarfs is read-only)
+    /// but the field is reserved for future modes.
+    pub flags: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct FsReadReq {
+    pub fd: u32,
+    pub buf_vaddr: usize,
+    pub len: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct FsStatReq {
+    pub path_vaddr: usize,
+    pub path_len: usize,
+    /// User VA of the `Stat` out-buffer. The kernel writes
+    /// `size_of::<Stat>` bytes — caller must reserve at least that
+    /// much.
+    pub stat_vaddr: usize,
+}
+
+/// Cap on user-supplied path lengths. Generous enough for tar's
+/// `prefix + "/" + name` joint limit (155 + 1 + 100 = 256), tight
+/// enough that the kernel can keep the copy on its own stack.
+pub const MAX_FS_PATH_LEN: usize = 256;
+
+#[derive(Debug, Clone, Copy)]
 pub struct CreateProcessReq {
     pub elf_vaddr: usize,
     pub elf_len: usize,
@@ -116,6 +150,29 @@ pub enum PendingWork {
         /// the new thread's `allowed_affinity`/`affinity` pair, so a
         /// thread can't widen the family's reach.
         parent_allowed: u64,
+        handle: CompletionHandle,
+    },
+    FsOpen {
+        req: FsOpenReq,
+        pid: u16,
+        root_pa: u64,
+        handle: CompletionHandle,
+    },
+    FsRead {
+        req: FsReadReq,
+        pid: u16,
+        root_pa: u64,
+        /// User thread's handle. The manager hands a clone to the
+        /// virtio-blk IRQ slot, so the IRQ signals it directly with
+        /// `bytes_read` (success) or `-EIO` (failure). On submit
+        /// failure (queue full, bad fd, …) the manager signals the
+        /// retained clone with the errno itself.
+        handle: CompletionHandle,
+    },
+    FsStat {
+        req: FsStatReq,
+        pid: u16,
+        root_pa: u64,
         handle: CompletionHandle,
     },
 }

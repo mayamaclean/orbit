@@ -1,0 +1,5 @@
+Orbit rootfs.
+
+Contents are tarred into disk.img by tools/build-disk.sh and served to
+the kernel via virtio-blk. The §12c tarfs mount parses ustar headers
+on boot and exposes entries through the FS syscalls (§12d).

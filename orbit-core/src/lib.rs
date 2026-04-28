@@ -23,7 +23,8 @@ pub mod tlb_shootdown;
 pub mod trap;
 
 pub use pending_work::{
-    CloseHandleReq, CreateProcessReq, CreateThreadReq, MemMapReq, NetChannelCreationReq, PendingWork,
+    CloseHandleReq, CreateProcessReq, CreateThreadReq, FsOpenReq, FsReadReq, FsStatReq,
+    MAX_FS_PATH_LEN, MemMapReq, NetChannelCreationReq, PendingWork,
 };
 
 /// Page size assumed by pure logic when bounding user-memory ranges. Must

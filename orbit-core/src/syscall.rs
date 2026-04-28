@@ -11,8 +11,8 @@ use orbit_abi::errno::{Errno, EAGAIN, EBUSY, EFAULT, EINVAL, EIO, EPERM};
 use orbit_abi::layout::{user_priv_range_ok, user_range_ok, user_shared_range_ok};
 
 use crate::{
-    CloseHandleReq, CreateProcessReq, CreateThreadReq, Hardware, MemMapReq,
-    NetChannelCreationReq, PAGE_SIZE, PendingWork, SyscallOutcome,
+    CloseHandleReq, CreateProcessReq, CreateThreadReq, FsOpenReq, FsReadReq, FsStatReq, Hardware,
+    MAX_FS_PATH_LEN, MemMapReq, NetChannelCreationReq, PAGE_SIZE, PendingWork, SyscallOutcome,
 };
 use net_channel::BindSpec;
 
@@ -204,6 +204,128 @@ pub fn create_process_req<H: Hardware>(
     }
     let handle = CompletionHandle::new();
     let work = PendingWork::CreateProcess {
+        req,
+        pid: thread.pid,
+        root_pa: thread.root_table_addr() as u64,
+        handle: handle.clone(),
+    };
+    if hw.push_pending_work(work).is_err() {
+        return SyscallOutcome::Return { ret: Errno::new(EAGAIN).to_ret() };
+    }
+    thread.handle = Some(handle);
+    SyscallOutcome::Yield {
+        state: ThreadState::Blocking,
+        ret: None,
+    }
+}
+
+/// `fs_open(path_ptr, path_len, flags) → fd | -errno`. Park the caller
+/// on a fresh handle and queue the manager work; the manager copies
+/// the path bytes, looks the inode up via the mounted filesystem, and
+/// allocates an `Fd` in the calling pid's handle table.
+pub fn fs_open_req<H: Hardware>(
+    thread: &mut Thread,
+    frame: &TrapFrame,
+    hw: &mut H,
+) -> SyscallOutcome {
+    let req = FsOpenReq {
+        path_vaddr: frame.regs[11],
+        path_len: frame.regs[12],
+        flags: frame.regs[13],
+    };
+    if req.path_len == 0 || req.path_len > MAX_FS_PATH_LEN {
+        return SyscallOutcome::Return { ret: Errno::new(EINVAL).to_ret() };
+    }
+    if !user_range_ok(req.path_vaddr as u64, req.path_len as u64) {
+        return SyscallOutcome::Return { ret: Errno::new(EFAULT).to_ret() };
+    }
+    let handle = CompletionHandle::new();
+    let work = PendingWork::FsOpen {
+        req,
+        pid: thread.pid,
+        root_pa: thread.root_table_addr() as u64,
+        handle: handle.clone(),
+    };
+    if hw.push_pending_work(work).is_err() {
+        return SyscallOutcome::Return { ret: Errno::new(EAGAIN).to_ret() };
+    }
+    thread.handle = Some(handle);
+    SyscallOutcome::Yield {
+        state: ThreadState::Blocking,
+        ret: None,
+    }
+}
+
+/// `fs_read(fd, buf_ptr, len) → bytes | -errno`. v1 contract: `len`
+/// must equal `SECTOR_SIZE` (512). The kernel reads one sector at the
+/// fd's current offset into the user buffer (DMA direct, no bounce),
+/// auto-advances the offset by `SECTOR_SIZE`, and returns
+/// `min(SECTOR_SIZE, file_size - prev_offset)` — `0` at EOF.
+///
+/// Parks on a handle that the virtio-blk IRQ signals directly. If the
+/// manager-side submit fails (bad fd, queue full, …) the manager
+/// signals the retained handle clone with the errno.
+pub fn fs_read_req<H: Hardware>(
+    thread: &mut Thread,
+    frame: &TrapFrame,
+    hw: &mut H,
+) -> SyscallOutcome {
+    let req = FsReadReq {
+        fd: frame.regs[11] as u32,
+        buf_vaddr: frame.regs[12],
+        len: frame.regs[13],
+    };
+    // v1: exactly one sector per syscall. Larger reads chunk in user
+    // space. See §12d roadmap notes for why we chose the strict cap.
+    const SECTOR_SIZE: usize = 512;
+    if req.len != SECTOR_SIZE {
+        return SyscallOutcome::Return { ret: Errno::new(EINVAL).to_ret() };
+    }
+    if !user_range_ok(req.buf_vaddr as u64, req.len as u64) {
+        return SyscallOutcome::Return { ret: Errno::new(EFAULT).to_ret() };
+    }
+    let handle = CompletionHandle::new();
+    let work = PendingWork::FsRead {
+        req,
+        pid: thread.pid,
+        root_pa: thread.root_table_addr() as u64,
+        handle: handle.clone(),
+    };
+    if hw.push_pending_work(work).is_err() {
+        return SyscallOutcome::Return { ret: Errno::new(EAGAIN).to_ret() };
+    }
+    thread.handle = Some(handle);
+    SyscallOutcome::Yield {
+        state: ThreadState::Blocking,
+        ret: None,
+    }
+}
+
+/// `fs_stat(path_ptr, path_len, stat_ptr) → 0 | -errno`. Park on a
+/// handle and queue manager work; the manager copies the path, looks
+/// the inode up, and writes `size_of::<Stat>` bytes into the user's
+/// stat buffer.
+pub fn fs_stat_req<H: Hardware>(
+    thread: &mut Thread,
+    frame: &TrapFrame,
+    hw: &mut H,
+) -> SyscallOutcome {
+    let req = FsStatReq {
+        path_vaddr: frame.regs[11],
+        path_len: frame.regs[12],
+        stat_vaddr: frame.regs[13],
+    };
+    if req.path_len == 0 || req.path_len > MAX_FS_PATH_LEN {
+        return SyscallOutcome::Return { ret: Errno::new(EINVAL).to_ret() };
+    }
+    if !user_range_ok(req.path_vaddr as u64, req.path_len as u64) {
+        return SyscallOutcome::Return { ret: Errno::new(EFAULT).to_ret() };
+    }
+    if !user_range_ok(req.stat_vaddr as u64, core::mem::size_of::<orbit_abi::fs::Stat>() as u64) {
+        return SyscallOutcome::Return { ret: Errno::new(EFAULT).to_ret() };
+    }
+    let handle = CompletionHandle::new();
+    let work = PendingWork::FsStat {
         req,
         pid: thread.pid,
         root_pa: thread.root_table_addr() as u64,

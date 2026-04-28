@@ -29,7 +29,7 @@ use core::panic::PanicInfo;
 
 use orbit_abi::errno::{Errno, EAGAIN};
 use orbit_abi::net::SockType;
-use orbit_abi::{logln, user::{exit, get_micros, sleep_ms, SerialWriter}};
+use orbit_abi::{logln, user::{exit, get_micros, sleep_ms, ConsoleWriter}};
 use net_channel::{BindSpec, NetChannel, NC_MAX_REGION_SIZE};
 use orbit_rt::netch::NetCh;
 
@@ -130,7 +130,7 @@ fn run_round(round: usize) -> bool {
     let mib_per_sec_x100 = (bps * 100) / (1024 * 1024);
     let elapsed_ms = elapsed_us / 1_000;
 
-    let mut w = SerialWriter::new();
+    let mut w = ConsoleWriter::new();
     let _ = writeln!(
         w,
         "BENCH round {round}: bytes={sent} elapsed_us={elapsed_us} \
@@ -167,7 +167,7 @@ pub unsafe extern "C" fn _start() -> ! {
 #[panic_handler]
 fn panic_time(p: &PanicInfo) -> ! {
     use core::fmt::Write;
-    let mut w = SerialWriter::new();
+    let mut w = ConsoleWriter::new();
     let _ = writeln!(w, "umode-tcp-bench panic: {p}");
     w.flush();
     exit(isize::MIN);

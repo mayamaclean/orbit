@@ -102,12 +102,13 @@ mod tests {
 
     #[test]
     fn truncated_buffer_yields_partial_entries() {
-        // Kernel writes 16 entries (256 + 8 = 264 bytes). User has a
-        // 100-byte buffer: kernel must clamp to floor((100-8)/16) = 5
-        // full entries + 8-byte header = 88 bytes written, header
-        // declares count=5. Trailing 12 bytes of user buffer untouched.
+        // Kernel writes Sysno::COUNT entries (16 B each) + 8-byte
+        // header. User has a 100-byte buffer: kernel must clamp to
+        // floor((100-8)/16) = 5 full entries + header = 88 bytes
+        // written, header declares count=5. Trailing 12 bytes of user
+        // buffer untouched.
         let kernel_total = SYSCALL_STATS_MIN_LEN + Sysno::COUNT * core::mem::size_of::<SyscallEntry>();
-        assert_eq!(kernel_total, 264);
+        assert_eq!(kernel_total, 8 + Sysno::COUNT * 16);
 
         let user_buf_len: usize = 100;
         let entries_capacity =

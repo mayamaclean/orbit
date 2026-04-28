@@ -4,6 +4,7 @@ pub mod fb;
 pub mod fonts;
 pub mod k_gpu;
 pub mod plic;
+pub mod virtio_blk_dev;
 pub mod virtio_gpu_dev;
 pub mod virtio_input_dev;
 pub mod virtio_probe;

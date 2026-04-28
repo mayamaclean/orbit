@@ -30,7 +30,7 @@ use minicbor::{Decode, Encode};
 use net_channel::{BindSpec, NetChannel, NC_MAX_REGION_SIZE};
 use orbit_abi::errno::Errno;
 use orbit_abi::net::SockType;
-use orbit_abi::{logln, user::{create_process, exit, SerialWriter}};
+use orbit_abi::{logln, user::{create_process, exit, ConsoleWriter}};
 use orbit_rt::netch::{NetCh, Session};
 
 const LISTEN_PORT: u16 = 7777;
@@ -209,7 +209,7 @@ fn spawn(body_only: &[u8]) -> Result<u16, LoaderErr> {
 #[panic_handler]
 fn panic_time(p: &PanicInfo) -> ! {
     use core::fmt::Write;
-    let mut w = SerialWriter::new();
+    let mut w = ConsoleWriter::new();
     let _ = writeln!(w, "orbit-loader: panic: {p}");
     w.flush();
     exit(isize::MIN);

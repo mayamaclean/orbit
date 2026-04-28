@@ -31,6 +31,13 @@ pub const QUERY_SYSCALL_STATS: usize = 4102;
 // share the same range.
 pub const CREATE_THREAD:   usize = 5000;
 
+// 6000+ — filesystem. v1 is read-only tarfs; close re-uses
+// `CLOSE_HANDLE = 4098` (handle table is shared across NetCh / file
+// fds) so there's no FS_CLOSE here.
+pub const FS_OPEN:         usize = 6000;
+pub const FS_READ:         usize = 6001;
+pub const FS_STAT:         usize = 6002;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(usize)]
 pub enum Sysno {
@@ -51,6 +58,9 @@ pub enum Sysno {
     QueryStats        = QUERY_STATS,
     QuerySyscallStats = QUERY_SYSCALL_STATS,
     CreateThread   = CREATE_THREAD,
+    FsOpen         = FS_OPEN,
+    FsRead         = FS_READ,
+    FsStat         = FS_STAT,
 }
 
 impl Sysno {
@@ -73,6 +83,9 @@ impl Sysno {
             QUERY_STATS         => Self::QueryStats,
             QUERY_SYSCALL_STATS => Self::QuerySyscallStats,
             CREATE_THREAD  => Self::CreateThread,
+            FS_OPEN        => Self::FsOpen,
+            FS_READ        => Self::FsRead,
+            FS_STAT        => Self::FsStat,
             _              => return None,
         })
     }
@@ -100,6 +113,9 @@ impl Sysno {
             Self::QuerySyscallStats => 14,
             Self::CreateThread      => 15,
             Self::GetMicros         => 16,
+            Self::FsOpen            => 17,
+            Self::FsRead            => 18,
+            Self::FsStat            => 19,
         }
     }
 
@@ -108,7 +124,7 @@ impl Sysno {
     /// when adding a `Sysno` variant. Older userland with a smaller
     /// COUNT reads a prefix of the kernel's table; newer userland with
     /// a larger COUNT treats the kernel's missing slots as zero.
-    pub const COUNT: usize = 17;
+    pub const COUNT: usize = 20;
 }
 
 #[cfg(test)]
@@ -134,6 +150,9 @@ mod tests {
         assert_eq!(Sysno::from_usize(QUERY_STATS),         Some(Sysno::QueryStats));
         assert_eq!(Sysno::from_usize(QUERY_SYSCALL_STATS), Some(Sysno::QuerySyscallStats));
         assert_eq!(Sysno::from_usize(CREATE_THREAD),  Some(Sysno::CreateThread));
+        assert_eq!(Sysno::from_usize(FS_OPEN),  Some(Sysno::FsOpen));
+        assert_eq!(Sysno::from_usize(FS_READ),  Some(Sysno::FsRead));
+        assert_eq!(Sysno::from_usize(FS_STAT),  Some(Sysno::FsStat));
     }
 
     #[test]
@@ -143,6 +162,8 @@ mod tests {
         assert_eq!(Sysno::from_usize(4103), None);
         assert_eq!(Sysno::from_usize(4999), None);
         assert_eq!(Sysno::from_usize(5001), None);
+        assert_eq!(Sysno::from_usize(5999), None);
+        assert_eq!(Sysno::from_usize(6003), None);
         assert_eq!(Sysno::from_usize(usize::MAX), None);
     }
 
@@ -165,6 +186,9 @@ mod tests {
         assert_eq!(Sysno::QueryStats        as usize, QUERY_STATS);
         assert_eq!(Sysno::QuerySyscallStats as usize, QUERY_SYSCALL_STATS);
         assert_eq!(Sysno::CreateThread      as usize, CREATE_THREAD);
+        assert_eq!(Sysno::FsOpen            as usize, FS_OPEN);
+        assert_eq!(Sysno::FsRead            as usize, FS_READ);
+        assert_eq!(Sysno::FsStat            as usize, FS_STAT);
     }
 
     #[test]
@@ -188,6 +212,9 @@ mod tests {
         assert_eq!(QUERY_STATS, 4101);
         assert_eq!(QUERY_SYSCALL_STATS, 4102);
         assert_eq!(CREATE_THREAD, 5000);
+        assert_eq!(FS_OPEN, 6000);
+        assert_eq!(FS_READ, 6001);
+        assert_eq!(FS_STAT, 6002);
     }
 
     #[test]
@@ -200,7 +227,8 @@ mod tests {
             Sysno::GetAffinity, Sysno::GetHartId, Sysno::Mmap,
             Sysno::CreateNetch, Sysno::CloseHandle, Sysno::CreateProcess,
             Sysno::NcYield, Sysno::QueryStats, Sysno::QuerySyscallStats,
-            Sysno::CreateThread, Sysno::GetMicros,
+            Sysno::CreateThread, Sysno::GetMicros, Sysno::FsOpen,
+            Sysno::FsRead, Sysno::FsStat,
         ];
         assert_eq!(all.len(), Sysno::COUNT);
         let mut seen = [false; Sysno::COUNT];

@@ -378,6 +378,53 @@ pub fn create_process(
         .map(|p| p as u16)
 }
 
+/// `fs_open(path, flags)` — resolve `path` against the mounted
+/// filesystem and return an `Fd`. v1 is read-only tarfs; pass
+/// [`crate::fs::OPEN_RDONLY`] (= 0) for `flags`. Errnos: `ENOENT`
+/// (path not in archive), `EINVAL` (path too long / empty),
+/// `EFAULT` (bad pointer), `EAGAIN` (manager work ring full).
+#[inline]
+pub fn fs_open(path: &str, flags: usize) -> Result<u32, Errno> {
+    Errno::from_ret(unsafe {
+        ecall3(syscall::FS_OPEN, path.as_ptr() as usize, path.len(), flags)
+    })
+    .map(|fd| fd as u32)
+}
+
+/// `fs_read(fd, buf)` — read one sector at the fd's current offset.
+/// `buf.len()` must equal 512; the buffer must not straddle a 4 KiB
+/// page boundary (sector-align it). Returns bytes considered valid
+/// (up to 512); 0 at EOF. Auto-advances the fd's offset by 512 on
+/// success, even at the file tail. Trailing bytes past the file size
+/// in the final sector are zero-padded by the on-disk archive.
+#[inline]
+pub fn fs_read(fd: u32, buf: &mut [u8]) -> Result<usize, Errno> {
+    Errno::from_ret(unsafe {
+        ecall3(
+            syscall::FS_READ,
+            fd as usize,
+            buf.as_mut_ptr() as usize,
+            buf.len(),
+        )
+    })
+}
+
+/// `fs_stat(path, &mut stat)` — fill `stat` with metadata for the
+/// named entry. Layout matches Linux's generic-arch `struct stat`
+/// (see [`crate::fs::Stat`]).
+#[inline]
+pub fn fs_stat(path: &str, stat: &mut crate::fs::Stat) -> Result<(), Errno> {
+    Errno::from_ret(unsafe {
+        ecall3(
+            syscall::FS_STAT,
+            path.as_ptr() as usize,
+            path.len(),
+            stat as *mut _ as usize,
+        )
+    })
+    .map(|_| ())
+}
+
 /// Snapshot per-process and kernel-wide accounting. The wrapper owns
 /// the buffer so callers don't have to think about ABI sizing — pass
 /// `()`, get a struct back. On a kernel newer than this build,
@@ -441,12 +488,12 @@ pub fn query_syscall_stats(
     Ok((hdr, entries))
 }
 
-pub struct SerialWriter {
+pub struct ConsoleWriter {
     buf: [u8; 256],
     len: usize,
 }
 
-impl SerialWriter {
+impl ConsoleWriter {
     pub const fn new() -> Self { Self { buf: [0u8; 256], len: 0 } }
     pub fn flush(&mut self) {
         if self.len == 0 {
@@ -473,6 +520,45 @@ impl SerialWriter {
     }
 }
 
+impl core::fmt::Write for ConsoleWriter {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        for &b in s.as_bytes() {
+            if self.len >= self.buf.len() { self.flush(); }
+            self.buf[self.len] = b;
+            self.len += 1;
+        }
+        Ok(())
+    }
+}
+
+/// Like [`ConsoleWriter`] but flushes via the `serial_print` syscall
+/// instead of `console_write`. Output goes straight to the kernel's
+/// serial back-channel, **not** to the per-process framebuffer
+/// scrollback — useful when a short-lived process needs its output
+/// to survive past its exit (the scrollback compositor may not have
+/// rendered the message before the source gets torn down) or when
+/// you want output to appear on the harness `-serial` log without
+/// involving the gpu thread at all.
+pub struct SerialWriter {
+    buf: [u8; 256],
+    len: usize,
+}
+
+impl SerialWriter {
+    pub const fn new() -> Self { Self { buf: [0u8; 256], len: 0 } }
+    pub fn flush(&mut self) {
+        if self.len == 0 {
+            return;
+        }
+        // serial_print rejects len > PAGE_SIZE; our buffer is 256 B so
+        // a single call is always safe. Errors (EINVAL on non-utf8,
+        // EFAULT on bad ptr) shouldn't happen with stack-resident
+        // buffer + correct callers — drop on the floor.
+        let _ = serial_print(self.buf.as_ptr() as usize, self.len);
+        self.len = 0;
+    }
+}
+
 impl core::fmt::Write for SerialWriter {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
         for &b in s.as_bytes() {
@@ -484,11 +570,25 @@ impl core::fmt::Write for SerialWriter {
     }
 }
 
+/// `logln!`-shaped macro that writes through `SerialWriter` instead
+/// of `ConsoleWriter`. Use when output needs to survive on the
+/// kernel serial log even if the calling process exits before the
+/// framebuffer compositor can render the message.
+#[macro_export]
+macro_rules! serialln {
+    ($($arg:tt)*) => {{
+        use core::fmt::Write;
+        let mut w = $crate::user::SerialWriter::new();
+        let _ = writeln!(w, $($arg)*);
+        w.flush();
+    }};
+}
+
 #[macro_export]
 macro_rules! logln {
     ($($arg:tt)*) => {{
         use core::fmt::Write;
-        let mut w = SerialWriter::new();
+        let mut w = $crate::user::ConsoleWriter::new();
         let _ = writeln!(w, $($arg)*);
         w.flush();
     }};

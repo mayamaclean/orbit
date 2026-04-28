@@ -26,8 +26,12 @@ use alloc::vec::Vec;
 use core::panic::PanicInfo;
 
 use orbit_abi::{
+    fs::Stat,
     logln,
-    user::{console_write, exit, query_stats, read_stdin, sleep_ms, SerialWriter},
+    user::{
+        close_handle, console_write, ConsoleWriter, create_process, exit, fs_open, fs_read,
+        fs_stat, query_stats, read_stdin, sleep_ms,
+    },
 };
 use core::fmt::Write;
 
@@ -40,7 +44,7 @@ const CHUNK: usize = 4096;
 /// Send `bytes` through `console_write`, splitting at the kernel's
 /// 4 KiB PIPE_BUF boundary. Errors (ring full, etc.) are dropped on
 /// the floor — `console_write` already retries internally for EAGAIN
-/// via the SerialWriter shim used elsewhere; the console treats output
+/// via the ConsoleWriter shim used elsewhere; the console treats output
 /// as best-effort to keep the read-edit loop responsive.
 fn write_chunked(bytes: &[u8]) {
     let mut i = 0;
@@ -172,7 +176,7 @@ impl core::fmt::Display for HumanBytes {
     }
 }
 
-/// Line-buffered writer over `write_chunked`. SerialWriter goes through
+/// Line-buffered writer over `write_chunked`. ConsoleWriter goes through
 /// the kernel serial back-channel; this one writes through the
 /// framebuffer scrollback path that the rest of the console uses.
 struct LineWriter {
@@ -201,6 +205,70 @@ impl core::fmt::Write for LineWriter {
     }
 }
 
+/// Read a regular file off the mounted FS into a fresh `Vec<u8>`.
+/// Sector-aligned 512-byte scratch buffer per chunk; loops until the
+/// stat-reported size is consumed or we hit EOF.
+fn slurp_file(path: &str) -> Result<alloc::vec::Vec<u8>, &'static str> {
+    let mut st = Stat::default();
+    fs_stat(path, &mut st).map_err(|_| "stat failed")?;
+    if st.st_size <= 0 {
+        return Err("empty or non-regular");
+    }
+    let total = st.st_size as usize;
+
+    let fd = fs_open(path, 0).map_err(|_| "open failed")?;
+
+    #[repr(align(512))]
+    struct AlignedBuf([u8; 512]);
+    let mut scratch = AlignedBuf([0; 512]);
+    let mut buf = alloc::vec::Vec::with_capacity(total);
+
+    while buf.len() < total {
+        match fs_read(fd, &mut scratch.0) {
+            Ok(0) => break,
+            Ok(n) => buf.extend_from_slice(&scratch.0[..n]),
+            Err(_) => {
+                let _ = close_handle(fd);
+                return Err("read failed");
+            }
+        }
+    }
+    let _ = close_handle(fd);
+    if buf.len() != total {
+        return Err("short read");
+    }
+    Ok(buf)
+}
+
+/// Resolve `path` against the mounted FS, read it, and hand the bytes
+/// to `create_process`. Spawn-and-detach (no `wait_pid` until §13a),
+/// so we print the new pid and re-prompt — child runs concurrently.
+fn exec_path(path: &str) {
+    let elf = match slurp_file(path) {
+        Ok(b) => b,
+        Err(why) => {
+            write_chunked(b"exec: ");
+            write_chunked(path.as_bytes());
+            write_chunked(b": ");
+            write_chunked(why.as_bytes());
+            write_chunked(b"\n");
+            return;
+        }
+    };
+    match create_process(elf.as_ptr(), elf.len(), 0, 0) {
+        Ok(pid) => {
+            let mut w = LineWriter::new();
+            let _ = writeln!(w, "exec: spawned {} pid={}", path, pid);
+            w.flush();
+        }
+        Err(e) => {
+            let mut w = LineWriter::new();
+            let _ = writeln!(w, "exec: create_process {}: errno {}", path, e.0);
+            w.flush();
+        }
+    }
+}
+
 /// Run a single command line (already stripped of its trailing `\n`).
 /// Empty input → no-op (matches dash behavior — re-prompt only).
 fn dispatch(line: &[u8]) {
@@ -209,6 +277,13 @@ fn dispatch(line: &[u8]) {
         Err(_) => { write_chunked(b"console: input was not utf-8\n"); return; }
     };
     if s.is_empty() { return; }
+    // Anything starting with `/` is treated as a path to exec — no
+    // PATH search yet. Matches what users type when they explicitly
+    // run a file.
+    if s.starts_with('/') {
+        exec_path(s);
+        return;
+    }
     let mut it = s.splitn(2, char::is_whitespace);
     let cmd = it.next().unwrap_or("");
     let args = it.next().unwrap_or("").trim_start();
@@ -219,6 +294,7 @@ fn dispatch(line: &[u8]) {
         }
         "help" => {
             write_chunked(b"builtins: echo <text>, help, clear, stats\n");
+            write_chunked(b"exec: type a path starting with /, e.g. /bin/hello\n");
         }
         "clear" => {
             // Form-feed: compositor clears this source's scrollback.
@@ -260,7 +336,7 @@ pub unsafe extern "C" fn _start() -> ! {
 #[panic_handler]
 fn panic_time(p: &PanicInfo) -> ! {
     use core::fmt::Write;
-    let mut w = SerialWriter::new();
+    let mut w = ConsoleWriter::new();
     let _ = writeln!(w, "console panic: {p}");
     w.flush();
     exit(isize::MIN);

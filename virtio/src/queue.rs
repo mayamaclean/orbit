@@ -248,4 +248,21 @@ impl Virtqueue {
         let used_idx = unsafe { (self.used.add(2) as *const u16).read_volatile() };
         used_idx != self.last_used_idx
     }
+
+    /// Descriptor index that the next `push_chain` call will use as
+    /// the chain head — i.e. `desc[free_head]`. Returns `None` when
+    /// the free list is empty. Stays valid until the next call to any
+    /// other `Virtqueue` method on this queue (push or pop both touch
+    /// `free_head`).
+    ///
+    /// virtio-blk uses this to populate per-head arena slots (request
+    /// header / status byte) *before* `push_chain` publishes the chain
+    /// to the device.
+    pub fn peek_free_head(&self) -> Option<u16> {
+        if self.num_free == 0 {
+            None
+        } else {
+            Some(self.free_head)
+        }
+    }
 }

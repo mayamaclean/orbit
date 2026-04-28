@@ -1,0 +1,8 @@
+[package]
+name = "virtio_blk"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+virtio = { path = "../virtio" }
+tracing = { version = "0.1.44", default-features = false, features = [] }

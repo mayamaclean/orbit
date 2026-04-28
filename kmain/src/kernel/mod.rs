@@ -27,14 +27,15 @@ use orbit_abi::errno::{
     Errno, EAGAIN, EBADF, EFAULT, EINVAL, EIO, ENOEXEC, ENOMEM, EPERM, ESRCH,
 };
 use orbit_core::{
-    CloseHandleReq, CreateProcessReq, CreateThreadReq, MemMapReq, NetChannelCreationReq,
-    PendingWork,
+    CloseHandleReq, CreateProcessReq, CreateThreadReq, FsOpenReq, FsReadReq, FsStatReq,
+    MAX_FS_PATH_LEN, MemMapReq, NetChannelCreationReq, PendingWork,
 };
 use orbit_core::ready_queue::ReadyQueue;
 use orbit_core::sleep_heap::SleepHeap;
 use thingbuf::StaticThingBuf;
 
-use crate::kernel::handle::{Handle, ProcessHandles};
+use crate::kernel::fs::FsErr;
+use crate::kernel::handle::{Handle, OpenFile, ProcessHandles};
 use crate::kernel::memmap::FrameToKdmap;
 use crate::kernel::shared_user_ptr::SharedUserPtr;
 use riscv::register::satp::{Mode, Satp};
@@ -56,6 +57,7 @@ use crate::{NetPackage, SocketReq};
 
 pub mod accounting;
 pub mod context;
+pub mod fs;
 pub mod handle;
 pub mod input;
 pub mod memmap;
@@ -892,12 +894,212 @@ impl Orbit {
                     return Errno::new(EIO).to_ret();
                 }
             }
+            Handle::File(_) => {
+                // No revoke step — file handles carry no SharedUserPtr,
+                // and the inode table outlives any single fd. Just drop.
+            }
         }
 
         // `handle` drops here, releasing the manager's Arc. If k_net
         // still holds a clone the backing survives until its next
         // drop.
         drop(handle);
+        0
+    }
+
+    /// Copy `len` bytes of a user path string into a kernel-side
+    /// buffer. Caller has already enforced `len <= MAX_FS_PATH_LEN`
+    /// at the syscall boundary so this stays bounded. Returns the
+    /// path as a `&str` borrowed from `out`, or an errno on failure.
+    fn copy_user_path<'a>(
+        &mut self,
+        root_pa: u64,
+        vaddr: u64,
+        len: usize,
+        out: &'a mut [u8; MAX_FS_PATH_LEN],
+    ) -> Result<&'a str, isize> {
+        let root_table = unsafe { memmap::kernel_root_from_pa(root_pa) };
+        let mut copied = 0;
+        while copied < len {
+            let cursor = vaddr + copied as u64;
+            let page_base = cursor & !(PAGE_SIZE as u64 - 1);
+            let page_off = (cursor - page_base) as usize;
+            let take = core::cmp::min(PAGE_SIZE - page_off, len - copied);
+            let pa = unsafe {
+                mmu::mmap::virt_to_phys(&root_table, VirtAddr::new(page_base))
+            }
+            .ok_or(Errno::new(EFAULT).to_ret())?;
+            unsafe {
+                let mut w = user_page::UserPageWindow::map(pa as u64, PAGE_SIZE);
+                let page = w.as_mut_slice();
+                out[copied..copied + take]
+                    .copy_from_slice(&page[page_off..page_off + take]);
+            }
+            copied += take;
+        }
+        core::str::from_utf8(&out[..len]).map_err(|_| Errno::new(EINVAL).to_ret())
+    }
+
+    fn run_fs_open_req(&mut self, req: FsOpenReq, pid: u16, root_pa: u64) -> isize {
+        let Some(fs) = crate::kernel::fs::mounted() else {
+            warn!("fs_open: no mounted filesystem");
+            return Errno::new(EIO).to_ret();
+        };
+        let mut path_buf = [0u8; MAX_FS_PATH_LEN];
+        let path = match self.copy_user_path(root_pa, req.path_vaddr as u64, req.path_len, &mut path_buf) {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+        let inode = match fs.open(path) {
+            Ok(i) => i,
+            Err(FsErr::NotFound) => return Errno::new(orbit_abi::errno::ENOENT).to_ret(),
+            Err(_) => return Errno::new(EIO).to_ret(),
+        };
+        // Lazy-create the handle table — same pattern create_netch
+        // uses, since a process that opens a file before ever creating
+        // a NetChannel won't have an entry yet.
+        let fd = self
+            .process_handles
+            .entry(pid)
+            .or_insert_with(ProcessHandles::new)
+            .insert(Handle::File(OpenFile {
+                fs,
+                inode,
+                offset: 0,
+            }));
+        info!("fs_open: pid={pid} path={path} → fd={fd} ino={inode}");
+        fd as isize
+    }
+
+    /// Returns `Some(v)` for synchronous signal (manager signals the
+    /// retained handle clone with `v`); `None` means async — the
+    /// manager passed its handle clone to the virtio-blk slot table
+    /// and the IRQ owns it now.
+    fn run_fs_read_req(
+        &mut self,
+        req: FsReadReq,
+        pid: u16,
+        root_pa: u64,
+        handle: process::CompletionHandle,
+    ) -> Option<isize> {
+        const SECTOR: u64 = 512;
+
+        // Look up the file handle and snapshot what we need.
+        let Some(ph) = self.process_handles.get_mut(&pid) else {
+            return Some(Errno::new(EBADF).to_ret());
+        };
+        let Some(handle_ref) = ph.get_mut(req.fd) else {
+            return Some(Errno::new(EBADF).to_ret());
+        };
+        let Handle::File(of) = handle_ref else {
+            return Some(Errno::new(EBADF).to_ret());
+        };
+        let fs = of.fs;
+        let inode = of.inode;
+        let prev_off = of.offset;
+
+        let file_size = match fs.size(inode) {
+            Ok(s) => s,
+            Err(_) => return Some(Errno::new(EIO).to_ret()),
+        };
+        if prev_off >= file_size {
+            // EOF — sync signal 0; don't touch the device.
+            return Some(0);
+        }
+
+        // Single-page constraint: a sector-sized buffer can straddle
+        // at most one 4 KiB page boundary, and we don't bounce. User
+        // aligns to 512.
+        let buf_va = req.buf_vaddr as u64;
+        if (buf_va & (PAGE_SIZE as u64 - 1)) + req.len as u64 > PAGE_SIZE as u64 {
+            return Some(Errno::new(EINVAL).to_ret());
+        }
+
+        let root_table = unsafe { memmap::kernel_root_from_pa(root_pa) };
+        let page_base = buf_va & !(PAGE_SIZE as u64 - 1);
+        let page_off = buf_va - page_base;
+        let page_pa = match unsafe {
+            mmu::mmap::virt_to_phys(&root_table, VirtAddr::new(page_base))
+        } {
+            Some(p) => p as u64,
+            None => return Some(Errno::new(EFAULT).to_ret()),
+        };
+        let buf_pa = page_pa + page_off;
+
+        // Commit-then-submit: advance the offset before submission so
+        // a re-entrant fs_read against the same fd can't double-read
+        // this sector. On submit failure we revert below.
+        of.offset = prev_off + SECTOR;
+
+        match unsafe { fs.read_async(inode, prev_off, req.len as u32, buf_pa, handle) } {
+            Ok(()) => None, // IRQ owns the handle now.
+            Err(e) => {
+                // Revert the offset since the read didn't actually go
+                // out — keep fd state consistent.
+                if let Some(ph) = self.process_handles.get_mut(&pid)
+                    && let Some(Handle::File(of)) = ph.get_mut(req.fd)
+                {
+                    of.offset = prev_off;
+                }
+                let errno = match e {
+                    FsErr::NotRegular => orbit_abi::errno::EISDIR,
+                    FsErr::BadInode => EBADF,
+                    FsErr::BadRange => EINVAL,
+                    FsErr::IoError => EIO,
+                    FsErr::NotFound => orbit_abi::errno::ENOENT,
+                };
+                Some(Errno::new(errno).to_ret())
+            }
+        }
+    }
+
+    fn run_fs_stat_req(&mut self, req: FsStatReq, pid: u16, root_pa: u64) -> isize {
+        let Some(fs) = crate::kernel::fs::mounted() else {
+            return Errno::new(EIO).to_ret();
+        };
+        let mut path_buf = [0u8; MAX_FS_PATH_LEN];
+        let path = match self.copy_user_path(root_pa, req.path_vaddr as u64, req.path_len, &mut path_buf) {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+        let inode = match fs.open(path) {
+            Ok(i) => i,
+            Err(FsErr::NotFound) => return Errno::new(orbit_abi::errno::ENOENT).to_ret(),
+            Err(_) => return Errno::new(EIO).to_ret(),
+        };
+        let stat = match fs.stat(inode) {
+            Ok(s) => s,
+            Err(_) => return Errno::new(EIO).to_ret(),
+        };
+
+        // Copy out the Stat struct. Fits inside one page (128 B), so
+        // a single UserPageWindow does it. Cross-page case: same
+        // single-buffer constraint as fs_read.
+        let stat_bytes = unsafe {
+            core::slice::from_raw_parts(
+                &stat as *const _ as *const u8,
+                core::mem::size_of::<orbit_abi::fs::Stat>(),
+            )
+        };
+        let stat_va = req.stat_vaddr as u64;
+        if (stat_va & (PAGE_SIZE as u64 - 1)) + stat_bytes.len() as u64 > PAGE_SIZE as u64 {
+            return Errno::new(EINVAL).to_ret();
+        }
+        let root_table = unsafe { memmap::kernel_root_from_pa(root_pa) };
+        let page_base = stat_va & !(PAGE_SIZE as u64 - 1);
+        let page_off = (stat_va - page_base) as usize;
+        let page_pa = match unsafe {
+            mmu::mmap::virt_to_phys(&root_table, VirtAddr::new(page_base))
+        } {
+            Some(p) => p as u64,
+            None => return Errno::new(EFAULT).to_ret(),
+        };
+        unsafe {
+            let mut w = user_page::UserPageWindow::map(page_pa, PAGE_SIZE);
+            let page = w.as_mut_slice();
+            page[page_off..page_off + stat_bytes.len()].copy_from_slice(stat_bytes);
+        }
+        info!("fs_stat: pid={pid} path={path} ino={inode} size={}", stat.st_size);
         0
     }
 
@@ -1167,6 +1369,26 @@ impl Orbit {
                     let result = self.run_create_thread_req(req, pid, parent_allowed);
                     handle.signal(result);
                 }
+                PendingWork::FsOpen { req, pid, root_pa, handle } => {
+                    let result = self.run_fs_open_req(req, pid, root_pa);
+                    handle.signal(result);
+                }
+                PendingWork::FsRead { req, pid, root_pa, handle } => {
+                    // The submit path takes a clone of `handle`. If
+                    // submit succeeds, `run_fs_read_req` returns
+                    // `None` and the IRQ will signal that clone (and
+                    // ours, sharing the Arc state). If it returns
+                    // `Some(v)` (EOF / errno), the manager-retained
+                    // clone signals the value sync.
+                    match self.run_fs_read_req(req, pid, root_pa, handle.clone()) {
+                        Some(v) => handle.signal(v),
+                        None => {}
+                    }
+                }
+                PendingWork::FsStat { req, pid, root_pa, handle } => {
+                    let result = self.run_fs_stat_req(req, pid, root_pa);
+                    handle.signal(result);
+                }
             }
         }
     }
@@ -1328,6 +1550,11 @@ impl Orbit {
                                 process.pid,
                             );
                         }
+                    }
+                    Handle::File(_) => {
+                        // No revoke step — file handles carry no
+                        // SharedUserPtr; just drop with the rest of
+                        // the table below.
                     }
                 }
             }
@@ -1903,6 +2130,7 @@ impl Orbit {
         self.discover_virtio(&fdt);
         self.setup_virtio_gpu();
         self.setup_virtio_input();
+        self.setup_virtio_blk();
     }
 
     fn setup_plic(&mut self, fdt: &Fdt<'_>) {
@@ -1947,6 +2175,10 @@ impl Orbit {
 
     fn setup_virtio_input(&mut self) {
         crate::drivers::virtio_input_dev::setup_virtio_input(&mut self.kernel_pages);
+    }
+
+    fn setup_virtio_blk(&mut self) {
+        crate::drivers::virtio_blk_dev::setup_virtio_blk(&mut self.kernel_pages);
     }
 
     /// `stack_pa` is the physical base of the user stack. User PT leaves

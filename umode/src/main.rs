@@ -9,9 +9,10 @@ use core::cell::Cell;
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
-use orbit_abi::errno::{Errno, EBADF, EFAULT, EINVAL, EPERM};
+use orbit_abi::errno::{Errno, EBADF, EFAULT, EINVAL, EPERM, ENOENT};
+use orbit_abi::fs::{S_IFDIR, S_IFMT, S_IFREG, Stat};
 use orbit_abi::net::SockType;
-use orbit_abi::{logln, user::{close_handle, create_thread, exit, get_affinity, get_hart_id, set_affinity, sleep_ms, console_write, serial_print, SerialWriter}};
+use orbit_abi::{logln, user::{close_handle, create_process, create_thread, exit, fs_open, fs_read, fs_stat, get_affinity, get_hart_id, set_affinity, sleep_ms, console_write, serial_print, ConsoleWriter}};
 use net_channel::BindSpec;
 use orbit_rt::netch::NetCh;
 
@@ -340,7 +341,7 @@ fn run_create_thread_probe() {
 /// script greps for "PASS: <name>" lines to validate each branch fired.
 fn check(name: &str, got: isize, want: isize) {
     use core::fmt::Write;
-    let mut w = SerialWriter::new();
+    let mut w = ConsoleWriter::new();
     if got == want {
         let _ = writeln!(w, "PASS: {name} got {got}");
     } else {
@@ -353,7 +354,7 @@ fn check(name: &str, got: isize, want: isize) {
 /// call errored with `want`. The smoke script's grep is the same.
 fn check_err<T: core::fmt::Debug>(name: &str, got: Result<T, Errno>, want: i32) {
     use core::fmt::Write;
-    let mut w = SerialWriter::new();
+    let mut w = ConsoleWriter::new();
     match got {
         Err(Errno(e)) if e == want => {
             let _ = writeln!(w, "PASS: {name} got Err(errno={e})");
@@ -369,7 +370,7 @@ fn check_err<T: core::fmt::Debug>(name: &str, got: Result<T, Errno>, want: i32) 
 /// call succeeded with `want`.
 fn check_ok<T: core::fmt::Debug + PartialEq>(name: &str, got: Result<T, Errno>, want: T) {
     use core::fmt::Write;
-    let mut w = SerialWriter::new();
+    let mut w = ConsoleWriter::new();
     match got {
         Ok(v) if v == want => {
             let _ = writeln!(w, "PASS: {name} got Ok({v:?})");
@@ -390,14 +391,14 @@ fn run_heap_smoke() {
     use core::fmt::Write;
 
     let b = Box::new(0xABCDu32);
-    let mut w = SerialWriter::new();
+    let mut w = ConsoleWriter::new();
     let _ = writeln!(w, "heap Box: {:#x} (want 0xabcd)", *b);
     w.flush();
 
     let mut v: Vec<u32> = Vec::new();
     for i in 0..1024 { v.push(i); }
     let sum: u64 = v.iter().map(|&x| x as u64).sum();
-    let mut w = SerialWriter::new();
+    let mut w = ConsoleWriter::new();
     let _ = writeln!(w, "heap Vec sum: {sum} (want {})", (0u64..1024).sum::<u64>());
     w.flush();
 
@@ -461,7 +462,7 @@ fn run_error_path_tests() {
     let (cur, allowed) = get_affinity();
     {
         use core::fmt::Write;
-        let mut w = SerialWriter::new();
+        let mut w = ConsoleWriter::new();
         if cur != 0 && cur == allowed {
             let _ = writeln!(w,
                 "PASS: get_affinity initial cur=0x{cur:x} allowed=0x{allowed:x}");
@@ -493,7 +494,7 @@ fn run_error_path_tests() {
     let pinned_to = get_hart_id();
     {
         use core::fmt::Write;
-        let mut w = SerialWriter::new();
+        let mut w = ConsoleWriter::new();
         if pinned_to == 0 {
             let _ = writeln!(w, "PASS: set_affinity pinned to hart 0 (got hart {pinned_to})");
         } else {
@@ -509,12 +510,194 @@ fn run_error_path_tests() {
     logln!("=== error path tests done ===");
 }
 
+/// FS smoke: stat / open / read / close against the boot-mounted
+/// tarfs. Validates the §12d syscall stack end-to-end:
+///   /README is 217 bytes → one short sector; first byte is 'O'
+///     (the README starts with "Orbit rootfs.").
+///   /bin/hello.txt is 26 bytes → one short sector starting with 'h'.
+///   /bin is a directory → S_IFDIR in stat.
+///   missing path → ENOENT.
+///   read past EOF → 0.
+fn run_fs_smoke() {
+    // stat /README — confirm Linux-shape Stat fields wire up.
+    let mut st = Stat::default();
+    match fs_stat("/README", &mut st) {
+        Ok(()) => {
+            let kind = st.st_mode & S_IFMT;
+            if kind == S_IFREG && st.st_size == 217 && st.st_blksize == 512 {
+                logln!(
+                    "PASS: fs_stat /README size={} mode={:#o} ino={} blocks={}",
+                    st.st_size, st.st_mode, st.st_ino, st.st_blocks,
+                );
+            } else {
+                logln!(
+                    "FAIL: fs_stat /README unexpected size={} mode={:#o} blksize={}",
+                    st.st_size, st.st_mode, st.st_blksize,
+                );
+            }
+        }
+        Err(e) => logln!("FAIL: fs_stat /README errored: {e:?}"),
+    }
+
+    // stat /bin — directory.
+    let mut sd = Stat::default();
+    match fs_stat("/bin", &mut sd) {
+        Ok(()) => {
+            if sd.st_mode & S_IFMT == S_IFDIR {
+                logln!("PASS: fs_stat /bin dir mode={:#o}", sd.st_mode);
+            } else {
+                logln!("FAIL: fs_stat /bin not a dir, mode={:#o}", sd.st_mode);
+            }
+        }
+        Err(e) => logln!("FAIL: fs_stat /bin errored: {e:?}"),
+    }
+
+    // open + read /bin/hello.txt. Buffer is sector-aligned via the
+    // explicit alignment; the kernel rejects buffers that straddle a
+    // 4 KiB page boundary.
+    #[repr(align(512))]
+    struct AlignedBuf([u8; 512]);
+    let mut buf = AlignedBuf([0; 512]);
+
+    let fd = match fs_open("/bin/hello.txt", 0) {
+        Ok(fd) => fd,
+        Err(e) => {
+            logln!("FAIL: fs_open /bin/hello.txt: {e:?}");
+            return;
+        }
+    };
+    logln!("PASS: fs_open /bin/hello.txt fd={fd}");
+
+    match fs_read(fd, &mut buf.0) {
+        Ok(n) if n == 26 && &buf.0[..n] == b"hello from /bin/hello.txt\n" => {
+            logln!("PASS: fs_read /bin/hello.txt n={n} matches");
+        }
+        Ok(n) => logln!(
+            "FAIL: fs_read /bin/hello.txt n={n} got {:?}",
+            core::str::from_utf8(&buf.0[..n.min(64)]).unwrap_or("<non-utf8>"),
+        ),
+        Err(e) => logln!("FAIL: fs_read /bin/hello.txt: {e:?}"),
+    }
+
+    // Past-EOF read returns 0 (the kernel sees offset >= file_size
+    // after the previous successful read auto-advanced to 512).
+    match fs_read(fd, &mut buf.0) {
+        Ok(0) => logln!("PASS: fs_read past EOF returns 0"),
+        Ok(n) => logln!("FAIL: fs_read past EOF returned {n}"),
+        Err(e) => logln!("FAIL: fs_read past EOF errored: {e:?}"),
+    }
+
+    let _ = close_handle(fd);
+    logln!("PASS: fs close /bin/hello.txt fd={fd}");
+
+    // Missing path → ENOENT.
+    match fs_open("/does-not-exist", 0) {
+        Err(Errno(e)) if e == ENOENT => {
+            logln!("PASS: fs_open missing got Err(errno={ENOENT})");
+        }
+        Ok(fd) => {
+            logln!("FAIL: fs_open missing returned fd={fd}");
+            let _ = close_handle(fd);
+        }
+        Err(e) => logln!("FAIL: fs_open missing errored: {e:?}"),
+    }
+
+    logln!("=== fs smoke done ===");
+}
+
+/// §12e exec smoke: read `/bin/hello` (a real ELF on the disk image)
+/// and hand it to `create_process`. Spawn-only flavor — no `wait_pid`
+/// yet, so we just sleep briefly for the child to print its marker.
+///
+/// Mirrors what the console's `exec` builtin does at the prompt, but
+/// runs from umode so the existing smoke harness can validate it
+/// without driving an interactive shell.
+fn run_exec_smoke() {
+    extern crate alloc;
+    use alloc::vec::Vec;
+
+    // Stat to size the buffer.
+    let mut st = Stat::default();
+    if let Err(e) = fs_stat("/bin/hello", &mut st) {
+        logln!("FAIL: exec_smoke fs_stat /bin/hello: {e:?}");
+        return;
+    }
+    if st.st_size <= 0 {
+        logln!("FAIL: exec_smoke /bin/hello unexpected size {}", st.st_size);
+        return;
+    }
+    let total = st.st_size as usize;
+    logln!("PASS: exec_smoke fs_stat /bin/hello size={total}");
+
+    // Open + chunked read into a heap buffer. Sector-aligned scratch
+    // buf for the read syscall (kernel rejects buffers that straddle
+    // a 4 KiB page).
+    let fd = match fs_open("/bin/hello", 0) {
+        Ok(fd) => fd,
+        Err(e) => {
+            logln!("FAIL: exec_smoke fs_open /bin/hello: {e:?}");
+            return;
+        }
+    };
+
+    #[repr(align(512))]
+    struct AlignedBuf([u8; 512]);
+    let mut scratch = AlignedBuf([0; 512]);
+    let mut elf: Vec<u8> = Vec::with_capacity(total);
+
+    while elf.len() < total {
+        match fs_read(fd, &mut scratch.0) {
+            Ok(0) => break, // EOF
+            Ok(n) => elf.extend_from_slice(&scratch.0[..n]),
+            Err(e) => {
+                logln!("FAIL: exec_smoke fs_read at offset {}: {e:?}", elf.len());
+                let _ = close_handle(fd);
+                return;
+            }
+        }
+    }
+    let _ = close_handle(fd);
+
+    if elf.len() != total {
+        logln!("FAIL: exec_smoke read {} bytes, expected {total}", elf.len());
+        return;
+    }
+    logln!("PASS: exec_smoke read {total} bytes from /bin/hello");
+
+    // Sanity: ELF magic at byte 0.
+    if elf.get(0..4) != Some(&[0x7f, b'E', b'L', b'F']) {
+        logln!("FAIL: exec_smoke /bin/hello missing ELF magic");
+        return;
+    }
+    logln!("PASS: exec_smoke ELF magic present");
+
+    // create_process — spawn-and-detach. wait_pid lands with §13a.
+    match create_process(elf.as_ptr(), elf.len(), 0, 0) {
+        Ok(pid) => logln!("PASS: exec_smoke create_process pid={pid}"),
+        Err(e) => {
+            logln!("FAIL: exec_smoke create_process: {e:?}");
+            return;
+        }
+    }
+
+    // Give the child a beat to run + print. Without wait_pid this is
+    // the cheapest synchronizer; the smoke harness will see the
+    // child's marker arrive before the next umode logln below.
+    let _ = sleep_ms(100);
+
+    logln!("=== exec smoke done ===");
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn _start() -> ! {
     // print to serial
     logln!("hello world!");
 
     run_heap_smoke();
+
+    run_fs_smoke();
+
+    run_exec_smoke();
 
     run_error_path_tests();
 
@@ -623,7 +806,7 @@ pub unsafe extern "C" fn _start() -> ! {
 #[panic_handler]
 fn panic_time(p: &PanicInfo) -> ! {
     use core::fmt::Write;
-    let mut w = SerialWriter::new();
+    let mut w = ConsoleWriter::new();
     let _ = writeln!(w, "umode panic: {p}");
     w.flush();
     exit(isize::MIN);

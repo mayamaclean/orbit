@@ -814,6 +814,27 @@ pub fn handle_create_thread(epc: usize, hart_context: &'static HartContext, fram
 }
 
 #[unsafe(no_mangle)]
+pub fn handle_fs_open(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
+    dispatch_syscall(epc, hart_context, frame, |t, f| {
+        orbit_core::syscall::fs_open_req(t, f, &mut crate::hw::RiscvHardware)
+    });
+}
+
+#[unsafe(no_mangle)]
+pub fn handle_fs_read(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
+    dispatch_syscall(epc, hart_context, frame, |t, f| {
+        orbit_core::syscall::fs_read_req(t, f, &mut crate::hw::RiscvHardware)
+    });
+}
+
+#[unsafe(no_mangle)]
+pub fn handle_fs_stat(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
+    dispatch_syscall(epc, hart_context, frame, |t, f| {
+        orbit_core::syscall::fs_stat_req(t, f, &mut crate::hw::RiscvHardware)
+    });
+}
+
+#[unsafe(no_mangle)]
 pub fn handle_set_affinity(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
     dispatch_syscall(epc, hart_context, frame, |t, f| {
         orbit_core::syscall::set_affinity(t, f)
