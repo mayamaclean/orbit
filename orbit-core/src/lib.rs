@@ -11,6 +11,7 @@ extern crate alloc;
 
 use process::ThreadState;
 
+pub mod accounting;
 pub mod manager;
 pub mod net;
 pub mod pending_work;

@@ -1009,6 +1009,9 @@ impl Orbit {
             }
 
             let state = thread.state.load(Ordering::Acquire);
+
+            //trace!("manager checking {}: {}", thread.tid, state);
+
             if state == ThreadState::Ready as usize {
                 return Some(PThread(p.0))
             }
@@ -1065,7 +1068,7 @@ impl Orbit {
                 }
                 let logged = handle.ret(0);
                 thread.handle = None;
-                info!("unblocked thread{} (handle, n={}, a0={})",
+                trace!("unblocked thread{} (handle, n={}, a0={})",
                     thread.tid, n, logged);
                 thread.state.store(ThreadState::Ready as usize, Ordering::Release);
                 return Some(PThread(p.0));
@@ -1361,6 +1364,7 @@ impl Orbit {
             (riscv::register::sscratch::read() as *const HartContext)
                 .sub(context.hart_id as usize)
         };
+
         let self_hart_id = context.hart_id as usize;
         let cpu_count = self.cpu_count;
 
@@ -1368,6 +1372,7 @@ impl Orbit {
             hart_id: context.hart_id as usize,
             current: &context.current,
         };
+
         let remotes = (0..cpu_count).filter(move |&i| i != self_hart_id).map(move |i| {
             let hc = unsafe { hart_root.add(i).as_ref_unchecked() };
             HartView {

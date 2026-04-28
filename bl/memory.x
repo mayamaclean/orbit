@@ -34,19 +34,9 @@ PHDRS
 
 SECTIONS
 {
-  /* Stack at the BOTTOM of RAM, ahead of any loaded sections. SP grows
-     down from `_stack_end` toward `_stack_start = ORIGIN(RAM)`; an
-     overflow walks past 0x80000000 into qemu-virt MMIO/unmapped and
-     traps with an instruction-/load-access fault. Previously the stack
-     sat above .data/.bss and overflows silently chewed through
-     statics — exactly the failure mode that wiped `serial::SERIAL`
-     when kmain grew enough to push BSS into the page-table slot. */
   . = ORIGIN(RAM);
-  PROVIDE(_stack_start = .);
-  . = . + 0x80000;            /* 512 KiB stack region */
-  PROVIDE(_stack_end = .);
-
-  .text : ALIGN(4096) {
+  
+  .text : {
     PROVIDE(_text_start = .);
     *(.text.init) *(.text .text.*)
     PROVIDE(_text_end = .);
@@ -54,24 +44,28 @@ SECTIONS
 
   PROVIDE(_global_pointer = .);
 
+  .bss : {
+    PROVIDE(_bss_start = .);
+    *(.sbss .sbss.*) *(.bss .bss.*)
+    PROVIDE(_bss_end = .);
+  } >RAM AT>RAM :bss
+
+  .data : {
+    PROVIDE(_data_start = .);
+    *(.sdata .sdata.*)
+    *(.data .data.*)
+    PROVIDE(_data_end = .);
+  } >RAM AT>RAM :data
+
   .rodata : ALIGN(4096) {
     PROVIDE(_rodata_start = .);
     *(.rodata .rodata.*)
     PROVIDE(_rodata_end = .);
   } >RAM AT>RAM :rodata
 
-  .bss : ALIGN(4096) {
-    PROVIDE(_bss_start = .);
-    *(.sbss .sbss.*) *(.bss .bss.*)
-    PROVIDE(_bss_end = .);
-  } >RAM AT>RAM :bss
-
-  .data : ALIGN(4096) {
-    PROVIDE(_data_start = .);
-    *(.sdata .sdata.*)
-    *(.data .data.*)
-    PROVIDE(_data_end = .);
-  } >RAM AT>RAM :data
+  PROVIDE(_stack_start = .);
+  . = . + 0x80000;            /* 512 KiB stack region */
+  PROVIDE(_stack_end = .);
 
   /* Page-table pool: 128 KiB after all loaded sections, capped well
      below `TRAP_FRAME_ADDR` (0x80800000). Self-locating so kmain

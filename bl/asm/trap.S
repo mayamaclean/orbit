@@ -8,6 +8,20 @@
 .set NUM_GP_REGS, 32  # Number of registers per context
 .set REG_SIZE, 8   # Register size (in bytes)
 
+# TrapFrame field offsets (mirrored from device::TrapFrame).
+# regs[32] @ 0, fregs[32] @ 256, asid @ 512, scratch @ 520.
+# We piggyback the M-mode trap handler on the asid slot to stash the
+# saved mepc; scratch is currently unused but reserved for future
+# per-trap state.
+.set TRAPFRAME_MEPC_SAVE, 512
+
+# Per-hart M-mode trap stack slot. The 512 KiB stack region in memory.x
+# is split into one slot per hart so concurrent traps don't share sp.
+# Slot size = 128 KiB → shift 17. Hart_n's sp = _stack_end - n*128 KiB,
+# so hart 0 has the top slot; hart MAX-1 has the bottom slot adjacent
+# to .rodata (overflow there hits PMP-locked rodata once PR5 lands).
+.set HART_TRAP_STACK_SHIFT, 17
+
 # Use macros for saving and restoring multiple registers
 .macro save_gp i, basereg=t6
 	sd	x\i, ((\i)*REG_SIZE)(\basereg)
@@ -67,23 +81,32 @@ m_trap_vector:
 		.set	i, i+1
 	.endr
 1:
-	# Get ready to go into Rust (trap.rs)
-	# We don't want to write into the user's stack or whomever
-	# messed with us here.
-	csrw	mie, zero
+	# Note: hardware already sets mstatus.MIE = 0 on trap entry, which
+	# blocks nested M-mode interrupts for the duration of m_trap_vector.
+	# We deliberately do NOT touch `mie` here: m_trap's per-cause arms
+	# need to clear specific bits (e.g. mie.SSIE on cause-1, mie.MTIE on
+	# cause-7) to prevent the same interrupt re-firing the instant we
+	# mret. Clobbering mie around the call would undo those clears.
 
 	csrr	a0, mepc
-	sd		a0, 512(t5)
+	sd		a0, TRAPFRAME_MEPC_SAVE(t5)
 	csrr	a1, mtval
 	csrr	a2, mcause
 	csrr	a3, mhartid
 	csrr	a4, mstatus
 	csrr	a5, mscratch
-	# Switch to bl's own M-mode stack before calling m_trap. The kernel's
-	# sp lives in its own address space (KDMAP VA post-higher-half) which
-	# M-mode accesses bare — dereferencing it as a physical address faults.
+
+	# Per-hart M-mode trap stack. KERNEL_STACK_END holds `_stack_end`,
+	# the top of bl's stack region. Each hart gets a 128 KiB slot
+	# (HART_TRAP_STACK_SHIFT) carved from the top down — hart 0 at
+	# _stack_end, hart 1 at _stack_end - 128 KiB, etc. Without this
+	# every hart loaded the same sp and concurrent M-mode traps raced
+	# on the shared stack frames inside Rust's m_trap.
 	la		t0, KERNEL_STACK_END
-	ld		sp, 0(t0)
+	ld		t0, 0(t0)
+	csrr	t1, mhartid
+	slli	t1, t1, HART_TRAP_STACK_SHIFT
+	sub		sp, t0, t1
 	call	m_trap
 
 	# When we get here, we've returned from m_trap, restore registers
@@ -115,71 +138,3 @@ m_trap_vector:
 	# Since we ran this loop 31 times starting with i = 1,
 	# the last one loaded t6 back to its original value.
 	mret
-
-.global switch_to_user
-switch_to_user:
-    # a0 - Frame address
-	# a1 - Program counter
-	# a2 - SATP Register
-    csrw    mscratch, a0
-
-	# Load program counter
-	ld		a1, 520(a0)
-	# Load satp
-	ld		a2, 512(a0)
-	# Load processor mode
-	ld		a3, 552(a0)
-	# Pid
-	# ld		a4, 544(a0)
-
-	# 1 << 7 is MPIE
-	# Since user mode is 00, we don't need to set anything
-	# in MPP (bits 12:11)
-	li		t0, 1 << 7 | 1 << 5 | 1 << 13
-	# Combine enable bits with mode bits.
-	slli	a3, a3, 11
-	or		t0, t0, a3
-	csrw	mstatus, t0
-	csrw	mepc, a1
-	csrw	satp, a2
-	li		t1, 0xaaa
-	csrw	mie, t1
-	la		t2, m_trap_vector
-	csrw	mtvec, t2
-	# This fence forces the MMU to flush the TLB. However, since
-	# we're using the PID as the address space identifier, we might
-	# only need this when we create a process. Right now, this ensures
-	# correctness, however it isn't the most efficient.
-	# sfence.vma
-	# A0 is the context frame, so we need to reload it back
-	# and mret so we can start running the program.
-	mv	t6, a0
-	.set	i, 0
-	.rept	32
-		load_fp %i
-		.set i, i+1
-	.endr
-1:
-	.set	i, 1
-	.rept	31
-		load_gp %i, t6
-		.set	i, i+1
-	.endr
-
-    mret
-
-
-.global make_syscall
-make_syscall:
-	# We're setting this up to work with libgloss
-	# They want a7 to be the system call number and all parameters
-	# in a0 - a5
-	mv	a7, a0
-	mv	a0, a1
-	mv	a1, a2
-	mv	a2, a3
-	mv	a3, a4
-	mv	a4, a5
-	mv	a5, a6
-	ecall
-	ret

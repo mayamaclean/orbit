@@ -6,7 +6,7 @@ use std::alloc::{Layout, alloc_zeroed};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize};
 
-use device::{Stack, TrapFrame};
+use device::{HartContext, Stack, TrapFrame};
 use process::{Thread, ThreadState};
 use riscv::register::satp::Satp;
 use riscv::register::sstatus::SPP;
@@ -61,6 +61,10 @@ pub fn make_thread(state: ThreadState, mode: SPP) -> Thread {
             // directly after construction.
             allowed_affinity: u64::MAX,
             affinity: AtomicU64::new(u64::MAX),
+            context_switches: AtomicU64::new(0),
+            cpu_ticks_total: AtomicU64::new(0),
+            syscall_count: AtomicU64::new(0),
+            syscall_ticks: AtomicU64::new(0)
         }
     }
 }
@@ -68,6 +72,24 @@ pub fn make_thread(state: ThreadState, mode: SPP) -> Thread {
 /// A blank trap frame on the test heap. Callers mutate regs in place.
 pub fn make_frame() -> TrapFrame {
     TrapFrame::empty()
+}
+
+/// Zero-initialized `HartContext` on the test heap, returned as a
+/// `'static` reference so tests can share it across helper closures
+/// without lifetime gymnastics. Total allocation is ~4 MiB
+/// (two embedded `Stack` arrays at 2 MiB each); each instance is
+/// leaked and registered with miri.
+///
+/// All atomic fields read as zero, all stack bytes read as zero,
+/// `current` is null. Tests that need a non-null `current` write
+/// through the atomic explicitly.
+pub fn make_hart_context() -> &'static HartContext {
+    unsafe {
+        let ptr = alloc_zeroed(Layout::new::<HartContext>()) as *mut HartContext;
+        assert!(!ptr.is_null(), "alloc_zeroed::<HartContext>() returned null");
+        register_root(ptr as *const u8);
+        &*ptr
+    }
 }
 
 /// Configurable fake [`Hardware`] for host tests. Every knob is a plain

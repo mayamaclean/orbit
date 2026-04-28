@@ -11,7 +11,6 @@ use device::{TrapFrame};
 use riscv::register::mtvec::Mtvec;
 use riscv::register::satp::Mode;
 use riscv::register::mstatus::SPP;
-use riscv::register::stvec::{Stvec, TrapMode as STrapMode};
 
 use bl::{setup_interrupts};
 use device::*;
@@ -48,15 +47,9 @@ extern "C" fn m_trap(epc: usize,
                     hart: usize,
                     _status: usize,
                     _frame: &mut TrapFrame,
-                    code: usize, sarg: usize)
+                    _code: usize, _sarg: usize)
                      -> usize
 {
-    if cause == 0 {
-        loop {
-            riscv::asm::wfi();
-        }
-    }
-
 	let is_async = {
 		if cause >> 63 & 1 == 1 {
 			true
@@ -70,109 +63,47 @@ extern "C" fn m_trap(epc: usize,
 	let cause_num = cause & 0xfff;
 	let mut return_pc = epc;
 	if is_async {
-		// Asynchronous trap
+		// Asynchronous trap. Only cause 3 (machine software) should ever
+		// reach here in normal operation: bl uses CLINT MSIPs to kick
+		// secondaries out of `kinit_hart`'s WFI poll on KMAIN_ENTRY, and
+		// m_trap clears them on the receiving hart.
+		//
+		// Causes 1/5/9 (supervisor software/timer/external) are
+		// delegated to S-mode by `mideleg.SSIE/STIE/SEIE`, so they fire
+		// at stvec, not here. Causes 7/11 (machine timer/external)
+		// require `mie.MTIE`/`mie.MEIE` to fire and bl never sets
+		// either. Anything that lands in the catch-all is a bug — halt
+		// the hart so the failure is loud.
 		match cause_num {
-            1 => {
-                // supervisor software
-                unsafe {
-                    riscv::register::mie::clear_ssoft();
-                }
-            },
-			3 => {
-				// Machine software
-				//println!("Machine software interrupt CPU#{} 0x{return_pc:016X?}", hart);
-                unsafe { 
-                    clear_hart_int(hart);
-                }
-			},
-            5 => (),
-            7 => unsafe {
-                let mtimecmp = (0x0200_4000 as *mut u64).add(hart);
-                mtimecmp.write_volatile(u64::MAX);
-                riscv::register::mie::clear_mtimer();
-                mtimecmp.write_volatile(u64::MAX);
-
-                //println!("machine trap timer CPU#{hart}");
-            }
-			11 => {
-				// Machine external (interrupt from Platform Interrupt Controller (PLIC))
-				println!("Machine external interrupt CPU#{}", hart);
-			},
+			3 => unsafe { clear_hart_int(hart); },
 			_ => {
-				println!("Unhandled async trap CPU#{} -> {}\n", hart, cause_num);
-                loop{riscv::asm::wfi();}
+				println!("Unhandled M-mode async trap CPU#{} -> {}\n", hart, cause_num);
+				loop { riscv::asm::wfi(); }
 			}
 		}
 	}
 	else {
-		// Synchronous trap
+		// Synchronous trap. medeleg now delegates breakpoints, ecalls
+		// (U+S), instruction-access/page-fault, load-page-fault and
+		// store-page-fault to S-mode, so kmain's s_trap handles all of
+		// those. The only synchronous traps that should reach M-mode
+		// are bugs: PMP/access faults from M-mode itself, illegal
+		// instructions, ecalls bl issues against itself (it doesn't),
+		// or anything bl::setup_interrupts forgot to delegate. Halt
+		// loudly with the cause and tval so the failure is debuggable.
 		match cause_num {
-            1 => {
-                println!("Unhandled sync trap CPU#{} -> 0x{:08x}: 0x{:08x}", hart, epc, tval);
-                //return_pc += 4;
-                loop{riscv::asm::wfi();}
-            },
-			2 => {
-				// Illegal instruction
-				println!("Illegal instruction CPU#{} -> 0x{:08x}: 0x{:08x}\n", hart, epc, tval);
-                loop{riscv::asm::wfi();}
-			},
-            5 => {
-				// Load access fault
-				println!("Load access fault CPU#{} -> 0x{:08x}: 0x{:08x}\n", hart, epc, tval);
-                loop{riscv::asm::wfi();}
-			},
-			8 => {
-				// Environment (system) call from User mode
-				println!("E-call from User mode! CPU#{} -> 0x{:08x}", hart, epc);
-                loop{riscv::asm::wfi();}
-				//return_pc += 4;
-			},
 			9 => {
-				// Environment (system) call from Supervisor mode
-				
-                //println!("E-call({code}, {sarg:016X}) from Supervisor mode! CPU#{} -> 0x{:08x}", hart, epc);
-
+				// Ecall-from-S is delegated by medeleg.set_supervisor_env_call,
+				// but if it ever leaks into M-mode just skip past it
+				// instead of looping the hart.
 				return_pc += 4;
-
-                match code {
-                    1 => bl::HART_ROOT.store(sarg, Ordering::Release),
-                    2 => (),
-                    3 => unsafe {
-                        wake_hart(sarg);
-                    }
-                    4 => bl::KDMAP_BIAS.store(sarg, Ordering::Release),
-                    _ => ()
-                }
-			},
-			11 => {
-				// Environment (system) call from Machine mode
-				println!("E-call from Machine mode! CPU#{} -> 0x{:08x}\n", hart, epc);
-                return_pc += 4;
-			},
-			// Page faults
-			12 => {
-				// 2 fault
-				println!("Instruction page fault CPU#{} -> 0x{:08x}: 0x{:08x}", hart, epc, tval);
-				//return_pc += 4;
-                loop{riscv::asm::wfi();}
-			},
-			13 => {
-				// Load page fault
-				println!("Load page fault CPU#{} -> 0x{:08x}: 0x{:08x}", hart, epc, tval);
-				//return_pc += 4;
-                loop{riscv::asm::wfi();}
-			},
-			15 => {
-				// Store page fault
-				println!("Store page fault CPU#{} -> 0x{:08x}: 0x{:08x}", hart, epc, tval);
-				//return_pc += 4;
-                loop{riscv::asm::wfi();}
 			},
 			_ => {
-                println!("Unhandled sync trap CPU#{} -> 0x{:08x}: 0x{:08x}", hart, epc, tval);
-                //return_pc += 4;
-                loop{riscv::asm::wfi();}
+				println!(
+					"Unhandled M-mode sync trap CPU#{} -> cause={} epc=0x{:08x} stval=0x{:08x}\n",
+					hart, cause_num, epc, tval,
+				);
+				loop { riscv::asm::wfi(); }
 			}
 		}
 	};
@@ -253,8 +184,6 @@ extern "C" fn kinit(hartid: usize, dtb_addr: usize) {
             let _ = riscv::register::satp::try_set(Mode::Sv48, 0, root_ref as *const _ as usize / PAGE_SIZE);
             riscv::asm::sfence_vma_all();
 
-            bl::ID_MAP_ADDR.store(root_ref as *const _ as u64, Ordering::Release);
-
             println!("PTABLES=0x{:016X}..0x{:016X}", page_table_start, page_table_start + ptv.current_tables_size());
 
             bl::kmain_enter(addr, dtb_addr as usize);
@@ -274,71 +203,45 @@ extern "C" fn kinit_hart() {
         loop { riscv::asm::wfi(); }
     }
 
-    loop {
+    // Wait for hart 0 (still in bl) to copy the kernel ELF into RAM and
+    // publish its `_start` PA. CLINT MSIP from `kmain_enter`'s wake_hart
+    // unblocks the WFI; the M-mode trap clears the pending bit, the loop
+    // re-runs, sees KMAIN_ENTRY, and we sret straight to S-mode kmain.
+    let entry = loop {
+        let v = bl::KMAIN_ENTRY.load(Ordering::Acquire);
+        if v != 0 { break v; }
         riscv::asm::wfi();
-        let hart_root = bl::HART_ROOT.load(Ordering::Acquire);
-        if hart_root > 0 {
-            //serial::println!("hart{hartid} waking up");
+    };
 
-            unsafe {
-                // bl still dereferences HartContext fields via PA (we're in
-                // M-mode with satp=bare). But what the kernel *runs* with —
-                // sscratch and sp — has to be a KDMAP VA, because pool
-                // identity is gone from the kernel satp. Apply the bias
-                // published by the kernel's ecall(4).
-                let kdmap_bias = bl::KDMAP_BIAS.load(Ordering::Acquire);
-                let hart_context_phys = (hart_root as *const HartContext)
-                    .add(hartid);
-                let hart_context_kva = (hart_context_phys as usize).wrapping_add(kdmap_bias);
+    unsafe {
+        // Per-hart M-mode delegation + Sstc enable. Used to live further
+        // down inside the cooking block; pulled up so the sret path is
+        // a thin tail.
+        setup_interrupts();
 
-                riscv::register::sscratch::write(hart_context_kva);
+        riscv::register::sepc::write(entry);
+        riscv::register::mstatus::set_spp(SPP::Supervisor);
+        // Bare satp: kmain's `_start` runs at the load PA. The S-mode
+        // entry path (`_start_secondary` → trampoline satp →
+        // `secondary_rust_setup`) drives the satp transitions itself.
+        riscv::register::satp::write(riscv::register::satp::Satp::from_bits(0));
 
-                let hart_context = hart_context_phys.as_ref_unchecked();
-                let target = hart_context.kptr.load(Ordering::Acquire) as usize;
-                let sp_phys = hart_context.k_stack.stack_data.as_ptr() as usize + TRAP_STACK_SIZE - 16;
-                let sp = sp_phys.wrapping_add(kdmap_bias);
+        let dtb_ptr = bl::SYSINFO.dtb_addr.load(Ordering::Acquire);
+        let serial_ptr = bl::SYSINFO.serial.load(Ordering::Acquire);
 
-                riscv::register::stvec::write(Stvec::new(hart_context.s_trap_addr as usize, STrapMode::Direct));
-
-                riscv::register::sepc::write(target);
-                riscv::register::mstatus::set_spp(SPP::Supervisor);
-
-                setup_interrupts();
-
-                // 1. Sync data across cores
-                core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-                // 2. Invalidate local I-Cache
-                riscv::asm::fence_i();
-
-                riscv::asm::sfence_vma_all();
-                let _ = riscv::register::satp::write(hart_context.satp);
-                riscv::asm::sfence_vma_all();
-
-                let mtimecmp_addr = (0x02004000 as *mut u64).add(hartid);
-
-                asm!(
-                    "csrw pmpaddr0, {apmp}",
-                    "csrw pmpcfg0, {acfg}",
-                    "mv t0, {mt}",          // mtimecmp address for
-                    "li t1, 0x0200bff8",          // mtime address
-                    "ld t2, 0(t1)",               // Load current 64-bit mtime
-                    "li t3, 100000000",             // Example interval (1 million cycles)
-                    "add t2, t2, t3",             // t2 = mtime + interval
-                    "sd t2, 0(t0)",
-                    //"li t0, 0x222",        // This sets bits 1, 5, and 9
-                    //"csrs mideleg, t0",    // Ensure bit 5 (0x20) is definitely set2
-                    "mv sp, {s}",
-                    "fence w, rw", // Ensure ELF writes are visible to all harts
-                    "fence.i",    // Synchronize I-cache with D-cache
-                    "sfence.vma", // Flush the MMU TLB
-                    "sret",
-                    apmp = in(reg) !0,
-                    acfg = in(reg) 0xf | 0x80,
-                    mt = in(reg) mtimecmp_addr,
-                    s = in(reg) sp,
-                    options(noreturn),
-                );
-            }
-        }
+        asm!(
+            "csrw pmpaddr0, {apmp}",
+            "csrw pmpcfg0, {acfg}",
+            "fence w, rw",
+            "fence.i",
+            "sfence.vma",
+            "sret",
+            apmp = in(reg) !0,
+            acfg = in(reg) 0xf | 0x80,
+            in("a0") hartid,
+            in("a1") dtb_ptr,
+            in("a2") serial_ptr,
+            options(noreturn),
+        );
     }
 }

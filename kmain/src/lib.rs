@@ -491,40 +491,28 @@ pub extern "C" fn k_net(device: *mut NetPackage) {
             }
         }
 
-        unsafe {
-            let hart_context = {
-                (riscv::register::sscratch::read() as *mut HartContext).as_mut_unchecked()
-            };
+        // Drop SUM before parking — the kthread doesn't need user
+        // access while suspended, and leaving SUM set across the
+        // park widens the window in which a stray kernel deref of a
+        // user VA goes silently through instead of faulting.
+        unsafe { riscv::register::sstatus::clear_sum(); }
 
-            let this_thread = {
-                let p = hart_context.current.load(Ordering::Acquire) as *mut Thread;
-                //serial::println!("net thread on cpu{} t={p:016X?}", hart_context.hart_id);
-                
-                p.as_mut_unchecked()
-            };
-
-            hart_context.cscratch2 = 1;
-            this_thread.ticks = 0;
-            this_thread.wake_time = core::cmp::min(default_wake, wake_time);
-
-            riscv::register::sstatus::clear_sum();
-            riscv::register::sstatus::set_sie();
-
-            // State stays Running here on purpose. The cscratch2=1 path
-            // in the s_trap handler runs `exit_thread_with_state(Suspended)`
-            // after saving the frame, which nulls `current` *before*
-            // setting the new state — preventing the manager on another
-            // hart from picking up this thread while we still claim it.
-            // Setting `state = Suspended` from this side first would
-            // open the same race that produced double-dispatch of knet
-            // across harts (see bl/arm_hart_timer_*.log).
-
-            asm!("ebreak", "nop");
-
-            // TODO: store registers and stuff into a trap frame and switch threads
-            // -OR- *modiify supervisor ebreak into syscall type thing
-            // -OR- *try to pass some supervisor ecalls from machine mode back into supervisor mode (ssoft?) 
-        };
+        // Park until either `wake_time` ticks elapse or a producer
+        // (e1000 PLIC handler, update_tcp ring-progress, nc_yield
+        // syscall) ORs a wake reason into our wake_override. Resumes
+        // at the next iteration of this loop with all locals intact.
+        //
+        // Previously this was a hand-rolled `cscratch2 = 1; ebreak`
+        // that left state=Running and rode the s_trap cause=3 path
+        // → check_context_and_switch (Running → Ready) → busy-loop —
+        // a workaround for the double-dispatch race that
+        // kthread_park's stack-switch-then-publish ordering closes
+        // properly. The wake_time field is now honored, so the
+        // kthread actually sleeps between events.
+        crate::kernel::context::kthread_park(
+            ThreadState::Suspended,
+            core::cmp::min(default_wake, wake_time),
+        );
     }
 }
 

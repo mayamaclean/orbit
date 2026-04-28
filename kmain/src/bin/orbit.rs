@@ -8,7 +8,7 @@ use core::ptr::null_mut;
 use core::sync::atomic::{Ordering};
 use core::{alloc::Layout, panic::PanicInfo};
 
-use device::{HartContext, SysInfo, TRAP_STACK_SIZE, find_ram};
+use device::{HartContext, TRAP_STACK_SIZE, find_ram};
 use kmain::ktrace::OrbitSubscriber;
 use kmain::{check_context_and_switch, supervisor_clear_ipi};
 use kmain::kernel::Orbit;
@@ -311,7 +311,10 @@ extern "C" fn k_harthello() {
     };
 
     unsafe {
-        //println!("hart_context @ {:016X?} hartid={} kptr={:016X?}", hart_context as *const _, hart_context.hart_id, hart_context.kptr.load(Ordering::Relaxed));
+        info!("hart_context @ {:016X?} hartid={} kptr={:016X?}",
+            hart_context as *const _,
+            hart_context.hart_id,
+            hart_context.kptr.load(Ordering::Relaxed));
 
         hart_context.kptr.store(kmain::k_hart_loop as *mut (), Ordering::Relaxed);
 
@@ -357,8 +360,8 @@ pub extern "C" fn k_smpstart() {
 
     // Populate each hart_context's PLIC S-mode context index from the
     // PlicInfo stashed by `drivers::plic::install`. Done here (before
-    // the hart-wake ecall below) so secondary harts see correct values
-    // once they come online.
+    // the SECONDARY_GO publish below) so secondary harts see correct
+    // values once they come online.
     if let Some(info) = kmain::drivers::plic::info() {
         unsafe {
             let my_hc = hart_context as *const HartContext as *mut HartContext;
@@ -381,52 +384,21 @@ pub extern "C" fn k_smpstart() {
     orbit.create_new_process(kmain::kernel::UMODE_TEST_ELF, kmain::kernel::UPROC_STACK_DEFAULT, boot_affinity, boot_affinity)
         .expect("no test uprocess");
 
-    unsafe {
-        // bl dereferences HART_ROOT in M-mode with no paging, so it must be a
-        // physical address. hart_context is a KDMAP VA post-higher-half, so
-        // translate at the boundary.
-        let hart_root_phys = kmain::kernel::memmap::KdmapVa::new(
-            hart_context as *const _ as u64).to_phys().get_raw() as usize;
-
-        // Tell bl how to turn a RAM PA into its KDMAP alias. bl uses this to
-        // hand secondary harts a sscratch/sp that resolves under the kernel
-        // satp (pool identity is no longer mapped).
-        let kdmap_bias = kmain::kernel::memmap::kdmap_base()
-            .wrapping_sub(kmain::kernel::memmap::ram_phys_base()) as usize;
-
-        asm!(
-            "li a6, 4",
-            "mv a7, {0}",
-            "ecall",
-            in(reg) kdmap_bias
-        );
-
-        //signal bios to set hart root
-        asm!(
-            "li a6, 1",
-            "mv a7, {0}",
-            "ecall",
-            in(reg) hart_root_phys
-        );
-
-        kmain::kick_machine_harts(4);
+    // Release the secondary-hart S-mode spin in `secondary_rust_setup`.
+    // Release-store; secondaries Acquire and observe the publishes
+    // from `rust_main` (KSATP / HART_CTX_PA / KDMAP_BIAS_BOOT).
+    for hart in 1..orbit.cpu_count.min(MAX_HARTS) {
+        SECONDARY_GO[hart].store(true, Ordering::Release);
     }
+
+    kmain::kick_machine_harts(orbit.cpu_count);
+    //(0..orbit.cpu_count).for_each(|hart| kmain::supervisor_wake_hart(hart));
+
+    info!("kicked harts");
 
     k_harthello();
 }
 
-/*
-#[unsafe(naked)]
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn _start() -> ! {
-    naked_asm!(
-        "la sp, {stack_end}",
-        "j {rust_main}",
-        stack_end = sym _stack_end,
-        rust_main = sym rust_main
-    );
-}
-*/
 // Early paging tables, used only by the trampoline. 8 pages (32 KiB):
 // room for root + L2(identity) + L2/L1/L0(high-half) with slack. Zero-
 // initialized by bl's write_bytes over the PT_LOAD memsz-filesz gap — .bss
@@ -440,6 +412,92 @@ static mut EARLY_PT: EarlyPt = EarlyPt([0; 512 * 8]);
 
 const EARLY_PT_SIZE: usize = core::mem::size_of::<EarlyPt>();
 
+// =========================================================================
+// Secondary-hart entry path
+//
+// bl srets every hart into kmain's `_start` (a0 = hartid). Hart 0 takes the
+// existing trampoline path; hart != 0 dispatches to `_start_secondary`,
+// which sits on a tiny per-hart bootstrap stack and waits for hart 0 to
+// finish self-relocation. Once relocations are done it adopts the
+// trampoline satp (identity + high-half), jumps to high-VA, and from there
+// runs `secondary_rust_setup` in normal Rust — all globals are valid post-
+// relocation under trampoline satp because both PA and high-VA are mapped.
+// `secondary_rust_setup` then waits for the per-hart `SECONDARY_GO`
+// signal, reads its `HartContext` and the kernel satp, and switches to
+// the final kernel satp + `k_harthello`.
+//
+// This used to live in M-mode (bl::kinit_hart): bl polled `HART_ROOT`,
+// translated PA → KDMAP via `KDMAP_BIAS`, and cooked sret state per hart.
+// Moving it to S-mode shrinks the M-mode surface to "launch + trap".
+// =========================================================================
+
+const MAX_HARTS: usize = 4;
+// 16 KiB per hart — covers early_paging_setup, post_trampoline_entry, and
+// most of rust_main before hart 0 switches to its real kernel stack. Used
+// by hart 0 *and* secondaries as their pre-kernel-context stack, so that
+// no hart's S-mode sp aliases bl's `KERNEL_STACK_END` (which m_trap_vector
+// loads into sp on every M-mode trap — sharing that with hart 0's S-mode
+// path corrupts saved-ra slots and produces wild jumps into m_trap_vector
+// code that fault as "csrw mepc illegal" in S-mode).
+const BOOT_STACK_SHIFT: u32 = 14;
+const BOOT_STACK_SIZE: usize = 1 << BOOT_STACK_SHIFT;
+
+#[repr(C, align(16))]
+struct BootStacks([u8; BOOT_STACK_SIZE * MAX_HARTS]);
+
+#[unsafe(no_mangle)]
+#[used]
+static mut BOOT_STACKS: BootStacks =
+    BootStacks([0; BOOT_STACK_SIZE * MAX_HARTS]);
+
+// Set by hart 0 in `post_trampoline_entry` *after* `apply_relocations`.
+// While zero, secondary harts spin in `_start_secondary` under bare satp —
+// only PC-relative accesses are safe, since post-relocation Rust globals
+// resolve to high-VA which bare satp does not map.
+#[unsafe(no_mangle)]
+#[used]
+static RELOCS_DONE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+// Trampoline satp value (snapshot of `satp` while `post_trampoline_entry`
+// runs). Has both identity and high-half mappings, so secondaries can
+// adopt it from bare satp and then jump to high-VA in one step.
+#[unsafe(no_mangle)]
+#[used]
+static TRAMP_SATP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+// High-half VA of `secondary_rust_setup`. Captured via `lla` in
+// `post_trampoline_entry` (which already runs at high-VA), so secondaries
+// can `jr` to it under the trampoline satp.
+#[unsafe(no_mangle)]
+#[used]
+static SECONDARY_RUST_SETUP_VA: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+// Final kernel satp (KTEXT + KDMAP + KMMIO, no identity). Published at
+// the end of `rust_main` before hart 0 srets to `k_smpstart`.
+#[unsafe(no_mangle)]
+#[used]
+static KSATP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+// Physical address of the per-hart `HartContext` array. Secondaries
+// index by hartid * size_of::<HartContext>().
+#[unsafe(no_mangle)]
+#[used]
+static HART_CTX_PA: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+// kdmap_base() - ram_phys_base(). Add to a RAM PA to get its KDMAP VA.
+// Published once `init_layout` has run.
+#[unsafe(no_mangle)]
+#[used]
+static KDMAP_BIAS_BOOT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+// Per-hart "go" flag set by `k_smpstart` after the kernel state is ready.
+// Secondaries WFI-spin on this in `secondary_rust_setup` (under trampoline
+// satp, so WFI/Rust accesses are all safe).
+#[unsafe(no_mangle)]
+#[used]
+static SECONDARY_GO: [core::sync::atomic::AtomicBool; MAX_HARTS] =
+    [const { core::sync::atomic::AtomicBool::new(false) }; MAX_HARTS];
+
 // Upper 32 bits of KTEXT_NOMINAL (0xFFFF_FFC0_0000_0000). The asm loads
 // this as a signed 32-bit immediate and sllis by 32 to reconstruct the
 // full constant — a 64-bit `li` isn't portable in LLVM's assembler. When
@@ -452,12 +510,39 @@ const KTEXT_NOMINAL_HI32: u64 = kmain::kernel::memmap::KTEXT_NOMINAL >> 32;
 #[unsafe(link_section = ".text.init")]
 pub unsafe extern "C" fn _start() -> ! {
     naked_asm!(
-        // bl enters with a0=hartid, a1=sysinfo. Preserve them across the call
-        // to early_paging_setup via callee-saved s-registers.
+        // bl enters with a0=hartid, a1=dtb, a2=serial. Preserve them across the
+        // call to early_paging_setup via callee-saved s-registers.
+        //
+        // auipc MUST be the first instruction of _start: its result is
+        // used as `load_addr` everywhere downstream (raw = image_end_pa -
+        // load_addr; pa_range.start = load_addr). The 4 KiB-page path in
+        // map_va_range rejects a misaligned paddr, so even a 2-byte
+        // compressed instruction in front of auipc shifts load_addr off
+        // alignment and the bootstrap mapping fails. Dispatch on hartid
+        // *after* this snapshot — secondaries don't read s0/s1/s2.
         "auipc t0, 0",              // t0 = physical VA of _start (load_addr)
         "mv s0, t0",                // s0 = load_addr (callee-saved)
         "mv s1, a0",                // s1 = hartid
-        "mv s2, a1",                // s2 = sysinfo
+        "mv s2, a1",                // s2 = dtb
+        "mv s3, a2",                // s3 = serial
+
+        // sp from per-hart boot stack. bl's `mv sp, KERNEL_STACK_END`
+        // before sret hands every hart the SAME pointer (0x80080000),
+        // which m_trap_vector also loads on every M-mode trap. With
+        // shared sp between hart 0's S-mode path and concurrent M-mode
+        // trap handlers on harts 1..3, hart 0's saved-ra gets clobbered
+        // with the m_trap_vector return address and the next ret jumps
+        // there in S-mode, faulting on `csrw mepc, a0`. Per-hart slot
+        // here decouples them.
+        "lla   t1, {boot_stacks}",
+        "addi  t2, a0, 1",
+        "slli  t2, t2, {boot_stack_shift}",
+        "add   sp, t1, t2",
+
+        // bl enters every hart here. Secondaries take a separate S-mode
+        // path that waits for hart 0's bringup — bl is out of the
+        // per-hart cooking business entirely.
+        "bnez a0, 9f",
 
         // early_paging_setup(pt_base, pt_size, load_addr) -> satp. Args
         // computed PC-relative / as immediates; no GOT, no relocated globals.
@@ -481,19 +566,136 @@ pub unsafe extern "C" fn _start() -> ! {
         "slli t3, t3, 32",          // t3 = 0xFFFF_FFC0_0000_0000 (KTEXT_NOMINAL)
         "add t4, t3, t2",           // t4 = high-half VA of post_tramp
 
-        // Args for post_trampoline_entry(hartid, sysinfo, ktext_base, load_addr).
+        // Args for post_trampoline_entry(hartid, dtb, serial, ktext_base, load_addr).
         "mv a0, s1",
         "mv a1, s2",
-        "mv a2, t3",                // ktext_base
-        "mv a3, s0",                // load_addr
+        "mv a2, s3",
+        "mv a3, t3",                // ktext_base
+        "mv a4, s0",                // load_addr
 
         "jr t4",
+
+        // Secondary fall-through: tail-call into `_start_secondary`.
+        // Materialized as `lla + jr` so the assembler doesn't have to
+        // reach `_start_secondary` within ±1 MiB.
+    "9:",
+        "lla t0, {start_secondary}",
+        "jr  t0",
+
         early_pt = sym EARLY_PT,
         early_pt_size = const EARLY_PT_SIZE,
         early_paging_setup = sym early_paging_setup,
         post_tramp = sym post_trampoline_entry,
         ktext_hi32 = const KTEXT_NOMINAL_HI32,
+        start_secondary = sym _start_secondary,
+        boot_stacks = sym BOOT_STACKS,
+        boot_stack_shift = const BOOT_STACK_SHIFT,
     );
+}
+
+/// Secondary-hart entry. Hart != 0 lands here from `_start`'s dispatch
+/// with a0 = hartid, bare satp. Spins (under bare satp, PC-relative only)
+/// until hart 0 publishes `RELOCS_DONE` + `TRAMP_SATP` +
+/// `SECONDARY_RUST_SETUP_VA`, then adopts the trampoline satp and jumps
+/// to high-VA Rust.
+#[unsafe(naked)]
+#[unsafe(no_mangle)]
+#[unsafe(link_section = ".text.init")]
+pub unsafe extern "C" fn _start_secondary() -> ! {
+    naked_asm!(
+        // sp is already set by `_start` (per-hart slot in BOOT_STACKS)
+        // before we get here.
+
+        // Busy-spin on RELOCS_DONE. We can't WFI here without an stvec,
+        // and the wait is short (only until hart 0 finishes
+        // `apply_relocations` in post_trampoline_entry). The fence after
+        // the load makes the subsequent reads observe the publishes that
+        // happened-before the Release store on hart 0.
+        "lla   t0, {relocs_done}",
+    "1:",
+        "lw    t1, 0(t0)",
+        "beqz  t1, 1b",
+        "fence r, r",
+
+        // Read trampoline satp + high-VA target. PC-rel under bare satp
+        // gives PAs of the statics; the *values* loaded are just
+        // integers (not pointers needing relocation), so they're correct.
+        "lla   t0, {tramp_satp}",
+        "ld    t1, 0(t0)",
+        "lla   t0, {sec_setup_va}",
+        "ld    t2, 0(t0)",
+
+        // Switch to trampoline satp. PC stays valid because trampoline
+        // identity-maps RAM. After this, both PA and high-VA resolve, so
+        // jumping to the high-VA secondary_rust_setup is safe.
+        "sfence.vma",
+        "csrw  satp, t1",
+        "sfence.vma",
+
+        // Tail-call to high-VA secondary_rust_setup(hartid). a0 is
+        // already hartid; convention preserved.
+        "jr    t2",
+
+        relocs_done = sym RELOCS_DONE,
+        tramp_satp = sym TRAMP_SATP,
+        sec_setup_va = sym SECONDARY_RUST_SETUP_VA,
+    );
+}
+
+/// Runs at high-VA under the trampoline satp. Both PA (identity) and
+/// high-VA are mapped here, so post-relocation Rust globals resolve
+/// correctly. Waits for the per-hart `SECONDARY_GO`, then reads the
+/// `HartContext`, switches to the final kernel satp, and jumps to
+/// `k_harthello`.
+#[unsafe(no_mangle)]
+unsafe extern "C" fn secondary_rust_setup(hartid: usize) -> ! {
+    // bl::setup_interrupts left mie.MSIE set on this hart, and bl's
+    // m_trap_vector now save/restores mie around `call m_trap`, so
+    // MSIPs from `kick_machine_harts` correctly wake WFI.
+    while !SECONDARY_GO[hartid].load(Ordering::Acquire) {
+        riscv::asm::wfi();
+    }
+
+    let ksatp = KSATP.load(Ordering::Acquire);
+    let hart_ctx_base_pa = HART_CTX_PA.load(Ordering::Acquire) as usize;
+    let kdmap_bias = KDMAP_BIAS_BOOT.load(Ordering::Acquire) as usize;
+
+    let stride = core::mem::size_of::<HartContext>();
+    let hart_ctx_pa = hart_ctx_base_pa + hartid * stride;
+    let hart_ctx_kva = hart_ctx_pa.wrapping_add(kdmap_bias);
+
+    // Trampoline satp identity-maps RAM, so reading the HartContext
+    // through its PA is safe. Equivalently could use the KDMAP VA — same
+    // backing memory either way.
+    let hart_ctx = unsafe { &*(hart_ctx_pa as *const HartContext) };
+    let kptr = hart_ctx.kptr.load(Ordering::Acquire) as usize;
+    let stvec_addr = hart_ctx.s_trap_addr as usize;
+    let sp_pa = hart_ctx.k_stack.stack_data.as_ptr() as usize
+        + device::TRAP_STACK_SIZE - 16;
+    let sp_kva = sp_pa.wrapping_add(kdmap_bias);
+
+    // No stack access between csrw satp and `mv sp` — inline asm doesn't
+    // spill within a block, so sp can stay pointing at the bootstrap
+    // stack PA (no longer mapped under the final satp) until we move it
+    // to the KDMAP VA of the kernel stack.
+    unsafe {
+        asm!(
+            "csrw sscratch, {sscratch}",
+            "csrw stvec, {stvec}",
+            "sfence.vma",
+            "csrw satp, {ksatp}",
+            "sfence.vma",
+            "mv   sp, {sp}",
+            "fence.i",
+            "jr   {kptr}",
+            sscratch = in(reg) hart_ctx_kva,
+            stvec = in(reg) stvec_addr,
+            ksatp = in(reg) ksatp,
+            sp = in(reg) sp_kva,
+            kptr = in(reg) kptr,
+            options(noreturn),
+        );
+    }
 }
 
 /// Build the early page table and return its satp value. Runs pre-jump at
@@ -627,7 +829,8 @@ const DT_RELAENT: u64 = 9;
 #[inline(never)]
 unsafe extern "C" fn post_trampoline_entry(
     hartid: usize,
-    sysinfo: usize,
+    dtb: usize,
+    serial: usize,
     ktext_base: u64,
     load_addr: u64,
 ) -> ! {
@@ -642,7 +845,31 @@ unsafe extern "C" fn post_trampoline_entry(
         let slide = ktext_base.wrapping_sub(kmain::kernel::memmap::LINK_BASE);
         apply_relocations(slide, dynamic_section);
 
-        rust_main(hartid, sysinfo, load_addr);
+        // Publish the trampoline satp + the high-VA of secondary_rust_setup
+        // so the secondaries' asm prologue can adopt them. PC is already
+        // high-VA here (we jumped via the trampoline at the end of `_start`),
+        // so `lla` gives the high-VA of the symbol. `csrr satp` gives the
+        // trampoline satp bits.
+        let tramp_satp: u64;
+        core::arch::asm!(
+            "csrr {0}, satp",
+            out(reg) tramp_satp,
+            options(nomem, nostack, preserves_flags),
+        );
+        let sec_setup_va: u64;
+        core::arch::asm!(
+            "lla {0}, {sym}",
+            out(reg) sec_setup_va,
+            sym = sym secondary_rust_setup,
+            options(nomem, nostack, preserves_flags),
+        );
+        TRAMP_SATP.store(tramp_satp, Ordering::Release);
+        SECONDARY_RUST_SETUP_VA.store(sec_setup_va, Ordering::Release);
+        // Release-store last; secondaries Acquire on this and then read
+        // the two values above.
+        RELOCS_DONE.store(1, Ordering::Release);
+
+        rust_main(hartid, dtb, serial, load_addr);
     }
 }
 
@@ -680,7 +907,7 @@ unsafe fn apply_relocations(slide: u64, dynamic_section: *const Elf64Dyn) {
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn rust_main(_hartid: usize, sysinfo: usize, load_addr: u64) -> ! {
+extern "C" fn rust_main(_hartid: usize, dtb: usize, serial: usize, load_addr: u64) -> ! {
     unsafe {
         // 1. Sync data across cores
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
@@ -693,11 +920,8 @@ extern "C" fn rust_main(_hartid: usize, sysinfo: usize, load_addr: u64) -> ! {
         riscv::register::sie::clear_stimer();
         riscv::register::sie::clear_ssoft();
 
-        let sysinfo = (sysinfo as *const SysInfo)
-            .as_ref_unchecked();
-
-        let dtb_addr = sysinfo.dtb_addr.load(Ordering::Acquire);
-        let serial_addr = sysinfo.serial.load(Ordering::Acquire);
+        let dtb_addr = dtb;
+        let serial_addr = serial;
 
         serial::init_serial(serial_addr as usize);
 
@@ -776,7 +1000,7 @@ extern "C" fn rust_main(_hartid: usize, sysinfo: usize, load_addr: u64) -> ! {
 
         let cpu_count = 4;
         let context_size = cpu_count * core::mem::size_of::<HartContext>();
-        let (_hart_contexts_pa, hart_contexts_kva) = kpages
+        let (hart_contexts_pa, hart_contexts_kva) = kpages
             .alloc_kdmap(Layout::from_size_align_unchecked(context_size, 4096))
             .expect("failed to alloc hart contexts");
         let hart_contexts = hart_contexts_kva.as_mut_ptr::<HartContext>();
@@ -865,6 +1089,17 @@ extern "C" fn rust_main(_hartid: usize, sysinfo: usize, load_addr: u64) -> ! {
 
         riscv::register::sepc::write(this_pc as usize);
         riscv::register::sstatus::set_spp(riscv::register::sstatus::SPP::Supervisor);
+
+        // Publish boot state for secondary harts. They're spinning under
+        // the trampoline satp on `SECONDARY_GO[hartid]`, which
+        // `k_smpstart` flips after the kernel-side bringup has finished.
+        // Releases here happen-before that flip (same hart), so any
+        // Acquirer that observes GO=true also sees these values.
+        let kdmap_bias = kmain::kernel::memmap::kdmap_base()
+            .wrapping_sub(kmain::kernel::memmap::ram_phys_base());
+        KDMAP_BIAS_BOOT.store(kdmap_bias, Ordering::Release);
+        HART_CTX_PA.store(hart_contexts_pa.get_raw(), Ordering::Release);
+        KSATP.store(satp.bits() as u64, Ordering::Release);
 
         unmap_boot_only_regions(&orbit_root_table)
             .expect("failed to unmap boot-only regions");

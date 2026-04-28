@@ -1,9 +1,9 @@
 #![no_std]
 
 use core::arch::asm;
-use core::sync::{atomic::{AtomicU64, AtomicUsize, Ordering}};
+use core::sync::{atomic::{AtomicUsize, Ordering}};
 
-use device::{SysInfo, TrapFrame};
+use device::{SysInfo, TrapFrame, wake_hart};
 use mmu::{MB};
 use serial::println;
 
@@ -36,20 +36,16 @@ pub fn id_map_tables() -> usize {
     unsafe { KERNEL_ID_MAP_TABLES as usize }
 }
 
-pub static ID_MAP_ADDR: AtomicU64 = AtomicU64::new(0);
 pub static SYSINFO: SysInfo = SysInfo {
     dtb_addr: AtomicUsize::new(0),
     serial: AtomicUsize::new(0)
 };
-pub static HART_ROOT: AtomicUsize = AtomicUsize::new(0);
 
-// Offset added to a physical RAM address to produce its KDMAP alias in the
-// kernel's address space. Set by the kernel via M-mode ecall (code 4) before
-// it wakes harts 1..N. bl needs it to hand secondary harts a `sscratch` and
-// `sp` that resolve under the kernel satp (pool identity has been dropped).
-// Zero means "not yet published" — kinit_hart spins on HART_ROOT for the
-// kernel's setup ecall, so by the time it reads this the value is valid.
-pub static KDMAP_BIAS: AtomicUsize = AtomicUsize::new(0);
+// PA of kmain's `_start`, computed by hart 0 once it has copied the kernel
+// ELF into RAM. Secondary harts in `kinit_hart` spin on this; once set,
+// they sret straight to S-mode kmain (bare satp), where the per-hart
+// bringup now lives.
+pub static KMAIN_ENTRY: AtomicUsize = AtomicUsize::new(0);
 
 pub fn setup_interrupts() {
     use riscv::register::{mstatus, mie, mcounteren, mideleg, medeleg};
@@ -58,6 +54,28 @@ pub fn setup_interrupts() {
         //riscv::register::mstatus::set_mie();
         mstatus::set_sie();
 
+        // Sstc: enable supervisor counter+timer extensions in menvcfg
+        // (bit 63 = STCE). Done before stimecmp write below so the
+        // CSR exists for us to write.
+        asm!(
+            "csrw menvcfg, t0",
+            in("t0") 0x8000000000000000u64
+        );
+
+        // Park the S-mode timer comparator at +∞ before enabling
+        // mie.STIE. With Sstc on, mip.STIP follows mtime > stimecmp;
+        // stimecmp resets to 0, so mtime > 0 leaves STIP perpetually
+        // pending. Flipping mie.STIE without parking stimecmp first
+        // fires an STI trap in M-mode immediately (mideleg can't help
+        // because mideleg only delegates traps from S/U), and m_trap
+        // has no cause-5 arm — mret-stuck-in-m_trap-loop. kmain's
+        // s_trap arms its own stimecmp when it actually wants timer
+        // ticks.
+        asm!(
+            "csrw 0x14d, {0}",   // stimecmp = MAX
+            in(reg) usize::MAX,
+        );
+
         mie::set_msoft();
         //mie::set_mtimer();
         mie::set_stimer();
@@ -65,16 +83,12 @@ pub fn setup_interrupts() {
 
         mcounteren::set_tm();
 
-        asm!(
-            "csrw menvcfg, t0",
-            in("t0") 0x8000000000000000u64
-        );
-
         mideleg::set_stimer();
         mideleg::set_ssoft();
         mideleg::set_sext();
 
         medeleg::set_breakpoint();
+        medeleg::set_supervisor_env_call();
         medeleg::set_user_env_call();
         
         medeleg::set_instruction_fault();
@@ -156,12 +170,23 @@ pub extern "C" fn kmain_enter(serial_addr: usize, dtb_addr: usize) {
         riscv::register::mstatus::set_spp(SPP::Supervisor);
 
         setup_interrupts();
-        
-        let sysinfo_ptr = &SYSINFO as *const _ as usize;
+
         let hartid = riscv::register::mhartid::read();
 
         SYSINFO.dtb_addr.store(dtb_addr, Ordering::Relaxed);
         SYSINFO.serial.store(serial_addr, Ordering::Relaxed);
+
+        // Publish kmain entry + wake the secondary harts. They've been
+        // sitting in M-mode WFI inside `kinit_hart`; CLINT MSIP unblocks
+        // the WFI, the M-mode trap clears it, and they resume the
+        // KMAIN_ENTRY poll, see the new value, and sret to S-mode kmain
+        // with bare satp (kmain's `_start` is at the load PA, identity).
+        KMAIN_ENTRY.store(entrypoint, Ordering::Release);
+        for hart in 0..4 {
+            if hart != hartid {
+                wake_hart(hart);
+            }
+        }
 
         asm!(
             "csrw pmpaddr0, {apmp}",
@@ -183,7 +208,8 @@ pub extern "C" fn kmain_enter(serial_addr: usize, dtb_addr: usize) {
             acfg = in(reg) 0xf | 0x80,
             s = in(reg) KERNEL_STACK_END,
             in("a0") hartid,
-            in("a1") sysinfo_ptr,
+            in("a1") dtb_addr,
+            in("a2") serial_addr,
             options(noreturn),
         );
     }

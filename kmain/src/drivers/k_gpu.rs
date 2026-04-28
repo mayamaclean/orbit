@@ -201,33 +201,15 @@ pub extern "C" fn k_gpu(_a0: usize) {
             }
         }
 
-        // Park. Matches the k_net pattern: mark suspended with a
-        // ~50 ms wake deadline (timebase = 10 MHz → 500k ticks) so
-        // the thread yields cleanly to the scheduler. A producer
-        // that pushes onto CONSOLE_RING can still wake us via SSWI
-        // before the deadline.
-        unsafe {
-            let hart_context = (riscv::register::sscratch::read()
-                as *mut device::HartContext)
-                .as_mut_unchecked();
-            let this_thread = (hart_context.current.load(Ordering::Acquire)
-                as *mut process::Thread)
-                .as_mut_unchecked();
-
-            hart_context.cscratch2 = 1;
-            this_thread.ticks = 0;
-            this_thread.wake_time =
-                (riscv::register::time::read64().wrapping_add(500_000)) as usize;
-            // Don't set state=Suspended here — the cscratch2=1 trap arm
-            // calls `exit_thread_with_state(Suspended)` after saving
-            // the frame, which nulls `current` first and sets the new
-            // state second. Setting state from this side leaks a window
-            // where another hart's manager observes Suspended while
-            // we still claim `current`, leading to double-dispatch.
-            // Same fix as knet's self-yield in kmain/src/lib.rs.
-
-            riscv::register::sstatus::set_sie();
-            core::arch::asm!("ebreak", "nop");
-        }
+        // Park with a ~50 ms wake deadline (timebase = 10 MHz →
+        // 500k ticks) so the thread yields cleanly to the
+        // scheduler. A producer that pushes onto CONSOLE_RING can
+        // still wake us via wake_override before the deadline.
+        // kthread_park's stack-switch-then-publish ordering closes
+        // the double-dispatch race the prior cscratch2=1; ebreak
+        // workaround was fencing off — see kernel::context.
+        let wake_at = riscv::register::time::read64()
+            .wrapping_add(500_000) as usize;
+        crate::kernel::context::kthread_park(ThreadState::Suspended, wake_at);
     }
 }

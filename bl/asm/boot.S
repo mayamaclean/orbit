@@ -93,8 +93,12 @@ part3:
 	# change.
 
 	# We divide up the stack so the harts aren't clobbering one another.
+	# 128 KiB per hart matches the M-mode trap stack slot size in trap.S
+	# (HART_TRAP_STACK_SHIFT = 17). Keeping boot and trap stack slots
+	# the same size means the boot stack a hart uses in part3/kinit_hart
+	# can't drift into a different hart's trap-stack slot.
 	la		sp, _stack_end
-	li		t0, 0x10000
+	li		t0, 0x20000
 	csrr	a0, mhartid
 	mul		t0, t0, a0
 	sub		sp, sp, t0

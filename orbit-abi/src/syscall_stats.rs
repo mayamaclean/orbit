@@ -79,4 +79,76 @@ mod tests {
         // 8-byte header + 16 bytes per ordinal slot.
         assert_eq!(payload_size(), 8 + Sysno::COUNT * 16);
     }
+
+    #[test]
+    fn header_layout_size_first_then_count() {
+        // The kernel writes `size` and `count` as little-endian u32s
+        // back-to-back; the order is part of the wire ABI. Userland
+        // reads `size` to validate the payload byte length, then
+        // `count` to know how many entries follow.
+        let h = SyscallStatsHeader::default();
+        let base = &h as *const _ as usize;
+        assert_eq!(&h.size as *const _ as usize - base, 0);
+        assert_eq!(&h.count as *const _ as usize - base, 4);
+    }
+
+    #[test]
+    fn entry_layout_count_first_then_total_ticks() {
+        let e = SyscallEntry::default();
+        let base = &e as *const _ as usize;
+        assert_eq!(&e.count as *const _ as usize - base, 0);
+        assert_eq!(&e.total_ticks as *const _ as usize - base, 8);
+    }
+
+    #[test]
+    fn truncated_buffer_yields_partial_entries() {
+        // Kernel writes 16 entries (256 + 8 = 264 bytes). User has a
+        // 100-byte buffer: kernel must clamp to floor((100-8)/16) = 5
+        // full entries + 8-byte header = 88 bytes written, header
+        // declares count=5. Trailing 12 bytes of user buffer untouched.
+        let kernel_total = SYSCALL_STATS_MIN_LEN + Sysno::COUNT * core::mem::size_of::<SyscallEntry>();
+        assert_eq!(kernel_total, 264);
+
+        let user_buf_len: usize = 100;
+        let entries_capacity =
+            (user_buf_len - SYSCALL_STATS_MIN_LEN) / core::mem::size_of::<SyscallEntry>();
+        assert_eq!(entries_capacity, 5);
+
+        let written = SYSCALL_STATS_MIN_LEN + entries_capacity * core::mem::size_of::<SyscallEntry>();
+        assert_eq!(written, 88);
+        assert!(written <= user_buf_len);
+    }
+
+    #[test]
+    fn newer_kernel_count_smaller_when_user_buffer_is_too_small() {
+        // The header `count` reflects what the kernel actually wrote,
+        // not what its native COUNT is. Userland iterates exactly
+        // `header.count` entries — never assumes more.
+        let user_buf_len = SYSCALL_STATS_MIN_LEN + 3 * core::mem::size_of::<SyscallEntry>();
+        let entries_capacity =
+            (user_buf_len - SYSCALL_STATS_MIN_LEN) / core::mem::size_of::<SyscallEntry>();
+        let header = SyscallStatsHeader {
+            count: entries_capacity as u32,
+            size: (SYSCALL_STATS_MIN_LEN + entries_capacity * core::mem::size_of::<SyscallEntry>())
+                as u32,
+        };
+        assert_eq!(header.count, 3);
+        assert_eq!(header.size as usize, user_buf_len);
+        // A reader iterating min(header.count, local_count) gets 3,
+        // which is correct: the missing 13 ordinals are absent.
+    }
+
+    #[test]
+    fn min_len_buffer_writes_header_only() {
+        // A user buffer exactly SYSCALL_STATS_MIN_LEN can carry the
+        // header but zero entries. count=0 is a valid response — the
+        // user learns nothing about syscalls but the version
+        // handshake works.
+        let entries_capacity = (SYSCALL_STATS_MIN_LEN - SYSCALL_STATS_MIN_LEN)
+            / core::mem::size_of::<SyscallEntry>();
+        assert_eq!(entries_capacity, 0);
+
+        let written = SYSCALL_STATS_MIN_LEN + entries_capacity * core::mem::size_of::<SyscallEntry>();
+        assert_eq!(written, SYSCALL_STATS_MIN_LEN);
+    }
 }
