@@ -324,6 +324,22 @@ pub fn get_hart_id() -> u32 {
     r as u32
 }
 
+/// Absolute monotonic microseconds since system boot.
+///
+/// The base is opaque — only differences are meaningful. Backed by a
+/// `csrr time` on the kernel side (RISC-V `time` runs at 10 MHz on
+/// the QEMU virt machine; the syscall divides by 10 to give μs).
+///
+/// Use case: latency micro-benchmarks (sleep accuracy, RTT, throughput
+/// timing) that don't want platform-coupled raw ticks. For wallclock,
+/// add a future `get_realtime` syscall — `get_micros` is monotonic
+/// only, no time-of-day offset.
+#[inline]
+pub fn get_micros() -> u64 {
+    let r = unsafe { ecall1(syscall::GET_MICROS, 0) };
+    r as u64
+}
+
 /// Return `(current, allowed)` for the calling thread's affinity mask.
 /// Modeled on Windows's `GetProcessAffinityMask` — the immutable cap is
 /// returned alongside the current value so userspace can pick a valid

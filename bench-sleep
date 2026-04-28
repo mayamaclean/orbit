@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+#
+# `sleep_ms` accuracy histogram for the orbit kernel.
+#
+# Boots QEMU via the existing bl runner (with orbit-loader on
+# host:7777), ships umode-sleep-bench, and captures the per-target
+# `SLEEP target_ms=… buckets=[…]` lines.
+#
+# Use case: re-run after changes to the wakeup path (sleep heap,
+# WFI sizing, eager promotion). A regression to the pre-Phase D
+# behavior would show 1ms-target samples landing in the
+# `<10000us` bucket; healthy results have everything in the lowest
+# bucket(s).
+
+set -euo pipefail
+
+ROOT=$(cd "$(dirname "$0")" && pwd)
+QEMU_LOG=/tmp/orbit-bench-sleep-qemu.log
+: "${BENCH_TIMEOUT:=60}"
+
+die()  { echo "FAIL: $*" >&2; exit 1; }
+note() { printf ">> %s\n" "$*"; }
+
+note "building orbit-loader (release)"
+( cd "$ROOT/orbit-loader" && cargo build --release >/dev/null )
+
+note "building kmain (release)"
+( cd "$ROOT/kmain" && ./build.sh >/tmp/orbit-bench-sleep-kmain-build.log 2>&1 ) \
+  || die "kmain build failed (see /tmp/orbit-bench-sleep-kmain-build.log)"
+
+note "building bl (release)"
+( cd "$ROOT/bl" && cargo build --release --bin launch >/dev/null )
+
+note "building umode-sleep-bench (release)"
+( cd "$ROOT/umode-sleep-bench" && cargo build --release >/dev/null )
+
+BL_BIN="$ROOT/bl/target/riscv64gc-unknown-none-elf/release/launch"
+BENCH_BIN="$ROOT/umode-sleep-bench/target/riscv64gc-unknown-none-elf/release/umode-sleep-bench"
+[ -x "$BL_BIN" ] || die "bl binary missing at $BL_BIN"
+[ -f "$BENCH_BIN" ] || die "bench binary missing at $BENCH_BIN"
+
+if ss -ltn 2>/dev/null | grep -q ':7777 '; then
+  die "port 7777 already in use — kill any leftover listener first"
+fi
+
+note "booting qemu (timeout ${BENCH_TIMEOUT}s)"
+timeout "$BENCH_TIMEOUT" qemu-system-riscv64 \
+  -d guest_errors -smp 4 -m 2G \
+  -machine virt,aclint=on -cpu max,sstc=true \
+  -nographic -bios none -serial mon:stdio \
+  -netdev user,id=orbit0,net=192.168.76.0/24,dhcpstart=192.168.76.9,hostfwd=tcp::7777-:7777 \
+  -device e1000,netdev=orbit0 \
+  -kernel "$BL_BIN" \
+  </dev/null >"$QEMU_LOG" 2>&1 &
+QEMU_PID=$!
+trap 'kill "$QEMU_PID" 2>/dev/null || true' EXIT
+
+note "waiting for orbit-loader to start listening"
+for _ in $(seq 1 60); do
+  if grep -q 'orbit-loader: listening' "$QEMU_LOG" 2>/dev/null; then
+    break
+  fi
+  sleep 0.5
+done
+grep -q 'orbit-loader: listening' "$QEMU_LOG" \
+  || die "orbit-loader never reported listening — see $QEMU_LOG"
+
+note "shipping bench ELF via send-payload.py"
+python3 "$ROOT/orbit-loader/tools/send-payload.py" \
+  "$BENCH_BIN" --name umode-sleep-bench \
+  || die "send-payload failed"
+
+note "waiting for SLEEP lines"
+for _ in $(seq 1 $((BENCH_TIMEOUT * 2))); do
+  if grep -q 'umode-sleep-bench: done' "$QEMU_LOG" 2>/dev/null; then
+    break
+  fi
+  sleep 0.5
+done
+
+kill "$QEMU_PID" 2>/dev/null || true
+wait "$QEMU_PID" 2>/dev/null || true
+
+echo
+echo "=== sleep results ==="
+grep -E 'umode-sleep-bench: starting|SLEEP target_ms|umode-sleep-bench: done' "$QEMU_LOG" \
+  || die "no SLEEP lines in QEMU log — see $QEMU_LOG"
+
+if grep -q 'umode-sleep-bench: done' "$QEMU_LOG"; then
+  note "PASS"
+else
+  die "bench did not complete — see $QEMU_LOG"
+fi

@@ -60,6 +60,7 @@ SECTIONS
   .rodata : ALIGN(4096) {
     PROVIDE(_rodata_start = .);
     *(.rodata .rodata.*)
+    . = ALIGN(4096);
     PROVIDE(_rodata_end = .);
   } >RAM AT>RAM :rodata
 

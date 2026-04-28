@@ -1,0 +1,12 @@
+[package]
+name = "umode-sleep-bench"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "umode-sleep-bench"
+path = "src/main.rs"
+
+[dependencies]
+orbit-abi = { path = "../orbit-abi" }
+orbit-rt  = { path = "../orbit-rt" }

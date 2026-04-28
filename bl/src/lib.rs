@@ -81,6 +81,11 @@ pub fn setup_interrupts() {
         medeleg::set_instruction_page_fault();
         medeleg::set_load_page_fault();
         medeleg::set_store_page_fault();
+        medeleg::set_illegal_instruction();
+        medeleg::set_instruction_misaligned();
+        medeleg::set_load_misaligned();
+        medeleg::set_store_fault();
+        medeleg::set_store_misaligned();
     }
 }
 

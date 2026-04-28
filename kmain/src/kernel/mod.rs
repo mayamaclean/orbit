@@ -30,6 +30,8 @@ use orbit_core::{
     CloseHandleReq, CreateProcessReq, CreateThreadReq, MemMapReq, NetChannelCreationReq,
     PendingWork,
 };
+use orbit_core::ready_queue::ReadyQueue;
+use orbit_core::sleep_heap::SleepHeap;
 use thingbuf::StaticThingBuf;
 
 use crate::kernel::handle::{Handle, ProcessHandles};
@@ -128,6 +130,150 @@ impl Default for WakeEvent {
     fn default() -> Self { WakeEvent::None }
 }
 
+/// One park notification queued by a parking hart for the manager to
+/// fold into [`Orbit::sleeping`]. The parking hart writes the
+/// `Suspended` state and `fetch_add(1)`-s `sleep_seq` first, then
+/// pushes this notice. The manager later drains the inbox under
+/// `MANAGER_LOCK` and re-issues each entry into the heap.
+///
+/// `thread == null` is the [`Default`] sentinel that fills empty
+/// thingbuf slots; the drain skips these without touching the heap.
+#[derive(Clone, Copy)]
+pub struct SleepNotice {
+    pub wake_time: u64,
+    pub sleep_seq: u64,
+    pub thread: *mut Thread,
+}
+
+impl Default for SleepNotice {
+    fn default() -> Self {
+        Self { wake_time: 0, sleep_seq: 0, thread: core::ptr::null_mut() }
+    }
+}
+
+// SAFETY: `*mut Thread` here points into the kernel thread registry.
+// The registry frees a Thread only from `cleanup_threads_and_processes`,
+// which runs on the manager hart between `WAKE_QUEUE`/`SLEEP_INBOX`
+// drain and `assign_threads` — so a notice in the inbox always names
+// a live allocation when the manager pops it. Cross-hart movement of
+// the raw pointer is the whole point of this inbox; the SafetyDoc
+// captures that ordering.
+unsafe impl Send for SleepNotice {}
+unsafe impl Sync for SleepNotice {}
+
+/// MPSC ring of [`SleepNotice`] entries pushed by parking harts and
+/// drained into [`Orbit::sleeping`] by the manager. Same shape as
+/// [`WAKE_QUEUE`]; cap chosen to absorb burst parks across all harts
+/// without EAGAIN — at 4 harts and one park per syscall, 64 covers
+/// well over a manager tick of activity.
+pub static SLEEP_INBOX: StaticThingBuf<SleepNotice, 64> = StaticThingBuf::new();
+
+/// Per-hart "thread just became Ready" notification, queued by
+/// non-manager paths (e.g. `exit_thread_with_state(Ready)` on a
+/// preempted hart). The manager drains every per-hart inbox into
+/// `Orbit::ready` at the head of each `assign_threads` pass.
+///
+/// `thread == null` is the [`Default`] sentinel; the drain skips it.
+#[derive(Clone, Copy)]
+pub struct ReadyNotice {
+    pub thread: *mut Thread,
+}
+
+impl Default for ReadyNotice {
+    fn default() -> Self {
+        Self { thread: core::ptr::null_mut() }
+    }
+}
+
+// SAFETY: same registry-lifetime argument as `SleepNotice` — the
+// pointed-to Thread is freed only from the manager's
+// `cleanup_threads_and_processes`, which runs in the same critical
+// section as the inbox drain. No use-after-free window.
+unsafe impl Send for ReadyNotice {}
+unsafe impl Sync for ReadyNotice {}
+
+/// Per-hart inbox of newly-Ready threads. Indexed by hart id. SPSC
+/// from a single hart's perspective (it pushes; manager pops), but
+/// the static array as a whole holds one entry per hart — manager
+/// drains all of them.
+///
+/// Cap of 32 per hart is well above the working set: a hart can have
+/// at most one `current` thread plus a handful of in-flight unblocked
+/// threads waiting to be drained.
+pub static READY_INBOXES: [StaticThingBuf<ReadyNotice, 32>; shootdown::MAX_HARTS] =
+    [const { StaticThingBuf::new() }; shootdown::MAX_HARTS];
+
+/// Wake hook called from `process::completion::signal_n` when a
+/// signal claims a parked waiter. Reads the handle's freshly-stored
+/// rets out of `t.handle`, marshals them into the saved frame,
+/// clears the handle slot, marks the thread Ready, and pushes onto
+/// the current hart's READY_INBOXES.
+///
+/// Runs on the signaling hart (any hart). The thread isn't
+/// "current" on any hart at this point — the parker already set
+/// state=Blocking and cleared its own current — so writing
+/// `t.frame.regs` doesn't race with a dispatch.
+pub fn wake_blocked_inline(thread_ptr: *mut Thread) {
+    if thread_ptr.is_null() { return; }
+    // SAFETY: signaler claimed the waiter via take_waiter; the
+    // parker's set_waiter Release-ordered the prior `t.handle =
+    // Some(...)` write so reading it here is safe.
+    let t = unsafe { (thread_ptr as *mut Thread).as_mut_unchecked() };
+    let handle = match t.handle.take() {
+        Some(h) => h,
+        None => {
+            error!("wake_blocked_inline: tid={} has no handle", t.tid);
+            return;
+        }
+    };
+    let n = handle.ret_count();
+    for i in 0..n {
+        t.frame.regs[10 + i] = handle.ret(i) as usize;
+    }
+    drop(handle);
+    t.state.store(ThreadState::Ready as usize, Ordering::Release);
+    if push_ready_notice(thread_ptr).is_err() {
+        error!(
+            "READY_INBOX full on blocked-wake: tid={} — thread \
+             marked Ready but not queued; will need a fallback path",
+            t.tid,
+        );
+    }
+}
+
+/// Install [`wake_blocked_inline`] as the `process::completion`
+/// wake hook. Called once at boot by `rust_main` so signal_n can
+/// fire the kmain wake path without process needing to depend on
+/// kmain.
+pub fn install_completion_wake_hook() {
+    process::completion::set_wake_hook(wake_blocked_inline);
+}
+
+/// Push `thread` onto the calling hart's `READY_INBOXES` slot. Used
+/// by non-manager paths to publish a Ready transition without
+/// touching `Orbit::ready` (which is manager-only).
+///
+/// Must be called from a hart context (`sscratch` points at a valid
+/// `HartContext`). Returns `Err` if the inbox is full — caller is
+/// responsible for logging; the dropped notice means the thread is
+/// `Ready` but not queued, and currently nothing rescues it (no
+/// fallback scan exists post-Phase C). At cap=32 per hart this should
+/// not realistically fire.
+pub fn push_ready_notice(thread: *mut Thread) -> Result<(), ()> {
+    let hart_id = unsafe {
+        (riscv::register::sscratch::read() as *const HartContext)
+            .as_ref_unchecked()
+            .hart_id as usize
+    };
+    if hart_id >= shootdown::MAX_HARTS {
+        error!("push_ready_notice: hart_id={} >= MAX_HARTS", hart_id);
+        return Err(());
+    }
+    READY_INBOXES[hart_id]
+        .push(ReadyNotice { thread })
+        .map_err(|_| ())
+}
+
 /// PLIC IRQ handler for e1000 RX/TX events. Wired up in
 /// [`Orbit::setup_igb`] to whichever PLIC source the QEMU virt
 /// PCI swizzle assigns to the device's slot.
@@ -184,6 +330,23 @@ pub struct Orbit {
     /// spuriously by every netch tickle.
     net_thread_tid: Option<u32>,
     orphaned_sockets: Vec<SocketHandle>,
+
+    /// Min-heap of `(wake_time, sleep_seq, *mut Thread)` for Suspended
+    /// sleepers. Manager-only; populated each pass by draining
+    /// `SLEEP_INBOX`. Replaces the per-pass O(N_threads) Suspended
+    /// walk in `get_runnable_thread` with O(woken) at dispatch time.
+    /// See [orbit-core/src/sleep_heap.rs].
+    sleeping: SleepHeap,
+
+    /// FIFO of runnable threads. Manager-only. Populated by:
+    ///   * `drain_ready_inboxes` (per-hart inboxes — non-manager
+    ///     Ready transitions: preempted threads, signal_n's wake
+    ///     hook for unblocked threads).
+    ///   * `drain_sleeps` (sleep-heap promotion).
+    ///   * `set_wake_reason_where` (eager Suspended → Ready).
+    ///   * thread creation paths.
+    /// Drained by `get_runnable_thread` via `pop_for(hart_mask)`.
+    ready: ReadyQueue,
 
     /// Per-process handle tables. The manager's strong refs on
     /// `SharedUserPtr`-backed resources live here, keyed by the u32 Fd
@@ -304,23 +467,7 @@ impl Orbit {
         self.threads.iter()
             .filter(|(_, t)| unsafe {
                 let thread = (t.0 as *const Thread).as_ref_unchecked();
-                if thread.state.load(Ordering::Acquire) == ThreadState::Ready as usize {
-                    return true
-                }
-                else if thread.state.load(Ordering::Acquire) == ThreadState::Suspended as usize {
-                    // Wake on either: (a) the thread's own scheduled
-                    // wake_time has elapsed, or (b) the manager has set
-                    // a wake_override reason. Don't *consume* the
-                    // override here — that's `next_runnable`'s job;
-                    // counting Ready threads shouldn't have side
-                    // effects on the bitmask.
-                    let pending = thread.wake_override.load(Ordering::Acquire);
-                    if pending != 0 || riscv::register::time::read() >= thread.wake_time {
-                        thread.state.store(ThreadState::Ready as usize, Ordering::Release);
-                    }
-                    return true
-                }
-                false
+                thread.state.load(Ordering::Acquire) == ThreadState::Ready as usize
             })
             .count()
     }
@@ -358,6 +505,8 @@ impl Orbit {
                 socket_deletions: heapless::spsc::Queue::new()
             },
             orphaned_sockets: Vec::new(),
+            sleeping: SleepHeap::new(),
+            ready: ReadyQueue::new(),
             process_handles: BTreeMap::new(),
         }
     }
@@ -463,6 +612,7 @@ impl Orbit {
             wake_time: 0,
             wake_override: AtomicU64::new(0),
             last_wake_reason: AtomicU64::new(0),
+            sleep_seq: AtomicU64::new(0),
             handle: None,
             slot: None,
             fault_info: None,
@@ -481,6 +631,9 @@ impl Orbit {
         info!("created kthread@{:016X?}", tptr);
 
         self.threads.insert(tid, PThread(tptr));
+        // Constructor sets state=Ready; surface to the scheduler by
+        // pushing onto self.ready directly (we're in manager context).
+        self.ready.push(tptr);
 
         Ok(tid)
     }
@@ -944,15 +1097,42 @@ impl Orbit {
     /// `fetch_or(reason)` into `wake_override` on every thread matching
     /// `pred`. Helper for [`drain_wakes`]; `pred` runs against a
     /// `&Thread` from the global table.
+    ///
+    /// **Eager Suspended promotion**: when the matched thread is
+    /// currently `Suspended`, we don't just OR the reason bit and
+    /// wait for `drain_sleeps` to notice — we immediately consume the
+    /// override into `last_wake_reason` and flip the thread to
+    /// `Ready`. The corresponding sleep-heap entry becomes stale and
+    /// gets reaped on the next `drain_woken` (state mismatch). This
+    /// closes the latency gap between "tickle arrived" and "thread
+    /// dispatched": same-pass dispatch instead of waiting for the
+    /// next manager pass to walk the heap.
     fn set_wake_reason_where(&mut self, reason: u64, mut pred: impl FnMut(&Thread) -> bool) {
         for (_, p) in self.threads.iter() {
             // SAFETY: `PThread.0` is a raw ptr the registry owns; it
             // stays valid as long as the entry's in `self.threads`.
-            // We only read `pid`/`tid` and atomic-fetch_or
-            // `wake_override`, both safe under shared access.
             let thread = unsafe { (p.0 as *mut Thread).as_mut_unchecked() };
-            if pred(thread) {
-                thread.wake_override.fetch_or(reason, Ordering::Release);
+            if !pred(thread) { continue; }
+            thread.wake_override.fetch_or(reason, Ordering::Release);
+            // Eager promotion. CAS state Suspended → Ready; if state
+            // is anything else (already Ready, Running, etc.) leave
+            // it alone. The wake_override OR above means a thread
+            // that hadn't yet committed its park (Running on its way
+            // to Suspended) will see the override on its next
+            // dispatch via the sleep-heap path.
+            if thread.state.compare_exchange(
+                ThreadState::Suspended as usize,
+                ThreadState::Ready as usize,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ).is_ok() {
+                let pending = thread.wake_override.swap(0, Ordering::AcqRel);
+                thread.last_wake_reason.store(pending, Ordering::Release);
+                // Just promoted Suspended → Ready; queue it so
+                // get_runnable_thread picks it up this same pass.
+                // The sleep-heap entry becomes stale (state mismatch)
+                // and is reaped on the next drain_woken.
+                self.ready.push(p.0);
             }
         }
     }
@@ -992,89 +1172,13 @@ impl Orbit {
     }
     
     fn get_runnable_thread(&mut self, hart_mask: u64) -> Option<PThread> {
-        for (_tid, p) in self.threads.iter() {
-            let thread: &mut Thread = unsafe {
-                p.0.as_mut_unchecked()
-            };
-
-            // Affinity gate: skip threads that aren't permitted on the
-            // hart we're picking for. Read with Relaxed — set_affinity
-            // is the only writer and we tolerate observing a slightly
-            // stale value (worst case: thread waits one more scheduler
-            // pass to migrate). Done before state checks because most
-            // skip cases are state mismatches and we want the cheap
-            // load on the wide arm.
-            if thread.affinity.load(Ordering::Relaxed) & hart_mask == 0 {
-                continue;
-            }
-
-            let state = thread.state.load(Ordering::Acquire);
-
-            //trace!("manager checking {}: {}", thread.tid, state);
-
-            if state == ThreadState::Ready as usize {
-                return Some(PThread(p.0))
-            }
-            else if state == ThreadState::Running as usize {
-                continue
-            }
-            else if state == ThreadState::Assigned as usize {
-                continue
-            }
-            else if state == ThreadState::Exited as usize {
-                continue
-            }
-            else if state == ThreadState::Suspended as usize {
-                let now = riscv::register::time::read();
-
-                // Two ways to wake: scheduled `wake_time` elapsed, or
-                // the manager set a `wake_override` reason bit. The
-                // override is the dispatch consumption point — we
-                // `swap(0)` to atomically take whatever bits were
-                // pending and stash them in `last_wake_reason` for
-                // later query (e.g. a future `get_wake_reason` syscall
-                // from userspace). Concurrent producers between the
-                // load and the swap are fine: their bits are picked
-                // up the next time this thread parks and we get back
-                // here, since `swap` is the only consumer.
-                let pending = thread.wake_override.swap(0, Ordering::AcqRel);
-                thread.last_wake_reason.store(pending, Ordering::Release);
-                if pending == 0 && now < thread.wake_time {
-                    continue
-                }
-
-                thread.state.store(ThreadState::Ready as usize, Ordering::Release);
-
-                return Some(PThread(p.0))
-            }
-            else if state == ThreadState::Blocking as usize {
-                // Thread parked on a CompletionHandle; resume it once
-                // the handle is signaled, writing exactly the
-                // a-registers the handler claimed via signal_n(N).
-                // Slots a-regs the handler did not claim retain their
-                // trap-entry snapshot — preserves caller-saved regs
-                // that user code (e.g. orbit-loader) may depend on
-                // surviving across the ecall in practice.
-                let Some(handle) = thread.handle.as_ref() else {
-                    error!("thread{} Blocking with no handle", thread.tid);
-                    continue;
-                };
-                if !handle.is_signaled() {
-                    continue;
-                }
-                let n = handle.ret_count();
-                for i in 0..n {
-                    thread.frame.regs[10 + i] = handle.ret(i) as usize;
-                }
-                let logged = handle.ret(0);
-                thread.handle = None;
-                trace!("unblocked thread{} (handle, n={}, a0={})",
-                    thread.tid, n, logged);
-                thread.state.store(ThreadState::Ready as usize, Ordering::Release);
-                return Some(PThread(p.0));
-            }
-        }
-        None
+        // O(1) common case: the queue head matches the hart's
+        // affinity. Misses fall through to a head-scan in `pop_for`,
+        // bounded by ready-queue depth. All Ready transitions
+        // (preemption, sleep-heap wake, eager promote, blocking
+        // signal, thread creation) push onto self.ready before this
+        // method runs — see assign_threads's prelude.
+        self.ready.pop_for(hart_mask).map(PThread)
     }
 
     fn dealloc_thread(&mut self, thread: &'static Thread) {
@@ -1353,8 +1457,109 @@ impl Orbit {
         });
     }
     
+    /// Drain `SLEEP_INBOX` into the heap, then promote any sleepers
+    /// whose deadline has passed to `Ready`. Called from
+    /// `assign_threads` so the registry walk that follows already sees
+    /// the freshly-promoted threads as Ready and dispatches them like
+    /// any other runnable thread.
+    pub(crate) fn drain_sleeps(&mut self) {
+        while let Some(mut slot) = SLEEP_INBOX.pop_ref() {
+            let notice = core::mem::take(&mut *slot);
+            drop(slot);
+            if notice.thread.is_null() { continue; }
+            // Race repair: if `set_wake_reason_where` ran while this
+            // thread was mid-park (state=Running on its way to
+            // Suspended), the eager-promote CAS failed but the
+            // wake_override bit is set. Now that state has committed
+            // to Suspended, check the bit before filing the entry —
+            // if non-zero, eagerly promote here instead of letting
+            // the thread wait for its deadline.
+            let t = unsafe { (notice.thread as *mut Thread).as_mut_unchecked() };
+            if t.wake_override.load(Ordering::Acquire) != 0 {
+                if t.state.compare_exchange(
+                    ThreadState::Suspended as usize,
+                    ThreadState::Ready as usize,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ).is_ok() {
+                    let pending = t.wake_override.swap(0, Ordering::AcqRel);
+                    t.last_wake_reason.store(pending, Ordering::Release);
+                    self.ready.push(notice.thread);
+                    // Skip the heap push — entry would be stale
+                    // immediately anyway (state=Ready).
+                    continue;
+                }
+                // CAS failed: state was already Ready (a concurrent
+                // promotion won). The thread is queued; nothing to
+                // do here — also skip the heap push for the same
+                // staleness reason.
+                continue;
+            }
+            self.sleeping.push(notice.thread, notice.wake_time, notice.sleep_seq);
+        }
+
+        let now = riscv::register::time::read64();
+        let ready = &mut self.ready;
+        self.sleeping.drain_woken(now, |thread_ptr| {
+            // SAFETY: heap entries name live registry threads — see
+            // SLEEP_INBOX safety doc. We're under MANAGER_LOCK; no
+            // other writer touches state/wake_override here.
+            let t = unsafe { (thread_ptr as *mut Thread).as_mut_unchecked() };
+            // Mirror the (now-deleted) Suspended arm in
+            // `get_runnable_thread`: consume any pending wake_override
+            // bits into last_wake_reason so userspace can later query
+            // why it woke (timer-only wakes leave the bitmask 0).
+            let pending = t.wake_override.swap(0, Ordering::AcqRel);
+            t.last_wake_reason.store(pending, Ordering::Release);
+            t.state.store(ThreadState::Ready as usize, Ordering::Release);
+            ready.push(thread_ptr);
+        });
+    }
+
+    /// Drain every per-hart `READY_INBOXES` slot into `self.ready`.
+    /// Producers use these inboxes to publish Ready transitions
+    /// without touching `self.ready` directly (which is manager-only).
+    pub(crate) fn drain_ready_inboxes(&mut self) {
+        for inbox in READY_INBOXES.iter() {
+            while let Some(mut slot) = inbox.pop_ref() {
+                let notice = core::mem::take(&mut *slot);
+                drop(slot);
+                if notice.thread.is_null() { continue; }
+                self.ready.push(notice.thread);
+            }
+        }
+    }
+
+    /// Cycles until the earliest sleep-heap deadline, capped at the
+    /// safety-net `cap` (so the manager still runs periodically and
+    /// observes any new SLEEP_INBOX entries pushed after this read).
+    /// Returns `cap` when the heap is empty or the earliest entry is
+    /// further out than `cap`. Used by `k_hart_loop` to size the WFI
+    /// timer so a near-term sleeper wakes on its own deadline rather
+    /// than waiting for the next heartbeat.
+    ///
+    /// Manager-only: callers must hold `MANAGER_LOCK` (the heap is
+    /// not synchronized for concurrent peeks).
+    pub fn next_sleep_in_cycles(&self, now: u64, cap: u64) -> u64 {
+        match self.sleeping.next_wake() {
+            Some(t) if t > now => (t - now).min(cap),
+            Some(_) => 0,
+            None => cap,
+        }
+    }
+
     pub fn assign_threads(&mut self, context: &'static HartContext) {
         use orbit_core::sched::HartView;
+
+        // Order matters: drain_sleeps may push freshly-woken sleepers
+        // onto self.ready (so they get the same dispatch this pass),
+        // then drain_ready_inboxes folds in non-manager Ready
+        // transitions (preempted threads from other harts, and
+        // unblocked threads pushed by signal_n's wake hook). After
+        // this prelude, self.ready holds every runnable thread and
+        // get_runnable_thread is purely a queue pop.
+        self.drain_sleeps();
+        self.drain_ready_inboxes();
 
         // `sscratch` on this hart points at its own HartContext inside the
         // contiguous array allocated at boot; subtract the hart id to get
@@ -1831,10 +2036,12 @@ impl Orbit {
             .saturating_add(1);
 
         self.threads.insert(tid, PThread(tptr));
+        // Constructor sets state=Ready; queue for the scheduler.
+        self.ready.push(tptr);
 
         Ok(())
     }
-    
+
     pub fn create_new_thread(&mut self, pid: u16, root_table: &mmu::mmap::RootTable<'_>, entrypoint: usize, slot: u16, stack_size: u64, allowed_affinity: u64, affinity: u64) -> Result<Thread, ()> {
         if !validate_user_stack_size(stack_size) {
             error!("invalid user stack size {stack_size}");
@@ -2072,6 +2279,7 @@ impl Orbit {
             wake_time: 0,
             wake_override: AtomicU64::new(0),
             last_wake_reason: AtomicU64::new(0),
+            sleep_seq: AtomicU64::new(0),
             handle: None,
             slot: Some(slot),
             fault_info: None,
@@ -2145,6 +2353,8 @@ impl Orbit {
         proc.thread_count = 1;
 
         self.threads.insert(tid, PThread(tptr));
+        // Constructor sets state=Ready; queue for the scheduler.
+        self.ready.push(tptr);
 
         // Register a scrollback source with k_gpu so the process's
         // console_write output lands somewhere. If the ring is full

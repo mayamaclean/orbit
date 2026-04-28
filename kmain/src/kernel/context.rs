@@ -237,6 +237,31 @@ pub fn kthread_park(state: ThreadState, wake_time: usize) {
         return;
     }
 
+    // For a Suspended park, register the new park instance with the
+    // sleep heap before the noreturn handoff. fetch_add(Release) is
+    // ordered with the state.store(Release) the handoff asm performs
+    // after the sp switch — manager observing state=Suspended is
+    // guaranteed to see the matching seq. The push happens before
+    // the handoff because we lose control after; the manager won't
+    // observe the inbox entry as live until state actually hits
+    // Suspended (which is only published after the sp switch
+    // inside `kthread_handoff_to_kidle`).
+    if state == ThreadState::Suspended {
+        let seq = thread.sleep_seq.fetch_add(1, Ordering::Release)
+            .wrapping_add(1);
+        let notice = crate::kernel::SleepNotice {
+            wake_time: wake_time as u64,
+            sleep_seq: seq,
+            thread: cur as *mut Thread,
+        };
+        if crate::kernel::SLEEP_INBOX.push(notice).is_err() {
+            error!(
+                "SLEEP_INBOX full on kthread_park: tid={} wake_time={}",
+                thread.tid, wake_time,
+            );
+        }
+    }
+
     // First-time path. Frame is self-consistent; hand off to
     // k_hart_loop. The handoff switches sp onto k_stack first,
     // *then* publishes current=null (Release) and state (Release)
@@ -297,10 +322,84 @@ pub unsafe fn exit_thread_with_state(state: ThreadState) -> ! {
         let thread_addr = context.current.load(Ordering::Acquire);
         if thread_addr != null_mut() {
             let thread = (thread_addr as *const Thread).as_ref_unchecked();
+            // For a Suspended park, bump sleep_seq *before* publishing
+            // state so a manager observing state=Suspended via the
+            // Release store below also observes the new seq. Captured
+            // here for the SLEEP_INBOX push after the state release.
+            let mut sleep_notice: Option<crate::kernel::SleepNotice> = None;
+            if state == ThreadState::Suspended {
+                let seq = thread.sleep_seq.fetch_add(1, Ordering::Release)
+                    .wrapping_add(1);
+                sleep_notice = Some(crate::kernel::SleepNotice {
+                    wake_time: thread.wake_time as u64,
+                    sleep_seq: seq,
+                    thread: thread_addr as *mut Thread,
+                });
+            }
             // Null `current` first so the new `state` Release-store
             // carries the cur=null write with it. See doc comment.
             context.current.store(null_mut(), Ordering::Release);
             thread.state.store(state as usize, Ordering::Release);
+            if let Some(notice) = sleep_notice {
+                // Inbox-overflow: log and proceed. The thread still
+                // parks correctly (state is set), but won't be woken
+                // by the sleep-heap path until something else (e.g.
+                // a WAKE_QUEUE event) flips it Ready. At cap=64 this
+                // should not realistically fire; a hit means the
+                // manager is starved and the diagnostic is the
+                // important output.
+                if crate::kernel::SLEEP_INBOX.push(notice).is_err() {
+                    error!(
+                        "SLEEP_INBOX full on park: tid={} wake_time={}",
+                        thread.tid, notice.wake_time,
+                    );
+                }
+            }
+            // Ready transition (preemption / yield-to-scheduler):
+            // publish through the per-hart inbox so the manager
+            // folds it into self.ready next pass. Push happens
+            // after state.store(Ready) so the manager observing
+            // the inbox entry also observes the consistent state.
+            if state == ThreadState::Ready {
+                if crate::kernel::push_ready_notice(thread_addr as *mut Thread).is_err() {
+                    error!(
+                        "READY_INBOX full on yield: tid={} — thread will sit \
+                         until another path requeues it",
+                        thread.tid,
+                    );
+                }
+            }
+            // Blocking transition: wire the back-ref between the
+            // handle and this thread *after* the state Release so a
+            // concurrent signaler that observes state=Blocking also
+            // observes the waiter slot. set_waiter must run here
+            // (not in the syscall handler) because apply_syscall_outcome
+            // already committed the frame snapshot above us — running
+            // the hook earlier could have its frame marshaling
+            // clobbered by the snapshot copy.
+            //
+            // After publishing the waiter, re-check is_signaled:
+            // catches the race where the signaler raced our
+            // set_waiter and returned null from take_waiter (no wake
+            // fired). If we got back our own ptr, un-park inline.
+            if state == ThreadState::Blocking {
+                if let Some(handle) = thread.handle.as_ref() {
+                    handle.set_waiter(thread_addr as *mut Thread);
+                    if handle.is_signaled() {
+                        let claimed = handle.take_waiter();
+                        if !claimed.is_null() {
+                            // We won the race. Marshal handle rets
+                            // into the saved frame, take the handle
+                            // out of the thread, mark Ready, queue.
+                            // Same shape as the wake hook (kmain
+                            // has the registered fn).
+                            crate::kernel::wake_blocked_inline(
+                                thread_addr as *mut Thread,
+                            );
+                        }
+                    }
+                }
+            }
         }
 
         let target = context.kptr.load(Ordering::Acquire);

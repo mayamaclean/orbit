@@ -21,7 +21,47 @@
 //! the global allocator is reachable.
 
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicI64, AtomicU8, AtomicUsize, Ordering};
+use core::ptr::null_mut;
+use core::sync::atomic::{AtomicI64, AtomicPtr, AtomicU8, AtomicUsize, Ordering};
+
+use crate::Thread;
+
+/// Wake-hook signature. Called from `signal_n` with the parked thread
+/// pointer that the signaler atomically claimed via `take_waiter`.
+/// kmain registers an implementation that marshals the handle's rets
+/// into the thread's frame, marks it Ready, and pushes onto the
+/// per-hart ready inbox.
+pub type WakeHook = fn(*mut Thread);
+
+/// Storage for the registered hook. `0` is the "uninstalled" sentinel
+/// — at boot time the hook isn't registered yet, and host tests
+/// generally never install one. Round-tripping fn pointers through
+/// `usize` is lossless on RV64; const-eval forbids the cast in a
+/// static initializer though, hence the lazy install pattern.
+static WAKE_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+/// Install the wake hook called by `signal_n` for parked threads.
+/// Call once at boot from kmain. Subsequent calls overwrite (the last
+/// hook wins) — no current need for replacement so tests just
+/// initialize once.
+pub fn set_wake_hook(hook: WakeHook) {
+    WAKE_HOOK.store(hook as usize, Ordering::Release);
+}
+
+fn invoke_wake_hook(t: *mut Thread) {
+    let raw = WAKE_HOOK.load(Ordering::Acquire);
+    if raw == 0 {
+        // No hook installed (boot window or host test); silently
+        // swallow. The signal still completed (state=SIGNALED) — a
+        // future scan or polled re-check could still observe it.
+        return;
+    }
+    // SAFETY: `raw != 0` means a `WakeHook` fn pointer was stored
+    // via `set_wake_hook`. Function pointers round-trip through
+    // `usize` losslessly on RV64.
+    let hook: WakeHook = unsafe { core::mem::transmute(raw) };
+    hook(t);
+}
 
 const STATE_PENDING: u8 = 0;
 /// Transient: a signaler CAS-claimed the slot and is mid-write. The
@@ -53,6 +93,12 @@ pub struct CompletionInner {
     state: AtomicU8,
     ret_count: AtomicU8,
     rets: [AtomicI64; MAX_RET_SLOTS],
+    /// Parked thread to wake when this handle signals. Set by the
+    /// park path via [`CompletionHandle::set_waiter`] before publishing
+    /// `state=Blocking`; consumed by either `signal_n` (signaler wins
+    /// the race) or `take_waiter` from the park-time re-check
+    /// (parker wins). `null` means no waiter is registered.
+    waiter: AtomicPtr<Thread>,
 }
 
 impl CompletionInner {
@@ -66,6 +112,7 @@ impl CompletionInner {
                 AtomicI64::new(0),
                 AtomicI64::new(0),
             ],
+            waiter: AtomicPtr::new(null_mut()),
         }
     }
 }
@@ -124,6 +171,32 @@ impl CompletionHandle {
         }
         self.inner.ret_count.store(n as u8, Ordering::Relaxed);
         self.inner.state.store(STATE_SIGNALED, Ordering::Release);
+        // Race-free wake: atomically claim the waiter slot. If the
+        // parker hasn't published its set_waiter yet we get null and
+        // do nothing — the parker's post-park re-check will see
+        // is_signaled and un-park itself. If it has, we own the
+        // wake; invoke the registered hook.
+        let waiter = self.inner.waiter.swap(null_mut(), Ordering::AcqRel);
+        if !waiter.is_null() {
+            invoke_wake_hook(waiter);
+        }
+    }
+
+    /// Register `thread` as the parker on this handle. Caller is
+    /// responsible for the post-publish re-check pattern: after this
+    /// call, store `state=Blocking` and then call `take_waiter`; if
+    /// the handle was already signaled (and `take_waiter` returned
+    /// the parker's own ptr), un-park the thread inline.
+    pub fn set_waiter(&self, thread: *mut Thread) {
+        self.inner.waiter.store(thread, Ordering::Release);
+    }
+
+    /// Atomically claim and clear the waiter slot. Returns the
+    /// previously-set ptr (or null if none / already taken). Used
+    /// by the parker's post-park re-check to detect races where
+    /// the signal arrived between `set_waiter` and the re-check.
+    pub fn take_waiter(&self) -> *mut Thread {
+        self.inner.waiter.swap(null_mut(), Ordering::AcqRel)
     }
 
     /// `true` once any signaler has run. Acquire-ordered against the

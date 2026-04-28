@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+#
+# TCP-throughput micro-benchmark for the orbit kernel.
+#
+# Builds umode-tcp-bench, boots QEMU via the existing bl runner (which
+# also exposes orbit-loader on host:7777), starts an `nc` sink on
+# host:7780, ships the bench ELF over orbit-loader, and captures the
+# `BENCH round N: …` lines emitted on serial.
+#
+# Output: parses the bps lines and prints a small summary at the end.
+# Override BENCH_TIMEOUT to extend the wall-clock cap.
+#
+# Comparison usage: re-run after a scheduler change and diff the
+# steady-state MiB/s number. Variance across rounds is itself a signal
+# — large spread suggests scheduler stalls or unfair dispatch.
+
+set -euo pipefail
+
+ROOT=$(cd "$(dirname "$0")" && pwd)
+QEMU_LOG=/tmp/orbit-bench-tcp-qemu.log
+NC_LOG=/tmp/orbit-bench-tcp-nc.log
+BENCH_PORT=7780
+: "${BENCH_TIMEOUT:=60}"
+
+die()  { echo "FAIL: $*" >&2; exit 1; }
+note() { printf ">> %s\n" "$*"; }
+
+# --- build layers ---
+note "building orbit-loader (release)"
+( cd "$ROOT/orbit-loader" && cargo build --release >/dev/null )
+
+note "building kmain (release, no smoke feature — needs orbit-loader)"
+( cd "$ROOT/kmain" && ./build.sh >/tmp/orbit-bench-tcp-kmain-build.log 2>&1 ) \
+  || die "kmain build failed (see /tmp/orbit-bench-tcp-kmain-build.log)"
+
+note "building bl (release)"
+( cd "$ROOT/bl" && cargo build --release --bin launch >/dev/null )
+
+note "building umode-tcp-bench (release)"
+( cd "$ROOT/umode-tcp-bench" && cargo build --release >/dev/null )
+
+BL_BIN="$ROOT/bl/target/riscv64gc-unknown-none-elf/release/launch"
+BENCH_BIN="$ROOT/umode-tcp-bench/target/riscv64gc-unknown-none-elf/release/umode-tcp-bench"
+[ -x "$BL_BIN" ] || die "bl binary missing at $BL_BIN"
+[ -f "$BENCH_BIN" ] || die "bench binary missing at $BENCH_BIN"
+
+# --- pre-flight: ports free? ---
+for port in 7777 "$BENCH_PORT"; do
+  if ss -ltn 2>/dev/null | grep -q ":${port} "; then
+    die "port ${port} already in use — kill any leftover listener first"
+  fi
+done
+
+# --- host nc sink on BENCH_PORT ---
+# `-k` keeps nc accepting after the first connection drops, so each
+# round's fresh ClientOneShot can land. >/dev/null sinks the data;
+# the bench measures bytes accepted by TCP, not whether nc echoed
+# anything back.
+note "starting nc sink on :${BENCH_PORT}"
+nc -k -l "${BENCH_PORT}" >/dev/null 2>"$NC_LOG" &
+NC_PID=$!
+
+# Brief settle so the listen socket is bound before QEMU brings up DHCP.
+sleep 0.5
+kill -0 "$NC_PID" 2>/dev/null || die "nc failed to start (port ${BENCH_PORT} in use?)"
+trap 'kill "$NC_PID" 2>/dev/null || true' EXIT
+
+# --- boot QEMU in the background ---
+# hostfwd 7777 is required for orbit-loader to receive our ELF send.
+# stdin is /dev/null so QEMU doesn't put the controlling terminal
+# into raw mode (mirrors the smoke harness).
+note "booting qemu (timeout ${BENCH_TIMEOUT}s)"
+timeout "$BENCH_TIMEOUT" qemu-system-riscv64 \
+  -d guest_errors -smp 4 -m 2G \
+  -machine virt,aclint=on -cpu max,sstc=true \
+  -nographic -bios none -serial mon:stdio \
+  -netdev user,id=orbit0,net=192.168.76.0/24,dhcpstart=192.168.76.9,hostfwd=tcp::7777-:7777 \
+  -device e1000,netdev=orbit0 \
+  -kernel "$BL_BIN" \
+  </dev/null >"$QEMU_LOG" 2>&1 &
+QEMU_PID=$!
+trap 'kill "$NC_PID" "$QEMU_PID" 2>/dev/null || true' EXIT
+
+# --- wait for orbit-loader to be ready, then ship the bench ELF ---
+# orbit-loader prints "loader: listening on 0.0.0.0:7777" once its
+# socket is up. Poll the QEMU log for that marker.
+note "waiting for orbit-loader to start listening"
+for _ in $(seq 1 60); do
+  if grep -q 'orbit-loader: listening' "$QEMU_LOG" 2>/dev/null; then
+    break
+  fi
+  sleep 0.5
+done
+grep -q 'orbit-loader: listening' "$QEMU_LOG" \
+  || die "orbit-loader never reported listening — see $QEMU_LOG"
+
+note "shipping bench ELF via send-payload.py"
+python3 "$ROOT/orbit-loader/tools/send-payload.py" \
+  "$BENCH_BIN" --name umode-tcp-bench \
+  || die "send-payload failed"
+
+# --- wait for bench completion ---
+note "waiting for BENCH lines"
+for _ in $(seq 1 $((BENCH_TIMEOUT * 2))); do
+  if grep -q 'umode-tcp-bench: done' "$QEMU_LOG" 2>/dev/null; then
+    break
+  fi
+  sleep 0.5
+done
+
+# --- shut everything down ---
+kill "$QEMU_PID" 2>/dev/null || true
+wait "$QEMU_PID" 2>/dev/null || true
+kill "$NC_PID" 2>/dev/null || true
+wait "$NC_PID" 2>/dev/null || true
+
+# --- report ---
+echo
+echo "=== bench results ==="
+grep -E 'umode-tcp-bench: starting|BENCH round|umode-tcp-bench: done' "$QEMU_LOG" \
+  || die "no BENCH lines in QEMU log — see $QEMU_LOG"
+
+if grep -q 'umode-tcp-bench: done' "$QEMU_LOG"; then
+  note "PASS"
+else
+  die "bench did not complete — see $QEMU_LOG"
+fi

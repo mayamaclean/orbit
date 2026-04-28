@@ -46,6 +46,7 @@ pub fn make_thread(state: ThreadState, mode: SPP) -> Thread {
             wake_time: 0,
             wake_override: AtomicU64::new(0),
             last_wake_reason: AtomicU64::new(0),
+            sleep_seq: AtomicU64::new(0),
             frame,
             stack,
             satp: Satp::from_bits(0),

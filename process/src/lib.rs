@@ -281,6 +281,14 @@ pub struct Thread {
     /// future syscall to learn what woke it (I/O, signal, timer-cap,
     /// etc.). Kept off the trap frame so we don't clobber user a-regs.
     pub last_wake_reason: AtomicU64,
+    /// Generation counter for park instances. `fetch_add(1, Release)`-ed
+    /// on every transition into `Suspended`. The sleep-heap entry
+    /// captures the post-increment value at push; on pop the heap
+    /// compares the captured seq against the live `sleep_seq` and
+    /// treats a mismatch as stale (the thread re-parked since this
+    /// entry was pushed). See [orbit-core/src/sleep_heap.rs] for the
+    /// staleness contract.
+    pub sleep_seq: AtomicU64,
     pub frame: &'static mut TrapFrame,
     pub stack: &'static mut Stack,
     pub satp: Satp,

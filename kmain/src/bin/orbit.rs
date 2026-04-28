@@ -242,6 +242,9 @@ extern "C" fn s_trap(
                     7 => {
                         kmain::handle_get_hart_id(epc, hart_context, frame);
                     }
+                    8 => {
+                        kmain::handle_get_micros(epc, hart_context, frame);
+                    }
                     4096 => {
                         debug!("orbit handling u mode ecall({syscall})");
                         kmain::handle_mmap_req(epc, hart_context, frame);
@@ -1034,6 +1037,14 @@ extern "C" fn rust_main(_hartid: usize, dtb: usize, serial: usize, load_addr: u6
         // before any user PTE modification can fire `broadcast`. The
         // statics themselves are already pre-initialized.
         kmain::kernel::shootdown::init(cpu_count);
+
+        // Wire process::completion's wake hook to kmain's
+        // wake_blocked_inline. Once installed, signal_n on a
+        // CompletionHandle whose parker has set_waiter'd will
+        // immediately marshal the rets, mark the thread Ready,
+        // and queue it on the signaling hart's READY_INBOX —
+        // no manager scan required.
+        kmain::kernel::install_completion_wake_hook();
 
         info!("allocated orbit state @ {:016X?}", &raw const *orbit as usize);
 

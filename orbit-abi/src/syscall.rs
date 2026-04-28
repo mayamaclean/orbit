@@ -11,6 +11,11 @@ pub const READ_STDIN:      usize = 4;
 pub const SET_AFFINITY:    usize = 5;
 pub const GET_AFFINITY:    usize = 6;
 pub const GET_HART_ID:     usize = 7;
+/// `get_micros() -> u64` — absolute monotonic microseconds since
+/// system boot. Cheap unprivileged tick read on the kernel side
+/// (RISC-V `time` CSR / 10 since QEMU virt clocks at 10 MHz),
+/// returned in `a0`. Opaque base: only differences are meaningful.
+pub const GET_MICROS:      usize = 8;
 
 pub const MMAP:            usize = 4096;
 pub const CREATE_NETCH:    usize = 4097;
@@ -37,6 +42,7 @@ pub enum Sysno {
     SetAffinity    = SET_AFFINITY,
     GetAffinity    = GET_AFFINITY,
     GetHartId      = GET_HART_ID,
+    GetMicros      = GET_MICROS,
     Mmap           = MMAP,
     CreateNetch    = CREATE_NETCH,
     CloseHandle    = CLOSE_HANDLE,
@@ -58,6 +64,7 @@ impl Sysno {
             SET_AFFINITY   => Self::SetAffinity,
             GET_AFFINITY   => Self::GetAffinity,
             GET_HART_ID    => Self::GetHartId,
+            GET_MICROS     => Self::GetMicros,
             MMAP           => Self::Mmap,
             CREATE_NETCH   => Self::CreateNetch,
             CLOSE_HANDLE   => Self::CloseHandle,
@@ -92,6 +99,7 @@ impl Sysno {
             Self::QueryStats        => 13,
             Self::QuerySyscallStats => 14,
             Self::CreateThread      => 15,
+            Self::GetMicros         => 16,
         }
     }
 
@@ -100,7 +108,7 @@ impl Sysno {
     /// when adding a `Sysno` variant. Older userland with a smaller
     /// COUNT reads a prefix of the kernel's table; newer userland with
     /// a larger COUNT treats the kernel's missing slots as zero.
-    pub const COUNT: usize = 16;
+    pub const COUNT: usize = 17;
 }
 
 #[cfg(test)]
@@ -117,6 +125,7 @@ mod tests {
         assert_eq!(Sysno::from_usize(SET_AFFINITY),  Some(Sysno::SetAffinity));
         assert_eq!(Sysno::from_usize(GET_AFFINITY),  Some(Sysno::GetAffinity));
         assert_eq!(Sysno::from_usize(GET_HART_ID),   Some(Sysno::GetHartId));
+        assert_eq!(Sysno::from_usize(GET_MICROS),    Some(Sysno::GetMicros));
         assert_eq!(Sysno::from_usize(MMAP),         Some(Sysno::Mmap));
         assert_eq!(Sysno::from_usize(CREATE_NETCH), Some(Sysno::CreateNetch));
         assert_eq!(Sysno::from_usize(CLOSE_HANDLE), Some(Sysno::CloseHandle));
@@ -129,7 +138,7 @@ mod tests {
 
     #[test]
     fn unknown_returns_none() {
-        assert_eq!(Sysno::from_usize(8), None);
+        assert_eq!(Sysno::from_usize(9), None);
         assert_eq!(Sysno::from_usize(4095), None);
         assert_eq!(Sysno::from_usize(4103), None);
         assert_eq!(Sysno::from_usize(4999), None);
@@ -147,6 +156,7 @@ mod tests {
         assert_eq!(Sysno::SetAffinity   as usize, SET_AFFINITY);
         assert_eq!(Sysno::GetAffinity   as usize, GET_AFFINITY);
         assert_eq!(Sysno::GetHartId     as usize, GET_HART_ID);
+        assert_eq!(Sysno::GetMicros     as usize, GET_MICROS);
         assert_eq!(Sysno::Mmap          as usize, MMAP);
         assert_eq!(Sysno::CreateNetch   as usize, CREATE_NETCH);
         assert_eq!(Sysno::CloseHandle   as usize, CLOSE_HANDLE);
@@ -169,6 +179,7 @@ mod tests {
         assert_eq!(SET_AFFINITY, 5);
         assert_eq!(GET_AFFINITY, 6);
         assert_eq!(GET_HART_ID, 7);
+        assert_eq!(GET_MICROS, 8);
         assert_eq!(MMAP, 4096);
         assert_eq!(CREATE_NETCH, 4097);
         assert_eq!(CLOSE_HANDLE, 4098);
@@ -189,7 +200,7 @@ mod tests {
             Sysno::GetAffinity, Sysno::GetHartId, Sysno::Mmap,
             Sysno::CreateNetch, Sysno::CloseHandle, Sysno::CreateProcess,
             Sysno::NcYield, Sysno::QueryStats, Sysno::QuerySyscallStats,
-            Sysno::CreateThread,
+            Sysno::CreateThread, Sysno::GetMicros,
         ];
         assert_eq!(all.len(), Sysno::COUNT);
         let mut seen = [false; Sysno::COUNT];

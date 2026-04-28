@@ -173,6 +173,12 @@ pub extern "C" fn k_hart_loop() -> ! {
         // harts. (Already off from the loop-top clear above; redundant
         // store kept for clarity / defense in depth.)
         unsafe { riscv::register::sstatus::clear_sie(); }
+        // Default WFI duration when we don't know the next sleep
+        // deadline (lock contention path, or no sleepers). The
+        // manager runs at least this often as a safety net for any
+        // SLEEP_INBOX entry that landed between our read and the WFI.
+        const WFI_HEARTBEAT_CYCLES: u64 = 100_000;
+        let mut wfi_cycles: u64 = WFI_HEARTBEAT_CYCLES;
         if try_acquire_manager() {
             // Bucket hook 4: enter scheduler critical section.
             crate::kernel::accounting::switch_bucket(
@@ -188,6 +194,13 @@ pub extern "C" fn k_hart_loop() -> ! {
             orbit.drain_wakes();
             orbit.check_net();
             orbit.assign_threads(hart_context);
+
+            // Read the next sleep deadline while still holding the
+            // lock. Out of the lock-guarded section the heap can be
+            // mutated by the next manager pass; the value we cache
+            // here is the snapshot at end-of-pass.
+            let now = riscv::register::time::read64();
+            wfi_cycles = orbit.next_sleep_in_cycles(now, WFI_HEARTBEAT_CYCLES);
 
             // Bucket hook 5: leave scheduler critical section. Switch
             // *before* release so the next acquirer's snapshot doesn't
@@ -213,7 +226,12 @@ pub extern "C" fn k_hart_loop() -> ! {
         // run promptly while the hart is otherwise idle.
         unsafe {
             riscv::register::sie::set_ssoft();
-            setup_hart_timer(100_000);
+            // Sized from sleep-heap peek when we held the lock above:
+            // wakes at the earliest deadline rather than waiting the
+            // full heartbeat. Capped at WFI_HEARTBEAT_CYCLES so
+            // SLEEP_INBOX entries pushed after our snapshot still get
+            // observed within one heartbeat.
+            setup_hart_timer(wfi_cycles);
 
             // Bucket hook 3: drop into idle. Bracketed automatically
             // on wake by the s_trap entry hook (→ Kernel).
@@ -820,6 +838,24 @@ pub fn handle_get_hart_id(epc: usize, hart_context: &'static HartContext, frame:
     let hart_id = hart_context.hart_id;
     dispatch_syscall(epc, hart_context, frame, |_t, _f| {
         orbit_core::SyscallOutcome::Return { ret: hart_id as isize }
+    });
+}
+
+/// `get_micros()` — absolute monotonic microseconds since boot.
+///
+/// Backed by the RISC-V `time` CSR (10 MHz on QEMU virt; 10 ticks/μs).
+/// The CSR is unprivileged on M-mode but gated behind `scounteren.TM`
+/// for U-mode — keeping the read in the kernel sidesteps that gate
+/// and gives userspace a stable abstraction over whatever clock
+/// source future platforms use.
+#[unsafe(no_mangle)]
+pub fn handle_get_micros(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
+    let now_ticks = riscv::register::time::read64();
+    // 10 MHz → divide by 10 for microseconds. The division is by a
+    // const so the compiler turns it into a multiply-shift.
+    let micros = now_ticks / 10;
+    dispatch_syscall(epc, hart_context, frame, |_t, _f| {
+        orbit_core::SyscallOutcome::Return { ret: micros as isize }
     });
 }
 
