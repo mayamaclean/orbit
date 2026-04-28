@@ -3,7 +3,7 @@ use core::{mem::size_of, ptr::null_mut, sync::atomic::{AtomicPtr, Ordering}};
 use mem::{round_usize_up};
 use mmu::PAGE_SIZE;
 use smoltcp::phy::{Checksum, DeviceCapabilities, Medium};
-use tracing::{info, warn, error};
+use tracing::{error, info, trace, warn};
 
 use crate::kernel::memmap::KdmapVa;
 
@@ -449,7 +449,7 @@ impl<'e> smoltcp::phy::TxToken for E1000TxToken<'e> {
             let rdt = self.bar.add(RDT_REG_ADDR).read_volatile();
             let rdh = self.bar.add(RDH_REG_ADDR).read_volatile();
 
-            info!("e1000: status={:08X?}, icr0={:08X?}, icr1={:08X?}, rdt={rdt:08X?}, rdh={rdh:08X?}", status, icr0, icr1);
+            trace!("e1000: status={:08X?}, icr0={:08X?}, icr1={:08X?}, rdt={rdt:08X?}, rdh={rdh:08X?}", status, icr0, icr1);
         }
         r
     }
