@@ -67,18 +67,11 @@ SECTIONS
   . = . + 0x80000;            /* 512 KiB stack region */
   PROVIDE(_stack_end = .);
 
-  /* Page-table pool: 128 KiB after all loaded sections, capped well
-     below `TRAP_FRAME_ADDR` (0x80800000). Self-locating so kmain
-     growth doesn't push it into anything else. */
-  . = ALIGN(4096);
-  PROVIDE(_id_map_tables = .);
-
   PROVIDE(_memory_start = ORIGIN(RAM));
   PROVIDE(_memory_end = ORIGIN(RAM) + LENGTH(RAM));
 }
 
-/* Page-table pool stays clear of the M-mode trap frames at 0x80800000.
-   If kmain ever grows enough to push `_id_map_tables` past
-   `0x80800000 - 128 KiB`, the link fails loudly. */
-ASSERT(_id_map_tables + 0x20000 <= 0x80800000,
-       "bl page-table pool collides with TRAP_FRAME_ADDR — kmain too large?")
+/* bl's loaded image (text + rodata + bss + data + stack) must end well
+   below the M-mode TrapFrame base at 0x80800000. */
+ASSERT(_stack_end <= 0x80800000,
+       "bl loaded sections collide with TRAP_FRAME_ADDR — bl too large?")

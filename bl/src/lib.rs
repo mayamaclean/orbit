@@ -12,7 +12,8 @@ use riscv::register::mstatus::SPP;
 
 unsafe extern "C" {
     unsafe static KERNEL_STACK_END: u64;
-    unsafe static KERNEL_ID_MAP_TABLES: u64;
+    unsafe static RODATA_START: u64;
+    unsafe static RODATA_END: u64;
 }
 
 pub const KERNEL_ELF: &'static [u8] = include_bytes!("../../kmain/target/riscv64gc-unknown-none-elf/release/orbit");
@@ -20,21 +21,6 @@ pub const KERNEL_ELF_LEN: usize = KERNEL_ELF.len();
 
 pub const TRAP_FRAME_ADDR: usize = 0x80800000;
 pub const TRAP_FRAMES: *mut TrapFrame = 0x80800000 as *mut _;
-
-/// Start of the page-table pool, placed by the linker right after
-/// `.bss`/`.data` (see [`memory.x`](../../memory.x)). With the stack
-/// region now at the bottom of RAM, this is the natural spot to host
-/// 128 KiB of page tables — far from the stack, far from the loaded
-/// sections, and bounded above by `TRAP_FRAME_ADDR`. The linker
-/// `ASSERT` in `memory.x` enforces the upper bound at link time.
-///
-/// Was previously a fixed `TRAP_FRAME_ADDR - 2 MiB` constant, which
-/// silently broke when kmain grew enough to push `serial::SERIAL`
-/// into that slot. Now self-locates with the rest of the layout.
-#[inline]
-pub fn id_map_tables() -> usize {
-    unsafe { KERNEL_ID_MAP_TABLES as usize }
-}
 
 pub static SYSINFO: SysInfo = SysInfo {
     dtb_addr: AtomicUsize::new(0),
@@ -95,6 +81,78 @@ pub fn setup_interrupts() {
         medeleg::set_instruction_page_fault();
         medeleg::set_load_page_fault();
         medeleg::set_store_page_fault();
+    }
+}
+
+/// Configure PMP to (a) hide bl's M-mode region from S-mode and (b) lock
+/// `.rodata` read-only against M-mode itself. The latter turns a stack
+/// overflow from above into a store-access fault at the rodata boundary,
+/// since the stack region in [memory.x](../memory.x) sits immediately
+/// above `.rodata`.
+///
+/// Layout (PMP entries 0..4 in priority order, lowest wins):
+///
+///   0: TOR [0, 0x80000000)              RWX, L=0  — MMIO. S allowed, M bypasses.
+///   1: TOR [0x80000000, _rodata_start)  ---, L=0  — bl text/bss/data. S denied. M bypasses.
+///   2: TOR [_rodata_start, _rodata_end) R--, L=1  — rodata RO for *both* modes (stack guard).
+///   3: TOR [_rodata_end, 0x84000000)    ---, L=0  — bl stack + id_tables + trap frames + slack. S denied. M bypasses.
+///   4: TOR [0x84000000, !0)             RWX, L=0  — kmain region + everything past it. S allowed.
+///
+/// The asymmetry on rodata (M+S both R, neither W) is a PMP limitation:
+/// no single entry can give "S denied + M read-only", so we pick the
+/// half that catches a real bug class. S can read rodata bytes, but
+/// they're either things kmain has its own copy of (KERNEL_ELF) or
+/// non-sensitive (boot strings, mem.S linker constants). Per-hart
+/// CSR; called once on each hart's M-mode init (kmain_enter for hart 0,
+/// kinit_hart for secondaries) before sret.
+pub unsafe fn setup_pmp() {
+    // pmpcfg byte layout (one byte per entry):
+    //   bits 0..2 = R/W/X
+    //   bits 3..4 = A (0=Off, 1=TOR, 2=NA4, 3=NAPOT)
+    //   bits 5..6 = reserved
+    //   bit  7    = L
+    const TOR: u64 = 1 << 3;
+    const R:   u64 = 1 << 0;
+    const W:   u64 = 1 << 1;
+    const X:   u64 = 1 << 2;
+    const L:   u64 = 1 << 7;
+    let entry0 = TOR | R | W | X;       // 0x0F
+    let entry1 = TOR;                   // 0x08
+    let entry2 = TOR | R | L;           // 0x89
+    let entry3 = TOR;                   // 0x08
+    let entry4 = TOR | R | W | X;       // 0x0F
+    let pmpcfg0 = entry0
+        | (entry1 << 8)
+        | (entry2 << 16)
+        | (entry3 << 24)
+        | (entry4 << 32);
+
+    // Upper bound for "below kmain" — bl's text/data, stack, id_map_tables
+    // and the M-mode trap frames at 0x80800000 all live below this.
+    // kmain's load base is `0x80000000 + 64 MiB = 0x84000000`.
+    const KMAIN_LOAD_BASE: u64 = 0x8400_0000;
+
+    let pa0 = 0x8000_0000_u64 >> 2;
+    let pa1 = unsafe { RODATA_START } >> 2;
+    let pa2 = unsafe { RODATA_END } >> 2;
+    let pa3 = KMAIN_LOAD_BASE >> 2;
+    let pa4 = !0_u64 >> 2;
+
+    unsafe {
+        asm!(
+            "csrw pmpaddr0, {p0}",
+            "csrw pmpaddr1, {p1}",
+            "csrw pmpaddr2, {p2}",
+            "csrw pmpaddr3, {p3}",
+            "csrw pmpaddr4, {p4}",
+            "csrw pmpcfg0,  {cfg}",
+            p0 = in(reg) pa0,
+            p1 = in(reg) pa1,
+            p2 = in(reg) pa2,
+            p3 = in(reg) pa3,
+            p4 = in(reg) pa4,
+            cfg = in(reg) pmpcfg0,
+        );
     }
 }
 
@@ -170,6 +228,11 @@ pub extern "C" fn kmain_enter(serial_addr: usize, dtb_addr: usize) {
         riscv::register::mstatus::set_spp(SPP::Supervisor);
 
         setup_interrupts();
+        // Note: PMP is already armed by `kinit` at the top — running it
+        // again here would be a no-op for entries 0-1/3-4 (idempotent
+        // CSR writes) but the L=1 lock on entry 2 makes that entry's
+        // pmpcfg byte and pmpaddr2 immutable, so a re-write would
+        // either silently no-op or fault depending on hardware.
 
         let hartid = riscv::register::mhartid::read();
 
@@ -189,23 +252,17 @@ pub extern "C" fn kmain_enter(serial_addr: usize, dtb_addr: usize) {
         }
 
         asm!(
-            "csrw pmpaddr0, {apmp}",
-            "csrw pmpcfg0, {acfg}",
             "li t0, 0x02004000",          // mtimecmp address
             "li t1, 0x0200bff8",    // mtime address
             "ld t2, 0(t1)",               // Load current 64-bit mtime
             "li t3, 100000000",             // Example interval (1 million cycles)
             "add t2, t2, t3",             // t2 = mtime + interval
             "sd t2, 0(t0)",
-            //"li t0, 0x222",        // This sets bits 1, 5, and 9
-            //"csrs mideleg, t0",    // Ensure bit 5 (0x20) is definitely set2
             "mv sp, {s}",
             "fence w, rw", // Ensure ELF writes are visible to all harts
             "fence.i",    // Synchronize I-cache with D-cache
             "sfence.vma", // Flush the MMU TLB
             "sret",
-            apmp = in(reg) !0,
-            acfg = in(reg) 0xf | 0x80,
             s = in(reg) KERNEL_STACK_END,
             in("a0") hartid,
             in("a1") dtb_addr,

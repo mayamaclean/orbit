@@ -5,16 +5,12 @@ use core::arch::{asm, global_asm};
 use core::panic::PanicInfo;
 use core::sync::atomic::{Ordering};
 
-use mmu::mmap::{PageTableVec, RootTable, id_map_range, map_address_page};
-use mmu::sv48::{PhysAddr, VirtAddr};
-use device::{TrapFrame};
+use device::TrapFrame;
 use riscv::register::mtvec::Mtvec;
-use riscv::register::satp::Mode;
 use riscv::register::mstatus::SPP;
 
-use bl::{setup_interrupts};
+use bl::setup_interrupts;
 use device::*;
-use mmu::*;
 use serial::{init_serial, println};
 
 global_asm!(
@@ -112,82 +108,37 @@ extern "C" fn m_trap(epc: usize,
 
 #[unsafe(no_mangle)]
 extern "C" fn kinit(hartid: usize, dtb_addr: usize) {
+    // boot.S only routes hart 0 here (secondaries go to `kinit_hart`),
+    // so no `if hartid == 0` gate is needed. M-mode satp stays bare:
+    // kmain's `_start` builds its own trampoline page tables via
+    // `early_paging_setup`, so bl no longer needs to hand-set an id-map.
     unsafe {
         let frame_offset = bl::TRAP_FRAMES.add(hartid);
         riscv::register::mscratch::write(frame_offset as usize);
         riscv::register::mtvec::write(Mtvec::new(m_trap_vector as *const () as usize, riscv::register::mtvec::TrapMode::Direct));
-    }
+        // PMP first thing — locks rodata RO so any subsequent M-mode
+        // stack overflow traps as a store-access fault instead of
+        // silently chewing through bl. Also denies S-mode access to
+        // the bl region; protection is in effect for the entire kinit
+        // path, kmain_enter, and the eventual sret to S-mode.
+        bl::setup_pmp();
 
-    if hartid == 0 {
-        // load dtb and stuff
-        /*
-        a1 = 0x0000000087e00000
-        a2 = 0x0000000000001028
-         */
-        unsafe {
-            let dtb_addr = dtb_addr as *const u8;
+        let dtb_addr = dtb_addr as *const u8;
 
-            let addr = find_serial_port(dtb_addr).unwrap();
-            init_serial(addr);
+        let addr = find_serial_port(dtb_addr).unwrap();
+        init_serial(addr);
 
-            println!("dtb @ {dtb_addr:016X?}");
+        println!("dtb @ {dtb_addr:016X?}");
 
-            let test_va = VirtAddr::new(0xb8001000);
-            println!("test_va=vpn0={},vpn1={},vpn2={},vpn3={}",
-                test_va.vpn0(), test_va.vpn1(), test_va.vpn2(), test_va.vpn3()
-            );
-            
-            let (ram_start, ram_size) = find_ram(dtb_addr).unwrap();
+        let (ram_start, ram_size) = find_ram(dtb_addr).unwrap();
+        let mb = (ram_size as f64) / 1024. / 1024.;
+        println!("0x{:016x?}..0x{:016x?} ({:.02}MiB)", ram_start, ram_start+ram_size, mb);
 
-            let mb = (ram_size as f64) / 1024. / 1024.;
-            println!("0x{:016x?}..0x{:016x?} ({:.02}MiB)", ram_start, ram_start+ram_size, mb);
+        println!("BSS=0x{BSS_START:016X?}..0x{BSS_END:016X?}");
+        println!("BLSTACK=0x{KERNEL_STACK_START:016X?}..{KERNEL_STACK_END:016X?}");
+        println!("KELF=0x{:016X?}..{:016X?}", bl::KERNEL_ELF.as_ptr() as usize, bl::KERNEL_ELF.as_ptr() as usize + bl::KERNEL_ELF_LEN);
 
-            println!("BSS=0x{BSS_START:016X?}..0x{BSS_END:016X?}");
-            println!("BLSTACK=0x{KERNEL_STACK_START:016X?}..{KERNEL_STACK_END:016X?}");
-            println!("KELF=0x{:016X?}..{:016X?}", bl::KERNEL_ELF.as_ptr() as usize, bl::KERNEL_ELF.as_ptr() as usize + bl::KERNEL_ELF_LEN);
-
-            const MAX_ID_TABLES: usize = 32;
-            let page_table_start = bl::id_map_tables();
-            let mut ptv = PageTableVec::new(page_table_start, 4096 * MAX_ID_TABLES);
-            let mut pages = mmap::PageAlloc::PTV(&mut ptv);
-            let root_pa = pages.allocate_page_table().unwrap();
-            // PTV is identity-mapped in bl, so PA == VA. Zero before use —
-            // PageAlloc no longer zeros internally.
-            core::ptr::write_bytes(root_pa as *mut u8, 0, 4096);
-            let root_ref = (root_pa as *const mmu::sv48::PageTable).as_ref_unchecked();
-            let root_table = RootTable::identity(root_ref);
-
-            println!("made page table pool @ {:016x}, root table @ {:016x}", page_table_start, root_pa as usize);
-
-            let base_id_map_config = MappingConfig {
-                permissions: PagePermissions::R | PagePermissions::W | PagePermissions::X,
-                levels: 0, page_size: 0, vaddr: VirtAddr::new(0), paddr: PhysAddr::new(0),
-                log: false,
-                supervisor_tag: SupervisorTag::None
-            };
-            let id_mapping = id_map_range(&root_table, &mut pages, base_id_map_config, ram_start..(ram_start + ram_size));
-
-            let serial_perms = MappingConfig {
-                permissions: PagePermissions::R | PagePermissions::W,
-                levels: 4,
-                page_size: 4096,
-                vaddr: VirtAddr::new(addr as u64),
-                paddr: PhysAddr::new(addr as u64),
-                log: false,
-                supervisor_tag: SupervisorTag::None
-            };
-            map_address_page(&root_table, &mut pages, &serial_perms).unwrap();
-
-            println!("{id_mapping:?}");
-
-            riscv::asm::sfence_vma_all();
-            let _ = riscv::register::satp::try_set(Mode::Sv48, 0, root_ref as *const _ as usize / PAGE_SIZE);
-            riscv::asm::sfence_vma_all();
-
-            println!("PTABLES=0x{:016X}..0x{:016X}", page_table_start, page_table_start + ptv.current_tables_size());
-
-            bl::kmain_enter(addr, dtb_addr as usize);
-        }
+        bl::kmain_enter(addr, dtb_addr as usize);
     }
 }
 
@@ -202,6 +153,12 @@ extern "C" fn kinit_hart() {
     if hartid == 0 {
         loop { riscv::asm::wfi(); }
     }
+
+    // PMP first — same rationale as `kinit`: lock rodata RO and deny
+    // S-mode access to bl before anything else. mtvec/mscratch were set
+    // by boot.S part3 before mret to here, so traps from PMP violations
+    // resolve correctly.
+    unsafe { bl::setup_pmp(); }
 
     // Wait for hart 0 (still in bl) to copy the kernel ELF into RAM and
     // publish its `_start` PA. CLINT MSIP from `kmain_enter`'s wake_hart
@@ -230,14 +187,10 @@ extern "C" fn kinit_hart() {
         let serial_ptr = bl::SYSINFO.serial.load(Ordering::Acquire);
 
         asm!(
-            "csrw pmpaddr0, {apmp}",
-            "csrw pmpcfg0, {acfg}",
             "fence w, rw",
             "fence.i",
             "sfence.vma",
             "sret",
-            apmp = in(reg) !0,
-            acfg = in(reg) 0xf | 0x80,
             in("a0") hartid,
             in("a1") dtb_ptr,
             in("a2") serial_ptr,

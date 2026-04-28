@@ -32,6 +32,3 @@ KERNEL_STACK_START: .dword _stack_start
 
 .global KERNEL_STACK_END
 KERNEL_STACK_END: .dword _stack_end
-
-.global KERNEL_ID_MAP_TABLES
-KERNEL_ID_MAP_TABLES: .dword _id_map_tables
