@@ -3,7 +3,7 @@
 
 use core::arch::{asm, global_asm};
 use core::panic::PanicInfo;
-use core::sync::atomic::{Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use device::TrapFrame;
 use riscv::register::mtvec::Mtvec;
@@ -34,6 +34,22 @@ unsafe extern "C" {
     unsafe static BSS_END: u64;
 
     unsafe static KERNEL_STACK_START: u64;
+}
+
+// Set by the first hart to take an unhandled M-mode trap. Other harts'
+// cause-3 arm checks this after clear_hart_int — a wake from a faulted
+// hart redirects them into the same WFI halt instead of returning to
+// whatever they were doing (S-mode kmain, kinit_hart's KMAIN_ENTRY
+// poll, etc.). One bad hart stops the world.
+static M_FAULTED: AtomicBool = AtomicBool::new(false);
+
+fn broadcast_halt(self_hart: usize) {
+    M_FAULTED.store(true, Ordering::Release);
+    for h in 0..4 {
+        if h != self_hart {
+            unsafe { wake_hart(h); }
+        }
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -71,9 +87,19 @@ extern "C" fn m_trap(epc: usize,
 		// either. Anything that lands in the catch-all is a bug — halt
 		// the hart so the failure is loud.
 		match cause_num {
-			3 => unsafe { clear_hart_int(hart); },
+			3 => unsafe {
+				clear_hart_int(hart);
+				// A wake from a faulted hart redirects us into the
+				// halt loop instead of returning. Checked after the
+				// MSIP clear so the pending bit doesn't immediately
+				// re-trap us.
+				if M_FAULTED.load(Ordering::Acquire) {
+					loop { riscv::asm::wfi(); }
+				}
+			},
 			_ => {
 				println!("Unhandled M-mode async trap CPU#{} -> {}\n", hart, cause_num);
+				broadcast_halt(hart);
 				loop { riscv::asm::wfi(); }
 			}
 		}
@@ -99,6 +125,7 @@ extern "C" fn m_trap(epc: usize,
 					"Unhandled M-mode sync trap CPU#{} -> cause={} epc=0x{:08x} stval=0x{:08x}\n",
 					hart, cause_num, epc, tval,
 				);
+				broadcast_halt(hart);
 				loop { riscv::asm::wfi(); }
 			}
 		}

@@ -391,8 +391,7 @@ pub extern "C" fn k_smpstart() {
         SECONDARY_GO[hart].store(true, Ordering::Release);
     }
 
-    kmain::kick_machine_harts(orbit.cpu_count);
-    //(0..orbit.cpu_count).for_each(|hart| kmain::supervisor_wake_hart(hart));
+    (0..orbit.cpu_count).for_each(|hart| kmain::supervisor_wake_hart(hart));
 
     info!("kicked harts");
 
