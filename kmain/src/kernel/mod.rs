@@ -78,11 +78,16 @@ pub use memmap::KernelLayout;
 // listens on TCP :7777 and spawns ELFs via create_process, so umode
 // rebuilds don't drag kmain+bl along. The `smoke` Cargo feature swaps
 // in umode directly so ./smoke can run the automated self-test without
-// a host-side sender (and without the network-ready latency).
-#[cfg(not(feature = "smoke"))] 
+// a host-side sender (and without the network-ready latency). The
+// `hello-std` feature swaps in the §13e-stage hello-std binary built
+// against the `riscv64gc-unknown-orbit` triple — used to verify the
+// rustc fork's std PAL boots end-to-end.
+#[cfg(not(any(feature = "smoke", feature = "hello-std")))]
 pub const UMODE_TEST_ELF: &'static [u8] = include_bytes!("../../../orbit-loader/target/riscv64gc-unknown-none-elf/release/orbit-loader");
 #[cfg(feature = "smoke")]
 pub const UMODE_TEST_ELF: &'static [u8] = include_bytes!("../../../umode/target/riscv64gc-unknown-none-elf/release/umode");
+#[cfg(feature = "hello-std")]
+pub const UMODE_TEST_ELF: &'static [u8] = include_bytes!("../../../hello-std/target/riscv64gc-unknown-orbit/release/hello-std");
 
 // User address-space layout lives in the canonical orbit_abi::layout module.
 // Re-exported so existing `kernel::USER_TEXT_BASE`-style call sites keep
@@ -1515,7 +1520,7 @@ impl Orbit {
         // the current max + 1 — close enough for diagnostics; the real
         // tid is read off the registry below on success.
         match self.add_new_thread_to_process(
-            pid, req.entry, UPROC_STACK_DEFAULT, allowed, affinity,
+            pid, req.entry, UPROC_STACK_DEFAULT, allowed, affinity, req.arg,
         ) {
             Ok(()) => {
                 // Find the most-recently-inserted thread for this pid:
@@ -2652,7 +2657,7 @@ impl Orbit {
         }
     }
     
-    pub fn add_new_thread_to_process(&mut self, pid: u16, entrypoint: usize, stack_size: u64, allowed_affinity: u64, affinity: u64) -> Result<(), ()> {
+    pub fn add_new_thread_to_process(&mut self, pid: u16, entrypoint: usize, stack_size: u64, allowed_affinity: u64, affinity: u64, arg: usize) -> Result<(), ()> {
         if !self.processes.contains_key(&pid) {
             return Err(())
         }
@@ -2668,7 +2673,7 @@ impl Orbit {
             memmap::kernel_root_from_pa(addr as u64)
         };
 
-        let thread = match self.create_new_thread(pid, &root_table, entrypoint, slot, stack_size, allowed_affinity, affinity) {
+        let thread = match self.create_new_thread(pid, &root_table, entrypoint, slot, stack_size, allowed_affinity, affinity, arg) {
             Ok(t) => t,
             Err(e) => {
                 self.processes.get_mut(&pid).unwrap().thread_slots.free(slot);
@@ -2704,7 +2709,7 @@ impl Orbit {
         Ok(())
     }
 
-    pub fn create_new_thread(&mut self, pid: u16, root_table: &mmu::mmap::RootTable<'_>, entrypoint: usize, slot: u16, stack_size: u64, allowed_affinity: u64, affinity: u64) -> Result<Thread, ()> {
+    pub fn create_new_thread(&mut self, pid: u16, root_table: &mmu::mmap::RootTable<'_>, entrypoint: usize, slot: u16, stack_size: u64, allowed_affinity: u64, affinity: u64, arg: usize) -> Result<Thread, ()> {
         if !validate_user_stack_size(stack_size) {
             error!("invalid user stack size {stack_size}");
             return Err(())
@@ -2922,6 +2927,11 @@ impl Orbit {
         // user_tls_vaddr(slot); if the binary has no TLS the
         // reservation stays unmapped and any access faults clean.
         frame.regs[4] = tls_vaddr as usize;
+        // a0 = x10 = regs[10]: opaque thread arg the spawn syscall
+        // hands the new thread. `std::thread::spawn` boxes its
+        // closure state and passes the boxed pointer here so the
+        // C-ABI entry trampoline can read it as its first argument.
+        frame.regs[10] = arg;
         frame.asid = pid as usize;
 
         info!(
@@ -2985,7 +2995,11 @@ impl Orbit {
         // into proc.maps via self.processes.get_mut.
         self.processes.insert(pid, proc);
 
-        let thread = match self.create_new_thread(pid, &root_table, elf.entrypoint, slot, stack_size, allowed_affinity, affinity) {
+        // Initial process thread: arg=0. There's no parent closure to
+        // pass through — the binary's `_start` ignores a0. (argv is
+        // installed at a fixed VA via `install_argv_blob`, not via
+        // this register.)
+        let thread = match self.create_new_thread(pid, &root_table, elf.entrypoint, slot, stack_size, allowed_affinity, affinity, 0) {
             Ok(t) => t,
             Err(e) => {
                 let _ = self.processes.remove(&pid);

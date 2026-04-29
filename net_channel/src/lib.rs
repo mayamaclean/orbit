@@ -1,10 +1,22 @@
 #![no_std]
 
+mod spsc;
+
 use core::marker::PhantomData;
 use core::mem::size_of;
 use core::sync::atomic::{AtomicI32, AtomicU16, AtomicU32, AtomicUsize, Ordering};
 
-use mem::round_usize_up;
+pub use spsc::SpscQueue;
+
+/// Round `value` up to the next multiple of `alignment` (which must be
+/// a power of two). Inlined here so the user-side surface of this crate
+/// has zero non-core dependencies — that's the precondition for
+/// path-depping it from `library/std` under `rustc-dep-of-std`.
+#[inline]
+fn round_usize_up(value: usize, alignment: usize) -> usize {
+    debug_assert!(alignment.is_power_of_two(), "alignment must be a power of two");
+    (value + alignment - 1) & !(alignment - 1)
+}
 
 #[cfg(feature = "kernel")]
 use core::net::Ipv4Addr;
@@ -188,11 +200,14 @@ impl<'a> VolSlice<'a> {
     pub fn as_ptr(&self) -> *const u8 { self.ptr }
 }
 
-// SPSC queue lives in [`process::spsc`] (re-exported below) so other
-// kernel sync paths (e.g. ProcessStdin) can share the implementation.
-// The `#[repr(C)]` layout discipline that NetChannel's ABI relies on
-// is preserved by the `process::SpscQueue` type definition.
-pub use process::SpscQueue;
+// SPSC queue lives in this crate's [`spsc`] module — `pub use`
+// re-exported above. Used to live in `process::spsc`, but pulling
+// `process` into `library/std` (`rustc-dep-of-std`) is impractical
+// because of its kernel-side deps (mmu, riscv, smoltcp). The `process`
+// crate keeps an independent identical copy for kernel-side use; the
+// two layouts (`#[repr(C)]`) are byte-for-byte compatible by
+// construction. Other kernel sync paths (e.g. `ProcessStdin`) still
+// import `process::SpscQueue`.
 
 /// Fixed header offsets within a NetChannel region. The tx/rx queues follow
 /// at `NC_TX_OFF` and `NC_TX_OFF + queue_len` respectively — `queue_len` is
@@ -278,21 +293,60 @@ pub struct NetChannelDesired {
     _pad: [u8; 124],
 }
 
+/// User-visible session-state values published in
+/// [`NetChannelCurrent::state`]. The numeric values are part of the
+/// kernel/user ABI — user code polls the state byte through the
+/// shared NetChannel mapping, kernel code writes it via
+/// [`NetChannel::update_tcp`]. Don't renumber.
+///
+/// Use the constants below rather than literal numbers; the older
+/// ad-hoc `if state == 2` checks made it easy to forget about
+/// transient states like [`CLOSING`] (state 3).
+pub mod channel_state {
+    /// Idle. Server retain: kernel listening but no peer yet
+    /// connected. Client retain: between reconnect attempts. Client
+    /// one-shot: kernel waiting for `engaged = 1`.
+    pub const IDLE: i32 = 0;
+    /// In flight. Server: listen freshly armed but no peer. Client:
+    /// dialing (smoltcp `SynSent`).
+    pub const IN_FLIGHT: i32 = 1;
+    /// Active session: peer connected, rings are live, user may
+    /// `send_tcp` / `recv_tcp`.
+    pub const ACTIVE: i32 = 2;
+    /// Closing/draining. User has disengaged and the kernel is
+    /// driving smoltcp through the graceful-close handshake (FIN +
+    /// final ACKs) so any data the user wrote just before drop
+    /// actually reaches the peer. Set on the disengage edge in
+    /// `update_tcp`; cleared when the kernel observes
+    /// `socket.state() == Closed` and transitions to whatever the
+    /// binding wants next ([`IN_FLIGHT`] for server retain re-listen,
+    /// [`IDLE`] for client retain re-dial pending, [`FAILED`] for
+    /// one-shot terminal).
+    ///
+    /// User code that wants "kernel has fully released the rings"
+    /// must wait for state to leave both [`ACTIVE`] *and* [`CLOSING`]
+    /// — the older "wait for state != ACTIVE" idiom raced
+    /// `close_handle` against the in-flight close handshake and
+    /// dropped the last `write_all`.
+    pub const CLOSING: i32 = 3;
+    /// Sticky terminal failure. Consult
+    /// [`super::NetChannelCurrent::fail_cause`] for the
+    /// `EBIND_*`-flavoured reason.
+    pub const FAILED: i32 = -1;
+}
+
 /// Kernel-published per-session observation. Layout invariants:
 /// - `state` is the only field user code polls in `wait_for_session`-
 ///   style loops; it's the first field for cache-friendliness.
-/// - `peer_addr` / `peer_port` are populated when `state` reaches `2`
-///   and reflect the connection's *remote* endpoint (server bindings:
-///   the peer that connected; client bindings: redundant with the bind
-///   params, exposed for symmetry).
-/// - `fail_cause` is meaningful only when `state == -1`; otherwise 0.
+/// - `peer_addr` / `peer_port` are populated when `state` reaches
+///   [`channel_state::ACTIVE`] and reflect the connection's *remote*
+///   endpoint (server bindings: the peer that connected; client
+///   bindings: redundant with the bind params, exposed for symmetry).
+/// - `fail_cause` is meaningful only when `state == channel_state::FAILED`;
+///   otherwise 0.
 ///
-/// State values:
-/// - `0` idle (server bindings: kernel listening; client retain: between
-///   reconnects; client one-shot: kernel waiting for `engaged = 1`).
-/// - `1` in flight (connect dialing, or listen freshly armed but no peer).
-/// - `2` session active (peer connected, rings are live).
-/// - `-1` sticky terminal failure; consult `fail_cause`.
+/// See [`channel_state`] for the state-value constants and their
+/// transitions.
 #[repr(C, align(128))]
 pub struct NetChannelCurrent {
     pub state: AtomicI32,
@@ -392,6 +446,16 @@ pub enum Phase {
     /// buffered data); `current.state == 2`. Stays here until the user
     /// disengages.
     Active,
+    /// Graceful-close drain. User just disengaged; we issued
+    /// `socket.close()` (FIN-on-empty) and are waiting for smoltcp to
+    /// drive the close handshake to `Closed` so any data the
+    /// application wrote just before drop actually reaches the peer.
+    ///
+    /// Skipping this phase (the old "abort + reset on the disengage
+    /// edge" path) discarded any tx queued in the final `write_all` —
+    /// the response a listener wrote immediately before drop never
+    /// made it to the peer.
+    Closing,
     /// Sticky terminal. `current.state == -1` and `fail_cause` carries
     /// the errno-flavored explanation. One-shot bindings end here; retain
     /// bindings only enter Failed on a non-recoverable error
@@ -790,9 +854,66 @@ impl NetChannel {
         // Only act on the 1→0 edge, not on any poll where engaged==0;
         // otherwise a fresh session that the user hasn't claimed yet
         // would get torn down before they ever observed `state == 2`.
+        //
+        // Two-phase tear-down: enter `Closing` (graceful FIN, drain
+        // smoltcp tx, observe peer FIN-ACK) instead of immediately
+        // aborting + recycling. The old single-phase path discarded
+        // any tx queued in the final `write_all` — see roadmap.
         if was_engaged && !engaged && matches!(ctx.phase, Phase::Active) {
-            info!("netch[{:?}]: recycle on disengage edge (sock_state={:?})",
+            // Drain any tx the user wrote between the previous poll
+            // and this disengage. Without this the bytes sit in the
+            // user-side tx ring and `socket.close()` below queues a
+            // FIN that races them — peer sees an empty FIN, our
+            // pending data is discarded on recycle. Mirrors the
+            // Phase::Active drain block but runs on this last poll
+            // before we leave Active.
+            if socket.may_send() {
+                let tx = self.tx();
+                // SAFETY: kernel is the sole consumer of tx.increments.
+                while let Some(user_tx_count) = unsafe { tx.dequeue_increment() } {
+                    let _ = socket.send(|_b| (user_tx_count, user_tx_count));
+                    ctx.pending_tx_ack = false;
+                }
+            }
+
+            info!("netch[{:?}]: disengage edge → Closing (sock_state={:?})",
                   ctx.bind, socket.state());
+            // `close()` queues a FIN once the existing tx queue
+            // drains; smoltcp continues to send buffered data + the
+            // FIN before transitioning the socket to `Closed`.
+            socket.close();
+            ctx.phase = Phase::Closing;
+            // Move state to `CLOSING` (3) so the user-side
+            // `disengage_and_release` spin can wait for it to leave
+            // *both* `ACTIVE` *and* `CLOSING` before issuing
+            // `close_handle`. Using a distinct sentinel (rather than
+            // just != ACTIVE) lets the user race a still-draining
+            // smoltcp socket against `close_handle`'s revoke and
+            // drop the last `write_all`. See
+            // [`channel_state::CLOSING`].
+            cur.state.store(channel_state::CLOSING, Ordering::Release);
+            outcome.session_state_changed = true;
+            return (iface, outcome);
+        }
+
+        // ── Closing: drain smoltcp's tx + close handshake ───────────────
+        // Stay in this phase until smoltcp reaches `Closed`. Then
+        // reset_kernel_side and transition to whatever the binding
+        // semantics dictate (re-listen, re-dial, terminal).
+        if matches!(ctx.phase, Phase::Closing) {
+            // smoltcp's `state()` for a fully-closed connection. Any
+            // residual buffered tx has by now been ACK'd or RST'd.
+            if !matches!(socket.state(), TcpState::Closed) {
+                // Still flushing — try again on the next poll.
+                return (iface, outcome);
+            }
+
+            info!("netch[{:?}]: drain complete, recycling (sock_state={:?})",
+                  ctx.bind, socket.state());
+            // Even a graceful Closed leaves smoltcp with empty
+            // buffers — abort() is a no-op functionally but resets
+            // any internal state we'd otherwise carry into the next
+            // session.
             socket.abort();
             unsafe { self.reset_kernel_side(); }
             ctx.pending_rx_ack = false;
@@ -807,14 +928,14 @@ impl NetChannel {
                     if let Err(e) = socket.listen(port) {
                         error!("tcp: re-listen({port}) failed after recycle: {e:?}");
                         cur.fail_cause.store(EBIND_LISTEN as i32, Ordering::Release);
-                        cur.state.store(-1, Ordering::Release);
+                        cur.state.store(channel_state::FAILED, Ordering::Release);
                         outcome.session_state_changed = true;
                         ctx.phase = Phase::Failed;
                         return (iface, outcome);
                     }
                     info!("netch[ServerRetain port={port}]: re-armed listen, phase=Listening state=1");
                     ctx.phase = Phase::Listening;
-                    cur.state.store(1, Ordering::Release);
+                    cur.state.store(channel_state::IN_FLIGHT, Ordering::Release);
                     outcome.session_state_changed = true;
                 }
                 BindSpec::ClientRetain { .. } => {
@@ -822,13 +943,13 @@ impl NetChannel {
                     ctx.phase = Phase::FreshIdle;
                     ctx.backoff_ms = 0;
                     ctx.next_attempt_at_us = 0;
-                    cur.state.store(0, Ordering::Release);
+                    cur.state.store(channel_state::IDLE, Ordering::Release);
                     outcome.session_state_changed = true;
                 }
                 BindSpec::ServerOneShot { .. } | BindSpec::ClientOneShot { .. } => {
                     info!("netch[{:?}]: one-shot done, phase=Failed", ctx.bind);
                     cur.fail_cause.store(EBIND_DONE as i32, Ordering::Release);
-                    cur.state.store(-1, Ordering::Release);
+                    cur.state.store(channel_state::FAILED, Ordering::Release);
                     outcome.session_state_changed = true;
                     ctx.phase = Phase::Failed;
                     return (iface, outcome);
@@ -844,14 +965,14 @@ impl NetChannel {
                     if let Err(e) = socket.listen(port) {
                         error!("tcp: listen({port}) failed at bind: {e:?}");
                         cur.fail_cause.store(EBIND_LISTEN as i32, Ordering::Release);
-                        cur.state.store(-1, Ordering::Release);
+                        cur.state.store(channel_state::FAILED, Ordering::Release);
                         outcome.session_state_changed = true;
                         ctx.phase = Phase::Failed;
                         return (iface, outcome);
                     }
                     info!("netch[{:?}]: armed listen({port}), phase=Listening state=1", ctx.bind);
                     ctx.phase = Phase::Listening;
-                    cur.state.store(1, Ordering::Release);
+                    cur.state.store(channel_state::IN_FLIGHT, Ordering::Release);
                     outcome.session_state_changed = true;
                 }
                 BindSpec::ClientRetain { addr, port } => {
@@ -859,7 +980,7 @@ impl NetChannel {
                         if try_connect(&mut iface, socket, addr, port).is_ok() {
                             info!("netch[ClientRetain addr={addr:#x} port={port}]: dialed, phase=Connecting state=1");
                             ctx.phase = Phase::Connecting;
-                            cur.state.store(1, Ordering::Release);
+                            cur.state.store(channel_state::IN_FLIGHT, Ordering::Release);
                             outcome.session_state_changed = true;
                         } else {
                             schedule_retry(ctx, now_us);
@@ -872,12 +993,12 @@ impl NetChannel {
                         if try_connect(&mut iface, socket, addr, port).is_ok() {
                             info!("netch[ClientOneShot addr={addr:#x} port={port}]: dialed, phase=Connecting state=1");
                             ctx.phase = Phase::Connecting;
-                            cur.state.store(1, Ordering::Release);
+                            cur.state.store(channel_state::IN_FLIGHT, Ordering::Release);
                             outcome.session_state_changed = true;
                         } else {
                             error!("netch[ClientOneShot addr={addr:#x} port={port}]: dial failed at bind, phase=Failed");
                             cur.fail_cause.store(EBIND_CONNECT as i32, Ordering::Release);
-                            cur.state.store(-1, Ordering::Release);
+                            cur.state.store(channel_state::FAILED, Ordering::Release);
                             outcome.session_state_changed = true;
                             ctx.phase = Phase::Failed;
                             return (iface, outcome);
@@ -897,7 +1018,7 @@ impl NetChannel {
             info!("netch[{:?}]: peer connected addr={:#x} port={} sock_state={:?}, phase=Active state=2",
                   ctx.bind, pa, pp, socket.state());
             ctx.phase = Phase::Active;
-            cur.state.store(2, Ordering::Release);
+            cur.state.store(channel_state::ACTIVE, Ordering::Release);
             outcome.session_state_changed = true;
         }
 
@@ -912,14 +1033,14 @@ impl NetChannel {
                 ctx.phase = Phase::Active;
                 ctx.backoff_ms = 0;
                 ctx.next_attempt_at_us = 0;
-                cur.state.store(2, Ordering::Release);
+                cur.state.store(channel_state::ACTIVE, Ordering::Release);
                 outcome.session_state_changed = true;
             } else if socket.state() == TcpState::Closed {
                 match ctx.bind {
                     BindSpec::ClientOneShot { .. } => {
                         info!("netch[{:?}]: connect failed (RST/timeout), phase=Failed", ctx.bind);
                         cur.fail_cause.store(EBIND_CONNECT as i32, Ordering::Release);
-                        cur.state.store(-1, Ordering::Release);
+                        cur.state.store(channel_state::FAILED, Ordering::Release);
                         outcome.session_state_changed = true;
                         ctx.phase = Phase::Failed;
                         return (iface, outcome);
@@ -927,7 +1048,7 @@ impl NetChannel {
                     BindSpec::ClientRetain { .. } => {
                         ctx.phase = Phase::FreshIdle;
                         schedule_retry(ctx, now_us);
-                        cur.state.store(0, Ordering::Release);
+                        cur.state.store(channel_state::IDLE, Ordering::Release);
                         outcome.session_state_changed = true;
                         info!("netch[{:?}]: connect failed, retry in {}ms", ctx.bind, ctx.backoff_ms);
                     }
@@ -947,7 +1068,7 @@ impl NetChannel {
                     if let Err(e) = socket.recv(|_b| (user_rx_count, user_rx_count)) {
                         error!("tcp: failed recv: {e:?}");
                         cur.fail_cause.store(EBIND_IO as i32, Ordering::Release);
-                        cur.state.store(-1, Ordering::Release);
+                        cur.state.store(channel_state::FAILED, Ordering::Release);
                         outcome.session_state_changed = true;
                         ctx.phase = Phase::Failed;
                         return (iface, outcome);
@@ -976,7 +1097,7 @@ impl NetChannel {
                     if let Err(e) = socket.send(|_b| (user_tx_count, user_tx_count)) {
                         error!("tcp: failed send: {e:?}");
                         cur.fail_cause.store(EBIND_IO as i32, Ordering::Release);
-                        cur.state.store(-1, Ordering::Release);
+                        cur.state.store(channel_state::FAILED, Ordering::Release);
                         outcome.session_state_changed = true;
                         ctx.phase = Phase::Failed;
                         return (iface, outcome);
@@ -1009,12 +1130,15 @@ impl NetChannel {
     {
         let cur = self.current();
 
-        // `state < 2` covers idle (0), in-flight (1), and any sticky
-        // negative — none of which permit ring traffic. Returning the
-        // raw value preserves the negative-isize convention the user
-        // wrapper maps to errnos.
+        // Only `ACTIVE` permits ring traffic. `IDLE` (0), `IN_FLIGHT`
+        // (1), `CLOSING` (3), and `FAILED` (-1) all reject — the user
+        // wrapper maps the raw value to an errno via the
+        // negative-isize convention. Note that `CLOSING` looks
+        // numerically like a live state (3 > 2) but the kernel is
+        // already driving graceful close on the smoltcp socket; the
+        // user side must not write more.
         let channel_state = cur.state.load(Ordering::Acquire);
-        if channel_state < 2 {
+        if channel_state != channel_state::ACTIVE {
             return Err(channel_state as isize)
         }
 

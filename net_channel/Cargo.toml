@@ -4,11 +4,19 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-kernel = []
+default = []
+# Pull in smoltcp + serial + tracing for the kernel-side reconciler
+# (`update_tcp` etc.). Disabled by default so user-side consumers
+# (orbit-rt, library/std on `target_os = "orbit"`) get a tight,
+# zero-deps surface.
+kernel = ["dep:smoltcp", "dep:serial", "dep:tracing"]
+# Build under rustc's library/ workspace: bind `core` to the
+# `rustc-std-workspace-core` shim. Implies non-kernel build (smoltcp
+# et al. are unavailable inside library/).
+rustc-dep-of-std = ["core"]
 
 [dependencies]
-smoltcp = { path = "../../smoltcp", default-features = false, features = ["socket-raw", "socket-udp", "socket-tcp", "socket-icmp", "socket-dhcpv4", "socket-dns", "proto-ipv4"] }
-serial = { path = "../serial" }
-mem = { path = "../mem" }
-process = { path = "../process" }
-tracing = { version = "0.1.44", default-features = false, features = [] }
+smoltcp = { path = "../../smoltcp", default-features = false, features = ["socket-raw", "socket-udp", "socket-tcp", "socket-icmp", "socket-dhcpv4", "socket-dns", "proto-ipv4"], optional = true }
+serial = { path = "../serial", optional = true }
+tracing = { version = "0.1.44", default-features = false, features = [], optional = true }
+core = { version = "1.0.0", optional = true, package = "rustc-std-workspace-core" }

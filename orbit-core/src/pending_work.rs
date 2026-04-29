@@ -54,6 +54,12 @@ pub struct CreateThreadReq {
     /// be created with reach the parent itself doesn't have.
     pub allowed_affinity: u64,
     pub affinity: u64,
+    /// Opaque value the kernel writes into the new thread's a0 (x10)
+    /// at sret. By convention `std::thread::spawn` boxes the closure
+    /// state and passes the boxed pointer here; bare `extern "C" fn()
+    /// -> !` entries that don't read a0 ignore it. Not validated by
+    /// the kernel — the entry is responsible for interpreting it.
+    pub arg: usize,
 }
 
 #[derive(Debug, Clone, Copy)]

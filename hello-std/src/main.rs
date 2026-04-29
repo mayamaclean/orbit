@@ -1,0 +1,214 @@
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+
+fn main() {
+    println!("hello from std on orbit!");
+
+    let v: Vec<u32> = (0..10).collect();
+    println!("vec sum = {}", v.iter().sum::<u32>());
+
+    let now = std::time::Instant::now();
+    let then = std::time::Instant::now();
+    println!("instant delta micros = {}", then.duration_since(now).as_micros());
+
+    // §13e — std::thread::spawn round trip.
+    let counter = Arc::new(AtomicU32::new(0));
+    let worker_counter = counter.clone();
+    let handle = std::thread::spawn(move || {
+        for i in 0..5 {
+            worker_counter.fetch_add(1, Ordering::Relaxed);
+            println!("worker tick {i}");
+        }
+    });
+    handle.join().unwrap();
+    println!("post-join counter = {}", counter.load(Ordering::Acquire));
+
+    // §13e — Mutex round trip. Each worker takes the lock, bumps the
+    // shared counter, releases. Final value should be N_THREADS *
+    // BUMPS_PER_THREAD = 30.
+    let m = Arc::new(Mutex::new(0u32));
+    let workers: Vec<_> = (0..3)
+        .map(|tid| {
+            let m = m.clone();
+            std::thread::spawn(move || {
+                for _ in 0..10 {
+                    let mut g = m.lock().unwrap();
+                    *g += 1;
+                    drop(g);
+                    // tiny yield so the threads actually contend
+                    std::thread::yield_now();
+                }
+                println!("mutex worker {tid} done");
+            })
+        })
+        .collect();
+    for w in workers {
+        w.join().unwrap();
+    }
+    println!("post-mutex counter = {}", *m.lock().unwrap());
+
+    // §13e — Condvar round trip. Producer flips a flag and signals;
+    // consumer waits until the flag is true.
+    let pair = Arc::new((Mutex::new(false), Condvar::new()));
+    let pair2 = pair.clone();
+    let consumer = std::thread::spawn(move || {
+        let (lock, cvar) = &*pair2;
+        let mut started = lock.lock().unwrap();
+        while !*started {
+            started = cvar.wait(started).unwrap();
+        }
+        println!("condvar consumer woke");
+    });
+    let (lock, cvar) = &*pair;
+    {
+        let mut started = lock.lock().unwrap();
+        *started = true;
+        cvar.notify_one();
+        drop(started);
+    }
+    consumer.join().unwrap();
+    println!("condvar round trip done");
+
+    // §13e — RwLock smoke. One writer, two readers.
+    let rw = Arc::new(std::sync::RwLock::new(0u32));
+    let writer = {
+        let rw = rw.clone();
+        std::thread::spawn(move || {
+            let mut g = rw.write().unwrap();
+            *g = 99;
+        })
+    };
+    writer.join().unwrap();
+    let readers: Vec<_> = (0..2)
+        .map(|i| {
+            let rw = rw.clone();
+            std::thread::spawn(move || {
+                let g = rw.read().unwrap();
+                println!("rwlock reader {i} sees {}", *g);
+            })
+        })
+        .collect();
+    for r in readers {
+        r.join().unwrap();
+    }
+    println!("rwlock final = {}", *rw.read().unwrap());
+
+    // §13e — mpsc round trip. Producer ships 5 messages; consumer
+    // sums and reports. Channel internals layer on top of Mutex +
+    // Condvar so this is end-to-end coverage of the parking shape.
+    let (tx, rx) = std::sync::mpsc::channel::<u32>();
+    let producer = std::thread::spawn(move || {
+        for i in 1..=5 {
+            tx.send(i).unwrap();
+        }
+    });
+    let mut total = 0;
+    for v in rx {
+        total += v;
+    }
+    producer.join().unwrap();
+    println!("mpsc total = {total}");
+
+    // §13e — args + parallelism (read-only, no thread).
+    let args: Vec<_> = std::env::args_os().collect();
+    println!("argc = {}", args.len());
+    for (i, a) in args.iter().enumerate() {
+        println!("argv[{i}] = {}", a.to_string_lossy());
+    }
+    println!(
+        "available_parallelism = {}",
+        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0)
+    );
+
+    // §13e — HashMap. Backed by `hashmap_random_keys` which on orbit
+    // pulls a stack+heap address pair (low-quality entropy, but
+    // enough to bring HashMap up before a real RNG lands).
+    use std::collections::HashMap;
+    let mut h: HashMap<&'static str, u32> = HashMap::new();
+    h.insert("alpha", 1);
+    h.insert("beta", 2);
+    h.insert("gamma", 3);
+    let mut keys: Vec<_> = h.keys().copied().collect();
+    keys.sort();
+    let sum: u32 = h.values().sum();
+    println!("hashmap keys = {keys:?}");
+    println!("hashmap sum = {sum}");
+
+    // §13e — String formatting + sort + iteration over a heap-allocated
+    // slice. Catches any subtle alignment / unwind path that the
+    // earlier tests didn't exercise.
+    let mut nums: Vec<i32> = vec![5, 2, 8, 1, 9, 3];
+    nums.sort();
+    println!("sorted = {nums:?}");
+    let s: String = nums.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(",");
+    println!("joined = {s}");
+
+    // §13e — current thread identity. ThreadId's u64 accessor is
+    // unstable behind `thread_id_value`; print Debug for now.
+    let main_id = std::thread::current().id();
+    println!("main thread id = {main_id:?}");
+
+    // §13e — std::net::TcpStream::connect over the kernel's NetChannel
+    // primitive. Connect to QEMU's user-net gateway (which maps to host
+    // loopback) on a port the smoke harness has nc(1) listening on.
+    // Wait for DHCP first — NetChannel::open eats the DHCP-not-ready
+    // window in `state >= 2` polling, but a leading sleep is cheaper
+    // than 100ms+ of poll churn.
+    println!("waiting for net up...");
+    std::thread::sleep(std::time::Duration::from_secs(8));
+    use std::io::{Read, Write};
+    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream};
+    let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 168, 76, 2), 65535));
+    match TcpStream::connect(addr) {
+        Ok(mut s) => {
+            println!("tcp connected to {addr}");
+            if let Err(e) = s.write_all(b"hello-std over TcpStream!\n") {
+                println!("tcp write failed: {e}");
+            }
+            let mut buf = [0u8; 64];
+            match s.read(&mut buf) {
+                Ok(n) => {
+                    let txt = String::from_utf8_lossy(&buf[..n]);
+                    println!("tcp got {n} bytes: {txt:?}");
+                }
+                Err(e) => println!("tcp read failed: {e}"),
+            }
+        }
+        Err(e) => println!("tcp connect failed: {e}"),
+    }
+
+    // §13e — TcpListener round-trip. Bind to port 7778, accept one
+    // peer, echo what they send. The host driver sends a single
+    // line and disconnects.
+    use std::net::TcpListener;
+    match TcpListener::bind(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 7778))) {
+        Ok(listener) => {
+            println!("listener bound on :7778");
+            match listener.accept() {
+                Ok((mut peer, peer_addr)) => {
+                    println!("accepted peer {peer_addr}");
+                    let mut req = [0u8; 128];
+                    match peer.read(&mut req) {
+                        Ok(n) => {
+                            let txt = String::from_utf8_lossy(&req[..n]);
+                            println!("listener got {n} bytes: {txt:?}");
+                            let _ = peer.write_all(b"echo-back from listener\n");
+                        }
+                        Err(e) => println!("listener read failed: {e}"),
+                    }
+                }
+                Err(e) => println!("accept failed: {e}"),
+            }
+        }
+        Err(e) => println!("listener bind failed: {e}"),
+    }
+
+    // FIXME: `std::process::exit(0)` here faults inside std's
+    // at-exit cleanup (cause=2 stval=0 — null fn call, likely an
+    // unregistered hook). Plain return-from-main works because the
+    // PAL's `_start` calls `abi::exit(code)` directly without
+    // walking the cleanup chain. Investigate the cleanup-hook
+    // dispatch path before we promote `std::process::exit` to
+    // canonical.
+    println!("hello-std done; returning cleanly");
+}

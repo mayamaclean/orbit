@@ -4,3 +4,17 @@ version = "0.1.0"
 edition = "2024"
 
 [lib]
+
+# When pulled in as a dependency of std (target_os = "orbit") inside the
+# rustc tree, std needs orbit-abi to bind `core` to the
+# `rustc-std-workspace-core` stand-in instead of the regular `core` rlib.
+# The `rustc-dep-of-std` feature toggles that swap. Outside the rustc
+# tree this feature stays off and the crate behaves as a normal
+# `no_std` lib. We don't pull `compiler_builtins` because the crate is
+# pure constants + inline `asm!` — nothing in here calls a builtin.
+[features]
+default = []
+rustc-dep-of-std = ["core"]
+
+[dependencies]
+core = { version = "1.0.0", optional = true, package = "rustc-std-workspace-core" }

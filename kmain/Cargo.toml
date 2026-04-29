@@ -36,3 +36,7 @@ spin = { version = "0.10", default-features = false, features = ["spin_mutex", "
 # need a host-side sender.
 default = []
 smoke   = []
+# Embed the §13e-stage hello-std binary (built against the
+# `riscv64gc-unknown-orbit` triple via the local rustc fork) instead of
+# orbit-loader / umode. Used to verify the std PAL boots end-to-end.
+hello-std = []

@@ -674,6 +674,7 @@ pub fn create_thread<H: Hardware>(
         entry: frame.regs[11],
         allowed_affinity: frame.regs[12] as u64,
         affinity: frame.regs[13] as u64,
+        arg: frame.regs[14],
     };
     if !user_range_ok(req.entry as u64, 1) {
         return SyscallOutcome::Return { ret: Errno::new(EFAULT).to_ret() };

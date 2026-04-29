@@ -38,7 +38,7 @@ use core::{alloc::Layout, ptr::NonNull, sync::atomic::{AtomicBool, Ordering}};
 
 use alloc::vec::Vec;
 
-use net_channel::{BindSpec, NetChannel, NC_MAX_REGION_SIZE, NC_MIN_REGION_SIZE};
+use net_channel::{BindSpec, NetChannel, NC_MAX_REGION_SIZE, NC_MIN_REGION_SIZE, channel_state};
 use orbit_abi::{
     Errno, Fd,
     errno::{EAGAIN, EBUSY, EINVAL, EIO},
@@ -149,10 +149,11 @@ impl NetCh {
         self.descriptor
     }
 
-    /// Raw `current.state`. `0` is idle (server: kernel listening; client
-    /// retain: between reconnects), `1` is in-flight, `2` is an active
-    /// session, negative is a sticky terminal failure. Mostly useful for
-    /// diagnostics — normal callers go through [`next_session`].
+    /// Raw `current.state`. See [`net_channel::channel_state`] for
+    /// the value map: `IDLE` (0), `IN_FLIGHT` (1), `ACTIVE` (2),
+    /// `CLOSING` (3 — graceful-close drain), `FAILED` (-1).
+    /// Mostly useful for diagnostics; normal callers go through
+    /// [`next_session`].
     pub fn current_state(&self) -> i32 {
         self.channel()
             .current()
@@ -196,10 +197,10 @@ impl NetCh {
         self.channel().engage();
         loop {
             let s = self.current_state();
-            if s >= 2 {
+            if s == channel_state::ACTIVE {
                 return Ok(Session { nc: self });
             }
-            if s < 0 {
+            if s == channel_state::FAILED {
                 // Failed before we could claim: release the in-session
                 // guard and surface the error.
                 self.channel().disengage();
@@ -420,7 +421,13 @@ impl Drop for Session<'_> {
         nc.channel().disengage();
 
         for _ in 0..100 {
-            if nc.current_state() != 2 {
+            // Wait for the kernel to leave both ACTIVE *and* CLOSING
+            // — the older `!= ACTIVE` shape raced a still-draining
+            // smoltcp socket against the next session's `engage` and
+            // dropped the last `write_all`. See
+            // [`net_channel::channel_state::CLOSING`].
+            let s = nc.current_state();
+            if s != channel_state::ACTIVE && s != channel_state::CLOSING {
                 break;
             }
             // Drop can't propagate `?`; ignore EINTR-equivalent errors

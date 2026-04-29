@@ -344,13 +344,44 @@ pub fn create_thread(
     allowed_affinity: u64,
     affinity: u64,
 ) -> Result<u32, Errno> {
-    Errno::from_ret(unsafe { ecall3(
-        syscall::CREATE_THREAD,
-        entry as usize,
-        allowed_affinity as usize,
-        affinity as usize,
-    )})
-        .map(|t| t as u32)
+    create_thread_with_arg(
+        unsafe {
+            // SAFETY: layout of `extern "C" fn() -> !` and
+            // `extern "C" fn(usize) -> !` is identical at the
+            // calling-convention level; the new entry just ignores
+            // its a0. The cast is purely a type-system relaxation so
+            // existing call sites that don't care about `arg` keep
+            // compiling.
+            core::mem::transmute::<extern "C" fn() -> !, extern "C" fn(usize) -> !>(entry)
+        },
+        0,
+        allowed_affinity,
+        affinity,
+    )
+}
+
+/// Spawn a sibling thread that enters at `entry` with `arg` in `a0`.
+/// Same affinity rules as [`create_thread`]; the kernel writes `arg`
+/// into the new thread's `a0` (x10) before its first sret, so the
+/// entry can read it as its first C-ABI argument. `std::thread::spawn`
+/// uses this to hand the new thread a `Box<ThreadInit>` pointer.
+#[inline]
+pub fn create_thread_with_arg(
+    entry: extern "C" fn(usize) -> !,
+    arg: usize,
+    allowed_affinity: u64,
+    affinity: u64,
+) -> Result<u32, Errno> {
+    Errno::from_ret(unsafe {
+        ecall4(
+            syscall::CREATE_THREAD,
+            entry as usize,
+            allowed_affinity as usize,
+            affinity as usize,
+            arg,
+        )
+    })
+    .map(|t| t as u32)
 }
 
 /// Park the calling thread on `uaddr` if `*uaddr == expected`. The
