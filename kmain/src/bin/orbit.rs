@@ -54,6 +54,18 @@ fn setup_interrupts() {
         riscv::register::sie::set_ssoft();
         riscv::register::sie::set_stimer();
         riscv::register::sstatus::set_sie();
+
+        // §13a.4 — set scounteren.TM as forward-prep. By itself this
+        // is *not* enough on QEMU virt: the `time` CSR is spec'd as a
+        // view onto CLINT mtime, not a hardware register, so U-mode
+        // `csrr time` still traps even with the permission bit set —
+        // it needs an emulation handler (M-mode or S-mode reads
+        // mtime, writes the user's rd, bumps epc) we don't have yet.
+        // Keeping the bit on now means the day that handler lands,
+        // U-mode rdtime starts working without another CSR write.
+        // CY (rdcycle) and IR (rdinstret) stay disabled — both are
+        // useful side-channels we don't expose by default.
+        riscv::register::scounteren::set_tm();
     }
 }
 

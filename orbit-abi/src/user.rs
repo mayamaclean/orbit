@@ -467,6 +467,13 @@ pub fn wait_pid(pid: u16) -> Result<i32, Errno> {
 /// timing) that don't want platform-coupled raw ticks. For wallclock,
 /// add a future `get_realtime` syscall — `get_micros` is monotonic
 /// only, no time-of-day offset.
+///
+/// A direct `csrr time` from U-mode (the §13a.4 zero-syscall idea)
+/// is gated behind a CSR-emulation handler we don't have yet —
+/// QEMU's virt machine traps `rdtime` to M-mode for emulation even
+/// with `scounteren.TM` set, because the `time` CSR is spec'd as a
+/// view onto CLINT mtime, not a hardware register. The syscall is
+/// the canonical clock until that lands.
 #[inline]
 pub fn get_micros() -> u64 {
     let r = unsafe { ecall1(syscall::GET_MICROS, 0) };
