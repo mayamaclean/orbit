@@ -24,12 +24,17 @@ pub const CREATE_PROCESS:  usize = 4099;
 pub const NC_YIELD:        usize = 4100;
 pub const QUERY_STATS:         usize = 4101;
 pub const QUERY_SYSCALL_STATS: usize = 4102;
+pub const CREATE_PROCESS_EX:   usize = 4103;
+pub const ARGV_ENVP:           usize = 4104;
 
 // 5000+ — multi-thread / SMP control plane. Numbered out of the 4096
 // block so the categorical split is obvious in dispatch tables and so
 // future single-process-spanning syscalls (futex wake/wait, etc.)
 // share the same range.
 pub const CREATE_THREAD:   usize = 5000;
+pub const GETPID:          usize = 5001;
+pub const GETTID:          usize = 5002;
+pub const WAIT_PID:        usize = 5003;
 
 // 6000+ — filesystem. v1 is read-only tarfs; close re-uses
 // `CLOSE_HANDLE = 4098` (handle table is shared across NetCh / file
@@ -57,7 +62,12 @@ pub enum Sysno {
     NcYield        = NC_YIELD,
     QueryStats        = QUERY_STATS,
     QuerySyscallStats = QUERY_SYSCALL_STATS,
+    CreateProcessEx = CREATE_PROCESS_EX,
+    ArgvEnvp        = ARGV_ENVP,
     CreateThread   = CREATE_THREAD,
+    GetPid         = GETPID,
+    GetTid         = GETTID,
+    WaitPid        = WAIT_PID,
     FsOpen         = FS_OPEN,
     FsRead         = FS_READ,
     FsStat         = FS_STAT,
@@ -82,7 +92,12 @@ impl Sysno {
             NC_YIELD       => Self::NcYield,
             QUERY_STATS         => Self::QueryStats,
             QUERY_SYSCALL_STATS => Self::QuerySyscallStats,
+            CREATE_PROCESS_EX => Self::CreateProcessEx,
+            ARGV_ENVP      => Self::ArgvEnvp,
             CREATE_THREAD  => Self::CreateThread,
+            GETPID         => Self::GetPid,
+            GETTID         => Self::GetTid,
+            WAIT_PID       => Self::WaitPid,
             FS_OPEN        => Self::FsOpen,
             FS_READ        => Self::FsRead,
             FS_STAT        => Self::FsStat,
@@ -116,6 +131,11 @@ impl Sysno {
             Self::FsOpen            => 17,
             Self::FsRead            => 18,
             Self::FsStat            => 19,
+            Self::GetPid            => 20,
+            Self::GetTid            => 21,
+            Self::WaitPid           => 22,
+            Self::CreateProcessEx   => 23,
+            Self::ArgvEnvp          => 24,
         }
     }
 
@@ -124,7 +144,7 @@ impl Sysno {
     /// when adding a `Sysno` variant. Older userland with a smaller
     /// COUNT reads a prefix of the kernel's table; newer userland with
     /// a larger COUNT treats the kernel's missing slots as zero.
-    pub const COUNT: usize = 20;
+    pub const COUNT: usize = 25;
 }
 
 #[cfg(test)]
@@ -153,15 +173,20 @@ mod tests {
         assert_eq!(Sysno::from_usize(FS_OPEN),  Some(Sysno::FsOpen));
         assert_eq!(Sysno::from_usize(FS_READ),  Some(Sysno::FsRead));
         assert_eq!(Sysno::from_usize(FS_STAT),  Some(Sysno::FsStat));
+        assert_eq!(Sysno::from_usize(GETPID),   Some(Sysno::GetPid));
+        assert_eq!(Sysno::from_usize(GETTID),   Some(Sysno::GetTid));
+        assert_eq!(Sysno::from_usize(WAIT_PID), Some(Sysno::WaitPid));
+        assert_eq!(Sysno::from_usize(CREATE_PROCESS_EX), Some(Sysno::CreateProcessEx));
+        assert_eq!(Sysno::from_usize(ARGV_ENVP),         Some(Sysno::ArgvEnvp));
     }
 
     #[test]
     fn unknown_returns_none() {
         assert_eq!(Sysno::from_usize(9), None);
         assert_eq!(Sysno::from_usize(4095), None);
-        assert_eq!(Sysno::from_usize(4103), None);
+        assert_eq!(Sysno::from_usize(4105), None);
         assert_eq!(Sysno::from_usize(4999), None);
-        assert_eq!(Sysno::from_usize(5001), None);
+        assert_eq!(Sysno::from_usize(5004), None);
         assert_eq!(Sysno::from_usize(5999), None);
         assert_eq!(Sysno::from_usize(6003), None);
         assert_eq!(Sysno::from_usize(usize::MAX), None);
@@ -189,6 +214,11 @@ mod tests {
         assert_eq!(Sysno::FsOpen            as usize, FS_OPEN);
         assert_eq!(Sysno::FsRead            as usize, FS_READ);
         assert_eq!(Sysno::FsStat            as usize, FS_STAT);
+        assert_eq!(Sysno::GetPid            as usize, GETPID);
+        assert_eq!(Sysno::GetTid            as usize, GETTID);
+        assert_eq!(Sysno::WaitPid           as usize, WAIT_PID);
+        assert_eq!(Sysno::CreateProcessEx   as usize, CREATE_PROCESS_EX);
+        assert_eq!(Sysno::ArgvEnvp          as usize, ARGV_ENVP);
     }
 
     #[test]
@@ -215,6 +245,11 @@ mod tests {
         assert_eq!(FS_OPEN, 6000);
         assert_eq!(FS_READ, 6001);
         assert_eq!(FS_STAT, 6002);
+        assert_eq!(GETPID, 5001);
+        assert_eq!(GETTID, 5002);
+        assert_eq!(WAIT_PID, 5003);
+        assert_eq!(CREATE_PROCESS_EX, 4103);
+        assert_eq!(ARGV_ENVP, 4104);
     }
 
     #[test]
@@ -228,7 +263,8 @@ mod tests {
             Sysno::CreateNetch, Sysno::CloseHandle, Sysno::CreateProcess,
             Sysno::NcYield, Sysno::QueryStats, Sysno::QuerySyscallStats,
             Sysno::CreateThread, Sysno::GetMicros, Sysno::FsOpen,
-            Sysno::FsRead, Sysno::FsStat,
+            Sysno::FsRead, Sysno::FsStat, Sysno::GetPid, Sysno::GetTid,
+            Sysno::WaitPid, Sysno::CreateProcessEx, Sysno::ArgvEnvp,
         ];
         assert_eq!(all.len(), Sysno::COUNT);
         let mut seen = [false; Sysno::COUNT];

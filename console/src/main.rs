@@ -28,14 +28,15 @@ use core::panic::PanicInfo;
 use orbit_abi::{
     fs::Stat,
     logln,
+    syscall_stats::payload_size,
     user::{
         close_handle, console_write, ConsoleWriter, create_process, exit, fs_open, fs_read,
-        fs_stat, query_stats, read_stdin, sleep_ms,
+        fs_stat, query_stats, query_syscall_stats, read_stdin, sleep_ms, wait_pid,
     },
 };
 use core::fmt::Write;
 
-const PROMPT: &[u8] = b"console$ ";
+const PROMPT: &[u8] = b"console@orbit $ ";
 
 /// One PIPE_BUF chunk. `console_write` rejects `len > 4096` with EINVAL,
 /// so any longer payload has to be split before the syscall.
@@ -157,6 +158,79 @@ fn stats_cmd() {
     w.flush();
 }
 
+/// Map a `Sysno::ordinal()` value back to a human-readable name.
+/// Kept in sync with the match arms in `Sysno::ordinal` — appending a
+/// new variant there means appending one row here.
+fn syscall_name(ordinal: usize) -> &'static str {
+    match ordinal {
+        0 => "exit",
+        1 => "serial_print",
+        2 => "sleep_ms",
+        3 => "console_write",
+        4 => "read_stdin",
+        5 => "set_affinity",
+        6 => "get_affinity",
+        7 => "get_hart_id",
+        8 => "mmap",
+        9 => "create_netch",
+        10 => "close_handle",
+        11 => "create_process",
+        12 => "nc_yield",
+        13 => "query_stats",
+        14 => "query_syscall_stats",
+        15 => "create_thread",
+        16 => "get_micros",
+        17 => "fs_open",
+        18 => "fs_read",
+        19 => "fs_stat",
+        20 => "getpid",
+        21 => "gettid",
+        _ => "?",
+    }
+}
+
+/// Snapshot the kernel's per-syscall counters and dump them as a table.
+/// Buffer is sized for the kernel this binary was built against; a
+/// newer kernel writes a prefix (header reports the row count it
+/// actually filled), an older one fills fewer rows than `Sysno::COUNT`.
+fn syscall_stats_cmd() {
+    const BUF_LEN: usize = payload_size();
+    let mut buf = [0u8; BUF_LEN];
+    let (header, entries) = match query_syscall_stats(&mut buf) {
+        Ok(r) => r,
+        Err(e) => {
+            let mut w = LineWriter::new();
+            let _ = writeln!(w, "syscall-stats: query failed (errno {})", e.0);
+            w.flush();
+            return;
+        }
+    };
+
+    let n = core::cmp::min(header.count as usize, entries.len());
+    // 10 MHz `time` CSR — same conversion as stats_cmd.
+    let to_ms = |ticks: u64| ticks / 10_000;
+
+    let mut w = LineWriter::new();
+    let _ = writeln!(
+        w,
+        "{:<22}{:>12}{:>14}{:>12}",
+        "syscall", "count", "total_ms", "avg_us",
+    );
+    for i in 0..n {
+        let e = &entries[i];
+        let avg_us = if e.count > 0 { (e.total_ticks / e.count) / 10 } else { 0 };
+        let _ = writeln!(
+            w,
+            "{:<22}{:>12}{:>14}{:>12}",
+            syscall_name(i),
+            e.count,
+            to_ms(e.total_ticks),
+            avg_us,
+        );
+    }
+    w.flush();
+}
+
 /// `Display` shim for byte counts. Picks B / KiB / MiB based on the
 /// magnitude — keeps the column width predictable without forcing the
 /// user to count digits.
@@ -240,9 +314,10 @@ fn slurp_file(path: &str) -> Result<alloc::vec::Vec<u8>, &'static str> {
     Ok(buf)
 }
 
-/// Resolve `path` against the mounted FS, read it, and hand the bytes
-/// to `create_process`. Spawn-and-detach (no `wait_pid` until §13a),
-/// so we print the new pid and re-prompt — child runs concurrently.
+/// Resolve `path` against the mounted FS, read it, hand the bytes to
+/// `create_process`, and block on `wait_pid` for the child's exit
+/// status. Foreground execution — interactive shell shape; the
+/// `&` background-spawn case is a future addition.
 fn exec_path(path: &str) {
     let elf = match slurp_file(path) {
         Ok(b) => b,
@@ -255,15 +330,24 @@ fn exec_path(path: &str) {
             return;
         }
     };
-    match create_process(elf.as_ptr(), elf.len(), 0, 0) {
-        Ok(pid) => {
+    let pid = match create_process(elf.as_ptr(), elf.len(), 0, 0) {
+        Ok(p) => p,
+        Err(e) => {
             let mut w = LineWriter::new();
-            let _ = writeln!(w, "exec: spawned {} pid={}", path, pid);
+            let _ = writeln!(w, "exec: create_process {}: errno {}", path, e.0);
+            w.flush();
+            return;
+        }
+    };
+    match wait_pid(pid) {
+        Ok(code) => {
+            let mut w = LineWriter::new();
+            let _ = writeln!(w, "exec: {} exited {}", path, code);
             w.flush();
         }
         Err(e) => {
             let mut w = LineWriter::new();
-            let _ = writeln!(w, "exec: create_process {}: errno {}", path, e.0);
+            let _ = writeln!(w, "exec: wait_pid {} errored: errno {}", pid, e.0);
             w.flush();
         }
     }
@@ -293,7 +377,7 @@ fn dispatch(line: &[u8]) {
             write_chunked(b"\n");
         }
         "help" => {
-            write_chunked(b"builtins: echo <text>, help, clear, stats\n");
+            write_chunked(b"builtins: echo <text>, help, clear, stats, syscall-stats\n");
             write_chunked(b"exec: type a path starting with /, e.g. /bin/hello\n");
         }
         "clear" => {
@@ -301,6 +385,7 @@ fn dispatch(line: &[u8]) {
             write_chunked(b"\x0c");
         }
         "stats" => stats_cmd(),
+        "syscall-stats" => syscall_stats_cmd(),
         _ => {
             write_chunked(b"unknown command: ");
             write_chunked(cmd.as_bytes());

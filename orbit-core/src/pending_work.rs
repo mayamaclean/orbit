@@ -91,6 +91,15 @@ pub struct FsStatReq {
 pub const MAX_FS_PATH_LEN: usize = 256;
 
 #[derive(Debug, Clone, Copy)]
+pub struct WaitPidReq {
+    /// Pid to wait on. Manager validates that the caller is the
+    /// parent (returns EPERM otherwise) and that the pid currently
+    /// exists (ECHILD if not — covers both never-existed and
+    /// already-reaped).
+    pub target_pid: u16,
+}
+
+#[derive(Debug, Clone, Copy)]
 pub struct CreateProcessReq {
     pub elf_vaddr: usize,
     pub elf_len: usize,
@@ -105,6 +114,23 @@ pub struct CreateProcessReq {
     /// affinity bit that escapes allowed_affinity surfaces as EINVAL
     /// rather than silently widening the cap.
     pub allowed_affinity: u64,
+}
+
+/// `CreateProcessReq` plus a packed argv blob. v1 carries no envp;
+/// the field is reserved by the matching `argv_envp` syscall name
+/// (the kernel can extend the blob format later without bumping the
+/// syscall number).
+#[derive(Debug, Clone, Copy)]
+pub struct CreateProcessExReq {
+    pub elf_vaddr: usize,
+    pub elf_len: usize,
+    pub allowed_affinity: u64,
+    pub affinity: u64,
+    /// User VA of the packed argv blob (see `orbit_abi::argv`).
+    /// `0` / `len == 0` means "no argv" — equivalent to
+    /// `CREATE_PROCESS`.
+    pub argv_vaddr: usize,
+    pub argv_len: usize,
 }
 
 /// One slot in the manager's MPSC work ring. Fixed-size by virtue of
@@ -171,6 +197,24 @@ pub enum PendingWork {
     },
     FsStat {
         req: FsStatReq,
+        pid: u16,
+        root_pa: u64,
+        handle: CompletionHandle,
+    },
+    WaitPid {
+        req: WaitPidReq,
+        /// Caller's pid — manager checks this against the target's
+        /// `parent_pid` for the EPERM gate.
+        pid: u16,
+        /// Caller's handle. On success the manager installs this on
+        /// the target's `exit_waiter` slot and returns without
+        /// signaling — `dealloc_process` signals it later with the
+        /// child's exit code. Sync errors (ECHILD / EPERM / EBUSY)
+        /// signal here in the manager arm.
+        handle: CompletionHandle,
+    },
+    CreateProcessEx {
+        req: CreateProcessExReq,
         pid: u16,
         root_pa: u64,
         handle: CompletionHandle,

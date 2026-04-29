@@ -135,12 +135,27 @@ MARKERS=(
   'PASS: fs close /bin/hello.txt fd='
   'PASS: fs_open missing got Err\(errno=2\)'
   '=== fs smoke done ==='
+  # §13a.1 — getpid/gettid land synchronously off the per-hart context.
+  'PASS: getpid main got 1'
+  'PASS: gettid main got [0-9]+ \(stable across calls\)'
+  # §13a.2 wait_pid — happy path picks up hello's exit(42), error
+  # paths cover EINVAL (self-wait) / ECHILD (missing or post-reap).
+  'PASS: exec_smoke wait_pid pid=[0-9]+ got 42'
+  'PASS: wait_pid self got Err\(errno=22\)'
+  'PASS: wait_pid missing got Err\(errno=10\)'
+  'PASS: wait_pid post-reap got Err\(errno=10\)'
   # §12e exec — read /bin/hello off the disk, hand to create_process,
   # child prints its own marker.
   'PASS: exec_smoke fs_stat /bin/hello size='
   'PASS: exec_smoke read [0-9]+ bytes from /bin/hello'
   'PASS: exec_smoke ELF magic present'
-  'PASS: exec_smoke create_process pid='
+  'PASS: exec_smoke create_process_with_argv pid='
+  # §13a.3 hello-side argv prints. argc=3 corresponds to the
+  # ["/bin/hello", "world", "peace"] blob umode packs.
+  'USER\[2\.[0-9]+\]: hello argc=3'
+  'USER\[2\.[0-9]+\]: hello argv\[0\]=/bin/hello'
+  'USER\[2\.[0-9]+\]: hello argv\[1\]=world'
+  'USER\[2\.[0-9]+\]: hello argv\[2\]=peace'
   'USER\[2\.[0-9]+\]: hello from /bin/hello'
   '=== exec smoke done ==='
   'USER\[1\]: hello world!'

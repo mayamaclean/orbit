@@ -20,7 +20,22 @@ pub unsafe extern "C" fn _start() -> ! {
     // framebuffer scrollback when the source gets torn down, so go
     // straight to the kernel serial log instead.
     serialln!("hello from /bin/hello");
-    exit(0);
+
+    // §13a.3 — print argv. Each line is a separate serialln so
+    // cross-hart interleaving can't split a single arg across
+    // entries. `argc` is logged first so the smoke harness can pin
+    // on it.
+    let args = orbit_rt::argv::args();
+    serialln!("hello argc={}", args.len());
+    for (i, arg) in args.iter().enumerate() {
+        let s = core::str::from_utf8(arg).unwrap_or("<non-utf8>");
+        serialln!("hello argv[{i}]={s}");
+    }
+
+    // Distinct value so §13a.2's wait_pid smoke can verify the
+    // exit-code path through dealloc_process → exit_waiter →
+    // signal_pair → wake_blocked_inline → user a1.
+    exit(42);
 }
 
 #[panic_handler]

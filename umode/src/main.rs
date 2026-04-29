@@ -9,10 +9,10 @@ use core::cell::Cell;
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
-use orbit_abi::errno::{Errno, EBADF, EFAULT, EINVAL, EPERM, ENOENT};
+use orbit_abi::errno::{Errno, EBADF, ECHILD, EFAULT, EINVAL, EPERM, ENOENT};
 use orbit_abi::fs::{S_IFDIR, S_IFMT, S_IFREG, Stat};
 use orbit_abi::net::SockType;
-use orbit_abi::{logln, user::{close_handle, create_process, create_thread, exit, fs_open, fs_read, fs_stat, get_affinity, get_hart_id, set_affinity, sleep_ms, console_write, serial_print, ConsoleWriter}};
+use orbit_abi::{logln, user::{close_handle, create_process, create_process_with_argv, create_thread, exit, fs_open, fs_read, fs_stat, get_affinity, get_hart_id, getpid, gettid, set_affinity, sleep_ms, console_write, serial_print, wait_pid, ConsoleWriter}};
 use net_channel::BindSpec;
 use orbit_rt::netch::NetCh;
 
@@ -605,6 +605,29 @@ fn run_fs_smoke() {
     logln!("=== fs smoke done ===");
 }
 
+/// §13a.1 identity probe. Calls `getpid` and `gettid` from the main
+/// thread, asserts pid is the boot pid (1) and tid is non-zero +
+/// stable across calls. tid is system-global (matches Linux's
+/// `gettid()` shape), so its absolute value depends on how many
+/// kernel threads — k_net etc. — got allocated tids before umode
+/// started; assert nonzero and stability instead of a fixed value.
+fn run_identity_probe() {
+    let pid = getpid();
+    if pid == 1 {
+        logln!("PASS: getpid main got {pid}");
+    } else {
+        logln!("FAIL: getpid main got {pid} (want 1)");
+    }
+
+    let tid_a = gettid();
+    let tid_b = gettid();
+    if tid_a > 0 && tid_a == tid_b {
+        logln!("PASS: gettid main got {tid_a} (stable across calls)");
+    } else {
+        logln!("FAIL: gettid main got {tid_a} then {tid_b}");
+    }
+}
+
 /// §12e exec smoke: read `/bin/hello` (a real ELF on the disk image)
 /// and hand it to `create_process`. Spawn-only flavor — no `wait_pid`
 /// yet, so we just sleep briefly for the child to print its marker.
@@ -671,19 +694,50 @@ fn run_exec_smoke() {
     }
     logln!("PASS: exec_smoke ELF magic present");
 
-    // create_process — spawn-and-detach. wait_pid lands with §13a.
-    match create_process(elf.as_ptr(), elf.len(), 0, 0) {
-        Ok(pid) => logln!("PASS: exec_smoke create_process pid={pid}"),
+    // §13a.3 — pack argv ["world", "peace"] (hello's own path lands
+    // implicitly as argv[0] later if a convention emerges; v1 just
+    // packs whatever umode hands in). Spawn via create_process_ex.
+    let mut argv_buf = [0u8; 256];
+    let argv_args: [&[u8]; 3] = [b"/bin/hello", b"world", b"peace"];
+    let argv_len = orbit_abi::argv::pack(&argv_args, &mut argv_buf)
+        .expect("argv blob fits in 256 bytes");
+    let argv_blob = &argv_buf[..argv_len];
+
+    let child_pid = match create_process_with_argv(elf.as_ptr(), elf.len(), 0, 0, argv_blob) {
+        Ok(pid) => {
+            logln!("PASS: exec_smoke create_process_with_argv pid={pid}");
+            pid
+        }
         Err(e) => {
-            logln!("FAIL: exec_smoke create_process: {e:?}");
+            logln!("FAIL: exec_smoke create_process_with_argv: {e:?}");
             return;
         }
+    };
+
+    // §13a.2 — block until the child exits. Validates the full chain:
+    // dealloc_process takes exit_waiter, signal_pair fires the wake
+    // hook, the parked thread resumes with exit_code in a1.
+    match wait_pid(child_pid) {
+        Ok(42) => logln!("PASS: exec_smoke wait_pid pid={child_pid} got 42"),
+        Ok(n) => logln!("FAIL: exec_smoke wait_pid got {n} (want 42)"),
+        Err(e) => logln!("FAIL: exec_smoke wait_pid errored: {e:?}"),
     }
 
-    // Give the child a beat to run + print. Without wait_pid this is
-    // the cheapest synchronizer; the smoke harness will see the
-    // child's marker arrive before the next umode logln below.
-    let _ = sleep_ms(100);
+    // wait_pid error paths. Self-wait → EINVAL, missing pid → ECHILD,
+    // post-reap of the same child → ECHILD (no zombies in v1 — once
+    // dealloc_process runs, the Process is gone).
+    match wait_pid(getpid()) {
+        Err(Errno(e)) if e == EINVAL => logln!("PASS: wait_pid self got Err(errno={EINVAL})"),
+        other => logln!("FAIL: wait_pid self got {other:?}"),
+    }
+    match wait_pid(9999) {
+        Err(Errno(e)) if e == ECHILD => logln!("PASS: wait_pid missing got Err(errno={ECHILD})"),
+        other => logln!("FAIL: wait_pid missing got {other:?}"),
+    }
+    match wait_pid(child_pid) {
+        Err(Errno(e)) if e == ECHILD => logln!("PASS: wait_pid post-reap got Err(errno={ECHILD})"),
+        other => logln!("FAIL: wait_pid post-reap got {other:?}"),
+    }
 
     logln!("=== exec smoke done ===");
 }
@@ -694,6 +748,11 @@ pub unsafe extern "C" fn _start() -> ! {
     logln!("hello world!");
 
     run_heap_smoke();
+
+    // §13a.1 identity probe — runs before any worker thread spawns so
+    // the main thread's tid is deterministic (= 1, the first tid the
+    // kernel allocates). umode is the boot pid, so getpid() == 1.
+    run_identity_probe();
 
     run_fs_smoke();
 

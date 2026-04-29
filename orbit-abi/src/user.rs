@@ -83,6 +83,38 @@ pub unsafe fn ecall3(code: usize, arg0: usize, arg1: usize, arg2: usize) -> isiz
     r
 }
 
+/// Six-argument syscall returning an `isize` in `a0`. RISC-V's
+/// calling convention has plenty of arg registers (a0..a7); used by
+/// `create_process_with_argv` so the kernel can read elf + affinity
+/// + argv-blob fields in one trap without the caller marshalling
+/// them through user memory first.
+#[inline]
+pub unsafe fn ecall6(
+    code: usize,
+    arg0: usize,
+    arg1: usize,
+    arg2: usize,
+    arg3: usize,
+    arg4: usize,
+    arg5: usize,
+) -> isize {
+    let r: isize;
+    unsafe {
+        asm!(
+            "ecall",
+            in("a0") code,
+            in("a1") arg0,
+            in("a2") arg1,
+            in("a3") arg2,
+            in("a4") arg3,
+            in("a5") arg4,
+            in("a6") arg5,
+            lateout("a0") r,
+        );
+    }
+    r
+}
+
 /// Four-argument syscall returning an `isize` in `a0`.
 #[inline]
 pub unsafe fn ecall4(code: usize, arg0: usize, arg1: usize, arg2: usize, arg3: usize) -> isize {
@@ -111,6 +143,26 @@ pub unsafe fn ecall0_ret2(code: usize) -> (isize, isize) {
         asm!(
             "ecall",
             in("a0") code,
+            lateout("a0") r0,
+            lateout("a1") r1,
+        );
+    }
+    (r0, r1)
+}
+
+/// One-argument syscall returning a pair of `isize` in `a0, a1`.
+/// Used by `wait_pid` to return `(status_or_errno, exit_code)` in one
+/// trap — keeps exit-code encoding orthogonal to the errno-via-negative
+/// convention.
+#[inline]
+pub unsafe fn ecall1_ret2(code: usize, arg0: usize) -> (isize, isize) {
+    let r0: isize;
+    let r1: isize;
+    unsafe {
+        asm!(
+            "ecall",
+            in("a0") code,
+            in("a1") arg0,
             lateout("a0") r0,
             lateout("a1") r1,
         );
@@ -322,6 +374,87 @@ pub fn set_affinity(mask: u64) -> Result<(), Errno> {
 pub fn get_hart_id() -> u32 {
     let r = unsafe { ecall1(syscall::GET_HART_ID, 0) };
     r as u32
+}
+
+/// Return the calling process's pid. Stable for the process's
+/// lifetime — unlike [`get_hart_id`], which changes whenever the
+/// scheduler migrates the thread. Backs `std::process::id()`.
+#[inline]
+pub fn getpid() -> u16 {
+    let r = unsafe { ecall1(syscall::GETPID, 0) };
+    r as u16
+}
+
+/// Return the calling thread's tid. System-wide unique (not
+/// per-process), stable for the thread's lifetime. Backs
+/// `std::thread::current().id()`.
+#[inline]
+pub fn gettid() -> u32 {
+    let r = unsafe { ecall1(syscall::GETTID, 0) };
+    r as u32
+}
+
+/// Spawn a child process with command-line arguments. Same shape as
+/// [`create_process`] otherwise; `argv_blob` is the packed bytes
+/// described in [`crate::argv`] (header + offsets + string table).
+/// Pass an empty slice for arg-less spawn (matches `create_process`).
+///
+/// # Safety
+/// `elf_ptr`/`elf_len` must point to a valid mapped ELF range.
+/// `argv_blob` must be a self-contained packed blob — the kernel
+/// validates its `argc` field but trusts the offsets/strings to land
+/// inside `argv_blob.len()`. Malformed offsets surface as `EINVAL`.
+#[inline]
+pub fn create_process_with_argv(
+    elf_ptr: *const u8,
+    elf_len: usize,
+    allowed_affinity: u64,
+    affinity: u64,
+    argv_blob: &[u8],
+) -> Result<u16, Errno> {
+    Errno::from_ret(unsafe {
+        ecall6(
+            syscall::CREATE_PROCESS_EX,
+            elf_ptr as usize,
+            elf_len,
+            allowed_affinity as usize,
+            affinity as usize,
+            argv_blob.as_ptr() as usize,
+            argv_blob.len(),
+        )
+    })
+    .map(|p| p as u16)
+}
+
+/// Return the user VA where the kernel mapped this process's argv
+/// blob, or `0` if no argv was provided. Always reads the same value
+/// for a given process — orbit-rt's startup caches the result. v1
+/// returns either `0` or [`crate::layout::USER_ARGV_BASE`].
+#[inline]
+pub fn argv_envp() -> usize {
+    let r = unsafe { ecall1(syscall::ARGV_ENVP, 0) };
+    r as usize
+}
+
+/// Block the caller until child process `pid` exits, then return the
+/// child's exit code. Errnos:
+/// - `ECHILD` — `pid` doesn't exist (never existed or already reaped).
+///   v1 has no zombies; a child whose parent never waited is reaped
+///   immediately on exit, so a late `wait_pid` always sees ECHILD.
+/// - `EPERM`  — caller is not the parent of `pid`.
+/// - `EINVAL` — `pid == 0` or `pid == self`.
+/// - `EBUSY`  — another thread already parked on this child (v1 is
+///   single-waiter; futex lifts this).
+///
+/// On success returns the exit code passed to the child's `exit()`,
+/// or `-1` if the child died from a fault rather than a clean exit.
+/// The exit code lands in a separate register from the success/errno
+/// signal so negative exit codes don't collide with the errno-as-
+/// negative convention.
+#[inline]
+pub fn wait_pid(pid: u16) -> Result<i32, Errno> {
+    let (r0, r1) = unsafe { ecall1_ret2(syscall::WAIT_PID, pid as usize) };
+    Errno::from_ret(r0).map(|_| r1 as i32)
 }
 
 /// Absolute monotonic microseconds since system boot.

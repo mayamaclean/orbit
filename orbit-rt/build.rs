@@ -12,16 +12,16 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 
-use orbit_abi::layout::{UPROC_PRIV_BASE, USER_TEXT_BASE};
+use orbit_abi::layout::{USER_ARGV_BASE, USER_TEXT_BASE};
 
 fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
 
-    // The ELF region runs from USER_TEXT_BASE up to the start of the
-    // user-controlled priv range. Anything past that would collide with
-    // mmap territory the kernel rejects, so capping LENGTH here turns
-    // an oversized image into a link error instead of a runtime fault.
-    let length = UPROC_PRIV_BASE - USER_TEXT_BASE;
+    // The ELF region runs from USER_TEXT_BASE up to (but not into) the
+    // §13a.3 argv blob page just below UPROC_PRIV_BASE. Capping LENGTH
+    // here turns an oversized image into a link error instead of a
+    // runtime collision with the kernel-mapped argv page.
+    let length = USER_ARGV_BASE - USER_TEXT_BASE;
 
     let script = format!(
         r#"OUTPUT_ARCH( "riscv" )

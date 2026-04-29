@@ -27,8 +27,8 @@ use orbit_abi::errno::{
     Errno, EAGAIN, EBADF, EFAULT, EINVAL, EIO, ENOEXEC, ENOMEM, EPERM, ESRCH,
 };
 use orbit_core::{
-    CloseHandleReq, CreateProcessReq, CreateThreadReq, FsOpenReq, FsReadReq, FsStatReq,
-    MAX_FS_PATH_LEN, MemMapReq, NetChannelCreationReq, PendingWork,
+    CloseHandleReq, CreateProcessExReq, CreateProcessReq, CreateThreadReq, FsOpenReq, FsReadReq,
+    FsStatReq, MAX_FS_PATH_LEN, MemMapReq, NetChannelCreationReq, PendingWork, WaitPidReq,
 };
 use orbit_core::ready_queue::ReadyQueue;
 use orbit_core::sleep_heap::SleepHeap;
@@ -1103,6 +1103,254 @@ impl Orbit {
         0
     }
 
+    /// §13a.3 — `create_process_ex`. Same shape as
+    /// `run_create_process_req` plus the argv blob copy + map step.
+    /// The blob is one page at most (cap enforced at the syscall
+    /// boundary); copy it out via a single page walk, then after the
+    /// child Process is spawned, allocate a fresh kernel_pages page,
+    /// fix up the offset slots into absolute pointers (since the
+    /// child's mapping is at the constant `USER_ARGV_BASE`), and
+    /// install the page R+U+S in the child PT.
+    fn run_create_process_ex_req(
+        &mut self,
+        req: CreateProcessExReq,
+        parent_pid: u16,
+        root_pa: u64,
+    ) -> isize {
+        const MAX_ELF_BYTES: usize = 4 * 1024 * 1024;
+        if req.elf_len == 0 || req.elf_len > MAX_ELF_BYTES {
+            return Errno::new(EINVAL).to_ret();
+        }
+        let root_table = unsafe { memmap::kernel_root_from_pa(root_pa) };
+
+        // Copy the ELF (same loop as run_create_process_req).
+        let mut blob: Vec<u8> = Vec::with_capacity(req.elf_len);
+        let mut copied = 0usize;
+        while copied < req.elf_len {
+            let cursor = req.elf_vaddr + copied;
+            let page_base = cursor & !(PAGE_SIZE - 1);
+            let page_off = cursor - page_base;
+            let take = core::cmp::min(PAGE_SIZE - page_off, req.elf_len - copied);
+            let pa = match unsafe {
+                mmu::mmap::virt_to_phys(&root_table, VirtAddr::new(page_base as u64))
+            } {
+                Some(p) => p as u64,
+                None => {
+                    error!("create_process_ex: elf user va 0x{:X} does not translate", page_base);
+                    return Errno::new(EFAULT).to_ret();
+                }
+            };
+            unsafe {
+                let mut w = user_page::UserPageWindow::map(pa, PAGE_SIZE);
+                let page = w.as_mut_slice();
+                blob.extend_from_slice(&page[page_off..page_off + take]);
+            }
+            copied += take;
+        }
+
+        // Copy argv blob (single page at most).
+        let argv_bytes: Option<Vec<u8>> = if req.argv_len > 0 {
+            let mut buf = Vec::with_capacity(req.argv_len);
+            let mut argv_copied = 0usize;
+            while argv_copied < req.argv_len {
+                let cursor = req.argv_vaddr + argv_copied;
+                let page_base = cursor & !(PAGE_SIZE - 1);
+                let page_off = cursor - page_base;
+                let take = core::cmp::min(PAGE_SIZE - page_off, req.argv_len - argv_copied);
+                let pa = match unsafe {
+                    mmu::mmap::virt_to_phys(&root_table, VirtAddr::new(page_base as u64))
+                } {
+                    Some(p) => p as u64,
+                    None => {
+                        error!("create_process_ex: argv va 0x{:X} does not translate", page_base);
+                        return Errno::new(EFAULT).to_ret();
+                    }
+                };
+                unsafe {
+                    let mut w = user_page::UserPageWindow::map(pa, PAGE_SIZE);
+                    let page = w.as_mut_slice();
+                    buf.extend_from_slice(&page[page_off..page_off + take]);
+                }
+                argv_copied += take;
+            }
+            Some(buf)
+        } else {
+            None
+        };
+
+        // Affinity validation, identical to run_create_process_req.
+        let all_harts = self.all_harts_mask();
+        let allowed = if req.allowed_affinity == 0 { all_harts } else { req.allowed_affinity };
+        let affinity = if req.affinity == 0 { allowed } else { req.affinity };
+        if allowed & !all_harts != 0 || affinity & !allowed != 0 || affinity == 0 {
+            error!("create_process_ex: affinity validation failed");
+            return Errno::new(EINVAL).to_ret();
+        }
+
+        let pid = match self.create_new_process(&blob, UPROC_STACK_DEFAULT, allowed, affinity, parent_pid) {
+            Ok(pid) => pid,
+            Err(()) => {
+                error!("create_process_ex: create_new_process failed");
+                return Errno::new(ENOEXEC).to_ret();
+            }
+        };
+
+        if let Some(argv) = argv_bytes {
+            if let Err(_) = self.install_argv_blob(pid, &argv) {
+                // Process is alive; argv install failed. v1: log and
+                // continue — child will see "no argv" via argv_envp().
+                // We don't tear down the process for an argv error.
+                warn!("create_process_ex: argv install failed for pid={pid}, child will see no args");
+            }
+        }
+
+        info!("create_process_ex: spawned pid={pid} parent={parent_pid} argv_len={}", req.argv_len);
+        pid as isize
+    }
+
+    /// Allocate one kernel_pages page, copy `blob` into it with the
+    /// offset → absolute-pointer fixup, and map at `USER_ARGV_BASE`
+    /// in the child process's PT (R+U+S, no W/X). Stash the backing
+    /// on `Process.argv_blob` for later cleanup.
+    fn install_argv_blob(&mut self, pid: u16, blob: &[u8]) -> Result<(), ()> {
+        use orbit_abi::argv::{ARGV_OFFSETS_OFFSET, ArgvHeader};
+        use orbit_abi::layout::USER_ARGV_BASE;
+
+        if blob.len() > PAGE_SIZE {
+            error!("install_argv_blob: blob {} > page", blob.len());
+            return Err(());
+        }
+        if blob.len() < core::mem::size_of::<ArgvHeader>() {
+            error!("install_argv_blob: blob too small");
+            return Err(());
+        }
+
+        // Sanity-check argc against what the blob can hold.
+        let argc = u32::from_le_bytes([blob[0], blob[1], blob[2], blob[3]]) as usize;
+        let strings_off = ARGV_OFFSETS_OFFSET + argc * core::mem::size_of::<u64>();
+        if strings_off > blob.len() {
+            error!("install_argv_blob: argc={argc} overflows blob len={}", blob.len());
+            return Err(());
+        }
+
+        let layout = match Layout::from_size_align(PAGE_SIZE, PAGE_SIZE) {
+            Ok(l) => l,
+            Err(_) => return Err(()),
+        };
+        let (frame, kva) = self.kernel_pages.alloc_kdmap(layout).ok_or(())?;
+        let backing = process::PhysBacking::Shared { frame, layout };
+
+        // Zero the page first so any unused tail reads as zeros.
+        unsafe {
+            core::ptr::write_bytes(kva.as_mut_ptr::<u8>(), 0, PAGE_SIZE);
+        }
+        // Copy header + offsets + strings verbatim, then walk the
+        // offset slots and rewrite each as USER_ARGV_BASE + offset.
+        unsafe {
+            let dst = kva.as_mut_ptr::<u8>();
+            core::ptr::copy_nonoverlapping(blob.as_ptr(), dst, blob.len());
+
+            let slots = dst.add(ARGV_OFFSETS_OFFSET) as *mut u64;
+            for i in 0..argc {
+                let off = slots.add(i).read();
+                if off >= blob.len() as u64 {
+                    error!("install_argv_blob: arg {i} offset {off} >= blob len");
+                    self.free_backing(backing);
+                    return Err(());
+                }
+                slots.add(i).write(USER_ARGV_BASE.wrapping_add(off));
+            }
+        }
+
+        // Map the page R+U into the child's PT at USER_ARGV_BASE.
+        let proc = self.processes.get(&pid).ok_or(())?;
+        let proc_root_pa = (proc.satp.ppn() * PAGE_SIZE) as u64;
+        let proc_root_table = unsafe { memmap::kernel_root_from_pa(proc_root_pa) };
+        let argv_pa = match &backing {
+            process::PhysBacking::Shared { frame, .. } => frame.get_raw(),
+            process::PhysBacking::User { frame, .. } => frame.get_raw(),
+        };
+
+        let config = MappingConfig {
+            permissions: PagePermissions::R | PagePermissions::U,
+            levels: 4,
+            page_size: PAGE_SIZE as u64,
+            vaddr: VirtAddr::new(USER_ARGV_BASE),
+            paddr: PhysAddr::new(argv_pa),
+            log: false,
+            // No SharedRevocable tag — the page is freed via
+            // dealloc_process when the process exits, not via
+            // SharedUserPtr::revoke. The tag is purely a kernel-side
+            // policy bit.
+            supervisor_tag: SupervisorTag::None,
+        };
+        let vend = VirtAddr::new(USER_ARGV_BASE + PAGE_SIZE as u64);
+        let pend = PhysAddr::new(argv_pa + PAGE_SIZE as u64);
+        let mut pages = PageAlloc::FA(self.table_pages.frames_mut());
+        if let Err(_) = unsafe { map_address_range(&proc_root_table, &mut pages, &config, vend, pend) } {
+            error!("install_argv_blob: map_address_range failed");
+            self.free_backing(backing);
+            return Err(());
+        }
+
+        // Stash on the Process for dealloc-time cleanup.
+        if let Some(proc) = self.processes.get_mut(&pid) {
+            proc.argv_blob = Some(backing);
+        }
+
+        riscv::asm::sfence_vma(pid as usize, USER_ARGV_BASE as usize);
+        crate::kernel::shootdown::broadcast(0, 0);
+        Ok(())
+    }
+
+    /// Owns the signaling end-to-end. Sync errors signal
+    /// `(errno, 0)` here; async success installs the handle on the
+    /// target's `exit_waiter` slot and `dealloc_process` later signals
+    /// `(0, exit_code)`. The pair shape (a0 = success/errno, a1 =
+    /// exit_code) keeps the negative-as-errno convention orthogonal
+    /// to negative exit codes — see `orbit-abi/src/user.rs::wait_pid`.
+    fn run_wait_pid_req(
+        &mut self,
+        req: WaitPidReq,
+        caller_pid: u16,
+        handle: process::CompletionHandle,
+    ) {
+        // First check the caller's `dead_children` — covers the race
+        // where the target exited before this wait_pid syscall ran.
+        // dealloc_process stashed (target_pid → exit_code) on the
+        // parent's process struct; drain it here for sync return.
+        if let Some(parent) = self.processes.get_mut(&caller_pid)
+            && let Some(code) = parent.dead_children.remove(&req.target_pid)
+        {
+            handle.signal_pair(0, code as isize);
+            return;
+        }
+
+        let Some(target) = self.processes.get_mut(&req.target_pid) else {
+            // Never existed (or exited and the parent's already gone
+            // / wasn't tracked) — POSIX surfaces this as ECHILD.
+            handle.signal_pair(Errno::new(orbit_abi::errno::ECHILD).to_ret(), 0);
+            return;
+        };
+        if target.parent_pid != caller_pid {
+            handle.signal_pair(Errno::new(EPERM).to_ret(), 0);
+            return;
+        }
+        if target.exit_waiter.is_some() {
+            // Single-waiter v1 — multi-waiter wants a Vec and lands
+            // with futex (§13a.5).
+            handle.signal_pair(Errno::new(orbit_abi::errno::EBUSY).to_ret(), 0);
+            return;
+        }
+        // Install the parent's handle on the target. dealloc_process
+        // will take + signal it with the child's exit code.
+        target.exit_waiter = Some(handle);
+        info!(
+            "wait_pid: pid={caller_pid} parked on target={} exit",
+            req.target_pid
+        );
+    }
+
     fn run_create_thread_req(&mut self, req: CreateThreadReq, pid: u16, parent_allowed: u64) -> isize {
         info!("handling create_thread req: {req:?} pid={pid} parent_allowed={parent_allowed:#x}");
 
@@ -1163,7 +1411,7 @@ impl Orbit {
         }
     }
 
-    fn run_create_process_req(&mut self, req: CreateProcessReq, root_pa: u64) -> isize {
+    fn run_create_process_req(&mut self, req: CreateProcessReq, parent_pid: u16, root_pa: u64) -> isize {
         info!("handling create_process req: {req:?}");
 
         // Dev-loop safety cap. Well above any realistic test ELF but small
@@ -1224,9 +1472,9 @@ impl Orbit {
             return Errno::new(EINVAL).to_ret();
         }
 
-        match self.create_new_process(&blob, UPROC_STACK_DEFAULT, allowed, affinity) {
+        match self.create_new_process(&blob, UPROC_STACK_DEFAULT, allowed, affinity, parent_pid) {
             Ok(pid) => {
-                info!("create_process: spawned pid={pid} from {} bytes \
+                info!("create_process: spawned pid={pid} parent={parent_pid} from {} bytes \
                     allowed_affinity={allowed:#x} affinity={affinity:#x}", blob.len());
                 pid as isize
             }
@@ -1361,8 +1609,8 @@ impl Orbit {
                     let result = self.run_close_req(req, pid, root_pa);
                     handle.signal(result);
                 }
-                PendingWork::CreateProcess { req, root_pa, handle, .. } => {
-                    let result = self.run_create_process_req(req, root_pa);
+                PendingWork::CreateProcess { req, pid, root_pa, handle } => {
+                    let result = self.run_create_process_req(req, pid, root_pa);
                     handle.signal(result);
                 }
                 PendingWork::CreateThread { req, pid, parent_allowed, handle } => {
@@ -1387,6 +1635,18 @@ impl Orbit {
                 }
                 PendingWork::FsStat { req, pid, root_pa, handle } => {
                     let result = self.run_fs_stat_req(req, pid, root_pa);
+                    handle.signal(result);
+                }
+                PendingWork::WaitPid { req, pid, handle } => {
+                    // run_wait_pid_req owns the signaling — sync
+                    // errors signal (errno, 0); the async success
+                    // path installs the handle on the target's
+                    // exit_waiter slot and dealloc_process signals
+                    // (0, exit_code) when the child exits.
+                    self.run_wait_pid_req(req, pid, handle);
+                }
+                PendingWork::CreateProcessEx { req, pid, root_pa, handle } => {
+                    let result = self.run_create_process_ex_req(req, pid, root_pa);
                     handle.signal(result);
                 }
             }
@@ -1505,6 +1765,30 @@ impl Orbit {
 
     fn dealloc_process(&mut self, mut process: Process) {
         let process_root_table_pa = (process.satp.ppn() * PAGE_SIZE) as u64;
+
+        // §13a.2 — three exit paths:
+        //  1. Parent already parked on `wait_pid` → signal the waiter
+        //     directly with `(0, exit_code)`. Wake hook copies into
+        //     a-regs on resume.
+        //  2. Parent is alive but hasn't called `wait_pid` yet →
+        //     stash the exit code in the parent's `dead_children`
+        //     map. A later `wait_pid` drains it and returns sync.
+        //     Closes the race where the child exits faster than the
+        //     parent can park.
+        //  3. No parent (boot init) or parent already gone → drop
+        //     the exit code on the floor.
+        if let Some(handle) = process.exit_waiter.take() {
+            handle.signal_pair(0, process.exit_code as isize);
+        } else if process.parent_pid != 0
+            && let Some(parent) = self.processes.get_mut(&process.parent_pid)
+        {
+            parent.dead_children.insert(process.pid, process.exit_code);
+        }
+
+        // §13a.3 — return the argv blob page to kernel_pages.
+        if let Some(backing) = process.argv_blob.take() {
+            self.free_backing(backing);
+        }
 
         // Release the scrollback source so k_gpu advances `active`
         // off this pid on the next drain. Paired with the
@@ -1632,10 +1916,17 @@ impl Orbit {
                             warn!(
                                 "tid{} killed: {} cause={} epc={:#x} stval={:#x}",
                                 t.tid, label, f.cause, f.epc, f.stval);
+                            // Faulted threads carry no clean exit
+                            // value; surface as -1 to wait_pid waiters.
+                            // POSIX would use WIFSIGNALED here; a
+                            // distinguished negative is good enough
+                            // for v1.
+                            proc.exit_code = -1;
                         }
                         None => {
                             let status = t.frame.regs[11] as isize;
                             info!("tid{} dead, removing status={status}", t.tid);
+                            proc.exit_code = status as i32;
                         }
                     }
                 }
@@ -2524,7 +2815,7 @@ impl Orbit {
         })
     }
 
-    pub fn create_new_process(&mut self, elf_blob: &[u8], stack_size: u64, allowed_affinity: u64, affinity: u64) -> Result<u16, ()> {
+    pub fn create_new_process(&mut self, elf_blob: &[u8], stack_size: u64, allowed_affinity: u64, affinity: u64, parent_pid: u16) -> Result<u16, ()> {
         let (root_pa, root_table) = self.create_new_page_table()?;
         let mut elf = self.load_elf(&root_table, elf_blob)?;
         let pid = self.next_pid();
@@ -2534,7 +2825,7 @@ impl Orbit {
         proc_satp.set_mode(Mode::Sv48);
         proc_satp.set_asid(pid as usize);
 
-        let mut proc = Process::new(pid, proc_satp);
+        let mut proc = Process::new(pid, parent_pid, proc_satp);
         let slot = proc.thread_slots.alloc().ok_or(())?;
 
         // ELF segment backings are tracked on the process so dealloc_process
@@ -2803,6 +3094,16 @@ impl Orbit {
         self.current_thread_id = next;
 
         next
+    }
+
+    /// §13a.3 — does the named process have an argv blob installed?
+    /// Backs `argv_envp` syscall which returns either the fixed
+    /// `USER_ARGV_BASE` (true) or `0` (false).
+    pub fn process_has_argv(&self, pid: u16) -> bool {
+        self.processes
+            .get(&pid)
+            .map(|p| p.argv_blob.is_some())
+            .unwrap_or(false)
     }
 
     fn next_pid(&mut self) -> u16 {

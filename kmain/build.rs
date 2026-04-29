@@ -11,4 +11,5 @@ fn main() {
     println!("cargo:rerun-if-changed=memory.x");
     println!("cargo::rerun-if-changed=../umode/target/riscv64gc-unknown-none-elf/release/umode");
     println!("cargo::rerun-if-changed=../orbit-loader/target/riscv64gc-unknown-none-elf/release/orbit-loader");
+    println!("cargo::rerun-if-changed=../console/target/riscv64gc-unknown-none-elf/release/console");
 }

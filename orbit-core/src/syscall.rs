@@ -11,8 +11,9 @@ use orbit_abi::errno::{Errno, EAGAIN, EBUSY, EFAULT, EINVAL, EIO, EPERM};
 use orbit_abi::layout::{user_priv_range_ok, user_range_ok, user_shared_range_ok};
 
 use crate::{
-    CloseHandleReq, CreateProcessReq, CreateThreadReq, FsOpenReq, FsReadReq, FsStatReq, Hardware,
-    MAX_FS_PATH_LEN, MemMapReq, NetChannelCreationReq, PAGE_SIZE, PendingWork, SyscallOutcome,
+    CloseHandleReq, CreateProcessExReq, CreateProcessReq, CreateThreadReq, FsOpenReq, FsReadReq,
+    FsStatReq, Hardware, MAX_FS_PATH_LEN, MemMapReq, NetChannelCreationReq, PAGE_SIZE,
+    PendingWork, SyscallOutcome, WaitPidReq,
 };
 use net_channel::BindSpec;
 
@@ -219,6 +220,39 @@ pub fn create_process_req<H: Hardware>(
     }
 }
 
+/// `wait_pid(pid) → exit_code | -errno` (`-ECHILD` if the target
+/// doesn't exist or already reaped, `-EPERM` if the caller isn't its
+/// parent, `-EINVAL` for self-wait, `-EBUSY` if a sibling already
+/// parked on the target). Parks the caller on a fresh handle and
+/// queues `PendingWork::WaitPid`; the manager either installs the
+/// handle on the target's exit-waiter slot (alive case) or signals
+/// the error sync.
+pub fn wait_pid_req<H: Hardware>(
+    thread: &mut Thread,
+    frame: &TrapFrame,
+    hw: &mut H,
+) -> SyscallOutcome {
+    let target_pid = frame.regs[11] as u16;
+    if target_pid == 0 || target_pid == thread.pid {
+        return SyscallOutcome::Return { ret: Errno::new(EINVAL).to_ret() };
+    }
+    let req = WaitPidReq { target_pid };
+    let handle = CompletionHandle::new();
+    let work = PendingWork::WaitPid {
+        req,
+        pid: thread.pid,
+        handle: handle.clone(),
+    };
+    if hw.push_pending_work(work).is_err() {
+        return SyscallOutcome::Return { ret: Errno::new(EAGAIN).to_ret() };
+    }
+    thread.handle = Some(handle);
+    SyscallOutcome::Yield {
+        state: ThreadState::Blocking,
+        ret: None,
+    }
+}
+
 /// `fs_open(path_ptr, path_len, flags) → fd | -errno`. Park the caller
 /// on a fresh handle and queue the manager work; the manager copies
 /// the path bytes, looks the inode up via the mounted filesystem, and
@@ -326,6 +360,53 @@ pub fn fs_stat_req<H: Hardware>(
     }
     let handle = CompletionHandle::new();
     let work = PendingWork::FsStat {
+        req,
+        pid: thread.pid,
+        root_pa: thread.root_table_addr() as u64,
+        handle: handle.clone(),
+    };
+    if hw.push_pending_work(work).is_err() {
+        return SyscallOutcome::Return { ret: Errno::new(EAGAIN).to_ret() };
+    }
+    thread.handle = Some(handle);
+    SyscallOutcome::Yield {
+        state: ThreadState::Blocking,
+        ret: None,
+    }
+}
+
+/// `create_process_ex(elf_vaddr, elf_len, allowed_affinity, affinity,
+/// argv_vaddr, argv_len) → pid | -errno`. §13a.3 extension to
+/// `create_process` that carries an argv blob. Same async shape:
+/// park the caller, queue manager work, return on signal.
+///
+/// Bound-checks the argv user-VA range so the manager can trust the
+/// blob source. `argv_len == 0` (with any vaddr) is the "no args"
+/// shorthand and falls through to a plain create_process.
+pub fn create_process_ex_req<H: Hardware>(
+    thread: &mut Thread,
+    frame: &TrapFrame,
+    hw: &mut H,
+) -> SyscallOutcome {
+    let req = CreateProcessExReq {
+        elf_vaddr: frame.regs[11],
+        elf_len: frame.regs[12],
+        allowed_affinity: frame.regs[13] as u64,
+        affinity: frame.regs[14] as u64,
+        argv_vaddr: frame.regs[15],
+        argv_len: frame.regs[16],
+    };
+    if !user_range_ok(req.elf_vaddr as u64, req.elf_len as u64) {
+        return SyscallOutcome::Return { ret: Errno::new(EFAULT).to_ret() };
+    }
+    if req.argv_len > 0 && !user_range_ok(req.argv_vaddr as u64, req.argv_len as u64) {
+        return SyscallOutcome::Return { ret: Errno::new(EFAULT).to_ret() };
+    }
+    if req.argv_len > orbit_abi::argv::ARGV_BLOB_MAX {
+        return SyscallOutcome::Return { ret: Errno::new(EINVAL).to_ret() };
+    }
+    let handle = CompletionHandle::new();
+    let work = PendingWork::CreateProcessEx {
         req,
         pid: thread.pid,
         root_pa: thread.root_table_addr() as u64,

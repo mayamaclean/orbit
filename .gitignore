@@ -4,3 +4,4 @@
 *.dts
 *.log
 disk.img
+orbit-loader/tools/__pycache__/

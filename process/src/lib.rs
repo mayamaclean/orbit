@@ -354,6 +354,34 @@ pub enum ProcessState {
 #[derive(Debug)]
 pub struct Process {
     pub pid: u16,
+    /// Pid of the spawning process. `0` for the boot process (no
+    /// parent). §13a.2's `wait_pid` checks this against the caller's
+    /// pid to gate exit-status visibility.
+    pub parent_pid: u16,
+    /// Last exit status observed for this process — written when the
+    /// thread that empties `threads` reports its `exit(code)` value.
+    /// Read by `dealloc_process` to signal `exit_waiter` (if any).
+    /// Multi-threaded processes are last-writer-wins, matching POSIX's
+    /// "process exit status is what the calling thread passed to
+    /// exit()" looseness.
+    pub exit_code: i32,
+    /// Single-waiter slot for §13a.2 `wait_pid`. v1 contract: at most
+    /// one parent thread parks here at a time; a second `wait_pid`
+    /// call returns EBUSY. Multi-waiter wants a `Vec<CompletionHandle>`
+    /// and lands with futex (§13a.5).
+    pub exit_waiter: Option<crate::CompletionHandle>,
+    /// Already-exited children whose parent (this process) hasn't
+    /// called `wait_pid` yet. Keyed by child pid → child's exit code.
+    /// Drained when the parent waits, or freed wholesale when the
+    /// parent itself exits. Closes the wait_pid race when the child
+    /// exits before the parent has a chance to park.
+    pub dead_children: BTreeMap<u16, i32>,
+    /// §13a.3 argv blob backing — `Some` when the process was
+    /// spawned via `CREATE_PROCESS_EX` with non-empty argv. The
+    /// kernel maps this single page R+U+S at
+    /// `USER_ARGV_BASE` in the process PT; `dealloc_process` returns
+    /// the frame to `kernel_pages`.
+    pub argv_blob: Option<PhysBacking>,
     pub state: ProcessState,
     pub threads: BTreeSet<u32>,
     pub thread_count: u16,
@@ -387,9 +415,14 @@ pub struct Process {
 }
 
 impl Process {
-    pub fn new(pid: u16, satp: Satp) -> Self {
+    pub fn new(pid: u16, parent_pid: u16, satp: Satp) -> Self {
         Self {
             pid,
+            parent_pid,
+            exit_code: 0,
+            exit_waiter: None,
+            dead_children: BTreeMap::new(),
+            argv_blob: None,
             state: ProcessState::Running,
             threads: BTreeSet::new(),
             thread_count: 0,

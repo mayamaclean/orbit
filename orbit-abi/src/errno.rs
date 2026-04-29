@@ -13,6 +13,7 @@ pub const ESRCH:   i32 =  3;
 pub const EIO:     i32 =  5;
 pub const ENOEXEC: i32 =  8;
 pub const EBADF:   i32 =  9;
+pub const ECHILD:  i32 = 10;
 pub const EAGAIN:  i32 = 11;
 pub const ENOMEM:  i32 = 12;
 pub const EACCES:  i32 = 13;

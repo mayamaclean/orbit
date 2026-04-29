@@ -270,9 +270,26 @@ extern "C" fn s_trap(
                     4102 => {
                         kmain::handle_query_syscall_stats(epc, hart_context, frame);
                     }
+                    4103 => {
+                        debug!("orbit handling u mode ecall({syscall})");
+                        kmain::handle_create_process_ex(epc, hart_context, frame);
+                    }
+                    4104 => {
+                        kmain::handle_argv_envp(epc, hart_context, frame);
+                    }
                     5000 => {
                         debug!("orbit handling u mode ecall({syscall})");
                         kmain::handle_create_thread(epc, hart_context, frame);
+                    }
+                    5001 => {
+                        kmain::handle_getpid(epc, hart_context, frame);
+                    }
+                    5002 => {
+                        kmain::handle_gettid(epc, hart_context, frame);
+                    }
+                    5003 => {
+                        debug!("orbit handling u mode ecall({syscall})");
+                        kmain::handle_wait_pid(epc, hart_context, frame);
                     }
                     6000 => {
                         debug!("orbit handling u mode ecall({syscall})");
@@ -396,7 +413,7 @@ pub extern "C" fn k_smpstart() {
     }
 
     let boot_affinity = orbit.all_harts_mask();
-    orbit.create_new_process(kmain::kernel::UMODE_TEST_ELF, kmain::kernel::UPROC_STACK_DEFAULT, boot_affinity, boot_affinity)
+    orbit.create_new_process(kmain::kernel::UMODE_TEST_ELF, kmain::kernel::UPROC_STACK_DEFAULT, boot_affinity, boot_affinity, 0)
         .expect("no test uprocess");
 
     // Release the secondary-hart S-mode spin in `secondary_rust_setup`.

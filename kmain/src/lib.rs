@@ -806,6 +806,32 @@ pub fn handle_create_process_req(epc: usize, hart_context: &'static HartContext,
     });
 }
 
+/// §13a.3 — `create_process_ex(elf, argv_blob)`. Same async shape as
+/// `create_process` but carries an argv blob the kernel maps into
+/// the new process at `USER_ARGV_BASE`.
+#[unsafe(no_mangle)]
+pub fn handle_create_process_ex(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
+    dispatch_syscall(epc, hart_context, frame, |t, f| {
+        orbit_core::syscall::create_process_ex_req(t, f, &mut crate::hw::RiscvHardware)
+    });
+}
+
+/// §13a.3 — `argv_envp() → blob_va | 0`. Synchronous read off the
+/// caller's `Process.argv_blob` slot. `0` means "no argv was
+/// installed" — orbit-rt treats it as empty `argv`.
+#[unsafe(no_mangle)]
+pub fn handle_argv_envp(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
+    let orbit = unsafe { (hart_context.cscratch as *mut kernel::Orbit).as_mut_unchecked() };
+    dispatch_syscall(epc, hart_context, frame, |t, _f| {
+        let ret = if orbit.process_has_argv(t.pid) {
+            orbit_abi::layout::USER_ARGV_BASE as isize
+        } else {
+            0
+        };
+        orbit_core::SyscallOutcome::Return { ret }
+    });
+}
+
 #[unsafe(no_mangle)]
 pub fn handle_create_thread(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
     dispatch_syscall(epc, hart_context, frame, |t, f| {
@@ -845,6 +871,36 @@ pub fn handle_set_affinity(epc: usize, hart_context: &'static HartContext, frame
 pub fn handle_get_affinity(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
     dispatch_syscall(epc, hart_context, frame, |t, _f| {
         orbit_core::syscall::get_affinity(t)
+    });
+}
+
+/// `wait_pid(target_pid) → exit_code | -errno`. Async via the
+/// manager — the caller parks on a `CompletionHandle` that gets
+/// signaled either by `run_wait_pid_req` (sync error path) or by
+/// `dealloc_process` when the target exits.
+#[unsafe(no_mangle)]
+pub fn handle_wait_pid(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
+    dispatch_syscall(epc, hart_context, frame, |t, f| {
+        orbit_core::syscall::wait_pid_req(t, f, &mut crate::hw::RiscvHardware)
+    });
+}
+
+/// `getpid() → u16` — pid of the calling process. Stable for the
+/// process's lifetime; reads `thread.pid` directly. No manager
+/// round-trip, no blocking — same shape as `get_hart_id`.
+#[unsafe(no_mangle)]
+pub fn handle_getpid(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
+    dispatch_syscall(epc, hart_context, frame, |t, _f| {
+        orbit_core::SyscallOutcome::Return { ret: t.pid as isize }
+    });
+}
+
+/// `gettid() → u32` — tid of the calling thread. System-wide unique
+/// (not per-process); reads `thread.tid` directly. Trivially safe.
+#[unsafe(no_mangle)]
+pub fn handle_gettid(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
+    dispatch_syscall(epc, hart_context, frame, |t, _f| {
+        orbit_core::SyscallOutcome::Return { ret: t.tid as isize }
     });
 }
 

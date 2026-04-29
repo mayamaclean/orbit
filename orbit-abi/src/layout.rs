@@ -131,6 +131,14 @@ pub const fn validate_user_stack_size(size: u64) -> bool {
 /// User ELF image sits just above the 8 GiB stack region.
 pub const USER_TEXT_BASE: u64 = 0x2_2000_0000;
 
+/// One-page argv/envp blob mapped read-only into every process
+/// spawned via `CREATE_PROCESS_EX` (§13a.3). Sits in the high end of
+/// the ELF region (just below `UPROC_PRIV_BASE`) so the linker, which
+/// the orbit-rt build script keeps below `USER_ARGV_BASE`, won't lay
+/// anything on top.
+pub const USER_ARGV_BASE: u64 = 0x2_FFFF_F000;
+pub const USER_ARGV_LEN:  u64 = PAGE_SIZE;
+
 /// User-controlled private range — `mmap(share_with_kernel=false)`
 /// must land here. Sits *above* the kernel-managed stacks (8 GiB
 /// region anchored at [`UPROC_STACK_BASE`]) and the ELF image (at
