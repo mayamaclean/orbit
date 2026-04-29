@@ -12,7 +12,7 @@ use orbit_abi::layout::{user_priv_range_ok, user_range_ok, user_shared_range_ok}
 
 use crate::{
     CloseHandleReq, CreateProcessExReq, CreateProcessReq, CreateThreadReq, FsOpenReq, FsReadReq,
-    FsStatReq, FutexWaitReq, FutexWakeReq, Hardware, MAX_FS_PATH_LEN, MemMapReq,
+    FsReaddirReq, FsStatReq, FutexWaitReq, FutexWakeReq, Hardware, MAX_FS_PATH_LEN, MemMapReq,
     NetChannelCreationReq, PAGE_SIZE, PendingWork, SyscallOutcome, WaitPidReq,
 };
 use net_channel::BindSpec;
@@ -360,6 +360,46 @@ pub fn fs_stat_req<H: Hardware>(
     }
     let handle = CompletionHandle::new();
     let work = PendingWork::FsStat {
+        req,
+        pid: thread.pid,
+        root_pa: thread.root_table_addr() as u64,
+        handle: handle.clone(),
+    };
+    if hw.push_pending_work(work).is_err() {
+        return SyscallOutcome::Return { ret: Errno::new(EAGAIN).to_ret() };
+    }
+    thread.handle = Some(handle);
+    SyscallOutcome::Yield {
+        state: ThreadState::Blocking,
+        ret: None,
+    }
+}
+
+/// `fs_readdir(fd, buf_ptr, len) → bytes | -errno`. Park on a handle
+/// and queue manager work; the manager looks up the directory fd,
+/// asks the filesystem to pack as many entries as fit into the user
+/// buffer, and signals with bytes-written (`0` at end-of-dir).
+///
+/// v1 contract: `len` ≤ [`PAGE_SIZE`], buffer must not span more than
+/// one page (single `UserPageWindow` for the copy-out).
+pub fn fs_readdir_req<H: Hardware>(
+    thread: &mut Thread,
+    frame: &TrapFrame,
+    hw: &mut H,
+) -> SyscallOutcome {
+    let req = FsReaddirReq {
+        fd: frame.regs[11] as u32,
+        buf_vaddr: frame.regs[12],
+        len: frame.regs[13],
+    };
+    if req.len == 0 || req.len > PAGE_SIZE {
+        return SyscallOutcome::Return { ret: Errno::new(EINVAL).to_ret() };
+    }
+    if !user_range_ok(req.buf_vaddr as u64, req.len as u64) {
+        return SyscallOutcome::Return { ret: Errno::new(EFAULT).to_ret() };
+    }
+    let handle = CompletionHandle::new();
+    let work = PendingWork::FsReaddir {
         req,
         pid: thread.pid,
         root_pa: thread.root_table_addr() as u64,

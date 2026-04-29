@@ -27,11 +27,16 @@ pub type Inode = u32;
 pub enum FsErr {
     NotFound,
     NotRegular,
+    /// fd is a regular file (or non-dir) where a directory was expected
+    /// — `fs_readdir` on a `Kind::Reg` open file.
+    NotADirectory,
     BadInode,
     /// Underlying block device unavailable or returned an error.
     IoError,
     /// Argument outside the file's bounds (offset past EOF, len 0,
-    /// non-sector-aligned where the FS requires alignment, …).
+    /// non-sector-aligned where the FS requires alignment, …). For
+    /// `readdir` it also signals "buffer too small to hold the next
+    /// entry" — caller grows the buffer or accepts the partial read.
     BadRange,
 }
 
@@ -74,6 +79,29 @@ pub trait Filesystem: Send + Sync {
     /// for the read syscall handler that needs the cap without the
     /// rest of the stat fields.
     fn size(&self, ino: Inode) -> Result<u64, FsErr>;
+
+    /// Pack zero or more directory entries from `ino` into `out`,
+    /// starting at `cursor`. Returns `(bytes_written, next_cursor)`
+    /// — the manager stores `next_cursor` back on the `OpenFile` and
+    /// returns `bytes_written` to userland. `bytes_written == 0`
+    /// signals end-of-directory.
+    ///
+    /// Cursor is opaque to userland — every value the kernel returns
+    /// here is fed back unchanged on the next `readdir` call. Today's
+    /// tarfs implementation uses it as a sorted-children index;
+    /// future filesystems can reinterpret as needed.
+    ///
+    /// Errors:
+    /// - `NotADirectory` — `ino` is not a directory inode.
+    /// - `BadInode` — `ino` is unknown.
+    /// - `BadRange` — `out` is too small for even one entry. Caller
+    ///   grows the buffer; cursor is not advanced.
+    fn readdir(
+        &self,
+        ino: Inode,
+        cursor: u64,
+        out: &mut [u8],
+    ) -> Result<(usize, u64), FsErr>;
 }
 
 /// Single global mount slot. Write-once at boot from hart 0; readers

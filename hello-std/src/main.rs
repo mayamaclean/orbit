@@ -148,6 +148,81 @@ fn main() {
     let main_id = std::thread::current().id();
     println!("main thread id = {main_id:?}");
 
+    // §13e — std::fs smoke. Runs before the network section so it
+    // doesn't depend on DHCP / TCP listener completion.
+    {
+        use std::fs;
+        use std::io::Read as _;
+
+        match fs::metadata("/README") {
+            Ok(md) => {
+                if md.is_file() && md.len() == 217 {
+                    println!("PASS: std::fs::metadata /README is_file size=217");
+                } else {
+                    println!(
+                        "FAIL: std::fs::metadata /README is_file={} size={}",
+                        md.is_file(), md.len(),
+                    );
+                }
+            }
+            Err(e) => println!("FAIL: std::fs::metadata /README: {e}"),
+        }
+
+        match fs::File::open("/bin/hello.txt").and_then(|mut f| {
+            let mut s = String::new();
+            f.read_to_string(&mut s).map(|_| s)
+        }) {
+            Ok(s) if s == "hello from /bin/hello.txt\n" => {
+                println!("PASS: std::fs::File::open /bin/hello.txt read_to_string matches");
+            }
+            Ok(s) => println!("FAIL: std::fs read_to_string got {s:?}"),
+            Err(e) => println!("FAIL: std::fs::File::open /bin/hello.txt: {e}"),
+        }
+
+        match fs::read_dir("/") {
+            Ok(rd) => {
+                let mut names: Vec<String> = rd
+                    .filter_map(|r| r.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+                    .collect();
+                names.sort();
+                if names == ["README", "bin"] {
+                    println!("PASS: std::fs::read_dir / yields [README, bin]");
+                } else {
+                    println!("FAIL: std::fs::read_dir / yields {names:?}");
+                }
+            }
+            Err(e) => println!("FAIL: std::fs::read_dir /: {e}"),
+        }
+
+        match fs::read_dir("/bin") {
+            Ok(rd) => {
+                let mut entries: Vec<(String, bool)> = rd
+                    .filter_map(|r| r.ok())
+                    .map(|e| {
+                        let nm = e.file_name().to_string_lossy().into_owned();
+                        let is_file = e.file_type().map(|ft| ft.is_file()).unwrap_or(false);
+                        (nm, is_file)
+                    })
+                    .collect();
+                entries.sort_by(|a, b| a.0.cmp(&b.0));
+                if entries == [("hello".into(), true), ("hello.txt".into(), true)] {
+                    println!("PASS: std::fs::read_dir /bin yields [hello(file), hello.txt(file)]");
+                } else {
+                    println!("FAIL: std::fs::read_dir /bin yields {entries:?}");
+                }
+            }
+            Err(e) => println!("FAIL: std::fs::read_dir /bin: {e}"),
+        }
+
+        match fs::metadata("/does-not-exist") {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                println!("PASS: std::fs::metadata missing path -> NotFound");
+            }
+            Ok(_) => println!("FAIL: std::fs::metadata /does-not-exist returned Ok"),
+            Err(e) => println!("FAIL: std::fs::metadata /does-not-exist unexpected err: {e}"),
+        }
+    }
+
     // §13e — std::net::TcpStream::connect over the kernel's NetChannel
     // primitive. Connect to QEMU's user-net gateway (which maps to host
     // loopback) on a port the smoke harness has nc(1) listening on.

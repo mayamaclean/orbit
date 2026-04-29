@@ -21,6 +21,20 @@ To debug a running QEMU: `./debug <crate> <exec>` — e.g. `./debug bl launch` o
 
 There are no tests or lints configured for this project.
 
+### Building Orbit's std (forked rustc at [rust/](rust/))
+
+Std-on-orbit binaries (currently only [hello-std/](hello-std/), eventually any user app that wants `std`) require a custom rustc fork that knows about the `riscv64gc-unknown-orbit` target. The fork lives at [rust/](rust/); its bootstrap config in [rust/bootstrap.toml](rust/bootstrap.toml) targets both the host and orbit. Build flow:
+
+1. `cd rust && ./x build library --stage 1 --target riscv64gc-unknown-orbit` — compiles `core`/`alloc`/`std` for orbit. Stage 1 is enough; stage 2 adds nothing relevant. Output lives under [rust/build/x86_64-unknown-linux-gnu/stage1/lib/rustlib/riscv64gc-unknown-orbit/lib/](rust/build/x86_64-unknown-linux-gnu/stage1/lib/rustlib/riscv64gc-unknown-orbit/lib/).
+2. The toolchain is rustup-linked as `orbit-stage1` (run once: `rustup toolchain link orbit-stage1 /home/maya/projects/orbit/rust/build/x86_64-unknown-linux-gnu/stage1`).
+3. `cd hello-std && cargo +orbit-stage1 build` — builds against the freshly-built std. The `+orbit-stage1` selects the linked toolchain; without it cargo defaults to the project nightly which has no `riscv64gc-unknown-orbit` spec. `[build] target = "riscv64gc-unknown-orbit"` in `hello-std/.cargo/config.toml` pins the triple.
+
+Whenever a `library/std/src/sys/...` file changes (PAL surface — fs, net, thread, alloc, futex, …) you must rerun step 1 before rebuilding the consumer. Skipping this is silent: cargo reuses the stale rlib in the toolchain sysroot and the new code never lands.
+
+The `riscv64gc-unknown-orbit` target spec is built into the fork ([rust/compiler/rustc_target/src/spec/base/orbit.rs](rust/compiler/rustc_target/src/spec/base/orbit.rs)). It pins `linker = "rust-lld"`, static reloc model, no PIE, no eh_frame_header. orbit-abi's `rustc-dep-of-std` feature wires `core` to `rustc-std-workspace-core` so the kernel's pure-Rust types can be compiled into std.
+
+For an as-built map of the orbit-side std PAL — what's wired, what's stubbed, file paths, build-loop gotchas, and the priority order of remaining holes — see [docs/std-on-orbit.md](docs/std-on-orbit.md).
+
 External dependency: `smoltcp` is a path dependency at `../smoltcp` (sibling of this repo), not a crates.io version. If it is missing the workspace will fail to build `kmain`, `process`, and `net_channel`.
 
 ## Architecture

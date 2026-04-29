@@ -861,6 +861,13 @@ pub fn handle_fs_stat(epc: usize, hart_context: &'static HartContext, frame: &mu
 }
 
 #[unsafe(no_mangle)]
+pub fn handle_fs_readdir(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
+    dispatch_syscall(epc, hart_context, frame, |t, f| {
+        orbit_core::syscall::fs_readdir_req(t, f, &mut crate::hw::RiscvHardware)
+    });
+}
+
+#[unsafe(no_mangle)]
 pub fn handle_set_affinity(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
     dispatch_syscall(epc, hart_context, frame, |t, f| {
         orbit_core::syscall::set_affinity(t, f)

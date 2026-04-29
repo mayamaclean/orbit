@@ -24,12 +24,12 @@ use process::{
 };
 
 use orbit_abi::errno::{
-    Errno, EAGAIN, EBADF, EFAULT, EINVAL, EIO, ENOEXEC, ENOMEM, EPERM, ESRCH,
+    Errno, EAGAIN, EBADF, EFAULT, EINVAL, EIO, ENOEXEC, ENOMEM, ENOTDIR, EPERM, ESRCH,
 };
 use orbit_core::{
     CloseHandleReq, CreateProcessExReq, CreateProcessReq, CreateThreadReq, FsOpenReq, FsReadReq,
-    FsStatReq, FutexWaitReq, FutexWakeReq, MAX_FS_PATH_LEN, MemMapReq, NetChannelCreationReq,
-    PendingWork, WaitPidReq,
+    FsReaddirReq, FsStatReq, FutexWaitReq, FutexWakeReq, MAX_FS_PATH_LEN, MemMapReq,
+    NetChannelCreationReq, PendingWork, WaitPidReq,
 };
 use orbit_core::ready_queue::ReadyQueue;
 use orbit_core::sleep_heap::SleepHeap;
@@ -1002,6 +1002,7 @@ impl Orbit {
                 fs,
                 inode,
                 offset: 0,
+                dir_cursor: 0,
             }));
         info!("fs_open: pid={pid} path={path} → fd={fd} ino={inode}");
         fd as isize
@@ -1079,6 +1080,7 @@ impl Orbit {
                 }
                 let errno = match e {
                     FsErr::NotRegular => orbit_abi::errno::EISDIR,
+                    FsErr::NotADirectory => ENOTDIR,
                     FsErr::BadInode => EBADF,
                     FsErr::BadRange => EINVAL,
                     FsErr::IoError => EIO,
@@ -1137,6 +1139,84 @@ impl Orbit {
         }
         info!("fs_stat: pid={pid} path={path} ino={inode} size={}", stat.st_size);
         0
+    }
+
+    /// `fs_readdir` handler — packs a chunk of directory entries into
+    /// the user buffer, advances the fd's `dir_cursor`, returns
+    /// bytes-written. `0` means end-of-directory.
+    ///
+    /// Same single-page constraint as `fs_stat`: the user buffer must
+    /// fit inside one 4 KiB page so a single `UserPageWindow` covers
+    /// the copy-out. The pure-syscall layer caps `len` at `PAGE_SIZE`
+    /// before we get here.
+    fn run_fs_readdir_req(&mut self, req: FsReaddirReq, pid: u16, root_pa: u64) -> isize {
+        // Look up the file handle and snapshot what we need so we can
+        // drop the &mut on `process_handles` before the page-window
+        // map (which doesn't borrow the handle table, but keeping the
+        // borrow scope tight is consistent with run_fs_read_req).
+        let Some(ph) = self.process_handles.get_mut(&pid) else {
+            return Errno::new(EBADF).to_ret();
+        };
+        let Some(handle_ref) = ph.get_mut(req.fd) else {
+            return Errno::new(EBADF).to_ret();
+        };
+        let Handle::File(of) = handle_ref else {
+            return Errno::new(EBADF).to_ret();
+        };
+        let fs = of.fs;
+        let inode = of.inode;
+        let cursor = of.dir_cursor;
+
+        // Single-page constraint: buffer must fit inside one 4 KiB page.
+        let buf_va = req.buf_vaddr as u64;
+        if (buf_va & (PAGE_SIZE as u64 - 1)) + req.len as u64 > PAGE_SIZE as u64 {
+            return Errno::new(EINVAL).to_ret();
+        }
+        let root_table = unsafe { memmap::kernel_root_from_pa(root_pa) };
+        let page_base = buf_va & !(PAGE_SIZE as u64 - 1);
+        let page_off = (buf_va - page_base) as usize;
+        let page_pa = match unsafe {
+            mmu::mmap::virt_to_phys(&root_table, VirtAddr::new(page_base))
+        } {
+            Some(p) => p as u64,
+            None => return Errno::new(EFAULT).to_ret(),
+        };
+
+        // Pack into the user page directly. UserPageWindow gives us a
+        // kernel-mapped alias for the user's frame; we slice the
+        // range corresponding to `buf_va..buf_va+len` and hand it to
+        // the FS.
+        let (written, next_cursor) = unsafe {
+            let mut w = user_page::UserPageWindow::map(page_pa, PAGE_SIZE);
+            let page = w.as_mut_slice();
+            let dst = &mut page[page_off..page_off + req.len];
+            match fs.readdir(inode, cursor, dst) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    let errno = match e {
+                        FsErr::NotADirectory => ENOTDIR,
+                        FsErr::BadInode => EBADF,
+                        FsErr::BadRange => EINVAL,
+                        FsErr::IoError => EIO,
+                        FsErr::NotFound => orbit_abi::errno::ENOENT,
+                        FsErr::NotRegular => ENOTDIR,
+                    };
+                    return Errno::new(errno).to_ret();
+                }
+            }
+        };
+
+        // Commit the cursor advance now that the FS reported success.
+        if let Some(ph) = self.process_handles.get_mut(&pid)
+            && let Some(Handle::File(of)) = ph.get_mut(req.fd)
+        {
+            of.dir_cursor = next_cursor;
+        }
+        info!(
+            "fs_readdir: pid={pid} fd={} ino={inode} cursor={cursor}->{next_cursor} bytes={written}",
+            req.fd
+        );
+        written as isize
     }
 
     /// §13a.3 — `create_process_ex`. Same shape as
@@ -1769,6 +1849,10 @@ impl Orbit {
                 }
                 PendingWork::FsStat { req, pid, root_pa, handle } => {
                     let result = self.run_fs_stat_req(req, pid, root_pa);
+                    handle.signal(result);
+                }
+                PendingWork::FsReaddir { req, pid, root_pa, handle } => {
+                    let result = self.run_fs_readdir_req(req, pid, root_pa);
                     handle.signal(result);
                 }
                 PendingWork::WaitPid { req, pid, handle } => {

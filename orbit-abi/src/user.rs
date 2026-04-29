@@ -648,6 +648,42 @@ pub fn fs_stat(path: &str, stat: &mut crate::fs::Stat) -> Result<(), Errno> {
     .map(|_| ())
 }
 
+/// `fs_readdir(fd, buf)` — pull a chunk of directory entries off `fd`
+/// (which must come from `fs_open` on a directory). Returns bytes
+/// written; `0` means end-of-directory.
+///
+/// The buffer is filled with packed [`crate::fs::DirEntry`] records.
+/// Walk:
+/// ```ignore
+/// let mut p = 0;
+/// while p < n {
+///     let hdr = unsafe { core::ptr::read_unaligned(buf[p..].as_ptr() as *const DirEntry) };
+///     let name = &buf[p + DIRENT_HDR_LEN .. p + DIRENT_HDR_LEN + hdr.d_namelen as usize];
+///     p += hdr.d_reclen as usize;
+/// }
+/// ```
+///
+/// `buf.len()` must not span more than one 4 KiB page (the kernel
+/// uses a single page-window for the copy-out, same constraint as
+/// `fs_stat`). The cursor lives on the kernel-side `OpenFile`; pass
+/// the same `fd` repeatedly until `0` to drain the directory.
+///
+/// Errnos: `EBADF` (fd not open / not a dir), `ENOTDIR` (fd is a
+/// regular file), `EINVAL` (buffer crosses a page or is too small for
+/// the next entry), `EFAULT` (bad pointer), `EAGAIN` (manager work
+/// ring full).
+#[inline]
+pub fn fs_readdir(fd: u32, buf: &mut [u8]) -> Result<usize, Errno> {
+    Errno::from_ret(unsafe {
+        ecall3(
+            syscall::FS_READDIR,
+            fd as usize,
+            buf.as_mut_ptr() as usize,
+            buf.len(),
+        )
+    })
+}
+
 /// Snapshot per-process and kernel-wide accounting. The wrapper owns
 /// the buffer so callers don't have to think about ABI sizing — pass
 /// `()`, get a struct back. On a kernel newer than this build,

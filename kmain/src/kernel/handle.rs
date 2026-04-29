@@ -45,8 +45,14 @@ pub enum Handle {
 pub struct OpenFile {
     pub fs: &'static dyn Filesystem,
     pub inode: Inode,
-    /// Auto-advanced by `fs_read` (one sector per call in v1).
+    /// Auto-advanced by `fs_read` (one sector per call in v1). Only
+    /// meaningful when `inode` is a regular file.
     pub offset: u64,
+    /// Opaque cursor for `fs_readdir`. The filesystem hands one back
+    /// from each `readdir` call and we feed it forward. Only
+    /// meaningful when `inode` is a directory; readdir on a
+    /// regular-file fd returns ENOTDIR before the cursor is read.
+    pub dir_cursor: u64,
 }
 
 /// Per-process handle table + next-ID counter. Owned by `Orbit`, keyed

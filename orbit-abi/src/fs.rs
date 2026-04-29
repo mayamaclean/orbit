@@ -26,6 +26,60 @@ pub const S_IFLNK:  u32 = 0o120000;
 /// filesystem's actual sector geometry.
 pub const STAT_BLOCK_UNIT: u64 = 512;
 
+// `d_type` values for [`DirEntry`]. Numbers match Linux's `dirent.h`
+// (`DT_*`) so a future POSIX shim doesn't have to translate. Only the
+// types orbit can produce today are listed; add variants as the FS
+// learns to emit them.
+/// Type unknown — caller should `fs_stat` to disambiguate. v1 tarfs
+/// never returns this, but the constant exists so future filesystems
+/// without inline type info have a value to use.
+pub const DT_UNKNOWN: u8 = 0;
+/// Directory.
+pub const DT_DIR: u8 = 4;
+/// Regular file.
+pub const DT_REG: u8 = 8;
+/// Symbolic link. Reserved — tarfs v1 doesn't produce these.
+pub const DT_LNK: u8 = 10;
+
+/// Packed directory entry header. The kernel writes a stream of
+/// `DirEntry` records back-to-back into the user buffer for
+/// `fs_readdir`; each record carries its name immediately after the
+/// header, then padding so the next record starts on an 8-byte
+/// boundary.
+///
+/// Walk order: read header at offset 0, name spans `[12 ..
+/// 12+d_namelen]`, advance by `d_reclen`. Repeat until `d_reclen`
+/// would exit the returned byte count.
+///
+/// Layout matches Linux's `linux_dirent64` minus `d_off` — orbit keeps
+/// the directory cursor on the kernel side (in the `OpenFile`'s
+/// `dir_cursor`) rather than threading it through user buffers, so
+/// there's nothing for `d_off` to carry.
+#[repr(C, packed)]
+#[derive(Clone, Copy, Debug)]
+pub struct DirEntry {
+    /// FS-internal inode number. Matches what `fs_stat` returns in
+    /// `Stat::st_ino` for the same path.
+    pub d_ino: u64,
+    /// Total bytes from the start of this record to the start of the
+    /// next, including padding. Always a multiple of 8.
+    pub d_reclen: u16,
+    /// `DT_*` type bits. `DT_UNKNOWN` means "fs_stat to find out".
+    pub d_type: u8,
+    /// Length of the name in bytes that follow this header. No NUL
+    /// terminator — caller slices `[..d_namelen]` raw.
+    pub d_namelen: u8,
+}
+
+/// Header size in bytes. Pinned for `fs_readdir` consumers that walk
+/// records without dragging in `core::mem::size_of`.
+pub const DIRENT_HDR_LEN: usize = 12;
+
+/// Alignment that `d_reclen` is rounded up to. Matches Linux. Picked so
+/// a `DirEntry` after the name lands on a u64 boundary, which keeps
+/// the unaligned-load story simple for callers.
+pub const DIRENT_ALIGN: usize = 8;
+
 /// POD `struct stat`. Layout pinned to Linux generic-arch — do not
 /// reorder fields or change widths. Add new fields via a future
 /// `fs_statx` syscall (separate, larger struct) rather than tail
@@ -83,5 +137,17 @@ mod tests {
     #[test]
     fn size_matches_linux_generic() {
         assert_eq!(core::mem::size_of::<Stat>(), 128);
+    }
+
+    /// Pin DirEntry layout — the kernel writes packed records keyed
+    /// off `DIRENT_HDR_LEN`, and userland walks with `d_reclen` strides.
+    /// Reordering or padding the struct silently breaks `fs_readdir`.
+    #[test]
+    fn direntry_header_layout() {
+        assert_eq!(core::mem::size_of::<DirEntry>(), DIRENT_HDR_LEN);
+        // `#[repr(C, packed)]` gives alignment 1; the kernel emits
+        // records that *land* on 8-byte boundaries via padding, but
+        // the struct itself is byte-packed so misaligned loads work.
+        assert_eq!(core::mem::align_of::<DirEntry>(), 1);
     }
 }

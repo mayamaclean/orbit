@@ -12,7 +12,10 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use orbit_abi::fs::{S_IFDIR, S_IFREG, STAT_BLOCK_UNIT, Stat};
+use orbit_abi::fs::{
+    DIRENT_ALIGN, DIRENT_HDR_LEN, DT_DIR, DT_REG, DirEntry, S_IFDIR, S_IFREG, STAT_BLOCK_UNIT,
+    Stat,
+};
 use process::CompletionHandle;
 use tracing::{info, warn};
 use virtio_blk::{Block, BlockError, SECTOR_SIZE};
@@ -102,6 +105,24 @@ impl Tarfs {
         let mut inodes: Vec<Option<TarInode>> = Vec::new();
         inodes.push(None); // inode 0 = null sentinel
         let mut by_path: BTreeMap<String, Inode> = BTreeMap::new();
+
+        // Synthesize the FS root. Tar archives don't carry an explicit
+        // root entry (the bare `./` collapses to "" in canonicalize and
+        // we'd skip it below), but `fs_open("/")` and `fs_readdir(root)`
+        // need an inode to refer to. Pin it at id 1; mtime=0 since we
+        // have no source for it.
+        const ROOT_INO: Inode = 1;
+        inodes.push(Some(TarInode {
+            path: String::new(),
+            kind: Kind::Dir,
+            data_sector: 0,
+            size: 0,
+            mode_perms: 0o755,
+            uid: 0,
+            gid: 0,
+            mtime: 0,
+        }));
+        by_path.insert(String::from("/"), ROOT_INO);
 
         let capacity = dev.capacity_sectors();
         let mut lba: u64 = 0;
@@ -287,6 +308,112 @@ impl Filesystem for Tarfs {
 
     fn size(&self, ino: Inode) -> Result<u64, FsErr> {
         Ok(self.entry(ino)?.size)
+    }
+
+    /// Pack as many direct children of `ino` as fit into `out`,
+    /// starting at sorted-children index `cursor`. Tarfs has no
+    /// dir→children pointers; we filter the BTreeMap each call.
+    /// At the "few entries per dir" scale of v1 that's fine; if dirs
+    /// ever get hundreds of entries we'd pre-build a child list at
+    /// mount time.
+    fn readdir(
+        &self,
+        ino: Inode,
+        cursor: u64,
+        out: &mut [u8],
+    ) -> Result<(usize, u64), FsErr> {
+        let entry = self.entry(ino)?;
+        if !matches!(entry.kind, Kind::Dir) {
+            return Err(FsErr::NotADirectory);
+        }
+        // Listing prefix. Root dir's `path` is "" (synthesized) — its
+        // listing prefix is "/" so `/foo` and `/bar` show up. Non-root
+        // dirs append "/" so `/bin` lists only `/bin/<name>`.
+        let prefix: String = if entry.path.is_empty() {
+            String::from("/")
+        } else {
+            let mut s = String::with_capacity(entry.path.len() + 1);
+            s.push_str(&entry.path);
+            s.push('/');
+            s
+        };
+
+        // Walk the BTreeMap range starting at `prefix`, take entries
+        // whose key starts with `prefix` and whose remainder is a
+        // single path segment (no further `/`), preserving sort
+        // order. `cursor` is the index into this filtered stream.
+        let mut idx: u64 = 0;
+        let mut written: usize = 0;
+
+        for (path, &child_ino) in self.by_path.range(prefix.clone()..) {
+            if !path.starts_with(&prefix) {
+                break;
+            }
+            let suffix = &path[prefix.len()..];
+            if suffix.is_empty() || suffix.contains('/') {
+                continue;
+            }
+            if idx < cursor {
+                idx += 1;
+                continue;
+            }
+            // We have a candidate child at index `idx` with name `suffix`.
+            let Some(child) = self.inodes.get(child_ino as usize).and_then(|e| e.as_ref()) else {
+                idx += 1;
+                continue;
+            };
+            let d_type = match child.kind {
+                Kind::Reg => DT_REG,
+                Kind::Dir => DT_DIR,
+            };
+            // d_reclen = header + name, padded up to 8.
+            let raw = DIRENT_HDR_LEN + suffix.len();
+            let reclen = raw.div_ceil(DIRENT_ALIGN) * DIRENT_ALIGN;
+            // Name length capped at u8::MAX. Tarfs's joint name limit
+            // is 256 (prefix+name) but a single segment within that
+            // can still exceed 255 in pathological inputs — guard.
+            if suffix.len() > u8::MAX as usize {
+                idx += 1;
+                continue;
+            }
+            if written + reclen > out.len() {
+                if written == 0 {
+                    return Err(FsErr::BadRange);
+                }
+                break;
+            }
+
+            let hdr = DirEntry {
+                d_ino: child_ino as u64,
+                d_reclen: reclen as u16,
+                d_type,
+                d_namelen: suffix.len() as u8,
+            };
+            // Pack header then name. `#[repr(C, packed)]` means we
+            // can't take a &DirEntry — copy field-by-field through
+            // unaligned writes, which lower to byte stores.
+            let base = written;
+            unsafe {
+                core::ptr::write_unaligned(
+                    out[base..].as_mut_ptr() as *mut DirEntry,
+                    hdr,
+                );
+            }
+            let name_start = base + DIRENT_HDR_LEN;
+            out[name_start..name_start + suffix.len()].copy_from_slice(suffix.as_bytes());
+            // Zero the trailing padding so userland can't observe
+            // stale stack bytes (the kernel uses a UserPageWindow
+            // backed by user-mapped memory, but defensive zeroing
+            // keeps the contract clean).
+            for b in &mut out[name_start + suffix.len()..base + reclen] {
+                *b = 0;
+            }
+
+            written += reclen;
+            idx += 1;
+        }
+
+        Ok((written, idx))
     }
 }
 

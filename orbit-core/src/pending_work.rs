@@ -91,6 +91,19 @@ pub struct FsStatReq {
     pub stat_vaddr: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct FsReaddirReq {
+    /// Open directory fd (returned by `fs_open` on a directory path).
+    pub fd: u32,
+    /// User VA of the out-buffer. Filled with packed
+    /// [`orbit_abi::fs::DirEntry`] records.
+    pub buf_vaddr: usize,
+    /// Buffer length in bytes. Capped at one page on the kernel side
+    /// (single `UserPageWindow` for the copy-out, same constraint as
+    /// `fs_stat`).
+    pub len: usize,
+}
+
 /// Cap on user-supplied path lengths. Generous enough for tar's
 /// `prefix + "/" + name` joint limit (155 + 1 + 100 = 256), tight
 /// enough that the kernel can keep the copy on its own stack.
@@ -230,6 +243,12 @@ pub enum PendingWork {
     },
     FsStat {
         req: FsStatReq,
+        pid: u16,
+        root_pa: u64,
+        handle: CompletionHandle,
+    },
+    FsReaddir {
+        req: FsReaddirReq,
         pid: u16,
         root_pa: u64,
         handle: CompletionHandle,

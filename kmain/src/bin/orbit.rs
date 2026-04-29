@@ -321,6 +321,10 @@ extern "C" fn s_trap(
                         debug!("orbit handling u mode ecall({syscall})");
                         kmain::handle_fs_stat(epc, hart_context, frame);
                     }
+                    6003 => {
+                        debug!("orbit handling u mode ecall({syscall})");
+                        kmain::handle_fs_readdir(epc, hart_context, frame);
+                    }
                     _ => {
                         debug!("orbit handling u mode ecall({syscall})");
                         kmain::update_thread_and_trap_frame(epc + 4, hart_context, frame, from_user);

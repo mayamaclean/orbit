@@ -134,6 +134,12 @@ MARKERS=(
   'PASS: fs_read past EOF returns 0'
   'PASS: fs close /bin/hello.txt fd='
   'PASS: fs_open missing got Err\(errno=2\)'
+  # fs_readdir — synthesized root, /bin sub-listing, EOD, ENOTDIR.
+  'PASS: fs_readdir / opened fd='
+  'PASS: fs_readdir / count=2 README\+bin with right d_type'
+  'PASS: fs_readdir / EOD returns 0'
+  'PASS: fs_readdir /bin count=2 hello\+hello.txt'
+  'PASS: fs_readdir on regular file got Err\(errno=20\)'
   '=== fs smoke done ==='
   # §13a.1 — getpid/gettid land synchronously off the per-hart context.
   'PASS: getpid main got 1'

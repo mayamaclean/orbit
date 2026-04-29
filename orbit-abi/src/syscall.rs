@@ -44,6 +44,7 @@ pub const FUTEX_WAKE:      usize = 5005;
 pub const FS_OPEN:         usize = 6000;
 pub const FS_READ:         usize = 6001;
 pub const FS_STAT:         usize = 6002;
+pub const FS_READDIR:      usize = 6003;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(usize)]
@@ -75,6 +76,7 @@ pub enum Sysno {
     FsOpen         = FS_OPEN,
     FsRead         = FS_READ,
     FsStat         = FS_STAT,
+    FsReaddir      = FS_READDIR,
 }
 
 impl Sysno {
@@ -107,6 +109,7 @@ impl Sysno {
             FS_OPEN        => Self::FsOpen,
             FS_READ        => Self::FsRead,
             FS_STAT        => Self::FsStat,
+            FS_READDIR     => Self::FsReaddir,
             _              => return None,
         })
     }
@@ -144,6 +147,7 @@ impl Sysno {
             Self::ArgvEnvp          => 24,
             Self::FutexWait         => 25,
             Self::FutexWake         => 26,
+            Self::FsReaddir         => 27,
         }
     }
 
@@ -152,7 +156,7 @@ impl Sysno {
     /// when adding a `Sysno` variant. Older userland with a smaller
     /// COUNT reads a prefix of the kernel's table; newer userland with
     /// a larger COUNT treats the kernel's missing slots as zero.
-    pub const COUNT: usize = 27;
+    pub const COUNT: usize = 28;
 }
 
 #[cfg(test)]
@@ -181,6 +185,7 @@ mod tests {
         assert_eq!(Sysno::from_usize(FS_OPEN),  Some(Sysno::FsOpen));
         assert_eq!(Sysno::from_usize(FS_READ),  Some(Sysno::FsRead));
         assert_eq!(Sysno::from_usize(FS_STAT),  Some(Sysno::FsStat));
+        assert_eq!(Sysno::from_usize(FS_READDIR), Some(Sysno::FsReaddir));
         assert_eq!(Sysno::from_usize(GETPID),   Some(Sysno::GetPid));
         assert_eq!(Sysno::from_usize(GETTID),   Some(Sysno::GetTid));
         assert_eq!(Sysno::from_usize(WAIT_PID), Some(Sysno::WaitPid));
@@ -198,7 +203,7 @@ mod tests {
         assert_eq!(Sysno::from_usize(4999), None);
         assert_eq!(Sysno::from_usize(5006), None);
         assert_eq!(Sysno::from_usize(5999), None);
-        assert_eq!(Sysno::from_usize(6003), None);
+        assert_eq!(Sysno::from_usize(6004), None);
         assert_eq!(Sysno::from_usize(usize::MAX), None);
     }
 
@@ -224,6 +229,7 @@ mod tests {
         assert_eq!(Sysno::FsOpen            as usize, FS_OPEN);
         assert_eq!(Sysno::FsRead            as usize, FS_READ);
         assert_eq!(Sysno::FsStat            as usize, FS_STAT);
+        assert_eq!(Sysno::FsReaddir         as usize, FS_READDIR);
         assert_eq!(Sysno::GetPid            as usize, GETPID);
         assert_eq!(Sysno::GetTid            as usize, GETTID);
         assert_eq!(Sysno::WaitPid           as usize, WAIT_PID);
@@ -257,6 +263,7 @@ mod tests {
         assert_eq!(FS_OPEN, 6000);
         assert_eq!(FS_READ, 6001);
         assert_eq!(FS_STAT, 6002);
+        assert_eq!(FS_READDIR, 6003);
         assert_eq!(GETPID, 5001);
         assert_eq!(GETTID, 5002);
         assert_eq!(WAIT_PID, 5003);
@@ -279,7 +286,7 @@ mod tests {
             Sysno::CreateThread, Sysno::GetMicros, Sysno::FsOpen,
             Sysno::FsRead, Sysno::FsStat, Sysno::GetPid, Sysno::GetTid,
             Sysno::WaitPid, Sysno::CreateProcessEx, Sysno::ArgvEnvp,
-            Sysno::FutexWait, Sysno::FutexWake,
+            Sysno::FutexWait, Sysno::FutexWake, Sysno::FsReaddir,
         ];
         assert_eq!(all.len(), Sysno::COUNT);
         let mut seen = [false; Sysno::COUNT];

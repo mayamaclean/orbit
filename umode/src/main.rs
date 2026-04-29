@@ -9,10 +9,12 @@ use core::cell::Cell;
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
-use orbit_abi::errno::{Errno, EBADF, ECHILD, EFAULT, EINVAL, EPERM, ENOENT};
-use orbit_abi::fs::{S_IFDIR, S_IFMT, S_IFREG, Stat};
+use orbit_abi::errno::{Errno, EBADF, ECHILD, EFAULT, EINVAL, ENOENT, ENOTDIR, EPERM};
+use orbit_abi::fs::{
+    DIRENT_HDR_LEN, DT_DIR, DT_REG, DirEntry, S_IFDIR, S_IFMT, S_IFREG, Stat,
+};
 use orbit_abi::net::SockType;
-use orbit_abi::{logln, user::{close_handle, create_process_with_argv, create_thread, exit, fs_open, fs_read, fs_stat, futex_wait, futex_wake, get_affinity, get_hart_id, getpid, gettid, set_affinity, sleep_ms, console_write, serial_print, wait_pid, ConsoleWriter}};
+use orbit_abi::{logln, user::{close_handle, create_process_with_argv, create_thread, exit, fs_open, fs_read, fs_readdir, fs_stat, futex_wait, futex_wake, get_affinity, get_hart_id, getpid, gettid, set_affinity, sleep_ms, console_write, serial_print, wait_pid, ConsoleWriter}};
 use net_channel::BindSpec;
 use orbit_rt::netch::NetCh;
 
@@ -737,7 +739,165 @@ fn run_fs_smoke() {
         Err(e) => logln!("FAIL: fs_open missing errored: {e:?}"),
     }
 
+    run_fs_readdir_smoke();
+
     logln!("=== fs smoke done ===");
+}
+
+/// `fs_readdir` smoke. The known rootfs (built from /rootfs/) has
+/// exactly two top-level entries (`/README` regular, `/bin` dir) and
+/// two entries under `/bin` (`hello`, `hello.txt`). Verify:
+///   - readdir on `/` yields both top-level names with the right d_type
+///   - a follow-up readdir returns 0 (end-of-directory)
+///   - readdir on `/bin` yields the two child names
+///   - readdir on a regular-file fd returns ENOTDIR
+fn run_fs_readdir_smoke() {
+    // ---- / ----
+    let fd_root = match fs_open("/", 0) {
+        Ok(fd) => fd,
+        Err(e) => {
+            logln!("FAIL: fs_readdir / open: {e:?}");
+            return;
+        }
+    };
+    logln!("PASS: fs_readdir / opened fd={fd_root}");
+
+    let mut buf = [0u8; 256];
+    let n = match fs_readdir(fd_root, &mut buf) {
+        Ok(n) => n,
+        Err(e) => {
+            logln!("FAIL: fs_readdir / read: {e:?}");
+            let _ = close_handle(fd_root);
+            return;
+        }
+    };
+
+    let mut saw_readme_reg = false;
+    let mut saw_bin_dir = false;
+    let mut count_root = 0usize;
+    if !walk_dirents(&buf[..n], |name, d_type, _ino| {
+        count_root += 1;
+        if name == "README" && d_type == DT_REG {
+            saw_readme_reg = true;
+        }
+        if name == "bin" && d_type == DT_DIR {
+            saw_bin_dir = true;
+        }
+    }) {
+        logln!("FAIL: fs_readdir / packed records malformed");
+        let _ = close_handle(fd_root);
+        return;
+    }
+    if saw_readme_reg && saw_bin_dir && count_root == 2 {
+        logln!("PASS: fs_readdir / count=2 README+bin with right d_type");
+    } else {
+        logln!(
+            "FAIL: fs_readdir / count={count_root} readme_reg={saw_readme_reg} bin_dir={saw_bin_dir}",
+        );
+    }
+
+    // EOD: a second call past the cursor returns 0.
+    match fs_readdir(fd_root, &mut buf) {
+        Ok(0) => logln!("PASS: fs_readdir / EOD returns 0"),
+        Ok(n) => logln!("FAIL: fs_readdir / EOD returned {n}"),
+        Err(e) => logln!("FAIL: fs_readdir / EOD errored: {e:?}"),
+    }
+    let _ = close_handle(fd_root);
+
+    // ---- /bin ----
+    let fd_bin = match fs_open("/bin", 0) {
+        Ok(fd) => fd,
+        Err(e) => {
+            logln!("FAIL: fs_readdir /bin open: {e:?}");
+            return;
+        }
+    };
+    let n = match fs_readdir(fd_bin, &mut buf) {
+        Ok(n) => n,
+        Err(e) => {
+            logln!("FAIL: fs_readdir /bin read: {e:?}");
+            let _ = close_handle(fd_bin);
+            return;
+        }
+    };
+    let mut saw_hello = false;
+    let mut saw_hello_txt = false;
+    let mut count_bin = 0usize;
+    if !walk_dirents(&buf[..n], |name, d_type, _ino| {
+        count_bin += 1;
+        if name == "hello" && d_type == DT_REG {
+            saw_hello = true;
+        }
+        if name == "hello.txt" && d_type == DT_REG {
+            saw_hello_txt = true;
+        }
+    }) {
+        logln!("FAIL: fs_readdir /bin packed records malformed");
+        let _ = close_handle(fd_bin);
+        return;
+    }
+    if saw_hello && saw_hello_txt && count_bin == 2 {
+        logln!("PASS: fs_readdir /bin count=2 hello+hello.txt");
+    } else {
+        logln!(
+            "FAIL: fs_readdir /bin count={count_bin} hello={saw_hello} hello_txt={saw_hello_txt}",
+        );
+    }
+    let _ = close_handle(fd_bin);
+
+    // ---- ENOTDIR on a regular-file fd ----
+    let fd_file = match fs_open("/README", 0) {
+        Ok(fd) => fd,
+        Err(e) => {
+            logln!("FAIL: fs_readdir ENOTDIR open /README: {e:?}");
+            return;
+        }
+    };
+    match fs_readdir(fd_file, &mut buf) {
+        Err(Errno(e)) if e == ENOTDIR => {
+            logln!("PASS: fs_readdir on regular file got Err(errno={ENOTDIR})");
+        }
+        Ok(n) => logln!("FAIL: fs_readdir on regular file returned {n}"),
+        Err(e) => logln!("FAIL: fs_readdir on regular file errored: {e:?}"),
+    }
+    let _ = close_handle(fd_file);
+}
+
+/// Walk a packed-record buffer produced by `fs_readdir`, calling
+/// `visit(name, d_type, d_ino)` for each entry. Returns `false` if the
+/// stream is malformed (header runs off the end, name overflows the
+/// record, non-utf8 name, d_reclen smaller than header+name).
+fn walk_dirents(
+    buf: &[u8],
+    mut visit: impl FnMut(&str, u8, u64),
+) -> bool {
+    let mut p = 0usize;
+    while p < buf.len() {
+        if p + DIRENT_HDR_LEN > buf.len() {
+            return false;
+        }
+        let hdr = unsafe {
+            core::ptr::read_unaligned(buf[p..].as_ptr() as *const DirEntry)
+        };
+        // Copy out packed fields by value (taking refs into a packed
+        // struct is UB; copies are fine).
+        let reclen = hdr.d_reclen as usize;
+        let nlen = hdr.d_namelen as usize;
+        let d_type = hdr.d_type;
+        let ino = hdr.d_ino;
+        if reclen < DIRENT_HDR_LEN + nlen || p + reclen > buf.len() {
+            return false;
+        }
+        let name_start = p + DIRENT_HDR_LEN;
+        let name_bytes = &buf[name_start..name_start + nlen];
+        let name = match core::str::from_utf8(name_bytes) {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        visit(name, d_type, ino);
+        p += reclen;
+    }
+    true
 }
 
 /// §13a.1 identity probe. Calls `getpid` and `gettid` from the main
