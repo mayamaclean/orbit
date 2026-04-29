@@ -70,6 +70,7 @@ extern crate alloc;
 
 pub mod argv;
 pub mod netch;
+pub mod start;
 
 use core::alloc::Layout;
 use core::sync::atomic::{AtomicUsize, Ordering};

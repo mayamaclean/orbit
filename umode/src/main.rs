@@ -878,7 +878,7 @@ fn run_exec_smoke() {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn _start() -> ! {
+pub extern "C" fn main() -> i32 {
     // print to serial
     logln!("hello world!");
 
@@ -995,11 +995,11 @@ pub unsafe extern "C" fn _start() -> ! {
         Ok(()) => logln!("close_handle ok!"),
         Err(Errno(e)) => {
             logln!("close_handle failed: errno={e}");
-            exit(-(e as isize));
+            return -(e as i32);
         }
     }
 
-    exit(0);
+    0
 }
 
 #[panic_handler]

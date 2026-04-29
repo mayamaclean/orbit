@@ -14,8 +14,12 @@ use orbit_abi::{
 };
 use orbit_rt as _;
 
+/// orbit-rt's `_start` calls this after eagerly resolving argv. The
+/// return value is passed to `exit` — `42` keeps §13a.2's wait_pid
+/// path well-tested through dealloc_process →
+/// exit_waiter → signal_pair → wake_blocked_inline → user a1.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn _start() -> ! {
+pub extern "C" fn main() -> i32 {
     // serialln! (not logln!) — short-lived processes lose their
     // framebuffer scrollback when the source gets torn down, so go
     // straight to the kernel serial log instead.
@@ -32,10 +36,7 @@ pub unsafe extern "C" fn _start() -> ! {
         serialln!("hello argv[{i}]={s}");
     }
 
-    // Distinct value so §13a.2's wait_pid smoke can verify the
-    // exit-code path through dealloc_process → exit_waiter →
-    // signal_pair → wake_blocked_inline → user a1.
-    exit(42);
+    42
 }
 
 #[panic_handler]

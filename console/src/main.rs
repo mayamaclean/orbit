@@ -395,8 +395,7 @@ fn dispatch(line: &[u8]) {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn _start() -> ! {
-    logln!("console: up");
+pub extern "C" fn main() -> i32 {
     write_chunked(PROMPT);
 
     let mut buf = [0u8; 64];

@@ -80,7 +80,7 @@ enum LoaderErr {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn _start() -> ! {
+pub extern "C" fn main() -> i32 {
     // Spawn the in-tree console first so a user has a pane to flip to
     // on Ctrl+Tab while the loader is still negotiating its NetChannel.
     // Failure here isn't fatal — the loader is still useful for
@@ -93,7 +93,7 @@ pub unsafe extern "C" fn _start() -> ! {
     }
 
     if let Err(e) = sleep_ms(2000) {
-        exit(e.to_ret())
+        return e.to_ret() as i32;
     }
 
     // ServerRetain: the kernel keeps `socket.listen(LISTEN_PORT)` armed
