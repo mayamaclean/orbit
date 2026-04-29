@@ -25,6 +25,7 @@ pub const EISDIR:  i32 = 21;
 pub const EINVAL:  i32 = 22;
 pub const ENFILE:  i32 = 23;
 pub const ENOSYS:  i32 = 38;
+pub const ETIMEDOUT: i32 = 110;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(transparent)]

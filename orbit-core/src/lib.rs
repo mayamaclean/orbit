@@ -24,7 +24,8 @@ pub mod trap;
 
 pub use pending_work::{
     CloseHandleReq, CreateProcessExReq, CreateProcessReq, CreateThreadReq, FsOpenReq, FsReadReq,
-    FsStatReq, MAX_FS_PATH_LEN, MemMapReq, NetChannelCreationReq, PendingWork, WaitPidReq,
+    FsStatReq, FutexWaitReq, FutexWakeReq, MAX_FS_PATH_LEN, MemMapReq, NetChannelCreationReq,
+    PendingWork, WaitPidReq,
 };
 
 /// Page size assumed by pure logic when bounding user-memory ranges. Must

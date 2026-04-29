@@ -184,6 +184,12 @@ MARKERS=(
   'PASS: set_affinity pinned to hart 0 \(got hart 0\)'
   'PASS: create_thread worker ran on hart 1'
   'PASS: TLS isolation'
+  # §13a.5 futex round-trip: EAGAIN fast path, wake-after-park,
+  # wake-on-empty-queue.
+  'PASS: futex_wait value mismatch got Err\(errno=11\)'
+  'PASS: futex_wake n=1 woke 1'
+  'PASS: futex_wait worker resumed \(code=0\)'
+  'PASS: futex_wake empty queue woke 0'
   'PASS: shootdown probe — worker faulted on post-revoke read'
   # Sentinel — printed by umode after the last error-path check returns.
   # Without this, a panic / early-exit between two PASS markers would only

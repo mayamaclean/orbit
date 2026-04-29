@@ -12,8 +12,8 @@ use orbit_abi::layout::{user_priv_range_ok, user_range_ok, user_shared_range_ok}
 
 use crate::{
     CloseHandleReq, CreateProcessExReq, CreateProcessReq, CreateThreadReq, FsOpenReq, FsReadReq,
-    FsStatReq, Hardware, MAX_FS_PATH_LEN, MemMapReq, NetChannelCreationReq, PAGE_SIZE,
-    PendingWork, SyscallOutcome, WaitPidReq,
+    FsStatReq, FutexWaitReq, FutexWakeReq, Hardware, MAX_FS_PATH_LEN, MemMapReq,
+    NetChannelCreationReq, PAGE_SIZE, PendingWork, SyscallOutcome, WaitPidReq,
 };
 use net_channel::BindSpec;
 
@@ -407,6 +407,85 @@ pub fn create_process_ex_req<H: Hardware>(
     }
     let handle = CompletionHandle::new();
     let work = PendingWork::CreateProcessEx {
+        req,
+        pid: thread.pid,
+        root_pa: thread.root_table_addr() as u64,
+        handle: handle.clone(),
+    };
+    if hw.push_pending_work(work).is_err() {
+        return SyscallOutcome::Return { ret: Errno::new(EAGAIN).to_ret() };
+    }
+    thread.handle = Some(handle);
+    SyscallOutcome::Yield {
+        state: ThreadState::Blocking,
+        ret: None,
+    }
+}
+
+/// `futex_wait(uaddr, expected, timeout_ns)` — park on `uaddr` iff the
+/// observed value equals `expected`. The compare-and-park happens on
+/// the manager so a concurrent `futex_wake` can't slip between the
+/// read and the queue insert.
+///
+/// The syscall layer's job is just to bound-check the user pointer
+/// (4-byte aligned, mapped word) and queue the work; the manager
+/// resolves uaddr → PA, reads `*uaddr`, and either signals
+/// `-EAGAIN` (mismatch) or installs the handle on `futex_waiters[PA]`.
+pub fn futex_wait_req<H: Hardware>(
+    thread: &mut Thread,
+    frame: &TrapFrame,
+    hw: &mut H,
+) -> SyscallOutcome {
+    let uaddr = frame.regs[11];
+    let expected = frame.regs[12] as u32;
+    let timeout_ns = frame.regs[13] as u64;
+    if uaddr & 0b11 != 0 {
+        return SyscallOutcome::Return { ret: Errno::new(EINVAL).to_ret() };
+    }
+    if !user_range_ok(uaddr as u64, 4) {
+        return SyscallOutcome::Return { ret: Errno::new(EFAULT).to_ret() };
+    }
+    let req = FutexWaitReq { uaddr, expected, timeout_ns };
+    let handle = CompletionHandle::new();
+    let work = PendingWork::FutexWait {
+        req,
+        pid: thread.pid,
+        root_pa: thread.root_table_addr() as u64,
+        handle: handle.clone(),
+    };
+    if hw.push_pending_work(work).is_err() {
+        return SyscallOutcome::Return { ret: Errno::new(EAGAIN).to_ret() };
+    }
+    thread.handle = Some(handle);
+    SyscallOutcome::Yield {
+        state: ThreadState::Blocking,
+        ret: None,
+    }
+}
+
+/// `futex_wake(uaddr, n) → n_woken`. Manager resolves `uaddr` → PA,
+/// drains up to `n` parked waiters from the futex table, signals
+/// each with `0`, and returns the count.
+///
+/// Sync via the manager (not handler-thread) for the same reason as
+/// `futex_wait`: serializing the table mutation against waiters and
+/// against `dealloc_process` cleanup.
+pub fn futex_wake_req<H: Hardware>(
+    thread: &mut Thread,
+    frame: &TrapFrame,
+    hw: &mut H,
+) -> SyscallOutcome {
+    let uaddr = frame.regs[11];
+    let n = frame.regs[12] as u32;
+    if uaddr & 0b11 != 0 {
+        return SyscallOutcome::Return { ret: Errno::new(EINVAL).to_ret() };
+    }
+    if !user_range_ok(uaddr as u64, 4) {
+        return SyscallOutcome::Return { ret: Errno::new(EFAULT).to_ret() };
+    }
+    let req = FutexWakeReq { uaddr, n };
+    let handle = CompletionHandle::new();
+    let work = PendingWork::FutexWake {
         req,
         pid: thread.pid,
         root_pa: thread.root_table_addr() as u64,

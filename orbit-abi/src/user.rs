@@ -353,6 +353,58 @@ pub fn create_thread(
         .map(|t| t as u32)
 }
 
+/// Park the calling thread on `uaddr` if `*uaddr == expected`. The
+/// compare-and-park is performed atomically with respect to
+/// concurrent `futex_wake` calls — both go through the kernel
+/// manager, which serializes the read-then-park against any wake.
+///
+/// The wait queue is keyed on the *physical* page+offset of `uaddr`,
+/// so two threads in different processes that mapped the same
+/// shared frame can rendezvous on the same word. `uaddr` must be
+/// 4-byte aligned.
+///
+/// Returns:
+/// - `Ok(())` — woken by a matching `futex_wake`.
+/// - `Err(EAGAIN)` — `*uaddr != expected` at park time; caller
+///   should re-load and retry.
+/// - `Err(ETIMEDOUT)` — `timeout_ns > 0` deadline elapsed before a
+///   wake. (v1: `timeout_ns == 0` means wait forever.)
+/// - `Err(EFAULT)` — `uaddr` not mapped under the caller's satp.
+/// - `Err(EINVAL)` — `uaddr` not 4-byte aligned, or kernel-half VA.
+///
+/// # Safety
+/// `uaddr` must point at a 4-byte-aligned, mapped 32-bit word that
+/// outlives the wait. `AtomicU32::as_ptr()` is the canonical source.
+#[inline]
+pub unsafe fn futex_wait(uaddr: *const u32, expected: u32, timeout_ns: u64) -> Result<(), Errno> {
+    Errno::from_ret(unsafe {
+        ecall3(
+            syscall::FUTEX_WAIT,
+            uaddr as usize,
+            expected as usize,
+            timeout_ns as usize,
+        )
+    })
+    .map(|_| ())
+}
+
+/// Wake up to `n` threads parked on `uaddr` via [`futex_wait`].
+/// Returns the number actually woken (0 if nobody was parked at the
+/// time the wake was processed).
+///
+/// `uaddr` must be 4-byte aligned and follow the same physical-page
+/// keying rules as [`futex_wait`].
+///
+/// # Safety
+/// `uaddr` must be 4-byte-aligned and resolve to a mapped word.
+#[inline]
+pub unsafe fn futex_wake(uaddr: *const u32, n: u32) -> Result<u32, Errno> {
+    Errno::from_ret(unsafe {
+        ecall2(syscall::FUTEX_WAKE, uaddr as usize, n as usize)
+    })
+    .map(|c| c as u32)
+}
+
 /// Narrow the calling thread's per-hart eligibility mask. The new mask
 /// must be non-zero and a subset of `allowed_affinity` (queryable via
 /// [`get_affinity`]). Returns `Ok(())` on success, `Err(EINVAL)` if

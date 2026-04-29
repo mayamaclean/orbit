@@ -12,7 +12,7 @@ use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use orbit_abi::errno::{Errno, EBADF, ECHILD, EFAULT, EINVAL, EPERM, ENOENT};
 use orbit_abi::fs::{S_IFDIR, S_IFMT, S_IFREG, Stat};
 use orbit_abi::net::SockType;
-use orbit_abi::{logln, user::{close_handle, create_process, create_process_with_argv, create_thread, exit, fs_open, fs_read, fs_stat, get_affinity, get_hart_id, getpid, gettid, set_affinity, sleep_ms, console_write, serial_print, wait_pid, ConsoleWriter}};
+use orbit_abi::{logln, user::{close_handle, create_process_with_argv, create_thread, exit, fs_open, fs_read, fs_stat, futex_wait, futex_wake, get_affinity, get_hart_id, getpid, gettid, set_affinity, sleep_ms, console_write, serial_print, wait_pid, ConsoleWriter}};
 use net_channel::BindSpec;
 use orbit_rt::netch::NetCh;
 
@@ -334,6 +334,141 @@ fn run_create_thread_probe() {
         logln!("PASS: create_thread worker ran on hart 1 (target_bit=0x{target_bit:x})");
     } else {
         logln!("FAIL: create_thread worker ran on hart {observed} (want 1)");
+    }
+}
+
+// =====================================================================
+// §13a.5 futex probe.
+//
+// Two threads in the same process share a 4-byte counter at a fixed
+// process-private VA (a `static AtomicU32`). The worker `futex_wait`s
+// while the counter is `0`; main bumps the counter to `1` and
+// `futex_wake`s. The worker's `futex_wait` then returns Ok(()), it
+// publishes a "I woke" marker, and main verifies the EAGAIN fast-
+// path separately by waiting on a value that doesn't match.
+//
+// Two threads in the same process is the minimum non-trivial test —
+// a single-thread test couldn't `wake` itself. The cross-process
+// shared-frame case (different satps, same PA) is part of the
+// smoke's design intent but is gated on shared mmap from another
+// process, which is its own bringup; covered in a future smoke.
+// =====================================================================
+static FUTEX_COUNTER: AtomicU32 = AtomicU32::new(0);
+static FUTEX_WORKER_RAN: AtomicU32 = AtomicU32::new(0);
+static FUTEX_WORKER_RESULT: AtomicU32 = AtomicU32::new(u32::MAX);
+
+extern "C" fn futex_worker_entry() -> ! {
+    FUTEX_WORKER_RAN.store(1, Ordering::Release);
+    // Park while counter is still 0. The kernel re-reads the value
+    // under the manager lock; if main already bumped it before we
+    // get here we'd return EAGAIN immediately and the test would
+    // FAIL by way of FUTEX_WORKER_RESULT not being 0. Main sleeps
+    // for 50 ms after spawning to leave us time to land in the
+    // wait queue before bumping the counter.
+    let r = unsafe { futex_wait(FUTEX_COUNTER.as_ptr(), 0, 0) };
+    let code = match r {
+        Ok(()) => 0,
+        Err(Errno(e)) => e as u32,
+    };
+    FUTEX_WORKER_RESULT.store(code, Ordering::Release);
+    exit(0);
+}
+
+fn run_futex_probe() {
+    let (_cur, allowed) = get_affinity();
+    if allowed.count_ones() < 2 {
+        logln!("futex probe skipped (only one hart)");
+        return;
+    }
+
+    // Reset state — defensive; we only run this once today.
+    FUTEX_COUNTER.store(0, Ordering::Release);
+    FUTEX_WORKER_RAN.store(0, Ordering::Release);
+    FUTEX_WORKER_RESULT.store(u32::MAX, Ordering::Release);
+
+    // EAGAIN fast path: counter is 0, but we ask for `expected=42`.
+    // The kernel reads `*counter`, sees `0 != 42`, and returns
+    // -EAGAIN sync without parking.
+    let eagain = unsafe { futex_wait(FUTEX_COUNTER.as_ptr(), 42, 0) };
+    match eagain {
+        Err(Errno(e)) if e == orbit_abi::errno::EAGAIN => {
+            logln!("PASS: futex_wait value mismatch got Err(errno={e})");
+        }
+        other => {
+            logln!("FAIL: futex_wait value mismatch want EAGAIN got {other:?}");
+            return;
+        }
+    }
+
+    // Spawn the parker on hart 1 — a different hart than main, so the
+    // wake path crosses the IPI boundary (same shape as
+    // create_thread_probe).
+    let target_bit = 1u64 << 1;
+    if let Err(Errno(e)) = create_thread(futex_worker_entry, 0, target_bit) {
+        logln!("FAIL: futex probe create_thread errno={e}");
+        return;
+    }
+
+    // Wait for worker to enter futex_wait. The RAN flag is set just
+    // before the syscall — there's a short window between RAN=1 and
+    // the kernel actually inserting the waiter. The 50ms sleep below
+    // covers that window with margin.
+    let mut tries = 0u32;
+    while FUTEX_WORKER_RAN.load(Ordering::Acquire) == 0 {
+        if tries >= 100 {
+            logln!("FAIL: futex probe worker never entered wait");
+            return;
+        }
+        let _ = sleep_ms(10);
+        tries += 1;
+    }
+    let _ = sleep_ms(50);
+
+    // Bump the counter and wake one waiter. Order matters: the user-
+    // observable invariant is "counter != 0 implies the waker has
+    // run" — the wake itself is an event signal, not the data
+    // delivery, so the store goes first.
+    FUTEX_COUNTER.store(1, Ordering::Release);
+    let woken = unsafe { futex_wake(FUTEX_COUNTER.as_ptr(), 1) };
+    match woken {
+        Ok(n) => {
+            if n != 1 {
+                logln!("FAIL: futex_wake want 1 woke got {n}");
+                return;
+            }
+            logln!("PASS: futex_wake n=1 woke {n}");
+        }
+        Err(Errno(e)) => {
+            logln!("FAIL: futex_wake errno={e}");
+            return;
+        }
+    }
+
+    // Wait for worker to publish its return code. With wake working,
+    // the worker's `futex_wait` returns Ok(()) (code 0).
+    let mut tries = 0u32;
+    while FUTEX_WORKER_RESULT.load(Ordering::Acquire) == u32::MAX {
+        if tries >= 200 {
+            logln!("FAIL: futex probe worker never resumed after wake");
+            return;
+        }
+        let _ = sleep_ms(10);
+        tries += 1;
+    }
+    let r = FUTEX_WORKER_RESULT.load(Ordering::Acquire);
+    if r == 0 {
+        logln!("PASS: futex_wait worker resumed (code=0)");
+    } else {
+        logln!("FAIL: futex_wait worker code={r} (want 0)");
+        return;
+    }
+
+    // Wake on an empty queue: counter has nobody parked anymore.
+    // Returns 0 woken.
+    let woken_empty = unsafe { futex_wake(FUTEX_COUNTER.as_ptr(), 1) };
+    match woken_empty {
+        Ok(0) => logln!("PASS: futex_wake empty queue woke 0"),
+        other => logln!("FAIL: futex_wake empty queue want Ok(0) got {other:?}"),
     }
 }
 
@@ -770,6 +905,11 @@ pub unsafe extern "C" fn _start() -> ! {
     // per-thread (each thread sees its own copy). Must run before
     // the shootdown probe pins main to hart 0.
     run_tls_isolation_probe();
+
+    // §13a.5 futex round trip — must run before the shootdown probe
+    // pins main to hart 0; the worker pinned to hart 1 needs main on
+    // a different hart so the wake crosses the IPI boundary.
+    run_futex_probe();
 
     // §10 layer-3: cross-hart TLB shootdown probe. Pins itself and
     // restores affinity on the way out. Must run before the TCP

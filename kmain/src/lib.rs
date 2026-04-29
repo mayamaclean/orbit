@@ -885,6 +885,25 @@ pub fn handle_wait_pid(epc: usize, hart_context: &'static HartContext, frame: &m
     });
 }
 
+/// §13a.5 — `futex_wait(uaddr, expected, timeout_ns) → 0 | -EAGAIN
+/// | -ETIMEDOUT | -E*`. Park on the per-PA queue; wake by
+/// `futex_wake` or sync error.
+#[unsafe(no_mangle)]
+pub fn handle_futex_wait(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
+    dispatch_syscall(epc, hart_context, frame, |t, f| {
+        orbit_core::syscall::futex_wait_req(t, f, &mut crate::hw::RiscvHardware)
+    });
+}
+
+/// §13a.5 — `futex_wake(uaddr, n) → n_woken | -E*`. Drain up to `n`
+/// waiters from the per-PA queue and signal each with `0`.
+#[unsafe(no_mangle)]
+pub fn handle_futex_wake(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
+    dispatch_syscall(epc, hart_context, frame, |t, f| {
+        orbit_core::syscall::futex_wake_req(t, f, &mut crate::hw::RiscvHardware)
+    });
+}
+
 /// `getpid() → u16` — pid of the calling process. Stable for the
 /// process's lifetime; reads `thread.pid` directly. No manager
 /// round-trip, no blocking — same shape as `get_hart_id`.

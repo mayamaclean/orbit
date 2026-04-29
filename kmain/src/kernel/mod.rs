@@ -28,7 +28,8 @@ use orbit_abi::errno::{
 };
 use orbit_core::{
     CloseHandleReq, CreateProcessExReq, CreateProcessReq, CreateThreadReq, FsOpenReq, FsReadReq,
-    FsStatReq, MAX_FS_PATH_LEN, MemMapReq, NetChannelCreationReq, PendingWork, WaitPidReq,
+    FsStatReq, FutexWaitReq, FutexWakeReq, MAX_FS_PATH_LEN, MemMapReq, NetChannelCreationReq,
+    PendingWork, WaitPidReq,
 };
 use orbit_core::ready_queue::ReadyQueue;
 use orbit_core::sleep_heap::SleepHeap;
@@ -356,6 +357,35 @@ pub struct Orbit {
     /// `SocketReq`. On process exit the table is walked to revoke
     /// every Shared mapping before the manager drops its Arcs.
     process_handles: BTreeMap<u16, ProcessHandles>,
+
+    /// §13a.5 — futex wait queues keyed on the *physical* page+offset
+    /// of `uaddr`. Two threads in different processes that mapped the
+    /// same shared frame end up under the same key, so a single
+    /// `futex_wake` reaches them both. Manager-only; mutated under
+    /// `MANAGER_LOCK`. v1 has no timeout scan — `timeout_ns` is
+    /// captured but ignored (waiters block until woken or until
+    /// their owning process exits).
+    futex_waiters: BTreeMap<u64, Vec<FutexWaiter>>,
+}
+
+/// One slot on a futex wait queue. Captured at `futex_wait` request
+/// time; consumed by `futex_wake` (signal `0`) or by `dealloc_process`
+/// when the calling thread's process exits before a wake arrives
+/// (signal `-ESRCH`, which the unblock path turns back into a
+/// detectable errno on resume).
+#[derive(Debug)]
+pub struct FutexWaiter {
+    pub handle: process::CompletionHandle,
+    /// Pid of the parking thread. Used at `dealloc_process` time to
+    /// find and signal-and-drop waiters whose owner is going away,
+    /// so a futex queue keyed on a still-shared frame doesn't keep
+    /// pointing at a freed `CompletionHandle`'s consumer.
+    pub pid: u16,
+    /// Reserved: absolute tick deadline for `-ETIMEDOUT`. `0` = no
+    /// timeout. v1 always parks `0` regardless of the user-supplied
+    /// `timeout_ns` (the timeout-scan path lands when std::sync needs
+    /// it).
+    pub deadline_ticks: u64,
 }
 
 impl Orbit {
@@ -510,6 +540,7 @@ impl Orbit {
             sleeping: SleepHeap::new(),
             ready: ReadyQueue::new(),
             process_handles: BTreeMap::new(),
+            futex_waiters: BTreeMap::new(),
         }
     }
 
@@ -1351,6 +1382,104 @@ impl Orbit {
         );
     }
 
+    /// §13a.5 — futex wait. Owns the signaling: sync errors signal
+    /// here; the async park installs the waiter on the per-PA queue
+    /// and a later `futex_wake` (or process teardown) signals the
+    /// handle.
+    ///
+    /// The compare-then-park is atomic against any concurrent
+    /// `futex_wake` because both run on the manager hart under
+    /// `MANAGER_LOCK`. A wake that drains the queue runs to
+    /// completion before this wait arm sees it.
+    fn run_futex_wait_req(
+        &mut self,
+        req: FutexWaitReq,
+        pid: u16,
+        root_pa: u64,
+        handle: process::CompletionHandle,
+    ) {
+        let root_table = unsafe { memmap::kernel_root_from_pa(root_pa) };
+        let pa = match unsafe {
+            mmu::mmap::virt_to_phys(&root_table, VirtAddr::new(req.uaddr as u64))
+        } {
+            Some(p) => p as u64,
+            None => {
+                handle.signal(Errno::new(EFAULT).to_ret());
+                return;
+            }
+        };
+        // Read `*uaddr` through a transient KSCRATCH window. user_pages
+        // has no KDMAP alias under the kernel satp (kernel only KDMAPs
+        // its own pools), so a direct deref of `phys_to_kdmap(pa)`
+        // would land on an unmapped VA. UserPageWindow installs a
+        // leaf PTE at KSCRATCH for the page containing `pa`, lets us
+        // read the word, and tears down on drop. We hold
+        // `MANAGER_LOCK`, which is the single-slot serializer
+        // UserPageWindow assumes.
+        let page_pa = pa & !(PAGE_SIZE as u64 - 1);
+        let page_off = (pa - page_pa) as usize;
+        let observed = unsafe {
+            let mut win = crate::kernel::user_page::UserPageWindow::map(page_pa, PAGE_SIZE);
+            core::ptr::read_volatile(win.as_mut_ptr().add(page_off) as *const u32)
+        };
+        if observed != req.expected {
+            handle.signal(Errno::new(EAGAIN).to_ret());
+            return;
+        }
+        // Park: install the waiter on the per-PA queue. v1 ignores
+        // `timeout_ns` — the field is reserved; the wait blocks
+        // until a `futex_wake` (or `dealloc_process`) drains it.
+        let waiter = FutexWaiter {
+            handle,
+            pid,
+            deadline_ticks: 0,
+        };
+        self.futex_waiters.entry(pa).or_default().push(waiter);
+        trace!("futex_wait: pid={pid} pa={pa:#x} expected={}", req.expected);
+    }
+
+    /// §13a.5 — futex wake. Drains up to `req.n` waiters from
+    /// `futex_waiters[pa]`, signals each with `0`, and signals the
+    /// caller's handle with the count (or a negative errno on
+    /// translation failure).
+    fn run_futex_wake_req(
+        &mut self,
+        req: FutexWakeReq,
+        _pid: u16,
+        root_pa: u64,
+        handle: process::CompletionHandle,
+    ) {
+        let root_table = unsafe { memmap::kernel_root_from_pa(root_pa) };
+        let pa = match unsafe {
+            mmu::mmap::virt_to_phys(&root_table, VirtAddr::new(req.uaddr as u64))
+        } {
+            Some(p) => p as u64,
+            None => {
+                handle.signal(Errno::new(EFAULT).to_ret());
+                return;
+            }
+        };
+        let n_woken = match self.futex_waiters.get_mut(&pa) {
+            Some(waiters) => {
+                let take = core::cmp::min(req.n as usize, waiters.len());
+                // Drain from the front so wake order matches park
+                // order (FIFO). Since waiters are pushed at the tail
+                // in `run_futex_wait_req`, the oldest is at index 0.
+                let drained: Vec<FutexWaiter> = waiters.drain(..take).collect();
+                if waiters.is_empty() {
+                    self.futex_waiters.remove(&pa);
+                }
+                for w in drained {
+                    w.handle.signal(0);
+                }
+                take as isize
+            }
+            None => 0,
+        };
+        handle.signal(n_woken);
+        trace!("futex_wake: pa={pa:#x} requested={} woke={n_woken}", req.n);
+    }
+
     fn run_create_thread_req(&mut self, req: CreateThreadReq, pid: u16, parent_allowed: u64) -> isize {
         info!("handling create_thread req: {req:?} pid={pid} parent_allowed={parent_allowed:#x}");
 
@@ -1648,6 +1777,16 @@ impl Orbit {
                 PendingWork::CreateProcessEx { req, pid, root_pa, handle } => {
                     let result = self.run_create_process_ex_req(req, pid, root_pa);
                     handle.signal(result);
+                }
+                PendingWork::FutexWait { req, pid, root_pa, handle } => {
+                    // run_futex_wait_req owns the signaling — sync
+                    // EAGAIN/EFAULT signal here; the async park
+                    // installs the handle on `futex_waiters[pa]` and
+                    // a later `futex_wake` signals it with `0`.
+                    self.run_futex_wait_req(req, pid, root_pa, handle);
+                }
+                PendingWork::FutexWake { req, pid, root_pa, handle } => {
+                    self.run_futex_wake_req(req, pid, root_pa, handle);
                 }
             }
         }

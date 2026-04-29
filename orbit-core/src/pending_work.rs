@@ -116,6 +116,33 @@ pub struct CreateProcessReq {
     pub allowed_affinity: u64,
 }
 
+/// `futex_wait(uaddr, expected, timeout_ns)` request. The manager
+/// resolves `uaddr` to a physical address via the caller's user PT
+/// and uses the PA as the wait-queue key — two threads in different
+/// processes that mapped the same shared frame can rendezvous.
+///
+/// The expected-value compare-then-park is also done on the manager
+/// (after the PA resolve) so the read and the wait-queue insert are
+/// atomic with respect to a concurrent `futex_wake` (the manager is
+/// single-threaded — only one hart holds `MANAGER_LOCK`).
+#[derive(Debug, Clone, Copy)]
+pub struct FutexWaitReq {
+    pub uaddr: usize,
+    pub expected: u32,
+    /// `0` → wait forever (current v1 contract). Reserved for the
+    /// future timeout-scan path (see roadmap §13a.5).
+    pub timeout_ns: u64,
+}
+
+/// `futex_wake(uaddr, n)` request. Manager resolves `uaddr` to a PA
+/// the same way `FutexWaitReq` does and drains up to `n` waiters
+/// from `futex_waiters[PA]`, signaling each with `0`.
+#[derive(Debug, Clone, Copy)]
+pub struct FutexWakeReq {
+    pub uaddr: usize,
+    pub n: u32,
+}
+
 /// `CreateProcessReq` plus a packed argv blob. v1 carries no envp;
 /// the field is reserved by the matching `argv_envp` syscall name
 /// (the kernel can extend the blob format later without bumping the
@@ -217,6 +244,25 @@ pub enum PendingWork {
         req: CreateProcessExReq,
         pid: u16,
         root_pa: u64,
+        handle: CompletionHandle,
+    },
+    FutexWait {
+        req: FutexWaitReq,
+        pid: u16,
+        root_pa: u64,
+        /// Caller's handle. The manager either signals it
+        /// synchronously with `-EAGAIN` (value mismatch) or installs
+        /// it on the per-PA wait queue; a later `futex_wake` (or
+        /// timeout scan) signals with `0` / `-ETIMEDOUT`.
+        handle: CompletionHandle,
+    },
+    FutexWake {
+        req: FutexWakeReq,
+        pid: u16,
+        root_pa: u64,
+        /// Caller's handle. Signaled synchronously with the count of
+        /// waiters actually woken (≤ `req.n`) or a negative errno on
+        /// translation failure.
         handle: CompletionHandle,
     },
 }

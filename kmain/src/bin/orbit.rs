@@ -303,6 +303,12 @@ extern "C" fn s_trap(
                         debug!("orbit handling u mode ecall({syscall})");
                         kmain::handle_wait_pid(epc, hart_context, frame);
                     }
+                    5004 => {
+                        kmain::handle_futex_wait(epc, hart_context, frame);
+                    }
+                    5005 => {
+                        kmain::handle_futex_wake(epc, hart_context, frame);
+                    }
                     6000 => {
                         debug!("orbit handling u mode ecall({syscall})");
                         kmain::handle_fs_open(epc, hart_context, frame);
