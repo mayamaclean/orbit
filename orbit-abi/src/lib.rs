@@ -1,6 +1,7 @@
 #![no_std]
 
 pub mod argv;
+pub mod envp;
 pub mod errno;
 pub mod fs;
 pub mod layout;

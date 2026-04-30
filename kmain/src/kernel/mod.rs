@@ -43,7 +43,7 @@ use riscv::register::satp::{Mode, Satp};
 use riscv::register::sstatus::SPP;
 use smoltcp::iface::{Config, Interface, SocketHandle};
 use smoltcp::wire::{EthernetAddress};
-use tracing::{error, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::drivers::e1000::{
     E1000, E1000Pbuf, RX_RING_BUFS_BYTES,
@@ -2110,7 +2110,7 @@ impl Orbit {
                 Frame::<process::Table>::new(PhysAddr::new(process_root_table_pa)),
                 Self::TABLE_LAYOUT);
             let ktables_after = self.table_pages.allocated_bytes();
-            info!(
+            debug!(
                 "dealloc pid{}: ktables before={}B unmap_freed={}B root_freed={}B after={}B",
                 process.pid,
                 ktables_before,
@@ -3103,7 +3103,7 @@ impl Orbit {
             }
         }
 
-        info!(
+        debug!(
             "create pid{}: ktables consumed={}B (entry={}B now={}B)",
             pid,
             self.table_pages.allocated_bytes().saturating_sub(ktables_at_create),

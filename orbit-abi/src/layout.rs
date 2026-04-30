@@ -131,13 +131,27 @@ pub const fn validate_user_stack_size(size: u64) -> bool {
 /// User ELF image sits just above the 8 GiB stack region.
 pub const USER_TEXT_BASE: u64 = 0x2_2000_0000;
 
-/// One-page argv/envp blob mapped read-only into every process
-/// spawned via `CREATE_PROCESS_EX` (§13a.3). Sits in the high end of
-/// the ELF region (just below `UPROC_PRIV_BASE`) so the linker, which
-/// the orbit-rt build script keeps below `USER_ARGV_BASE`, won't lay
+/// One-page argv blob mapped read-only into every process spawned via
+/// `CREATE_PROCESS_EX` (§13a.3). Sits in the high end of the ELF
+/// region (just below `UPROC_PRIV_BASE`) so the linker — which the
+/// orbit-rt build script keeps below `USER_ENVP_BASE` — won't lay
 /// anything on top.
 pub const USER_ARGV_BASE: u64 = 0x2_FFFF_F000;
 pub const USER_ARGV_LEN:  u64 = PAGE_SIZE;
+
+/// One-page envp blob, format identical to the argv blob (see
+/// [`crate::argv`]); entries are NUL-terminated `KEY=VALUE` byte
+/// strings. Sits one page below [`USER_ARGV_BASE`] so the kernel can
+/// install argv and envp at known fixed VAs without per-process
+/// negotiation. orbit-rt's build script caps the ELF region at
+/// `USER_ENVP_BASE`; everything above (envp + argv) is kernel-mapped
+/// after process creation.
+///
+/// `0` is the syscall-level sentinel for "no envp installed" — see
+/// the second return slot of `argv_envp` (§13e). If non-zero, this is
+/// the value the kernel returns there.
+pub const USER_ENVP_BASE: u64 = 0x2_FFFF_E000;
+pub const USER_ENVP_LEN:  u64 = PAGE_SIZE;
 
 /// User-controlled private range — `mmap(share_with_kernel=false)`
 /// must land here. Sits *above* the kernel-managed stacks (8 GiB
@@ -448,6 +462,23 @@ mod tests {
         // Catching divergence here saves a debugging session when
         // someone adjusts STRIDE without updating the docs.
         assert_eq!(UPROC_STACK_MAX, 28 * 1024 * 1024);
+    }
+
+    #[test]
+    fn argv_envp_pages_abut_below_priv_base() {
+        // envp directly below argv, both one page, both above
+        // USER_TEXT_BASE and below UPROC_PRIV_BASE. orbit-rt's build
+        // script caps the ELF text at USER_ENVP_BASE — anything that
+        // shifts these constants past each other (or past
+        // UPROC_PRIV_BASE) breaks user-binary linking.
+        assert_eq!(USER_ENVP_BASE + USER_ENVP_LEN, USER_ARGV_BASE,
+            "envp page should immediately precede argv page");
+        assert_eq!(USER_ARGV_BASE + USER_ARGV_LEN, UPROC_PRIV_BASE,
+            "argv page should sit just below UPROC_PRIV_BASE");
+        assert!(USER_TEXT_BASE < USER_ENVP_BASE,
+            "envp page must sit above the ELF region");
+        assert_eq!(USER_ARGV_LEN, PAGE_SIZE);
+        assert_eq!(USER_ENVP_LEN, PAGE_SIZE);
     }
 
     #[test]

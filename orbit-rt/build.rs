@@ -12,16 +12,28 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 
-use orbit_abi::layout::{USER_ARGV_BASE, USER_TEXT_BASE};
+// Mirrors `orbit_abi::layout::USER_TEXT_BASE` and
+// `orbit_abi::layout::USER_ENVP_BASE`. Hardcoded here (instead of
+// imported as a build-dep) because build-dep features unify with
+// normal-dep features under Cargo's resolver v1 — see Cargo.toml's
+// note on why orbit-abi can't be a build-dep. A `const _` assertion in
+// `src/lib.rs` panics at compile time if these drift from the
+// authoritative values in `orbit-abi/src/layout.rs`.
+//
+// `USER_ENVP_BASE` (not `USER_ARGV_BASE`) is the ELF cap: envp sits
+// one page below argv, so the lower of the two is the upper bound.
+const USER_TEXT_BASE: u64 = 0x2_2000_0000;
+const USER_ENVP_BASE: u64 = 0x2_FFFF_E000;
 
 fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
 
     // The ELF region runs from USER_TEXT_BASE up to (but not into) the
-    // §13a.3 argv blob page just below UPROC_PRIV_BASE. Capping LENGTH
-    // here turns an oversized image into a link error instead of a
-    // runtime collision with the kernel-mapped argv page.
-    let length = USER_ARGV_BASE - USER_TEXT_BASE;
+    // §13e envp blob page (which sits one page below the §13a.3 argv
+    // blob, both just under UPROC_PRIV_BASE). Capping LENGTH here
+    // turns an oversized image into a link error instead of a runtime
+    // collision with the kernel-mapped envp/argv pages.
+    let length = USER_ENVP_BASE - USER_TEXT_BASE;
 
     let script = format!(
         r#"OUTPUT_ARCH( "riscv" )

@@ -4,22 +4,63 @@ version = "0.1.0"
 edition = "2024"
 build = "build.rs"
 
+[features]
+default = ["full-runtime"]
+
+# Tells orbit-rt and its rustc-dep-of-std-aware deps to swap their
+# `core` / `alloc` imports for the in-tree std-workspace shims. Set
+# when orbit-rt is pulled in as a `rustc-dep-of-std` style transitive
+# dep from std-on-orbit. std-on-orbit's Cargo.toml combines this with
+# `default-features = false` so the `full-runtime` feature stays off,
+# gating out modules with transitive deps (mem/heapless/byteorder/...)
+# that don't speak rustc-dep-of-std and therefore can't link into std.
+#
+# The two `*-workspace-*` deps below (`core`, `compiler_builtins`) only
+# get pulled in when this feature is on — they're optional path-deps
+# enabled here. Without the swap, orbit-rt's `extern crate core` would
+# resolve to a fresh copy and confuse the bootstrap into thinking
+# multiple cores exist in the std build's dep graph.
+rustc-dep-of-std = [
+    "dep:core",
+    "orbit-abi/rustc-dep-of-std",
+    "net_channel/rustc-dep-of-std",
+]
+
+# Default for no_std user binaries (umode, console, hello, orbit-loader,
+# benches). Pulls in the runtime modules std-on-orbit doesn't need:
+# `_start`, the NetCh wrapper, and the SharedVa shared-range allocator
+# (which depends on `mem` → `heapless` → `byteorder`, none of which are
+# rustc-dep-of-std-friendly).
+full-runtime = ["dep:mem"]
+
 [dependencies]
-talc      = { version = "5.0.3", default-features = false }
+# dlmalloc backs the `#[global_allocator]` for no_std orbit binaries.
+# Same crate std-on-orbit's PAL allocator uses (see
+# rust/library/std/src/sys/alloc/orbit.rs), so the runtime story is
+# consistent across no_std and std user code.
+dlmalloc = { version = "0.2.10", default-features = false }
 orbit-abi = { path = "../orbit-abi" }
 net_channel = { path = "../net_channel" }
 # `alloc` feature pulls in the buddy `FrameAllocator` we use to track
-# user-controlled VAs in the kernel-shared range.
-mem = { path = "../mem", features = ["alloc"] }
-# Used as the RawMutex backing for both the Talc heap (TalcLock) and
-# the SharedVa allocator's interior cell. Now that `create_thread`
-# (syscall 5000) lets a process span multiple harts, both allocators
-# are reachable concurrently and need real locking.
-spinning_top = { version = "0.3", default-features = false }
-lock_api = { version = "0.4", default-features = false }
+# user-controlled VAs in the kernel-shared range. Optional + gated
+# behind `full-runtime` so std-on-orbit's build (which sets
+# default-features = false + rustc-dep-of-std) doesn't pull mem and
+# its rustc-dep-of-std-incompatible transitive deps into std's graph.
+mem = { path = "../mem", features = ["alloc"], optional = true }
 
-# build.rs templates the user-app linker script from orbit-abi layout
-# constants so downstream binaries (umode, orbit-loader, console) don't
-# carry their own copy. See build.rs and src/lib.rs.
-[build-dependencies]
-orbit-abi = { path = "../orbit-abi" }
+# Std-workspace shims, only pulled in by the `rustc-dep-of-std`
+# feature. Mirrors the orbit-abi / net_channel pattern: when orbit-rt
+# is built inside the std workspace, its `core` import must alias the
+# in-tree `rustc-std-workspace-core` package; without the alias the
+# build sees two `core` crates and the in-tree compiler refuses to
+# acknowledge intrinsics from the wrong copy.
+core = { version = "1.0.0", optional = true, package = "rustc-std-workspace-core" }
+
+# NOTE: build.rs deliberately has *no* build-dependencies. With Cargo's
+# resolver v1 (which the rust source workspace uses), build-dep and
+# normal-dep features unify — pulling orbit-abi as a build-dep would
+# enable its `rustc-dep-of-std` feature in host-build context too,
+# which forces an in-tree-`core` compile before stage1 rustc exists
+# and breaks `./x build library`. The two layout constants build.rs
+# needs (USER_TEXT_BASE, USER_ARGV_BASE) are hardcoded; a `const _`
+# assertion in `src/lib.rs` keeps them in lockstep with orbit-abi.
