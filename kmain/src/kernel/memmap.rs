@@ -489,56 +489,66 @@ fn pool_regions(layout: &KernelLayout) -> [Region; 3] {
 // any of the dynamic arena entries (PCI, e1000, PLIC, virtio MMIO).
 // =========================================================================
 
-static SHARED_KMMIO_L2_PA: AtomicU64 = AtomicU64::new(0);
+static SHARED_KERNEL_L2_PA: AtomicU64 = AtomicU64::new(0);
 
+/// Sv48 root index that hosts the entire kernel high-half. KTEXT, KDMAP,
+/// KMMIO, and KSCRATCH are all 16 GiB apart starting at their
+/// `_NOMINAL` bases — comfortably inside the 512 GiB span of a single
+/// root entry — so all four share the same Mid-1 page table. This
+/// returns that one slot.
 #[inline]
-fn kmmio_root_slot() -> usize {
+fn shared_kernel_root_slot() -> usize {
     ((kmmio_base() >> 39) & 0x1FF) as usize
 }
 
-/// Snapshot the L2 PA that the kernel root just allocated for its KMMIO
-/// root slot. Called from `map_kernel_shared(is_kernel_root = true)`
-/// after `map_kernel_high_half` has installed the three fixed KMMIO
-/// leaves, which is what materializes the L2 in the first place.
-unsafe fn cache_shared_kmmio_l2(rt: &RootTable<'_>) {
-    let slot = kmmio_root_slot();
+/// Snapshot the Mid-1 PA the kernel root just allocated for its
+/// high-half slot. Called from `map_kernel_shared(is_kernel_root =
+/// true)` after `map_kernel_high_half` has materialized the table by
+/// installing the KTEXT / KDMAP / KMMIO leaves into it.
+unsafe fn cache_shared_kernel_l2(rt: &RootTable<'_>) {
+    let slot = shared_kernel_root_slot();
     let pte = &rt.table.entries[slot];
     assert!(
         pte.is_valid() && !pte.is_leaf(),
-        "cache_shared_kmmio_l2: kernel root slot {slot:#x} not a valid table entry",
+        "cache_shared_kernel_l2: kernel root slot {slot:#x} not a valid table entry",
     );
     let l2_pa = pte.ppn() * PAGE_SIZE as u64;
-    SHARED_KMMIO_L2_PA.store(l2_pa, Ordering::Release);
+    SHARED_KERNEL_L2_PA.store(l2_pa, Ordering::Release);
 }
 
-/// Install the cached KMMIO L2 PA into `rt`'s KMMIO root slot. Called
-/// from `map_kernel_shared(is_kernel_root = false)` when building user
-/// satps. Must run after `cache_shared_kmmio_l2` has set the static —
-/// the kernel root is built before any user process exists, so this
-/// holds in normal boot order.
-unsafe fn attach_shared_kmmio_l2(rt: &RootTable<'_>) {
-    let l2_pa = SHARED_KMMIO_L2_PA.load(Ordering::Acquire);
+/// Install the cached kernel Mid-1 PA into `rt`'s high-half slot.
+/// Called from `map_kernel_shared(is_kernel_root = false)` when
+/// building user satps. Must run after `cache_shared_kernel_l2` has
+/// set the static — the kernel root is built before any user process
+/// exists, so this holds in normal boot order.
+///
+/// User satps share the entire kernel high-half (KTEXT / KDMAP /
+/// KMMIO / KSCRATCH) through this single attach: a previous design
+/// that materialized per-process intermediates here before attaching
+/// orphaned them in place and leaked ~5 ktables pages per process.
+unsafe fn attach_shared_kernel_l2(rt: &RootTable<'_>) {
+    let l2_pa = SHARED_KERNEL_L2_PA.load(Ordering::Acquire);
     assert!(
         l2_pa != 0,
-        "attach_shared_kmmio_l2: shared L2 not yet cached \
-         (cache_shared_kmmio_l2 must run during kernel root setup)",
+        "attach_shared_kernel_l2: shared L2 not yet cached \
+         (cache_shared_kernel_l2 must run during kernel root setup)",
     );
-    let slot = kmmio_root_slot();
+    let slot = shared_kernel_root_slot();
     let ppn = l2_pa / PAGE_SIZE as u64;
     rt.table.entries[slot].set_raw(PageTableEntry::pack_table(ppn));
 }
 
-/// Drop the KMMIO root-slot pointer from `rt` so a subsequent recursive
-/// unmap doesn't descend into and free the shared subtree. Must be
-/// called immediately before `mmu::mmap::unmap` on a user satp during
-/// process teardown.
+/// Drop the high-half root-slot pointer from `rt` so a subsequent
+/// recursive unmap doesn't descend into and free the shared kernel
+/// subtree. Must be called immediately before `mmu::mmap::unmap` on a
+/// user satp during process teardown.
 ///
 /// Without this, the first process exit silently frees every L1/L0 PT
-/// page hanging off the shared L2 (plus the L2 itself), corrupting
-/// every other satp's KMMIO surface — pre-PLIC IRQs and post-MMIO
-/// loads start derailing as the freed pages get recycled.
-pub unsafe fn detach_shared_kmmio_l2(rt: &RootTable<'_>) {
-    let slot = kmmio_root_slot();
+/// page hanging off the shared Mid-1 (plus the Mid-1 itself),
+/// corrupting every other satp's kernel surface — pre-PLIC IRQs and
+/// post-MMIO loads start derailing as the freed pages get recycled.
+pub unsafe fn detach_shared_kernel_l2(rt: &RootTable<'_>) {
+    let slot = shared_kernel_root_slot();
     rt.table.entries[slot].set_raw(0);
 }
 
@@ -671,27 +681,28 @@ pub unsafe fn map_kernel_shared(
     is_kernel_root: bool,
 ) -> Result<(), ()> {
     unsafe {
-        // Kernel ELF, pools, and MMIO all live at high-half VAs. KDMAP covers
-        // RAM (so pool_regions doesn't need an identity alias); KMMIO covers
-        // device pages.
-        map_kernel_high_half(rt, pa, layout, is_kernel_root)?;
-
-        // Either snapshot the kernel root's KMMIO L2 PA (first time
-        // through, building the kernel root) or install that cached PA
-        // into this user satp's KMMIO root slot. Cf. the SHARED_KMMIO_L2
-        // commentary above.
         if is_kernel_root {
-            cache_shared_kmmio_l2(rt);
+            // Kernel root: materialize the high-half Mid-1 by installing
+            // KTEXT, pool/KDMAP, and KMMIO leaves; cache the resulting
+            // Mid-1 PA so user satps can share it; then pre-reserve
+            // KSCRATCH intermediates down to L0 (UserPageWindow opens a
+            // transient leaf here, and the L0 needs to exist before that
+            // first install). Every step writes into the kernel-owned
+            // Mid-1, so user satps inherit the work via the attach below.
+            map_kernel_high_half(rt, pa, layout, /*is_kernel_root=*/ true)?;
+            cache_shared_kernel_l2(rt);
+            reserve_va_range(rt, pa, kscratch_base(), kscratch_base() + KSCRATCH_SIZE)?;
         } else {
-            attach_shared_kmmio_l2(rt);
+            // User satps: KTEXT/KDMAP/KMMIO/KSCRATCH share root slot 511
+            // (16 GiB apart, all inside one 512-GiB root entry), so the
+            // cached kernel Mid-1 covers the entire kernel surface in a
+            // single PTE write. Don't materialize anything else here —
+            // `map_kernel_high_half` would walk this same root slot,
+            // allocate fresh per-process intermediates, and the attach
+            // would immediately orphan them in place. That was the
+            // ~5-pages-per-process ktables leak.
+            attach_shared_kernel_l2(rt);
         }
-
-        // Pre-materialize KSCRATCH intermediates (down to L0) but leave
-        // leaves V=0. UserPageWindow opens a transient leaf PTE here to
-        // access a user_pages backing from the kernel, and invalidates it
-        // on drop. Installed in every satp so the window works regardless
-        // of which satp is live when setup-time writes happen.
-        reserve_va_range(rt, pa, kscratch_base(), kscratch_base() + KSCRATCH_SIZE)?;
     }
     Ok(())
 }

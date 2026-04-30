@@ -2070,19 +2070,54 @@ impl Orbit {
             self.free_backing(b);
         }
 
+        // Drain any per-thread mappings still resident in proc.maps. In
+        // the normal teardown path, dealloc_thread already pulled each
+        // slot's Stack / TrapFrame / TLS entries out before this point,
+        // so the loop is a no-op. The partial-build Err arms in
+        // create_new_process route through here without dealloc_thread
+        // ever running, and would leak the user_pages stack/TLS frames
+        // and the kernel_pages trap frame otherwise.
+        while let Some((_va, m)) = process.maps.pop_first() {
+            if let Some(b) = m.backing {
+                self.free_backing(b);
+            }
+        }
+
+        // Leak-localization instrumentation for the ktables-growth bug.
+        // Dump the pool size at three boundaries — into dealloc, after the
+        // recursive unmap walk, and after the root free — so the per-pid
+        // delta is recoverable from the log. `unmap_freed` should account
+        // for every intermediate this pid materialized in user-half slots
+        // plus its private KTEXT/KDMAP/KSCRATCH chains; `root_freed`
+        // should be exactly `Self::TABLE_LAYOUT.size()`. A persistent net
+        // increase across two smoke runs localizes the leak to whatever
+        // sits between create_new_process entry and dealloc_process exit
+        // for this pid.
+        let ktables_before = self.table_pages.allocated_bytes();
         let mut pages = PageAlloc::FA(self.table_pages.frames_mut());
         unsafe {
-            // Detach the shared KMMIO L2 first — `unmap` is recursive and
-            // would otherwise descend into and free the shared subtree,
-            // corrupting every other satp's KMMIO surface.
-            memmap::detach_shared_kmmio_l2(&root_table);
+            // Detach the shared kernel high-half L2 first — `unmap` is
+            // recursive and would otherwise descend into and free the
+            // shared subtree, corrupting every other satp's kernel
+            // surface (KTEXT / KDMAP / KMMIO / KSCRATCH all live there).
+            memmap::detach_shared_kernel_l2(&root_table);
             unmap(&root_table, &mut pages);
+            let ktables_after_unmap = self.table_pages.allocated_bytes();
             // table_pages now returns typed frames — the walker's
             // `free_page` takes a raw PA directly; the root was allocated
             // from this pool so we reconstruct a `Frame<Table>` here.
             self.table_pages.free(
                 Frame::<process::Table>::new(PhysAddr::new(process_root_table_pa)),
                 Self::TABLE_LAYOUT);
+            let ktables_after = self.table_pages.allocated_bytes();
+            info!(
+                "dealloc pid{}: ktables before={}B unmap_freed={}B root_freed={}B after={}B",
+                process.pid,
+                ktables_before,
+                ktables_before.saturating_sub(ktables_after_unmap),
+                ktables_after_unmap.saturating_sub(ktables_after),
+                ktables_after,
+            );
 
             // Whole-ASID flush before `next_pid` can hand this u16 to a
             // fresh process. The dealloc_thread loop sfenced stack/trap
@@ -2460,88 +2495,6 @@ impl Orbit {
                     error!("failed to create knet thread");
                 }
             }
-
-            /*
-            // Create sockets
-            let mut dhcp_socket = dhcpv4::Socket::new();
-            dhcp_socket.set_max_lease_duration(Some(smoltcp::time::Duration::from_secs(600)));
-
-            let mut socket_shit = [SocketStorage::EMPTY; 16];
-
-            let mut sockets = SocketSet::new(&mut socket_shit[..]);
-            let dhcp_handle = sockets.add(dhcp_socket);
-
-            fn set_ipv4_addr(iface: &mut Interface, cidr: Ipv4Cidr) {
-                iface.update_ip_addrs(|addrs| {
-                    addrs.clear();
-                    addrs.push(IpCidr::Ipv4(cidr)).unwrap();
-                });
-            }
-
-            let tx_sockb = SocketBuffer::new(vec![0u8; 2048]);
-            let rx_sockb = SocketBuffer::new(vec![0u8; 2048]);
-            let tcp = smoltcp::socket::tcp::Socket::new(rx_sockb, tx_sockb);
-
-            let tcp_handle = sockets.add(tcp);
-            let mystery: &mut TcpSocket = sockets.get_mut(tcp_handle);
-
-            /*
-                1) allocate 4096b page for tx/rx bufs
-                2) map into kernel + maybe user memory
-                3) pass socket ingredients to k_net e.g. type + buffers
-
-                1) check for socket ingredient messages and create new sockets
-                2) disable interrupts
-                3) activate sum bit
-                3) poll iface and socketset
-                4) data goes into shared memory
-                5) kernel updates atomic ring buffer thing to inform thread of
-                   progress on its connection
-                6) 
-            */
-
-            loop {
-                let timestamp = smoltcp::time::Instant::from_micros(
-                    riscv::register::time::read() as i64 / 10
-                );
-
-                if iface.poll(timestamp, &mut e1000, &mut sockets) {
-                    let event = sockets.get_mut::<dhcpv4::Socket>(dhcp_handle).poll();
-                    match event {
-                        None => {
-                            //serial::println!("no event");
-                        }
-                        Some(dhcpv4::Event::Configured(config)) => {
-                            serial::println!("DHCP config acquired!");
-
-                            serial::println!("IP address:      {}", config.address);
-                            set_ipv4_addr(&mut iface, config.address);
-
-                            if let Some(router) = config.router {
-                                serial::println!("Default gateway: {}", router);
-                                iface.routes_mut().add_default_ipv4_route(router).unwrap();
-                            } else {
-                                serial::println!("Default gateway: None");
-                                iface.routes_mut().remove_default_ipv4_route();
-                            }
-
-                            for (i, s) in config.dns_servers.iter().enumerate() {
-                                serial::println!("DNS server {}:    {}", i, s);
-                            }
-                        }
-                        Some(dhcpv4::Event::Deconfigured) => {
-                            serial::println!("DHCP lost config!");
-                            iface.update_ip_addrs(|addrs| addrs.clear());
-                            iface.routes_mut().remove_default_ipv4_route();
-                        }
-                    }
-                }
-
-                
-
-                riscv::asm::delay(10_000_000);
-            }
-            */
         }
     }
     
@@ -2807,29 +2760,25 @@ impl Orbit {
         let guard_size       = user_stack_guard_size(stack_size);
         let trap_frame_vaddr = user_trap_frame_vaddr(slot);
 
-        // Root table PA is what satp wants. The `RootTable` handle stores
-        // a `&PageTable` at its KDMAP alias — reverse that to a `Frame<Table>`.
+        // Root table PA: derive directly from the borrowed `root_table`
+        // handle. We only need the PPN to stamp into the new thread's
+        // satp — the page belongs to the caller (the Process), and any
+        // intermediates we materialize below land in it.
         let root_kva = memmap::KdmapVa::new(root_table.table as *const _ as u64);
-        let root_frame = Frame::<process::Table>::new(root_kva.to_phys());
-        let root_ppn = root_frame.get_raw() as usize / PAGE_SIZE;
+        let root_pa = root_kva.to_phys();
+        let root_ppn = root_pa.get_raw() as usize / PAGE_SIZE;
 
         if let Err(_) = self.map_stack(root_table, stack_pa, stack_vaddr, stack_size) {
             self.user_pages.free(stack_frame, stack_layout);
             self.kernel_pages.free(tf_frame, Self::THREAD_TRAP_FRAME_LAYOUT);
-            self.table_pages.free(root_frame, Self::TABLE_LAYOUT);
-
             error!("failed to map stack");
-
             return Err(())
         }
 
         if let Err(_) = self.map_trap_frame(root_table, tf_pa, trap_frame_vaddr) {
             self.user_pages.free(stack_frame, stack_layout);
             self.kernel_pages.free(tf_frame, Self::THREAD_TRAP_FRAME_LAYOUT);
-            self.table_pages.free(root_frame, Self::TABLE_LAYOUT);
-
             error!("failed to map trap frame");
-
             return Err(())
         }
 
@@ -2858,7 +2807,6 @@ impl Orbit {
                 Err(e) => {
                     self.user_pages.free(stack_frame, stack_layout);
                     self.kernel_pages.free(tf_frame, Self::THREAD_TRAP_FRAME_LAYOUT);
-                    self.table_pages.free(root_frame, Self::TABLE_LAYOUT);
                     error!("bad TLS layout: {e:?}");
                     return Err(());
                 }
@@ -2868,7 +2816,6 @@ impl Orbit {
                 None => {
                     self.user_pages.free(stack_frame, stack_layout);
                     self.kernel_pages.free(tf_frame, Self::THREAD_TRAP_FRAME_LAYOUT);
-                    self.table_pages.free(root_frame, Self::TABLE_LAYOUT);
                     error!("failed to alloc TLS megapage");
                     return Err(());
                 }
@@ -2914,7 +2861,6 @@ impl Orbit {
                 self.user_pages.free(frame, layout);
                 self.user_pages.free(stack_frame, stack_layout);
                 self.kernel_pages.free(tf_frame, Self::THREAD_TRAP_FRAME_LAYOUT);
-                self.table_pages.free(root_frame, Self::TABLE_LAYOUT);
                 error!("failed to map TLS into process");
                 return Err(());
             }
@@ -3006,7 +2952,7 @@ impl Orbit {
 
         info!(
             "ventry={:016X?},vsp=0x{:016X?},vtp=0x{:016X?},rpt_pa={:016X?}",
-            entrypoint, frame.regs[2], frame.regs[4], root_frame.get_raw(),
+            entrypoint, frame.regs[2], frame.regs[4], root_pa.get_raw(),
         );
 
         Ok(Thread {
@@ -3041,6 +2987,13 @@ impl Orbit {
     /// empty argv via [`orbit_abi::user::argv_envp`]. Mirrors the
     /// warn-but-continue policy in `run_create_process_ex_req`.
     pub fn create_new_process(&mut self, elf_blob: &[u8], stack_size: u64, allowed_affinity: u64, affinity: u64, parent_pid: u16, argv_bytes: Option<&[u8]>) -> Result<u16, ()> {
+        // Leak-localization: pair this with the ktables snapshots in
+        // dealloc_process. `create_pid{N}: ktables consumed=B` reports the
+        // total table_pages footprint installed at process-construction
+        // time; a matching `dealloc pid{N}: ... root_freed=B after=B`
+        // shows what was reclaimed. The two should bracket each other on
+        // a leak-free run.
+        let ktables_at_create = self.table_pages.allocated_bytes();
         let (root_pa, root_table) = self.create_new_page_table()?;
         let mut elf = self.load_elf(&root_table, elf_blob)?;
         let pid = self.next_pid();
@@ -3078,18 +3031,34 @@ impl Orbit {
         let thread = match self.create_new_thread(pid, &root_table, elf.entrypoint, slot, stack_size, allowed_affinity, affinity, 0) {
             Ok(t) => t,
             Err(e) => {
-                let _ = self.processes.remove(&pid);
+                // Process was inserted before create_new_thread, with
+                // ELF segments tracked in heap_pages and ELF leaves +
+                // intermediates installed in the user satp. Hand it to
+                // dealloc_process for the full sweep — recursive unmap
+                // walks the user-half tree, drains heap_pages backings,
+                // frees the root. Zero parent_pid first so we don't
+                // pollute the parent's dead_children with a phantom
+                // (pid, 0) entry that nobody will wait_pid on.
+                if let Some(mut proc) = self.processes.remove(&pid) {
+                    proc.parent_pid = 0;
+                    self.dealloc_process(proc);
+                }
                 return Err(e);
             }
         };
         let tid = thread.tid;
 
         if let Err(_) = self.map_kernel_into(&root_table) {
-            let _ = self.processes.remove(&pid);
-            self.table_pages.free(root_pa, Self::TABLE_LAYOUT);
-
             error!("failed to map kernel into process");
-
+            // Same shape as the create_new_thread Err arm above, but
+            // proc.maps now also holds slot-0's Stack/TrapFrame/TLS
+            // entries from the just-completed create_new_thread.
+            // dealloc_process's proc.maps drain frees those backings;
+            // recursive unmap covers their intermediates.
+            if let Some(mut proc) = self.processes.remove(&pid) {
+                proc.parent_pid = 0;
+                self.dealloc_process(proc);
+            }
             return Err(())
         }
 
@@ -3133,6 +3102,14 @@ impl Orbit {
                 );
             }
         }
+
+        info!(
+            "create pid{}: ktables consumed={}B (entry={}B now={}B)",
+            pid,
+            self.table_pages.allocated_bytes().saturating_sub(ktables_at_create),
+            ktables_at_create,
+            self.table_pages.allocated_bytes(),
+        );
 
         Ok(pid)
     }
