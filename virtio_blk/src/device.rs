@@ -161,6 +161,20 @@ impl Block {
         self.capacity_sectors
     }
 
+    /// Predict the descriptor head that the next [`Self::submit_read`]
+    /// will produce. Lets a caller publish per-head bookkeeping (e.g.
+    /// the kernel's `IN_FLIGHT[head]` handle slot) *before* the submit
+    /// notifies the device — without this, the IRQ-side completion
+    /// could see an unregistered slot if the device finishes the chain
+    /// faster than the submitter can publish.
+    ///
+    /// Non-mutating: the head is not consumed until `submit_read`
+    /// actually calls `push_chain`. Returns `None` if the request
+    /// queue is full.
+    pub fn peek_next_head(&self) -> Option<u16> {
+        self.reqq.peek_free_head()
+    }
+
     fn header_slot(&self, head: u16) -> (*mut BlkReqHeader, u64) {
         let off = HEADER_OFFSET + head as usize * HEADER_STRIDE;
         let kva = unsafe { self.arena_kva.add(off) } as *mut BlkReqHeader;

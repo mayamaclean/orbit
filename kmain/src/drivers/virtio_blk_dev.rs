@@ -207,11 +207,18 @@ pub unsafe fn submit_blk_read(
     success_value: isize,
 ) -> Result<u16, BlockError> {
     let dev = block_dev().ok_or(BlockError::QueueFull)?;
-    let head = unsafe { dev.submit_read(lba, dst_pa, SECTOR_SIZE as u32)? };
 
-    // Order: write the value first, then publish the handle. The
-    // Release on IN_FLIGHT.swap synchronizes-with the AcqRel on the
-    // IRQ side, so the value store is visible.
+    // Pre-publish: peek the head that submit_read will use, then
+    // populate IN_FLIGHT[head] *before* submit_read runs (which
+    // notifies the device). Without this the device can complete the
+    // chain and fire the IRQ on another hart while we're still inside
+    // submit_read; the IRQ handler then sees a null `IN_FLIGHT[head]`
+    // and the parked thread strands waiting for a signal that never
+    // comes. The race window is short on QEMU but fundamental on real
+    // hardware. peek_next_head is non-consuming: submit_read's own
+    // peek_free_head + push_chain land on the same head we predicted.
+    let head = dev.peek_next_head().ok_or(BlockError::QueueFull)?;
+
     IN_FLIGHT_OK_VAL[head as usize].store(success_value as i64, Ordering::Relaxed);
 
     // Stash the handle's Arc for the IRQ handler to reclaim. swap, not
@@ -230,7 +237,31 @@ pub unsafe fn submit_blk_read(
             drop(CompletionHandle::from_raw(prev));
         }
     }
-    Ok(head)
+
+    // Now actually submit. push_chain must produce the same head we
+    // pre-published; if not, our handle is stranded at the wrong slot.
+    // submit_read debug_asserts head == predicted internally, so a
+    // mismatch panics in dev builds; in release it's silently wrong.
+    match unsafe { dev.submit_read(lba, dst_pa, SECTOR_SIZE as u32) } {
+        Ok(actual) => {
+            debug_assert!(
+                actual == head,
+                "submit_blk_read: predicted head={head} but submit produced {actual}",
+            );
+            Ok(head)
+        }
+        Err(e) => {
+            // Reclaim the handle since the chain never went out.
+            let raw = IN_FLIGHT[head as usize]
+                .swap(core::ptr::null_mut(), Ordering::AcqRel);
+            if !raw.is_null() {
+                unsafe {
+                    drop(CompletionHandle::from_raw(raw));
+                }
+            }
+            Err(e)
+        }
+    }
 }
 
 /// PLIC handler. Acks the device interrupt, drains every completed

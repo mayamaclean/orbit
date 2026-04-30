@@ -5,3 +5,10 @@
 *.log
 disk.img
 orbit-loader/tools/__pycache__/
+
+# Disk-staged user binaries — produced by tools/build-disk.sh from the
+# real source crates (console/, umode/, hello-std/). Text fixtures
+# under rootfs/ remain tracked.
+rootfs/bin/console
+rootfs/bin/smoke
+rootfs/bin/hello-std

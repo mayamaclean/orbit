@@ -836,8 +836,12 @@ fn run_fs_readdir_smoke() {
         let _ = close_handle(fd_bin);
         return;
     }
-    if saw_hello && saw_hello_txt && count_bin == 2 {
-        logln!("PASS: fs_readdir /bin count=2 hello+hello.txt");
+    // Don't pin the count — the disk image now also stages /bin/console,
+    // /bin/smoke, /bin/hello-std (see tools/build-disk.sh) so /bin has
+    // ≥4 entries. The fixtures `hello` and `hello.txt` are the only
+    // names this smoke pins.
+    if saw_hello && saw_hello_txt && count_bin >= 2 {
+        logln!("PASS: fs_readdir /bin contains hello+hello.txt (count={count_bin})");
     } else {
         logln!(
             "FAIL: fs_readdir /bin count={count_bin} hello={saw_hello} hello_txt={saw_hello_txt}",
@@ -906,12 +910,17 @@ fn walk_dirents(
 /// `gettid()` shape), so its absolute value depends on how many
 /// kernel threads — k_net etc. — got allocated tids before umode
 /// started; assert nonzero and stability instead of a fixed value.
+///
+/// pid was previously asserted == 1 because umode was the boot
+/// process. Post §13e tarfs-init, orbit-loader is pid 1 and umode
+/// is pid 2 (loaded from `/bin/smoke`). The exact pid varies with
+/// the boot lineage; assert > 0 instead of pinning a value.
 fn run_identity_probe() {
     let pid = getpid();
-    if pid == 1 {
+    if pid > 0 {
         logln!("PASS: getpid main got {pid}");
     } else {
-        logln!("FAIL: getpid main got {pid} (want 1)");
+        logln!("FAIL: getpid main got {pid} (want >0)");
     }
 
     let tid_a = gettid();
@@ -1046,7 +1055,8 @@ pub extern "C" fn main() -> i32 {
 
     // §13a.1 identity probe — runs before any worker thread spawns so
     // the main thread's tid is deterministic (= 1, the first tid the
-    // kernel allocates). umode is the boot pid, so getpid() == 1.
+    // kernel allocates). pid is whatever orbit-loader assigned us;
+    // we just assert nonzero + stability.
     run_identity_probe();
 
     run_fs_smoke();

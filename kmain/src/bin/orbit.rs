@@ -435,8 +435,37 @@ pub extern "C" fn k_smpstart() {
     }
 
     let boot_affinity = orbit.all_harts_mask();
-    orbit.create_new_process(kmain::kernel::UMODE_TEST_ELF, kmain::kernel::UPROC_STACK_DEFAULT, boot_affinity, boot_affinity, 0)
-        .expect("no test uprocess");
+    // Boot argv: orbit-loader gets argv[1] = path of the init binary
+    // it should fs_open + spawn from tarfs. Per cfg:
+    //   default     → /bin/console
+    //   feature smoke → /bin/smoke (umode renamed for clarity)
+    //   feature hello-std → /bin/hello-std
+    // The loader logs and continues past a missing init path, so an
+    // unmounted FS or mistyped path doesn't strand the boot.
+    #[cfg(not(any(feature = "smoke", feature = "hello-std")))]
+    let init_path: &[u8] = b"/bin/console";
+    #[cfg(feature = "smoke")]
+    let init_path: &[u8] = b"/bin/smoke";
+    #[cfg(feature = "hello-std")]
+    let init_path: &[u8] = b"/bin/hello-std";
+
+    let mut argv_buf = [0u8; 256];
+    let argv_len = orbit_abi::argv::pack(
+        &[b"/bin/orbit-loader", init_path],
+        &mut argv_buf,
+    )
+    .expect("boot argv fits in 256 bytes");
+    let argv_blob = &argv_buf[..argv_len];
+
+    orbit.create_new_process(
+        kmain::kernel::UMODE_TEST_ELF,
+        kmain::kernel::UPROC_STACK_DEFAULT,
+        boot_affinity,
+        boot_affinity,
+        0,
+        Some(argv_blob),
+    )
+    .expect("no test uprocess");
 
     // Release the secondary-hart S-mode spin in `secondary_rust_setup`.
     // Release-store; secondaries Acquire and observe the publishes
@@ -446,6 +475,14 @@ pub extern "C" fn k_smpstart() {
     }
 
     (0..orbit.cpu_count).for_each(|hart| kmain::supervisor_wake_hart(hart));
+
+    // Now that the secondaries are alive and will drain their
+    // shootdown rings, allow `shootdown::broadcast` to actually wait
+    // for acks. Until this point any broadcast (e.g. from
+    // `install_argv_blob` during the first user-process spawn above)
+    // is a silent no-op — there are no remote TLBs to invalidate
+    // anyway since no other hart has run yet.
+    kmain::kernel::shootdown::mark_secondaries_kicked();
 
     info!("kicked harts");
 

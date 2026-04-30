@@ -17,7 +17,7 @@
 //! its own local `sfence.vma` (typically the same one it was already
 //! doing pre-shootdown).
 
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use orbit_core::tlb_shootdown::{ShootdownRing, drain_shootdown_ring, tlb_shootdown};
 
@@ -58,6 +58,25 @@ pub fn init(cpu_count: usize) {
     CPU_COUNT.store(cpu_count, Ordering::Release);
 }
 
+/// Flips to `true` once hart 0 has issued the SECONDARY_GO release
+/// + IPI kicks in `k_smpstart`. Until then the secondary harts spin
+/// in `secondary_rust_setup` and can't drain their shootdown rings,
+/// so a [`broadcast`] would `wait_zero_spin` forever waiting for an
+/// ack that never arrives.
+///
+/// Pre-flip there's also no risk of stale TLB entries on remote
+/// harts (none have run any user PTE yet), so the broadcast is
+/// unnecessary. Both correctness and liveness say "no-op until
+/// secondaries are alive."
+static SECONDARIES_KICKED: AtomicBool = AtomicBool::new(false);
+
+/// Hart 0 calls this exactly once after `SECONDARY_GO`/`supervisor_wake_hart`
+/// in `k_smpstart`, signalling that subsequent broadcasts may safely
+/// wait for acks. Idempotent — second call is a no-op.
+pub fn mark_secondaries_kicked() {
+    SECONDARIES_KICKED.store(true, Ordering::Release);
+}
+
 /// Send a TLB-shootdown request for `[va, va + len)` to every hart
 /// other than the caller and block until each acks. The request shape
 /// the receiver honors:
@@ -79,6 +98,14 @@ pub fn init(cpu_count: usize) {
 pub fn broadcast(va: u64, len: u64) {
     let n = CPU_COUNT.load(Ordering::Acquire);
     if n <= 1 {
+        return;
+    }
+    // Boot-window guard: skip until hart 0 has woken the secondaries.
+    // Pre-kick they can't drain the shootdown ring (still spinning in
+    // `secondary_rust_setup`), and they have no TLB entries to
+    // invalidate yet anyway, so the IPI is both deadlock-prone and
+    // unnecessary.
+    if !SECONDARIES_KICKED.load(Ordering::Acquire) {
         return;
     }
     let self_id = get_hart_context().hart_id as usize;

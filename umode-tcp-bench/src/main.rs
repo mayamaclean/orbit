@@ -142,8 +142,11 @@ fn run_round(round: usize) -> bool {
     true
 }
 
+// orbit-rt's `_start` (§13b) is the canonical entrypoint; downstream
+// binaries provide `main` and let orbit-rt do the eager argv resolve
+// and exit.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn _start() -> ! {
+pub extern "C" fn main() -> i32 {
     logln!("umode-tcp-bench: starting (target={TARGET_BYTES} bytes/round, rounds={ROUNDS})");
 
     // Brief settle after process create so the netch subsystem has
@@ -161,7 +164,7 @@ pub unsafe extern "C" fn _start() -> ! {
     }
 
     logln!("umode-tcp-bench: done ({ok_rounds}/{ROUNDS} rounds completed)");
-    exit(0);
+    0
 }
 
 #[panic_handler]

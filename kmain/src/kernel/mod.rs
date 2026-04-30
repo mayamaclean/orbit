@@ -74,20 +74,15 @@ pub use memmap::KernelLayout;
 
 // TODO: page unmapping
 
-// Default build embeds orbit-loader as the initial user program —
-// listens on TCP :7777 and spawns ELFs via create_process, so umode
-// rebuilds don't drag kmain+bl along. The `smoke` Cargo feature swaps
-// in umode directly so ./smoke can run the automated self-test without
-// a host-side sender (and without the network-ready latency). The
-// `hello-std` feature swaps in the §13e-stage hello-std binary built
-// against the `riscv64gc-unknown-orbit` triple — used to verify the
-// rustc fork's std PAL boots end-to-end.
-#[cfg(not(any(feature = "smoke", feature = "hello-std")))]
+// kmain always embeds orbit-loader as the initial user program. The
+// loader fs_opens an init-binary path off the tarfs disk image and
+// `create_process`es it; what binary is selected is controlled by the
+// boot argv built in `k_smpstart`, not by recompiling kmain. The
+// previously-conditional `smoke` / `hello-std` swaps for embedding
+// `umode` / `hello-std` directly are gone — those binaries live on
+// disk under `/bin/smoke` and `/bin/hello-std` (see
+// tools/build-disk.sh) and the loader picks them via its argv.
 pub const UMODE_TEST_ELF: &'static [u8] = include_bytes!("../../../orbit-loader/target/riscv64gc-unknown-none-elf/release/orbit-loader");
-#[cfg(feature = "smoke")]
-pub const UMODE_TEST_ELF: &'static [u8] = include_bytes!("../../../umode/target/riscv64gc-unknown-none-elf/release/umode");
-#[cfg(feature = "hello-std")]
-pub const UMODE_TEST_ELF: &'static [u8] = include_bytes!("../../../hello-std/target/riscv64gc-unknown-orbit/release/hello-std");
 
 // User address-space layout lives in the canonical orbit_abi::layout module.
 // Re-exported so existing `kernel::USER_TEXT_BASE`-style call sites keep
@@ -1303,22 +1298,13 @@ impl Orbit {
             return Errno::new(EINVAL).to_ret();
         }
 
-        let pid = match self.create_new_process(&blob, UPROC_STACK_DEFAULT, allowed, affinity, parent_pid) {
+        let pid = match self.create_new_process(&blob, UPROC_STACK_DEFAULT, allowed, affinity, parent_pid, argv_bytes.as_deref()) {
             Ok(pid) => pid,
             Err(()) => {
                 error!("create_process_ex: create_new_process failed");
                 return Errno::new(ENOEXEC).to_ret();
             }
         };
-
-        if let Some(argv) = argv_bytes {
-            if let Err(_) = self.install_argv_blob(pid, &argv) {
-                // Process is alive; argv install failed. v1: log and
-                // continue — child will see "no argv" via argv_envp().
-                // We don't tear down the process for an argv error.
-                warn!("create_process_ex: argv install failed for pid={pid}, child will see no args");
-            }
-        }
 
         info!("create_process_ex: spawned pid={pid} parent={parent_pid} argv_len={}", req.argv_len);
         pid as isize
@@ -1686,7 +1672,7 @@ impl Orbit {
             return Errno::new(EINVAL).to_ret();
         }
 
-        match self.create_new_process(&blob, UPROC_STACK_DEFAULT, allowed, affinity, parent_pid) {
+        match self.create_new_process(&blob, UPROC_STACK_DEFAULT, allowed, affinity, parent_pid, None) {
             Ok(pid) => {
                 info!("create_process: spawned pid={pid} parent={parent_pid} from {} bytes \
                     allowed_affinity={allowed:#x} affinity={affinity:#x}", blob.len());
@@ -3048,7 +3034,13 @@ impl Orbit {
         })
     }
 
-    pub fn create_new_process(&mut self, elf_blob: &[u8], stack_size: u64, allowed_affinity: u64, affinity: u64, parent_pid: u16) -> Result<u16, ()> {
+    /// Build a fresh process from `elf_blob`. If `argv_bytes` is
+    /// `Some(blob)`, the packed argv is installed at `USER_ARGV_BASE`
+    /// before the process becomes runnable; argv-install failure is
+    /// non-fatal — the process still spawns and the child sees an
+    /// empty argv via [`orbit_abi::user::argv_envp`]. Mirrors the
+    /// warn-but-continue policy in `run_create_process_ex_req`.
+    pub fn create_new_process(&mut self, elf_blob: &[u8], stack_size: u64, allowed_affinity: u64, affinity: u64, parent_pid: u16, argv_bytes: Option<&[u8]>) -> Result<u16, ()> {
         let (root_pa, root_table) = self.create_new_page_table()?;
         let mut elf = self.load_elf(&root_table, elf_blob)?;
         let pid = self.next_pid();
@@ -3129,6 +3121,18 @@ impl Orbit {
         // place to deliver keystrokes once the process becomes the
         // active source. Removed by `dealloc_process` on teardown.
         crate::kernel::stdin::register(pid);
+
+        // Install argv blob if the caller provided one. Same
+        // warn-but-continue policy as `run_create_process_ex_req`:
+        // the process is alive and runnable; an argv-install failure
+        // just means the child observes argc=0.
+        if let Some(blob) = argv_bytes {
+            if self.install_argv_blob(pid, blob).is_err() {
+                warn!(
+                    "create_new_process: argv install failed for pid={pid}, child will see no args",
+                );
+            }
+        }
 
         Ok(pid)
     }

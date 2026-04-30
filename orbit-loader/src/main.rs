@@ -29,8 +29,11 @@ use core::panic::PanicInfo;
 use minicbor::{Decode, Encode};
 use net_channel::{BindSpec, NetChannel, NC_MAX_REGION_SIZE};
 use orbit_abi::errno::Errno;
+use orbit_abi::fs::Stat;
 use orbit_abi::net::SockType;
-use orbit_abi::{logln, user::{create_process, exit, ConsoleWriter}};
+use orbit_abi::{logln, user::{
+    close_handle, create_process, exit, fs_open, fs_read, fs_stat, ConsoleWriter,
+}};
 use orbit_rt::netch::{NetCh, Session};
 
 const LISTEN_PORT: u16 = 7777;
@@ -42,13 +45,11 @@ const RING_CAPACITY: usize = NetChannel::capacity_for(NC_MAX_REGION_SIZE);
 // to grow the heap to 4 MiB and then get -1'd by the syscall.
 const MAX_ELF_BYTES: usize = 4 * 1024 * 1024;
 
-// In-tree shell — spawned at loader startup so the user has a usable
-// pane on Ctrl+Tab without first having to push a payload over TCP.
-// Mirrors how kmain embeds this loader: build console first, then
-// orbit-loader picks up the latest release ELF.
-const CONSOLE_ELF: &[u8] = include_bytes!(
-    "../../console/target/riscv64gc-unknown-none-elf/release/console"
-);
+/// Cap on init-binary size we'll fs_read off the disk. Generous enough
+/// for hello-std-shaped binaries (~300 KiB today) with headroom; the
+/// loader's heap grows on demand via dlmalloc so a smaller cap doesn't
+/// save memory until we hit it.
+const MAX_INIT_ELF_BYTES: usize = 4 * 1024 * 1024;
 
 // `map` (not the derive default `array`) so new optional fields can be
 // added later without breaking existing senders — map entries are keyed
@@ -81,16 +82,17 @@ enum LoaderErr {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn main() -> i32 {
-    // Spawn the in-tree console first so a user has a pane to flip to
-    // on Ctrl+Tab while the loader is still negotiating its NetChannel.
-    // Failure here isn't fatal — the loader is still useful for
-    // sending ELFs over TCP without an interactive shell.
-    // Console gets the all-harts default — passing 0 for both affinity
-    // fields tells the kernel "no preference."
-    match create_process(CONSOLE_ELF.as_ptr(), CONSOLE_ELF.len(), 0, 0) {
-        Ok(pid) => logln!("orbit-loader: spawned console pid={pid}"),
-        Err(e)  => logln!("orbit-loader: console spawn failed: {e:?}"),
-    }
+    // Boot init: read argv[1] (init path), fs_load it from tarfs, and
+    // create_process. Replaces the previous `include_bytes!` of the
+    // console binary — kmain now passes the init path as argv when
+    // spawning the loader, so the same loader image serves
+    // default/console, smoke/umode, and hello-std bringups by just
+    // pointing at a different `/bin/<name>` entry.
+    //
+    // Failures (no argv, missing path, fs not mounted, oversize ELF,
+    // ...) log and fall through. The loader's TCP listener is still
+    // useful for ad-hoc binary delivery without a working init.
+    spawn_init_from_argv();
 
     if let Err(e) = sleep_ms(2000) {
         return e.to_ret() as i32;
@@ -122,6 +124,96 @@ pub extern "C" fn main() -> i32 {
         }
         // Session is dropped at end of accept_and_load — disengagement
         // and kernel-side relisten happen there.
+    }
+}
+
+/// Read argv[1] (init path), pull the ELF off tarfs, hand to
+/// `create_process`. All failure modes log and return — the caller
+/// continues into the TCP listen loop regardless.
+fn spawn_init_from_argv() {
+    let args = orbit_rt::argv::args();
+    let path_bytes = match args.get(1) {
+        Some(p) if !p.is_empty() => p,
+        _ => {
+            logln!("orbit-loader: no init path in argv (skipping init spawn)");
+            return;
+        }
+    };
+    let path = match core::str::from_utf8(path_bytes) {
+        Ok(s) => s,
+        Err(_) => {
+            logln!("orbit-loader: init path is not utf-8 (skipping)");
+            return;
+        }
+    };
+
+    // fs_stat to size the heap allocation. Without this we'd grow the
+    // Vec by sector, which works but wastes a few resizes for the
+    // common multi-hundred-KiB ELF.
+    let mut st = Stat::default();
+    if let Err(e) = fs_stat(path, &mut st) {
+        logln!("orbit-loader: fs_stat({path}) failed: {e:?} (skipping init)");
+        return;
+    }
+    let total = st.st_size as usize;
+    if total == 0 || total > MAX_INIT_ELF_BYTES {
+        logln!(
+            "orbit-loader: init {path} size={total} out of range (cap={}); skipping",
+            MAX_INIT_ELF_BYTES,
+        );
+        return;
+    }
+
+    let fd = match fs_open(path, 0) {
+        Ok(fd) => fd,
+        Err(e) => {
+            logln!("orbit-loader: fs_open({path}) failed: {e:?} (skipping init)");
+            return;
+        }
+    };
+
+    // Sector-aligned scratch buf. fs_read demands `len == 512` and
+    // rejects buffers that straddle a 4 KiB page; aligning to 512
+    // keeps the allocation page-resident.
+    #[repr(align(512))]
+    struct AlignedBuf([u8; 512]);
+    let mut scratch = AlignedBuf([0u8; 512]);
+    let mut elf: Vec<u8> = Vec::with_capacity(total);
+
+    while elf.len() < total {
+        match fs_read(fd, &mut scratch.0) {
+            Ok(0) => break, // EOF before total — surface below.
+            Ok(n) => {
+                let take = core::cmp::min(n, total - elf.len());
+                elf.extend_from_slice(&scratch.0[..take]);
+            }
+            Err(e) => {
+                logln!(
+                    "orbit-loader: fs_read({path}) at offset {} failed: {e:?}",
+                    elf.len(),
+                );
+                let _ = close_handle(fd);
+                return;
+            }
+        }
+    }
+    let _ = close_handle(fd);
+
+    if elf.len() != total {
+        logln!(
+            "orbit-loader: init {path} read {} bytes, expected {total} (skipping spawn)",
+            elf.len(),
+        );
+        return;
+    }
+
+    // Init gets the all-harts default — passing 0 for both affinity
+    // fields tells the kernel "no preference." If we ever want to
+    // pass argv to the init child, swap to `create_process_with_argv`
+    // and pack a blob; v1 inits don't need argv.
+    match create_process(elf.as_ptr(), elf.len(), 0, 0) {
+        Ok(pid) => logln!("orbit-loader: spawned init {path} pid={pid} bytes={total}"),
+        Err(e) => logln!("orbit-loader: init {path} create_process failed: {e:?}"),
     }
 }
 

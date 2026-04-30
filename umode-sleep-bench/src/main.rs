@@ -122,8 +122,12 @@ fn print_stats(target_ms: usize, s: &Stats) {
     w.flush();
 }
 
+// orbit-rt's `_start` (§13b) is the canonical entrypoint; downstream
+// binaries provide `main` and let orbit-rt do the eager argv resolve
+// and exit. Defining `_start` here would collide with the rt one and
+// fail to link.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn _start() -> ! {
+pub extern "C" fn main() -> i32 {
     logln!("umode-sleep-bench: starting");
 
     // Brief settle so any startup churn doesn't skew the first sample.
@@ -135,7 +139,7 @@ pub unsafe extern "C" fn _start() -> ! {
     }
 
     logln!("umode-sleep-bench: done");
-    exit(0);
+    0
 }
 
 #[panic_handler]
