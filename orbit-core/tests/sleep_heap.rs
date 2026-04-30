@@ -17,11 +17,18 @@ mod common;
 /// Mirrors the parking-hart sequence in
 /// `exit_thread_with_state`/`kthread_park`. Returns the post-increment
 /// `sleep_seq` value the caller would push into `SLEEP_INBOX`.
-fn park(thread: &mut process::Thread, wake_time: usize) -> u64 {
-    let seq = thread.sleep_seq.fetch_add(1, Ordering::Release).wrapping_add(1);
-    thread.wake_time = wake_time;
-    thread.state.store(ThreadState::Suspended as usize, Ordering::Release);
-    seq
+///
+/// Takes `*mut Thread` rather than `&mut Thread` so the write to
+/// `wake_time` doesn't reborrow as a sibling `&mut Thread` of the heap
+/// entry's raw pointer — under Tree Borrows that would Disable the
+/// raw tag, and the eventual `drain_woken` reborrow would fail.
+unsafe fn park(thread: *mut process::Thread, wake_time: usize) -> u64 {
+    unsafe {
+        let seq = (*thread).sleep_seq.fetch_add(1, Ordering::Release).wrapping_add(1);
+        (*thread).wake_time = wake_time;
+        (*thread).state.store(ThreadState::Suspended as usize, Ordering::Release);
+        seq
+    }
 }
 
 fn make_suspended() -> Box<process::Thread> {
@@ -41,8 +48,8 @@ fn empty_heap_no_wakes() {
 #[test]
 fn single_entry_deadline_passed() {
     let mut t = make_suspended();
-    let tp: *mut _ = &mut *t;
-    let seq = park(&mut t, 100);
+    let tp: *mut _ = &raw mut *t;
+    let seq = unsafe { park(tp, 100) };
     let mut h = SleepHeap::new();
     h.push(tp, 100, seq);
     assert_eq!(h.next_wake(), Some(100));
@@ -56,8 +63,8 @@ fn single_entry_deadline_passed() {
 #[test]
 fn deadline_in_future_not_drained() {
     let mut t = make_suspended();
-    let tp: *mut _ = &mut *t;
-    let seq = park(&mut t, 200);
+    let tp: *mut _ = &raw mut *t;
+    let seq = unsafe { park(tp, 200) };
     let mut h = SleepHeap::new();
     h.push(tp, 200, seq);
 
@@ -73,12 +80,12 @@ fn min_heap_order() {
     let mut t1 = make_suspended();
     let mut t2 = make_suspended();
     let mut t3 = make_suspended();
-    let tp1: *mut _ = &mut *t1;
-    let tp2: *mut _ = &mut *t2;
-    let tp3: *mut _ = &mut *t3;
-    let s1 = park(&mut t1, 300);
-    let s2 = park(&mut t2, 100);
-    let s3 = park(&mut t3, 200);
+    let tp1: *mut _ = &raw mut *t1;
+    let tp2: *mut _ = &raw mut *t2;
+    let tp3: *mut _ = &raw mut *t3;
+    let s1 = unsafe { park(tp1, 300) };
+    let s2 = unsafe { park(tp2, 100) };
+    let s3 = unsafe { park(tp3, 200) };
 
     let mut h = SleepHeap::new();
     // Push out of order; heap must still drain in deadline order.
@@ -97,8 +104,8 @@ fn min_heap_order() {
 #[test]
 fn stale_entry_state_changed_to_ready() {
     let mut t = make_suspended();
-    let tp: *mut _ = &mut *t;
-    let seq = park(&mut t, 100);
+    let tp: *mut _ = &raw mut *t;
+    let seq = unsafe { park(tp, 100) };
     let mut h = SleepHeap::new();
     h.push(tp, 100, seq);
 
@@ -115,8 +122,8 @@ fn stale_entry_state_changed_to_ready() {
 #[test]
 fn stale_entry_state_exited() {
     let mut t = make_suspended();
-    let tp: *mut _ = &mut *t;
-    let seq = park(&mut t, 100);
+    let tp: *mut _ = &raw mut *t;
+    let seq = unsafe { park(tp, 100) };
     let mut h = SleepHeap::new();
     h.push(tp, 100, seq);
 
@@ -131,14 +138,14 @@ fn stale_entry_state_exited() {
 #[test]
 fn stale_entry_seq_mismatch_after_repark() {
     let mut t = make_suspended();
-    let tp: *mut _ = &mut *t;
-    let seq1 = park(&mut t, 100);
+    let tp: *mut _ = &raw mut *t;
+    let seq1 = unsafe { park(tp, 100) };
     let mut h = SleepHeap::new();
     h.push(tp, 100, seq1);
 
     // Eager wake → re-park with new deadline. seq increments.
     t.state.store(ThreadState::Ready as usize, Ordering::Release);
-    let seq2 = park(&mut t, 500);
+    let seq2 = unsafe { park(tp, 500) };
     h.push(tp, 500, seq2);
     assert_eq!(h.len(), 2);
     assert_ne!(seq1, seq2);
@@ -162,12 +169,15 @@ fn transient_state_running_with_matching_seq() {
     // must NOT pop+drop (the park is real and pending), and must
     // NOT fire (deadline check would be on a half-committed park).
     let mut t = make_suspended();
-    let tp: *mut _ = &mut *t;
+    let tp: *mut _ = &raw mut *t;
     // Pre-park sequence: fetch_add seq, set wake_time, but state is
     // still Running (asm handoff hasn't published Suspended yet).
-    let seq = t.sleep_seq.fetch_add(1, Ordering::Release).wrapping_add(1);
-    t.wake_time = 100;
-    t.state.store(ThreadState::Running as usize, Ordering::Release);
+    let seq = unsafe {
+        let s = (*tp).sleep_seq.fetch_add(1, Ordering::Release).wrapping_add(1);
+        (*tp).wake_time = 100;
+        (*tp).state.store(ThreadState::Running as usize, Ordering::Release);
+        s
+    };
     let mut h = SleepHeap::new();
     h.push(tp, 100, seq);
 
@@ -190,12 +200,12 @@ fn mix_of_live_stale_and_pending() {
     let mut t1 = make_suspended();
     let mut t2 = make_suspended();
     let mut t3 = make_suspended();
-    let tp1: *mut _ = &mut *t1;
-    let tp2: *mut _ = &mut *t2;
-    let tp3: *mut _ = &mut *t3;
-    let s1 = park(&mut t1, 100);
-    let s2 = park(&mut t2, 200);
-    let s3 = park(&mut t3, 300);
+    let tp1: *mut _ = &raw mut *t1;
+    let tp2: *mut _ = &raw mut *t2;
+    let tp3: *mut _ = &raw mut *t3;
+    let s1 = unsafe { park(tp1, 100) };
+    let s2 = unsafe { park(tp2, 200) };
+    let s3 = unsafe { park(tp3, 300) };
     let mut h = SleepHeap::new();
     h.push(tp1, 100, s1);
     h.push(tp2, 200, s2);
@@ -218,10 +228,10 @@ fn drain_stops_at_first_future_live_entry() {
     // top-to-bottom each pass.
     let mut t1 = make_suspended();
     let mut t2 = make_suspended();
-    let tp1: *mut _ = &mut *t1;
-    let tp2: *mut _ = &mut *t2;
-    let s1 = park(&mut t1, 1000);
-    let s2 = park(&mut t2, 2000);
+    let tp1: *mut _ = &raw mut *t1;
+    let tp2: *mut _ = &raw mut *t2;
+    let s1 = unsafe { park(tp1, 1000) };
+    let s2 = unsafe { park(tp2, 2000) };
     let mut h = SleepHeap::new();
     h.push(tp1, 1000, s1);
     h.push(tp2, 2000, s2);
