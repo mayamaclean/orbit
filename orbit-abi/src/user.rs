@@ -115,6 +115,41 @@ pub unsafe fn ecall6(
     r
 }
 
+/// Seven-argument syscall returning an `isize` in `a0`. Saturates the
+/// RISC-V arg-register file (a0..a7 = code + 7 args). Used by
+/// `create_process_with_argv_envp` to carry elf + affinity + argv +
+/// envp pointers in one trap; envp blob length isn't passed because
+/// the kernel always reads a full page at the envp VA — see
+/// [`crate::layout::USER_ENVP_BASE`] and [`crate::envp`].
+#[inline]
+pub unsafe fn ecall7(
+    code: usize,
+    arg0: usize,
+    arg1: usize,
+    arg2: usize,
+    arg3: usize,
+    arg4: usize,
+    arg5: usize,
+    arg6: usize,
+) -> isize {
+    let r: isize;
+    unsafe {
+        asm!(
+            "ecall",
+            in("a0") code,
+            in("a1") arg0,
+            in("a2") arg1,
+            in("a3") arg2,
+            in("a4") arg3,
+            in("a5") arg4,
+            in("a6") arg5,
+            in("a7") arg6,
+            lateout("a0") r,
+        );
+    }
+    r
+}
+
 /// Four-argument syscall returning an `isize` in `a0`.
 #[inline]
 pub unsafe fn ecall4(code: usize, arg0: usize, arg1: usize, arg2: usize, arg3: usize) -> isize {
@@ -482,6 +517,9 @@ pub fn gettid() -> u32 {
 /// described in [`crate::argv`] (header + offsets + string table).
 /// Pass an empty slice for arg-less spawn (matches `create_process`).
 ///
+/// Thin wrapper over [`create_process_with_argv_envp`] that passes
+/// `0` for the envp VA (no environment installed).
+///
 /// # Safety
 /// `elf_ptr`/`elf_len` must point to a valid mapped ELF range.
 /// `argv_blob` must be a self-contained packed blob — the kernel
@@ -495,8 +533,42 @@ pub fn create_process_with_argv(
     affinity: u64,
     argv_blob: &[u8],
 ) -> Result<u16, Errno> {
+    create_process_with_argv_envp(
+        elf_ptr,
+        elf_len,
+        allowed_affinity,
+        affinity,
+        argv_blob,
+        0,
+    )
+}
+
+/// Spawn a child process with both command-line arguments and an
+/// environment block. `argv_blob` follows the format in
+/// [`crate::argv`]; pass an empty slice for arg-less spawn. `envp_va`
+/// is the page-aligned user VA of an envp blob (same wire format as
+/// argv — see [`crate::envp`]) or `0` for no envp.
+///
+/// The kernel always reads exactly one page at `envp_va`; callers
+/// should hand over a page-resident, page-sized buffer (zero-padded
+/// past the packed bytes). Subset of the trade-off keeping
+/// `CREATE_PROCESS_EX` to seven user args (a1..a7).
+///
+/// # Safety
+/// Same as [`create_process_with_argv`]. Additionally, when `envp_va
+/// != 0` it must be page-aligned and the page must be mapped readable
+/// for the caller's lifetime; otherwise the kernel returns `EFAULT`.
+#[inline]
+pub fn create_process_with_argv_envp(
+    elf_ptr: *const u8,
+    elf_len: usize,
+    allowed_affinity: u64,
+    affinity: u64,
+    argv_blob: &[u8],
+    envp_va: usize,
+) -> Result<u16, Errno> {
     Errno::from_ret(unsafe {
-        ecall6(
+        ecall7(
             syscall::CREATE_PROCESS_EX,
             elf_ptr as usize,
             elf_len,
@@ -504,19 +576,25 @@ pub fn create_process_with_argv(
             affinity as usize,
             argv_blob.as_ptr() as usize,
             argv_blob.len(),
+            envp_va,
         )
     })
     .map(|p| p as u16)
 }
 
-/// Return the user VA where the kernel mapped this process's argv
-/// blob, or `0` if no argv was provided. Always reads the same value
-/// for a given process — orbit-rt's startup caches the result. v1
-/// returns either `0` or [`crate::layout::USER_ARGV_BASE`].
+/// Return `(argv_va, envp_va)` — user VAs where the kernel mapped
+/// this process's argv and envp blobs, with `0` in either slot
+/// meaning "not installed" (process spawned via the bare
+/// [`create_process`] path, or via [`create_process_with_argv`] with
+/// no envp). Stable for the process's lifetime; orbit-rt's startup
+/// caches the pair.
+///
+/// In v1 a non-zero argv VA is always [`crate::layout::USER_ARGV_BASE`]
+/// and a non-zero envp VA is always [`crate::layout::USER_ENVP_BASE`].
 #[inline]
-pub fn argv_envp() -> usize {
-    let r = unsafe { ecall1(syscall::ARGV_ENVP, 0) };
-    r as usize
+pub fn argv_envp() -> (usize, usize) {
+    let (r0, r1) = unsafe { ecall0_ret2(syscall::ARGV_ENVP) };
+    (r0 as usize, r1 as usize)
 }
 
 /// Block the caller until child process `pid` exits, then return the

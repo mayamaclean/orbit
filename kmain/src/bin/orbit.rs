@@ -457,6 +457,21 @@ pub extern "C" fn k_smpstart() {
     .expect("boot argv fits in 256 bytes");
     let argv_blob = &argv_buf[..argv_len];
 
+    // §13e — boot envp. orbit-loader inherits these from the kernel;
+    // when it spawns the init binary it can repack and propagate. A
+    // tiny baseline keeps env-aware tools (PATH lookups, terminal
+    // detection) working with no per-process setup. Values are
+    // intentionally Linux-shaped so a binary that already speaks
+    // POSIX env doesn't need orbit-specific knowledge to find its
+    // bin dir or pick a fallback termcap.
+    let mut envp_buf = [0u8; 256];
+    let envp_len = orbit_abi::envp::pack(
+        &[b"PATH=/bin", b"HOME=/", b"TERM=dumb"],
+        &mut envp_buf,
+    )
+    .expect("boot envp fits in 256 bytes");
+    let envp_blob = &envp_buf[..envp_len];
+
     orbit.create_new_process(
         kmain::kernel::UMODE_TEST_ELF,
         kmain::kernel::UPROC_STACK_DEFAULT,
@@ -464,6 +479,7 @@ pub extern "C" fn k_smpstart() {
         boot_affinity,
         0,
         Some(argv_blob),
+        Some(envp_blob),
     )
     .expect("no test uprocess");
 

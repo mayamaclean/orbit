@@ -382,6 +382,12 @@ pub struct Process {
     /// `USER_ARGV_BASE` in the process PT; `dealloc_process` returns
     /// the frame to `kernel_pages`.
     pub argv_blob: Option<PhysBacking>,
+    /// §13e envp blob backing — `Some` when the process was spawned
+    /// via `CREATE_PROCESS_EX` with a non-zero `envp_vaddr`. Wire
+    /// format is identical to `argv_blob`; the kernel maps this
+    /// single page R+U+S at `USER_ENVP_BASE`. `dealloc_process`
+    /// returns the frame to `kernel_pages`.
+    pub envp_blob: Option<PhysBacking>,
     pub state: ProcessState,
     pub threads: BTreeSet<u32>,
     pub thread_count: u16,
@@ -423,6 +429,7 @@ impl Process {
             exit_waiter: None,
             dead_children: BTreeMap::new(),
             argv_blob: None,
+            envp_blob: None,
             state: ProcessState::Running,
             threads: BTreeSet::new(),
             thread_count: 0,

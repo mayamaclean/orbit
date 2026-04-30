@@ -435,6 +435,7 @@ pub fn create_process_ex_req<H: Hardware>(
         affinity: frame.regs[14] as u64,
         argv_vaddr: frame.regs[15],
         argv_len: frame.regs[16],
+        envp_vaddr: frame.regs[17],
     };
     if !user_range_ok(req.elf_vaddr as u64, req.elf_len as u64) {
         return SyscallOutcome::Return { ret: Errno::new(EFAULT).to_ret() };
@@ -444,6 +445,17 @@ pub fn create_process_ex_req<H: Hardware>(
     }
     if req.argv_len > orbit_abi::argv::ARGV_BLOB_MAX {
         return SyscallOutcome::Return { ret: Errno::new(EINVAL).to_ret() };
+    }
+    // envp blob: the kernel always copies one page, so require a
+    // page-aligned, page-resident VA. Mismatch surfaces as EFAULT
+    // before the manager queues the work.
+    if req.envp_vaddr != 0 {
+        if (req.envp_vaddr as u64) & (PAGE_SIZE as u64 - 1) != 0 {
+            return SyscallOutcome::Return { ret: Errno::new(EINVAL).to_ret() };
+        }
+        if !user_range_ok(req.envp_vaddr as u64, PAGE_SIZE as u64) {
+            return SyscallOutcome::Return { ret: Errno::new(EFAULT).to_ret() };
+        }
     }
     let handle = CompletionHandle::new();
     let work = PendingWork::CreateProcessEx {

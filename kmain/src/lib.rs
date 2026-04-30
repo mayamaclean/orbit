@@ -816,19 +816,25 @@ pub fn handle_create_process_ex(epc: usize, hart_context: &'static HartContext, 
     });
 }
 
-/// §13a.3 — `argv_envp() → blob_va | 0`. Synchronous read off the
-/// caller's `Process.argv_blob` slot. `0` means "no argv was
-/// installed" — orbit-rt treats it as empty `argv`.
+/// §13a.3 / §13e — `argv_envp() → (argv_va, envp_va)`. Synchronous
+/// read off the caller's `Process.argv_blob` / `envp_blob` slots; a
+/// `0` in either slot means "not installed" — orbit-rt treats those
+/// as empty `argv` / `envp`.
 #[unsafe(no_mangle)]
 pub fn handle_argv_envp(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
     let orbit = unsafe { (hart_context.cscratch as *mut kernel::Orbit).as_mut_unchecked() };
     dispatch_syscall(epc, hart_context, frame, |t, _f| {
-        let ret = if orbit.process_has_argv(t.pid) {
+        let argv_va = if orbit.process_has_argv(t.pid) {
             orbit_abi::layout::USER_ARGV_BASE as isize
         } else {
             0
         };
-        orbit_core::SyscallOutcome::Return { ret }
+        let envp_va = if orbit.process_has_envp(t.pid) {
+            orbit_abi::layout::USER_ENVP_BASE as isize
+        } else {
+            0
+        };
+        orbit_core::SyscallOutcome::Return2 { ret0: argv_va, ret1: envp_va }
     });
 }
 

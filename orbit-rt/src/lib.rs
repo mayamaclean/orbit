@@ -84,10 +84,14 @@ extern crate alloc;
 
 pub mod argv;
 
-// Modules that rely on the `mem` crate (FrameAllocator) or define a
-// `_start` symbol that would clash with std-on-orbit's PAL `_start`.
-// Gated behind `full-runtime` so the std build (which sets
-// `default-features = false`) sees a smaller orbit-rt surface.
+// Modules that rely on the `mem` crate (FrameAllocator), the `alloc`
+// crate (BTreeMap / Vec / String), or a `_start` symbol that would
+// clash with std-on-orbit's PAL `_start`. Gated behind `full-runtime`
+// so the std build (which sets `default-features = false`) sees a
+// smaller orbit-rt surface and avoids the alloc / mem dep chain that
+// isn't `rustc-dep-of-std`-friendly.
+#[cfg(feature = "full-runtime")]
+pub mod env;
 #[cfg(feature = "full-runtime")]
 pub mod netch;
 #[cfg(feature = "full-runtime")]

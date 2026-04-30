@@ -32,7 +32,8 @@ use orbit_abi::errno::Errno;
 use orbit_abi::fs::Stat;
 use orbit_abi::net::SockType;
 use orbit_abi::{logln, user::{
-    close_handle, create_process, exit, fs_open, fs_read, fs_stat, ConsoleWriter,
+    close_handle, create_process, create_process_with_argv_envp, exit, fs_open, fs_read, fs_stat,
+    ConsoleWriter,
 }};
 use orbit_rt::netch::{NetCh, Session};
 
@@ -92,6 +93,7 @@ pub extern "C" fn main() -> i32 {
     // Failures (no argv, missing path, fs not mounted, oversize ELF,
     // ...) log and fall through. The loader's TCP listener is still
     // useful for ad-hoc binary delivery without a working init.
+    log_boot_env();
     spawn_init_from_argv();
 
     if let Err(e) = sleep_ms(2000) {
@@ -124,6 +126,23 @@ pub extern "C" fn main() -> i32 {
         }
         // Session is dropped at end of accept_and_load — disengagement
         // and kernel-side relisten happen there.
+    }
+}
+
+/// One-line dump of the boot envp the kernel installed for us. Lets
+/// `./smoke` confirm Phase 5 delivery without poking at internal log
+/// markers. Cheap: a single iter over the seeded BTreeMap.
+fn log_boot_env() {
+    let entries = orbit_rt::env::vars();
+    if entries.is_empty() {
+        logln!("orbit-loader: boot env empty");
+        return;
+    }
+    logln!("orbit-loader: boot env ({} entries):", entries.len());
+    for (k, v) in &entries {
+        let key = core::str::from_utf8(k).unwrap_or("<non-utf8>");
+        let val = core::str::from_utf8(v).unwrap_or("<non-utf8>");
+        logln!("  {key}={val}");
     }
 }
 
@@ -207,13 +226,70 @@ fn spawn_init_from_argv() {
         return;
     }
 
+    // Page-aligned, page-sized envp scratch. Stack-local because
+    // spawn_init_from_argv runs once at boot and a 4 KiB stack burst
+    // is well within the umode default stack. The VA must be
+    // page-aligned (kernel rejects misaligned envp_va with EINVAL)
+    // and the kernel always reads exactly one page from it.
+    #[repr(C, align(4096))]
+    struct EnvPage([u8; 4096]);
+    let mut env_page = EnvPage([0u8; 4096]);
+    let envp_va = pack_env_for_child(&mut env_page.0);
+
     // Init gets the all-harts default — passing 0 for both affinity
-    // fields tells the kernel "no preference." If we ever want to
-    // pass argv to the init child, swap to `create_process_with_argv`
-    // and pack a blob; v1 inits don't need argv.
-    match create_process(elf.as_ptr(), elf.len(), 0, 0) {
-        Ok(pid) => logln!("orbit-loader: spawned init {path} pid={pid} bytes={total}"),
+    // fields tells the kernel "no preference." Argv stays empty for
+    // v1 inits (they don't need command-line args from the loader).
+    // Envp is propagated from our own kernel-installed env so the
+    // child sees the same baseline (PATH/HOME/TERM, plus anything we
+    // add later).
+    let argv_blob: &[u8] = &[];
+    match create_process_with_argv_envp(elf.as_ptr(), elf.len(), 0, 0, argv_blob, envp_va) {
+        Ok(pid) => logln!(
+            "orbit-loader: spawned init {path} pid={pid} bytes={total} envp={}",
+            if envp_va == 0 { "skipped" } else { "inherited" },
+        ),
         Err(e) => logln!("orbit-loader: init {path} create_process failed: {e:?}"),
+    }
+}
+
+/// Snapshot the current process env (seeded from the kernel envp at
+/// boot) and pack it into `buf` for handoff to a child via
+/// `create_process_with_argv_envp`. Returns the page-aligned VA, or
+/// `0` if there's nothing to install (empty env or pack failure).
+///
+/// `buf` must be exactly one page and page-aligned — the kernel-side
+/// copy reads `PAGE_SIZE` bytes from the returned VA. The call zeros
+/// `buf` first so unused tail bytes don't carry uninitialised stack
+/// data into the child's env page.
+fn pack_env_for_child(buf: &mut [u8; 4096]) -> usize {
+    let entries = orbit_rt::env::vars();
+    if entries.is_empty() {
+        return 0;
+    }
+    // Flatten each (k, v) pair into "KEY=VALUE" bytes. The pack
+    // helper takes `&[&[u8]]`, so we own one Vec per entry and
+    // collect refs over the owned vec.
+    let kvs: Vec<Vec<u8>> = entries
+        .into_iter()
+        .map(|(mut k, v)| {
+            k.reserve(1 + v.len());
+            k.push(b'=');
+            k.extend_from_slice(&v);
+            k
+        })
+        .collect();
+    let refs: Vec<&[u8]> = kvs.iter().map(|e| e.as_slice()).collect();
+
+    buf.fill(0);
+    match orbit_abi::envp::pack(&refs, buf) {
+        Some(_) => buf.as_ptr() as usize,
+        None => {
+            // Total entries exceed one page — drop envp inheritance
+            // entirely rather than truncate (truncation would silently
+            // corrupt KEY=VALUE structure mid-string).
+            logln!("orbit-loader: env doesn't fit in one page; init spawned without envp");
+            0
+        }
     }
 }
 

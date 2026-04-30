@@ -7,6 +7,7 @@ pub mod fs;
 pub mod layout;
 pub mod mmap;
 pub mod net;
+pub mod perms;
 pub mod stats;
 pub mod syscall;
 pub mod syscall_stats;

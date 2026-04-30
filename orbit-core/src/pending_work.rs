@@ -162,10 +162,18 @@ pub struct FutexWakeReq {
     pub n: u32,
 }
 
-/// `CreateProcessReq` plus a packed argv blob. v1 carries no envp;
-/// the field is reserved by the matching `argv_envp` syscall name
-/// (the kernel can extend the blob format later without bumping the
-/// syscall number).
+/// `CreateProcessReq` plus a packed argv blob and (optionally) a
+/// packed envp blob. The two share a wire format (`orbit_abi::argv`
+/// / `orbit_abi::envp` — header + offsets + strings) so the kernel
+/// reuses one fixup helper for both.
+///
+/// `argv_len > 0` carries argv; `envp_vaddr != 0` carries envp. The
+/// envp blob is always passed as a page-aligned, page-resident
+/// buffer — the kernel reads `PAGE_SIZE` bytes — because the
+/// syscall ABI (`CREATE_PROCESS_EX`) saturates the seven a-regs at
+/// elf+affinity+argv+envp_vaddr and has no register left for
+/// `envp_len`. Callers pad the unused tail with zeros; install-side
+/// validation walks the header to ignore the padding.
 #[derive(Debug, Clone, Copy)]
 pub struct CreateProcessExReq {
     pub elf_vaddr: usize,
@@ -177,6 +185,10 @@ pub struct CreateProcessExReq {
     /// `CREATE_PROCESS`.
     pub argv_vaddr: usize,
     pub argv_len: usize,
+    /// User VA of the packed envp blob (see `orbit_abi::envp`); `0`
+    /// means "no envp." Must be page-aligned and page-resident; the
+    /// kernel always copies one page from this VA.
+    pub envp_vaddr: usize,
 }
 
 /// One slot in the manager's MPSC work ring. Fixed-size by virtue of

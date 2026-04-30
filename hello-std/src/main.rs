@@ -115,6 +115,46 @@ fn main() {
     for (i, a) in args.iter().enumerate() {
         println!("argv[{i}] = {}", a.to_string_lossy());
     }
+
+    // §13e env smoke. Boot envp is kmain-installed PATH=/bin / HOME=/
+    // / TERM=dumb, propagated by orbit-loader. Validates the std PAL
+    // path (env/orbit.rs's OnceLock<RwLock<BTreeMap>>) round-trips
+    // both reads and mutations — the latter only mutate the in-process
+    // map (children would need explicit envp repack to inherit them).
+    match std::env::var("PATH") {
+        Ok(v) if v == "/bin" => println!("PASS: std::env PATH=/bin"),
+        Ok(v) => println!("FAIL: std::env PATH got {v:?}"),
+        Err(e) => println!("FAIL: std::env PATH: {e}"),
+    }
+    match std::env::var("HOME") {
+        Ok(v) if v == "/" => println!("PASS: std::env HOME=/"),
+        Ok(v) => println!("FAIL: std::env HOME got {v:?}"),
+        Err(e) => println!("FAIL: std::env HOME: {e}"),
+    }
+    match std::env::var("TERM") {
+        Ok(v) if v == "dumb" => println!("PASS: std::env TERM=dumb"),
+        Ok(v) => println!("FAIL: std::env TERM got {v:?}"),
+        Err(e) => println!("FAIL: std::env TERM: {e}"),
+    }
+    let n_vars = std::env::vars_os().count();
+    if n_vars == 3 {
+        println!("PASS: std::env vars_os count=3");
+    } else {
+        println!("FAIL: std::env vars_os count={n_vars} (want 3)");
+    }
+    // Mutations exist solely in the in-process map — confirm round trip.
+    unsafe { std::env::set_var("FOO", "bar"); }
+    match std::env::var("FOO") {
+        Ok(v) if v == "bar" => println!("PASS: std::env set_var/var round trip"),
+        Ok(v) => println!("FAIL: std::env set_var/var got {v:?}"),
+        Err(e) => println!("FAIL: std::env set_var/var: {e}"),
+    }
+    unsafe { std::env::remove_var("FOO"); }
+    match std::env::var("FOO") {
+        Err(std::env::VarError::NotPresent) => println!("PASS: std::env remove_var clears entry"),
+        Ok(v) => println!("FAIL: std::env remove_var still returns {v:?}"),
+        Err(e) => println!("FAIL: std::env remove_var unexpected error: {e}"),
+    }
     println!(
         "available_parallelism = {}",
         std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0)

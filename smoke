@@ -146,8 +146,24 @@ MARKERS=(
   'PASS: fs_readdir on regular file got Err\(errno=20\)'
   '=== fs smoke done ==='
   # §13e tarfs-init: orbit-loader (pid 1) reads /bin/smoke off the
-  # disk and create_process()s it as pid 2.
-  'orbit-loader: spawned init /bin/smoke pid=2 bytes='
+  # disk and create_process()s it as pid 2. envp=inherited confirms
+  # orbit-loader propagated its kernel-installed env to the child via
+  # create_process_with_argv_envp (Phase 5/6 boot env delivery).
+  'orbit-loader: spawned init /bin/smoke pid=2 bytes=[0-9]+ envp=inherited'
+  # §13e boot envp end-to-end: orbit-loader sees the three kmain-
+  # packed entries on first env::vars() access.
+  'orbit-loader: boot env \(3 entries\):'
+  '  PATH=/bin'
+  '  HOME=/'
+  '  TERM=dumb'
+  # §13e env probe in umode (pid 2) — kmain pack → install_envp_blob →
+  # orbit-loader inherit + repack → install_envp_blob → seeded BTreeMap.
+  'PASS: env PATH=/bin'
+  'PASS: env HOME=/'
+  'PASS: env TERM=dumb'
+  'PASS: env vars count=3'
+  'PASS: env set_var/var round trip'
+  'PASS: env remove_var clears entry'
   # §13a.1 — getpid/gettid land synchronously off the per-hart context.
   # Pid is whatever orbit-loader assigned us; just match the numeric.
   'PASS: getpid main got [0-9]+'

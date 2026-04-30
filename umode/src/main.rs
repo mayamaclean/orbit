@@ -932,6 +932,60 @@ fn run_identity_probe() {
     }
 }
 
+/// §13e env probe — confirms the kernel-installed envp blob seeded
+/// `orbit_rt::env`'s BTreeMap end-to-end (kmain pack →
+/// `install_envp_blob` → orbit-loader inherit + repack →
+/// install_envp_blob into us → seed BTreeMap on first access). Each
+/// PASS line covers one observable: presence of an entry, value
+/// match, total count, and behavior of set/remove against the
+/// in-process map (mutations stay local — this also exercises that
+/// `set_var` followed by `var` reads what was just written).
+fn run_env_probe() {
+    use orbit_rt::env;
+
+    // The boot env kmain packs: PATH=/bin, HOME=/, TERM=dumb. Each
+    // entry should round-trip verbatim through the kernel + loader.
+    match env::var(b"PATH") {
+        Some(v) if v == b"/bin" => logln!("PASS: env PATH=/bin"),
+        Some(v) => logln!("FAIL: env PATH got {:?}", core::str::from_utf8(&v).unwrap_or("<non-utf8>")),
+        None    => logln!("FAIL: env PATH missing"),
+    }
+    match env::var(b"HOME") {
+        Some(v) if v == b"/" => logln!("PASS: env HOME=/"),
+        Some(v) => logln!("FAIL: env HOME got {:?}", core::str::from_utf8(&v).unwrap_or("<non-utf8>")),
+        None    => logln!("FAIL: env HOME missing"),
+    }
+    match env::var(b"TERM") {
+        Some(v) if v == b"dumb" => logln!("PASS: env TERM=dumb"),
+        Some(v) => logln!("FAIL: env TERM got {:?}", core::str::from_utf8(&v).unwrap_or("<non-utf8>")),
+        None    => logln!("FAIL: env TERM missing"),
+    }
+
+    let count = env::vars().len();
+    if count == 3 {
+        logln!("PASS: env vars count=3");
+    } else {
+        logln!("FAIL: env vars count={count} (want 3)");
+    }
+
+    // Round-trip mutations against the local map. Doesn't escape the
+    // process (children only see what we re-pack via envp at spawn
+    // time); set + read-back here just confirms the BTreeMap path is
+    // wired both ways.
+    env::set_var(b"FOO", b"bar");
+    match env::var(b"FOO") {
+        Some(v) if v == b"bar" => logln!("PASS: env set_var/var round trip"),
+        Some(v) => logln!("FAIL: env set_var/var got {:?}", core::str::from_utf8(&v).unwrap_or("<non-utf8>")),
+        None    => logln!("FAIL: env set_var/var read-back missing"),
+    }
+
+    env::remove_var(b"FOO");
+    match env::var(b"FOO") {
+        None    => logln!("PASS: env remove_var clears entry"),
+        Some(v) => logln!("FAIL: env remove_var still returns {:?}", core::str::from_utf8(&v).unwrap_or("<non-utf8>")),
+    }
+}
+
 /// §12e exec smoke: read `/bin/hello` (a real ELF on the disk image)
 /// and hand it to `create_process`. Spawn-only flavor — no `wait_pid`
 /// yet, so we just sleep briefly for the child to print its marker.
@@ -1058,6 +1112,11 @@ pub extern "C" fn main() -> i32 {
     // kernel allocates). pid is whatever orbit-loader assigned us;
     // we just assert nonzero + stability.
     run_identity_probe();
+
+    // §13e env probe — confirms boot envp survived kernel install +
+    // orbit-loader inheritance and seeded our BTreeMap. Runs early so
+    // a regression here surfaces before the longer-running test paths.
+    run_env_probe();
 
     run_fs_smoke();
 

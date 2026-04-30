@@ -1289,6 +1289,31 @@ impl Orbit {
             None
         };
 
+        // Copy envp blob (always one page; syscall layer already
+        // bound-checked alignment and range when envp_vaddr != 0).
+        let envp_bytes: Option<Vec<u8>> = if req.envp_vaddr != 0 {
+            let pa = match unsafe {
+                mmu::mmap::virt_to_phys(&root_table, VirtAddr::new(req.envp_vaddr as u64))
+            } {
+                Some(p) => p as u64,
+                None => {
+                    error!(
+                        "create_process_ex: envp va 0x{:X} does not translate",
+                        req.envp_vaddr,
+                    );
+                    return Errno::new(EFAULT).to_ret();
+                }
+            };
+            let mut buf = Vec::with_capacity(PAGE_SIZE);
+            unsafe {
+                let mut w = user_page::UserPageWindow::map(pa, PAGE_SIZE);
+                buf.extend_from_slice(w.as_mut_slice());
+            }
+            Some(buf)
+        } else {
+            None
+        };
+
         // Affinity validation, identical to run_create_process_req.
         let all_harts = self.all_harts_mask();
         let allowed = if req.allowed_affinity == 0 { all_harts } else { req.allowed_affinity };
@@ -1298,7 +1323,15 @@ impl Orbit {
             return Errno::new(EINVAL).to_ret();
         }
 
-        let pid = match self.create_new_process(&blob, UPROC_STACK_DEFAULT, allowed, affinity, parent_pid, argv_bytes.as_deref()) {
+        let pid = match self.create_new_process(
+            &blob,
+            UPROC_STACK_DEFAULT,
+            allowed,
+            affinity,
+            parent_pid,
+            argv_bytes.as_deref(),
+            envp_bytes.as_deref(),
+        ) {
             Ok(pid) => pid,
             Err(()) => {
                 error!("create_process_ex: create_new_process failed");
@@ -1306,7 +1339,11 @@ impl Orbit {
             }
         };
 
-        info!("create_process_ex: spawned pid={pid} parent={parent_pid} argv_len={}", req.argv_len);
+        info!(
+            "create_process_ex: spawned pid={pid} parent={parent_pid} argv_len={} envp={}",
+            req.argv_len,
+            if envp_bytes.is_some() { "yes" } else { "no" },
+        );
         pid as isize
     }
 
@@ -1315,15 +1352,50 @@ impl Orbit {
     /// in the child process's PT (R+U+S, no W/X). Stash the backing
     /// on `Process.argv_blob` for later cleanup.
     fn install_argv_blob(&mut self, pid: u16, blob: &[u8]) -> Result<(), ()> {
-        use orbit_abi::argv::{ARGV_OFFSETS_OFFSET, ArgvHeader};
         use orbit_abi::layout::USER_ARGV_BASE;
+        let backing = self.install_argv_envp_page(pid, blob, USER_ARGV_BASE, "argv")?;
+        if let Some(proc) = self.processes.get_mut(&pid) {
+            proc.argv_blob = Some(backing);
+        }
+        Ok(())
+    }
+
+    /// `install_argv_blob`'s envp twin — same wire format
+    /// (`orbit_abi::envp` re-exports `argv`'s types) so the install
+    /// helper handles both. Maps the rewritten page at
+    /// `USER_ENVP_BASE` and stashes the backing on
+    /// `Process.envp_blob`.
+    fn install_envp_blob(&mut self, pid: u16, blob: &[u8]) -> Result<(), ()> {
+        use orbit_abi::layout::USER_ENVP_BASE;
+        let backing = self.install_argv_envp_page(pid, blob, USER_ENVP_BASE, "envp")?;
+        if let Some(proc) = self.processes.get_mut(&pid) {
+            proc.envp_blob = Some(backing);
+        }
+        Ok(())
+    }
+
+    /// Shared body of `install_argv_blob` / `install_envp_blob`. The
+    /// argv and envp blobs share the wire format
+    /// (`[ArgvHeader][offsets][strings]`); this helper allocates the
+    /// kernel page, validates argc, fixes up offsets to
+    /// `target_va + offset`, and maps R+U at `target_va` in the
+    /// child's PT. Returns the `PhysBacking` so the caller can stash
+    /// it on the right `Process` slot for dealloc-time cleanup.
+    fn install_argv_envp_page(
+        &mut self,
+        pid: u16,
+        blob: &[u8],
+        target_va: u64,
+        tag: &'static str,
+    ) -> Result<process::PhysBacking, ()> {
+        use orbit_abi::argv::{ARGV_OFFSETS_OFFSET, ArgvHeader};
 
         if blob.len() > PAGE_SIZE {
-            error!("install_argv_blob: blob {} > page", blob.len());
+            error!("install_{tag}_blob: blob {} > page", blob.len());
             return Err(());
         }
         if blob.len() < core::mem::size_of::<ArgvHeader>() {
-            error!("install_argv_blob: blob too small");
+            error!("install_{tag}_blob: blob too small");
             return Err(());
         }
 
@@ -1331,7 +1403,7 @@ impl Orbit {
         let argc = u32::from_le_bytes([blob[0], blob[1], blob[2], blob[3]]) as usize;
         let strings_off = ARGV_OFFSETS_OFFSET + argc * core::mem::size_of::<u64>();
         if strings_off > blob.len() {
-            error!("install_argv_blob: argc={argc} overflows blob len={}", blob.len());
+            error!("install_{tag}_blob: argc={argc} overflows blob len={}", blob.len());
             return Err(());
         }
 
@@ -1347,7 +1419,7 @@ impl Orbit {
             core::ptr::write_bytes(kva.as_mut_ptr::<u8>(), 0, PAGE_SIZE);
         }
         // Copy header + offsets + strings verbatim, then walk the
-        // offset slots and rewrite each as USER_ARGV_BASE + offset.
+        // offset slots and rewrite each as target_va + offset.
         unsafe {
             let dst = kva.as_mut_ptr::<u8>();
             core::ptr::copy_nonoverlapping(blob.as_ptr(), dst, blob.len());
@@ -1356,19 +1428,19 @@ impl Orbit {
             for i in 0..argc {
                 let off = slots.add(i).read();
                 if off >= blob.len() as u64 {
-                    error!("install_argv_blob: arg {i} offset {off} >= blob len");
+                    error!("install_{tag}_blob: entry {i} offset {off} >= blob len");
                     self.free_backing(backing);
                     return Err(());
                 }
-                slots.add(i).write(USER_ARGV_BASE.wrapping_add(off));
+                slots.add(i).write(target_va.wrapping_add(off));
             }
         }
 
-        // Map the page R+U into the child's PT at USER_ARGV_BASE.
+        // Map the page R+U into the child's PT at target_va.
         let proc = self.processes.get(&pid).ok_or(())?;
         let proc_root_pa = (proc.satp.ppn() * PAGE_SIZE) as u64;
         let proc_root_table = unsafe { memmap::kernel_root_from_pa(proc_root_pa) };
-        let argv_pa = match &backing {
+        let blob_pa = match &backing {
             process::PhysBacking::Shared { frame, .. } => frame.get_raw(),
             process::PhysBacking::User { frame, .. } => frame.get_raw(),
         };
@@ -1377,8 +1449,8 @@ impl Orbit {
             permissions: PagePermissions::R | PagePermissions::U,
             levels: 4,
             page_size: PAGE_SIZE as u64,
-            vaddr: VirtAddr::new(USER_ARGV_BASE),
-            paddr: PhysAddr::new(argv_pa),
+            vaddr: VirtAddr::new(target_va),
+            paddr: PhysAddr::new(blob_pa),
             log: false,
             // No SharedRevocable tag — the page is freed via
             // dealloc_process when the process exits, not via
@@ -1386,23 +1458,18 @@ impl Orbit {
             // policy bit.
             supervisor_tag: SupervisorTag::None,
         };
-        let vend = VirtAddr::new(USER_ARGV_BASE + PAGE_SIZE as u64);
-        let pend = PhysAddr::new(argv_pa + PAGE_SIZE as u64);
+        let vend = VirtAddr::new(target_va + PAGE_SIZE as u64);
+        let pend = PhysAddr::new(blob_pa + PAGE_SIZE as u64);
         let mut pages = PageAlloc::FA(self.table_pages.frames_mut());
         if let Err(_) = unsafe { map_address_range(&proc_root_table, &mut pages, &config, vend, pend) } {
-            error!("install_argv_blob: map_address_range failed");
+            error!("install_{tag}_blob: map_address_range failed");
             self.free_backing(backing);
             return Err(());
         }
 
-        // Stash on the Process for dealloc-time cleanup.
-        if let Some(proc) = self.processes.get_mut(&pid) {
-            proc.argv_blob = Some(backing);
-        }
-
-        riscv::asm::sfence_vma(pid as usize, USER_ARGV_BASE as usize);
+        riscv::asm::sfence_vma(pid as usize, target_va as usize);
         crate::kernel::shootdown::broadcast(0, 0);
-        Ok(())
+        Ok(backing)
     }
 
     /// Owns the signaling end-to-end. Sync errors signal
@@ -1672,7 +1739,7 @@ impl Orbit {
             return Errno::new(EINVAL).to_ret();
         }
 
-        match self.create_new_process(&blob, UPROC_STACK_DEFAULT, allowed, affinity, parent_pid, None) {
+        match self.create_new_process(&blob, UPROC_STACK_DEFAULT, allowed, affinity, parent_pid, None, None) {
             Ok(pid) => {
                 info!("create_process: spawned pid={pid} parent={parent_pid} from {} bytes \
                     allowed_affinity={allowed:#x} affinity={affinity:#x}", blob.len());
@@ -1999,8 +2066,11 @@ impl Orbit {
             parent.dead_children.insert(process.pid, process.exit_code);
         }
 
-        // §13a.3 — return the argv blob page to kernel_pages.
+        // §13a.3 / §13e — return the argv / envp blob pages to kernel_pages.
         if let Some(backing) = process.argv_blob.take() {
+            self.free_backing(backing);
+        }
+        if let Some(backing) = process.envp_blob.take() {
             self.free_backing(backing);
         }
 
@@ -2980,13 +3050,14 @@ impl Orbit {
         })
     }
 
-    /// Build a fresh process from `elf_blob`. If `argv_bytes` is
-    /// `Some(blob)`, the packed argv is installed at `USER_ARGV_BASE`
-    /// before the process becomes runnable; argv-install failure is
-    /// non-fatal — the process still spawns and the child sees an
-    /// empty argv via [`orbit_abi::user::argv_envp`]. Mirrors the
-    /// warn-but-continue policy in `run_create_process_ex_req`.
-    pub fn create_new_process(&mut self, elf_blob: &[u8], stack_size: u64, allowed_affinity: u64, affinity: u64, parent_pid: u16, argv_bytes: Option<&[u8]>) -> Result<u16, ()> {
+    /// Build a fresh process from `elf_blob`. If `argv_bytes` /
+    /// `envp_bytes` is `Some(blob)`, the packed blob is installed at
+    /// `USER_ARGV_BASE` / `USER_ENVP_BASE` before the process becomes
+    /// runnable; install failure for either is non-fatal — the
+    /// process still spawns and the child sees `0` for the
+    /// corresponding slot in [`orbit_abi::user::argv_envp`]. Mirrors
+    /// the warn-but-continue policy in `run_create_process_ex_req`.
+    pub fn create_new_process(&mut self, elf_blob: &[u8], stack_size: u64, allowed_affinity: u64, affinity: u64, parent_pid: u16, argv_bytes: Option<&[u8]>, envp_bytes: Option<&[u8]>) -> Result<u16, ()> {
         // Leak-localization: pair this with the ktables snapshots in
         // dealloc_process. `create_pid{N}: ktables consumed=B` reports the
         // total table_pages footprint installed at process-construction
@@ -3091,14 +3162,21 @@ impl Orbit {
         // active source. Removed by `dealloc_process` on teardown.
         crate::kernel::stdin::register(pid);
 
-        // Install argv blob if the caller provided one. Same
-        // warn-but-continue policy as `run_create_process_ex_req`:
-        // the process is alive and runnable; an argv-install failure
-        // just means the child observes argc=0.
+        // Install argv / envp blobs if the caller provided them.
+        // Same warn-but-continue policy as `run_create_process_ex_req`:
+        // the process is alive and runnable; a blob-install failure
+        // just means the child observes argc=0 / envc=0.
         if let Some(blob) = argv_bytes {
             if self.install_argv_blob(pid, blob).is_err() {
                 warn!(
                     "create_new_process: argv install failed for pid={pid}, child will see no args",
+                );
+            }
+        }
+        if let Some(blob) = envp_bytes {
+            if self.install_envp_blob(pid, blob).is_err() {
+                warn!(
+                    "create_new_process: envp install failed for pid={pid}, child will see no env",
                 );
             }
         }
@@ -3315,12 +3393,22 @@ impl Orbit {
     }
 
     /// §13a.3 — does the named process have an argv blob installed?
-    /// Backs `argv_envp` syscall which returns either the fixed
-    /// `USER_ARGV_BASE` (true) or `0` (false).
+    /// Backs the argv half of the `argv_envp` syscall return pair
+    /// (returns `USER_ARGV_BASE` if true, `0` otherwise).
     pub fn process_has_argv(&self, pid: u16) -> bool {
         self.processes
             .get(&pid)
             .map(|p| p.argv_blob.is_some())
+            .unwrap_or(false)
+    }
+
+    /// §13e — does the named process have an envp blob installed?
+    /// Backs the envp half of the `argv_envp` syscall return pair
+    /// (returns `USER_ENVP_BASE` if true, `0` otherwise).
+    pub fn process_has_envp(&self, pid: u16) -> bool {
+        self.processes
+            .get(&pid)
+            .map(|p| p.envp_blob.is_some())
             .unwrap_or(false)
     }
 
