@@ -16,6 +16,7 @@ pub mod manager;
 pub mod net;
 pub mod pending_work;
 pub mod ready_queue;
+pub mod roles;
 pub mod sched;
 pub mod sleep_heap;
 pub mod syscall;
