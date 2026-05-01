@@ -41,7 +41,7 @@ fn mmap_req_shared_marshals_args_and_blocks() {
     assert_eq!(hw.pending_work.len(), 1);
     match &hw.pending_work[0] {
         PendingWork::MemMap { req, pid, handle, .. } => {
-            assert_eq!(req.vaddr, SHARED_VA);
+            assert_eq!(req.vaddr.raw(), SHARED_VA as u64);
             assert_eq!(req.size, 4096);
             assert_eq!(req.page_permissions, 0x17);
             assert!(req.share_with_kernel);
@@ -68,7 +68,7 @@ fn mmap_req_priv_marshals_args_and_blocks() {
 
     match &hw.pending_work[0] {
         PendingWork::MemMap { req, .. } => {
-            assert_eq!(req.vaddr, PRIV_VA);
+            assert_eq!(req.vaddr.raw(), PRIV_VA as u64);
             assert!(!req.share_with_kernel);
         }
         other => panic!("unexpected pending work: {other:?}"),
@@ -111,7 +111,7 @@ fn nc_create_req_marshals_args_and_blocks() {
     assert!(t.handle.is_some());
     match &hw.pending_work[0] {
         PendingWork::NetChannelCreation { req, pid, .. } => {
-            assert_eq!(req.nc_vaddr, SHARED_VA);
+            assert_eq!(req.nc_vaddr.raw(), SHARED_VA as u64);
             assert_eq!(req.region_size, 4096);
             assert_eq!(req.nc_type, 0);
             assert_eq!(req.bind, bind);
@@ -202,7 +202,7 @@ fn create_process_req_marshals_args_and_blocks() {
     assert_eq!(hw.pending_work.len(), 1);
     match &hw.pending_work[0] {
         PendingWork::CreateProcess { req, pid, handle, .. } => {
-            assert_eq!(req.elf_vaddr, 0x2_2000_0000);
+            assert_eq!(req.elf_vaddr.raw(), 0x2_2000_0000);
             assert_eq!(req.elf_len, 0x4000);
             assert_eq!(*pid, t.pid);
             handle.signal(7);
@@ -232,7 +232,7 @@ fn create_thread_req_marshals_args_and_blocks() {
     assert_eq!(hw.pending_work.len(), 1);
     match &hw.pending_work[0] {
         PendingWork::CreateThread { req, pid, parent_allowed, handle } => {
-            assert_eq!(req.entry, USER_TEXT_BASE as usize + 0x100);
+            assert_eq!(req.entry.raw(), USER_TEXT_BASE + 0x100);
             assert_eq!(req.allowed_affinity, 0xF);
             assert_eq!(req.affinity, 0x4);
             assert_eq!(*pid, t.pid);
@@ -358,7 +358,10 @@ fn mmap_req_rejects_kernel_vaddr() {
 
     let outcome = syscall::mmap_req(&mut t, &frame, &mut hw);
 
-    assert_rejected_no_work(outcome, &hw, &t, Errno::new(EINVAL).to_ret());
+    // `UserVa::new` is the first gate; a kernel-half VA fails its
+    // user-mappable check and surfaces as EFAULT before mmap_req's
+    // pool-mismatch (EINVAL) check ever runs.
+    assert_rejected_no_work(outcome, &hw, &t, Errno::new(EFAULT).to_ret());
 }
 
 #[test]
@@ -372,7 +375,10 @@ fn mmap_req_rejects_trap_frame_region() {
 
     let outcome = syscall::mmap_req(&mut t, &frame, &mut hw);
 
-    assert_rejected_no_work(outcome, &hw, &t, Errno::new(EINVAL).to_ret());
+    // Same as above — the trap-frame region is outside user-mappable
+    // space, so `UserVa::new` rejects with EFAULT before the
+    // shared-range gate (EINVAL) runs.
+    assert_rejected_no_work(outcome, &hw, &t, Errno::new(EFAULT).to_ret());
 }
 
 #[test]

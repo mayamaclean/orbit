@@ -51,6 +51,11 @@ pub fn make_thread(state: ThreadState, mode: SPP) -> Thread {
             sleep_seq: AtomicU64::new(0),
             frame,
             stack,
+            // Test threads don't go through the kernel-thread allocator
+            // path that owns these — None matches the user-thread shape
+            // used in production for non-pid-0 threads.
+            kernel_stack: None,
+            kernel_trap_frame: None,
             satp: Satp::from_bits(0),
             mode,
             handle: None,
@@ -67,7 +72,8 @@ pub fn make_thread(state: ThreadState, mode: SPP) -> Thread {
             context_switches: AtomicU64::new(0),
             cpu_ticks_total: AtomicU64::new(0),
             syscall_count: AtomicU64::new(0),
-            syscall_ticks: AtomicU64::new(0)
+            syscall_ticks: AtomicU64::new(0),
+            permissions: orbit_abi::perms::Permissions::ZERO,
         }
     }
 }

@@ -674,7 +674,6 @@ impl Orbit {
         a0: Option<usize>,
     ) -> Result<u32, ()> {
         let (stack_frame, stack_kva) = self.allocate_thread_stack()?;
-        let stack_pa = stack_frame.raw();
 
         let (trap_frame_frame, trap_frame_kva) = match self.allocate_trap_frame() {
             Ok(p) => p,
@@ -685,7 +684,6 @@ impl Orbit {
                 return Err(());
             }
         };
-        let trap_frame_pa = trap_frame_frame.raw();
 
         let pid = 0;
         let tid = self.next_tid();
@@ -715,8 +713,8 @@ impl Orbit {
             ticks: 0,
             frame,
             stack,
-            kernel_stack_pa: Some(stack_pa),
-            kernel_trap_frame_pa: Some(trap_frame_pa),
+            kernel_stack: Some(stack_frame),
+            kernel_trap_frame: Some(trap_frame_frame),
             state: AtomicUsize::new(ThreadState::Ready as usize),
             wake_time: 0,
             wake_override: AtomicU64::new(0),
@@ -2514,21 +2512,19 @@ impl Orbit {
         self.ready.pop_for(hart_mask).map(PThread)
     }
 
-    fn dealloc_thread(&mut self, thread: &'static Thread) {
+    fn dealloc_thread(&mut self, mut thread: Box<Thread>) {
         match (thread.slot, thread.pid) {
             (None, 0) => {
                 // Kernel thread. Its stack and trap frame were allocated
                 // directly from kernel_pages with fixed layouts and aren't
-                // recorded in any proc.maps, so free them here. The PAs
-                // were captured at thread creation; reconstruct typed
-                // `Frame<Shared>` for the typed allocator API.
-                if let Some(pa) = thread.kernel_stack_pa {
-                    self.kernel_pages
-                        .free(Frame::<Shared>::new(pa), Self::THREAD_STACK_LAYOUT);
+                // recorded in any proc.maps, so free them here. Move the
+                // owning `Frame<Shared>` out of the Thread and hand it to
+                // the typed allocator.
+                if let Some(frame) = thread.kernel_stack.take() {
+                    self.kernel_pages.free(frame, Self::THREAD_STACK_LAYOUT);
                 }
-                if let Some(pa) = thread.kernel_trap_frame_pa {
-                    self.kernel_pages
-                        .free(Frame::<Shared>::new(pa), Self::THREAD_TRAP_FRAME_LAYOUT);
+                if let Some(frame) = thread.kernel_trap_frame.take() {
+                    self.kernel_pages.free(frame, Self::THREAD_TRAP_FRAME_LAYOUT);
                 }
             }
             (Some(slot), 0) => error!(
@@ -2850,13 +2846,11 @@ impl Orbit {
         for tid in tids_to_remove {
             let p = self.threads.remove(&tid).unwrap();
 
-            let thread = unsafe { p.0.as_ref_unchecked() };
-
-            self.dealloc_thread(thread);
-
-            // Now that no kernel state references this Thread, take
-            // ownership and drop — frees the heap allocation exactly once.
-            drop(unsafe { Box::from_raw(p.0) });
+            // Take ownership of the heap-leaked Thread and hand it to
+            // dealloc_thread, which moves its kernel-thread `Frame<Shared>`
+            // backings into `kernel_pages.free` and lets the Box drop at
+            // the end of the call to release the Thread allocation.
+            self.dealloc_thread(unsafe { Box::from_raw(p.0) });
         }
 
         for pid in pids_to_remove {
@@ -3445,7 +3439,9 @@ impl Orbit {
         let owning_process = self.processes.get_mut(&pid).unwrap();
 
         if !owning_process.threads.insert(tid) {
-            self.dealloc_thread(unsafe { tptr.as_ref_unchecked() });
+            // Reclaim the Box we leaked at `Box::into_raw(t)` so the
+            // Thread allocation isn't lost on this rollback path.
+            self.dealloc_thread(unsafe { Box::from_raw(tptr) });
             return Err(());
         }
 
@@ -3732,8 +3728,8 @@ impl Orbit {
             // User threads track stack/trap-frame ownership via
             // `Process.maps` `PhysBacking` entries — these fields are
             // kthread-only.
-            kernel_stack_pa: None,
-            kernel_trap_frame_pa: None,
+            kernel_stack: None,
+            kernel_trap_frame: None,
             state: AtomicUsize::new(ThreadState::Ready as usize),
             wake_time: 0,
             wake_override: AtomicU64::new(0),
