@@ -11,15 +11,32 @@ use orbit_abi::errno::{Errno, EAGAIN, EBUSY, EFAULT, EINVAL, EIO, EPERM};
 use orbit_abi::layout::{user_priv_range_ok, user_range_ok, user_shared_range_ok};
 
 use crate::{
-    CloseHandleReq, CreateProcessExReq, CreateProcessReq, CreateThreadReq, FsOpenReq, FsReadReq,
-    FsReaddirReq, FsStatReq, FutexWaitReq, FutexWakeReq, Hardware, MAX_FS_PATH_LEN, MemMapReq,
-    NetChannelCreationReq, PAGE_SIZE, PendingWork, SyscallOutcome, WaitPidReq,
+    CloseHandleReq, CreateProcessExReq, CreateProcessReq, CreateProcessV2Req, CreateThreadReq,
+    FsOpenReq, FsReadReq, FsReaddirReq, FsStatReq, FutexWaitReq, FutexWakeReq, Hardware,
+    MAX_FS_PATH_LEN, MemMapReq, NetChannelCreationReq, PAGE_SIZE, PendingWork, PledgeReq,
+    SyscallOutcome, WaitPidReq,
 };
 use net_channel::BindSpec;
 
 /// Cap on `sleep_ms(ms)` arguments. Anything at or above this returns
 /// `-EINVAL` without touching thread state.
 pub const MAX_SLEEP_MS: usize = 60 * 60 * 1000;
+
+/// True iff `[vaddr, vaddr + size)` lies within a single
+/// [`PAGE_SIZE`]-aligned page. Used by syscalls that hand a small
+/// fixed-size struct VA to the manager which then reads it via a
+/// single `UserPageWindow` — straddling a page boundary would make
+/// the second-page bytes silently come from a different physical
+/// frame. Cheap (two arithmetic ops); call alongside the alignment
+/// and `user_range_ok` checks.
+#[inline]
+fn struct_fits_in_one_page(vaddr: usize, size: usize) -> bool {
+    if size == 0 {
+        return true;
+    }
+    let page_mask = PAGE_SIZE - 1;
+    (vaddr & !page_mask) == ((vaddr + size - 1) & !page_mask)
+}
 
 /// `sleep_ms(ms)` — block the caller for `ms` milliseconds.
 ///
@@ -742,6 +759,101 @@ pub fn create_thread<H: Hardware>(
         req,
         pid: thread.pid,
         parent_allowed: thread.allowed_affinity,
+        handle: handle.clone(),
+    };
+    if hw.push_pending_work(work).is_err() {
+        return SyscallOutcome::Return { ret: Errno::new(EAGAIN).to_ret() };
+    }
+    thread.handle = Some(handle);
+    SyscallOutcome::Yield {
+        state: ThreadState::Blocking,
+        ret: None,
+    }
+}
+
+/// `pledge(req: *const PermsRequest)` — narrow this process's
+/// effective + cap masks. Park the caller on a fresh handle and
+/// queue [`PendingWork::Pledge`]; the manager — sole writer of
+/// `Process.permissions` — reads the request struct under the
+/// caller's satp, applies the narrowing, and walks every live
+/// thread of the process to rewrite each `Thread.permissions`
+/// snapshot.
+///
+/// `req_vaddr` must be 8-byte aligned, bound-checked against the
+/// caller's mappable range, and contained within a single page —
+/// the manager reads via a single `UserPageWindow`, so a struct
+/// straddling a page boundary would silently read garbage from
+/// the next page. The request struct is 16 bytes (two `u64`s in
+/// `PermsRequest`).
+pub fn pledge_req<H: Hardware>(
+    thread: &mut Thread,
+    frame: &TrapFrame,
+    hw: &mut H,
+) -> SyscallOutcome {
+    let req_vaddr = frame.regs[11];
+    let size = core::mem::size_of::<orbit_abi::perms::PermsRequest>();
+    if req_vaddr & 0b111 != 0 {
+        return SyscallOutcome::Return { ret: Errno::new(EINVAL).to_ret() };
+    }
+    if !user_range_ok(req_vaddr as u64, size as u64) {
+        return SyscallOutcome::Return { ret: Errno::new(EFAULT).to_ret() };
+    }
+    if !struct_fits_in_one_page(req_vaddr, size) {
+        return SyscallOutcome::Return { ret: Errno::new(EINVAL).to_ret() };
+    }
+    let req = PledgeReq { req_vaddr };
+    let handle = CompletionHandle::new();
+    let work = PendingWork::Pledge {
+        req,
+        pid: thread.pid,
+        root_pa: thread.root_table_addr() as u64,
+        handle: handle.clone(),
+    };
+    if hw.push_pending_work(work).is_err() {
+        return SyscallOutcome::Return { ret: Errno::new(EAGAIN).to_ret() };
+    }
+    thread.handle = Some(handle);
+    SyscallOutcome::Yield {
+        state: ThreadState::Blocking,
+        ret: None,
+    }
+}
+
+/// `create_process_v2(args: *const CreateProcessV2Args)` — role-aware
+/// spawn with explicit perms narrowing. Park the caller on a fresh
+/// handle and queue [`PendingWork::CreateProcessV2`]; the manager
+/// copies the args struct + ELF, runs `check_transition`, and
+/// signals the new pid on success or `-EPERM` (logged as a
+/// `RoleDeny` audit event) on a denied transition.
+///
+/// The args struct must be 8-byte aligned, bound-checked against
+/// the caller's mappable range, and contained within a single page
+/// — same single-`UserPageWindow` read as `pledge_req` (see its
+/// docs). Further validation (ELF range, affinity sanity) happens
+/// manager-side after the args copy.
+pub fn create_process_v2_req<H: Hardware>(
+    thread: &mut Thread,
+    frame: &TrapFrame,
+    hw: &mut H,
+) -> SyscallOutcome {
+    let args_vaddr = frame.regs[11];
+    let size = core::mem::size_of::<orbit_abi::perms::CreateProcessV2Args>();
+    if args_vaddr & 0b111 != 0 {
+        return SyscallOutcome::Return { ret: Errno::new(EINVAL).to_ret() };
+    }
+    if !user_range_ok(args_vaddr as u64, size as u64) {
+        return SyscallOutcome::Return { ret: Errno::new(EFAULT).to_ret() };
+    }
+    if !struct_fits_in_one_page(args_vaddr, size) {
+        return SyscallOutcome::Return { ret: Errno::new(EINVAL).to_ret() };
+    }
+
+    let req = CreateProcessV2Req { args_vaddr };
+    let handle = CompletionHandle::new();
+    let work = PendingWork::CreateProcessV2 {
+        req,
+        pid: thread.pid,
+        root_pa: thread.root_table_addr() as u64,
         handle: handle.clone(),
     };
     if hw.push_pending_work(work).is_err() {

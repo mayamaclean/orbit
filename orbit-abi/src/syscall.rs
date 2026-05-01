@@ -18,17 +18,17 @@ pub const GET_HART_ID:     usize = 7;
 pub const GET_MICROS:      usize = 8;
 
 /// `pledge(req: *const PermsRequest) -> 0 | -errno` — narrow this
-/// process's `perms` and `allowed_perms` masks. PR2 ships this as
-/// data-only: the kernel mutates `Process.permissions` for keeps,
-/// so a subsequent `derive_child_perms` clamps real children
-/// against the narrowed cap, but the dispatch gate stays in
-/// log-only shadow mode. PR3 flips the gate to EPERM.
+/// process's `perms` and `allowed_perms` masks. The kernel mutates
+/// `Process.permissions` and propagates the narrowed snapshot to
+/// every live thread of the process, so the dispatch-site gate
+/// EPERMs subsequent calls that needed a class the caller just
+/// pledged away.
 ///
 /// `req` is a `*const orbit_abi::perms::PermsRequest` in user
 /// memory; the kernel reads both `ClassMask` fields via the
 /// standard boundary-deserializer path. Errors:
 /// - `EFAULT` — `req` doesn't translate under the caller's satp.
-/// - `EPERM` (PR3+) — caller has pledged `class::PLEDGE` away.
+/// - `EPERM` — caller has pledged `class::PLEDGE` away.
 pub const PLEDGE:          usize = 9;
 
 pub const MMAP:            usize = 4096;
@@ -48,39 +48,34 @@ pub const ARGV_ENVP:           usize = 4104;
 /// Args struct in user memory because the call carries enough
 /// fields to overflow the `a1..a7` register window comfortably.
 ///
-/// PR2 ships in shadow mode: `check_transition` runs, on `Err` the
-/// kernel falls through to `install_child_shadow` (logged) instead
-/// of EPERMing. PR3 flips the `Err` arm to EPERM.
+/// `check_transition` runs against the parent's role; on `Err(_)`
+/// the kernel records a `DenialEvent::RoleDeny` audit entry, bumps
+/// the parent's `role_denials` counter, and returns `-EPERM`. On
+/// success the witness-derived `Permissions` are installed on the
+/// child.
 pub const CREATE_PROCESS_V2:   usize = 4105;
-/// `query_shadow_log(buf: *mut u8, buf_len: usize) -> bytes | -errno`
-/// — copy the kernel-wide shadow event ring into a user buffer in
+/// `query_denial_log(buf: *mut u8, buf_len: usize) -> bytes | -errno`
+/// — copy the kernel-wide denial event ring into a user buffer in
 /// chronological order. Reply layout is a packed sequence of
-/// `ShadowEvent`s; `bytes_written / size_of::<ShadowEvent>()`
+/// `DenialEvent`s; `bytes_written / size_of::<DenialEvent>()`
 /// gives the count. Buffer too small: returns the prefix that fits
 /// + `bytes_written` reflecting the partial copy.
 ///
 /// Unlike `query_stats`, the ring isn't per-process — it covers
 /// every gate event system-wide. Sized at
-/// `SHADOW_RING_CAPACITY * size_of::<ShadowEvent>()` for a complete
-/// snapshot (≈2.4 KiB at the PR2 cap of 50 events).
+/// `DENIAL_RING_CAPACITY * size_of::<DenialEvent>()` for a complete
+/// snapshot (≈2.4 KiB at the cap of 50 events).
 ///
 /// **Cross-process disclosure.** The reply contains pids, tids,
 /// syscall numbers, and (for `RoleDeny`) source/target roles for
-/// *every* would-be denial system-wide, not just the caller's. A
-/// process holding `class::STATS` can correlate which other
-/// processes are calling which syscalls and where they're being
-/// gated. Acceptable today (orbit is single-tenant); once
-/// multi-tenant workloads land, consider gating this behind a
-/// dedicated `class::SHADOW_LOG` so a low-trust observer role can
-/// hold STATS without seeing other processes' denials.
-///
-/// **Lifecycle.** Introduced in PR2 alongside the shadow ring.
-/// Whether it survives PR3 is open: enforcement-mode auditing may
-/// keep the ring (relabelling "would-be denials" to "actual
-/// denials"), or the ring may be deleted alongside
-/// `install_child_shadow`. Decide when PR3 lands; until then the
-/// syscall number stays reserved.
-pub const QUERY_SHADOW_LOG:    usize = 4106;
+/// *every* denial system-wide, not just the caller's. A process
+/// holding `class::STATS` can correlate which other processes are
+/// calling which syscalls and where they're being gated.
+/// Acceptable today (orbit is single-tenant); once multi-tenant
+/// workloads land, consider gating this behind a dedicated
+/// `class::DENIAL_LOG` so a low-trust observer role can hold STATS
+/// without seeing other processes' denials.
+pub const QUERY_DENIAL_LOG:    usize = 4106;
 
 // 5000+ — multi-thread / SMP control plane. Numbered out of the 4096
 // block so the categorical split is obvious in dispatch tables and so
@@ -124,7 +119,7 @@ pub enum Sysno {
     CreateProcessEx = CREATE_PROCESS_EX,
     ArgvEnvp        = ARGV_ENVP,
     CreateProcessV2 = CREATE_PROCESS_V2,
-    QueryShadowLog  = QUERY_SHADOW_LOG,
+    QueryDenialLog  = QUERY_DENIAL_LOG,
     CreateThread   = CREATE_THREAD,
     GetPid         = GETPID,
     GetTid         = GETTID,
@@ -160,7 +155,7 @@ impl Sysno {
             CREATE_PROCESS_EX => Self::CreateProcessEx,
             ARGV_ENVP      => Self::ArgvEnvp,
             CREATE_PROCESS_V2 => Self::CreateProcessV2,
-            QUERY_SHADOW_LOG  => Self::QueryShadowLog,
+            QUERY_DENIAL_LOG  => Self::QueryDenialLog,
             CREATE_THREAD  => Self::CreateThread,
             GETPID         => Self::GetPid,
             GETTID         => Self::GetTid,
@@ -211,7 +206,7 @@ impl Sysno {
             Self::FsReaddir         => 27,
             Self::Pledge            => 28,
             Self::CreateProcessV2   => 29,
-            Self::QueryShadowLog    => 30,
+            Self::QueryDenialLog    => 30,
         }
     }
 
@@ -259,15 +254,15 @@ mod tests {
         assert_eq!(Sysno::from_usize(ARGV_ENVP),         Some(Sysno::ArgvEnvp));
         assert_eq!(Sysno::from_usize(PLEDGE),            Some(Sysno::Pledge));
         assert_eq!(Sysno::from_usize(CREATE_PROCESS_V2), Some(Sysno::CreateProcessV2));
-        assert_eq!(Sysno::from_usize(QUERY_SHADOW_LOG),  Some(Sysno::QueryShadowLog));
+        assert_eq!(Sysno::from_usize(QUERY_DENIAL_LOG),  Some(Sysno::QueryDenialLog));
     }
 
     #[test]
     fn unknown_returns_none() {
-        // 9 was reserved for PLEDGE in PR2 — used to be a hole, now decodes.
+        // 9 is PLEDGE — used to be a hole below 4096, now decodes.
         assert_eq!(Sysno::from_usize(10), None);
         assert_eq!(Sysno::from_usize(4095), None);
-        // 4105/4106 are now CREATE_PROCESS_V2 / QUERY_SHADOW_LOG.
+        // 4105/4106 are now CREATE_PROCESS_V2 / QUERY_DENIAL_LOG.
         assert_eq!(Sysno::from_usize(4107), None);
         assert_eq!(Sysno::from_usize(4999), None);
         assert_eq!(Sysno::from_usize(5006), None);
@@ -308,7 +303,7 @@ mod tests {
         assert_eq!(Sysno::ArgvEnvp          as usize, ARGV_ENVP);
         assert_eq!(Sysno::Pledge            as usize, PLEDGE);
         assert_eq!(Sysno::CreateProcessV2   as usize, CREATE_PROCESS_V2);
-        assert_eq!(Sysno::QueryShadowLog    as usize, QUERY_SHADOW_LOG);
+        assert_eq!(Sysno::QueryDenialLog    as usize, QUERY_DENIAL_LOG);
     }
 
     #[test]
@@ -345,7 +340,7 @@ mod tests {
         assert_eq!(ARGV_ENVP, 4104);
         assert_eq!(PLEDGE, 9);
         assert_eq!(CREATE_PROCESS_V2, 4105);
-        assert_eq!(QUERY_SHADOW_LOG, 4106);
+        assert_eq!(QUERY_DENIAL_LOG, 4106);
     }
 
     #[test]
@@ -362,7 +357,7 @@ mod tests {
             Sysno::FsRead, Sysno::FsStat, Sysno::GetPid, Sysno::GetTid,
             Sysno::WaitPid, Sysno::CreateProcessEx, Sysno::ArgvEnvp,
             Sysno::FutexWait, Sysno::FutexWake, Sysno::FsReaddir,
-            Sysno::Pledge, Sysno::CreateProcessV2, Sysno::QueryShadowLog,
+            Sysno::Pledge, Sysno::CreateProcessV2, Sysno::QueryDenialLog,
         ];
         assert_eq!(all.len(), Sysno::COUNT);
         let mut seen = [false; Sysno::COUNT];

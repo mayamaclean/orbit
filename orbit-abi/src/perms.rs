@@ -230,12 +230,14 @@ pub mod role {
     /// or by `derive_child_perms` to a real process.
     pub const NOROLE: RoleId = 0;
 
-    /// Pre-enforcement default during the migration: PR2 stamps every
-    /// `Process` with `BOOTSTRAP` so older binaries keep running before
-    /// PR3 wires explicit role assignment for kmain → loader → console.
-    /// After PR3 it survives only as a rescue/test sentinel — transitions
-    /// to `LOADER` and `SHELL`, wide caps so a single self-`pledge` can
-    /// shed anything. See `ROLES[BOOTSTRAP]` in `orbit-core::roles`.
+    /// Migration default: legacy `CREATE_PROCESS` and
+    /// `CREATE_PROCESS_EX` callers stamp every spawned `Process`
+    /// with `BOOTSTRAP` so they keep working until the loader
+    /// switches to `CREATE_PROCESS_V2` with explicit role
+    /// assignment (kmain → loader → console). Survives long-term
+    /// as a rescue/test sentinel — transitions to `LOADER` and
+    /// `SHELL`, wide caps so a single self-`pledge` can shed
+    /// anything. See `ROLES[BOOTSTRAP]` in `orbit-core::roles`.
     pub const BOOTSTRAP: RoleId = 1;
 
     /// `orbit-loader`. Wide caps + wide transitions — the single
@@ -353,6 +355,59 @@ impl PermsRequest {
     };
 }
 
+/// `create_process_v2(args: *const CreateProcessV2Args) -> pid | -errno`
+/// argument bundle. Lives in user memory because the call carries
+/// more fields than the `a1..a7` register window can hold
+/// comfortably; the kernel reads via the standard boundary
+/// deserializer (one bounded copy on entry, no further user reads).
+///
+/// Fields are append-only — never reorder, never repurpose, never
+/// shrink. `_pad` exists so the struct's natural 8-byte alignment
+/// is explicit; future role-axis additions can repurpose the slot
+/// before extending the struct.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C)]
+pub struct CreateProcessV2Args {
+    /// User VA of the child's ELF blob. Validated by the syscall
+    /// boundary against `user_range_ok` before the manager copies.
+    pub elf_vaddr: usize,
+    /// Length of the ELF blob in bytes.
+    pub elf_len: usize,
+    /// Cap mask the child's first thread is constructed with —
+    /// sentinel `0` defers to the kernel's all-harts default. Same
+    /// shape as `CREATE_PROCESS`'s `allowed_affinity`.
+    pub allowed_affinity: u64,
+    /// Initial affinity for the child's first thread. Sentinel `0`
+    /// → resolved `allowed_affinity`.
+    pub affinity: u64,
+    /// Role to install on the child. Validated against the parent's
+    /// transition bitset by the kernel-side gate. On `Err(_)` the
+    /// gate logs a `RoleDeny` audit event, bumps the parent's
+    /// `role_denials` counter, and the syscall returns `-EPERM` —
+    /// no child is created.
+    pub target_role: role::RoleId,
+    /// Reserved — must be zero. Pinning the alignment without an
+    /// implicit padding slot keeps the wire shape grep-able.
+    pub _pad: u32,
+    /// Caller-requested narrowing of the child's effective perms.
+    /// Intersected with the role default + parent's allowed_perms.
+    pub request_perms: u64,
+    /// Caller-requested narrowing of the child's allowed_perms cap.
+    /// Independent axis — see [`Permissions`] struct docs.
+    pub request_allowed_perms: u64,
+}
+
+impl CreateProcessV2Args {
+    /// Typed view of the request masks, for the kernel-side
+    /// `derive_child_perms` clamp.
+    pub const fn request(&self) -> PermsRequest {
+        PermsRequest {
+            perms: ClassMask::from_raw(self.request_perms),
+            allowed_perms: ClassMask::from_raw(self.request_allowed_perms),
+        }
+    }
+}
+
 impl Permissions {
     /// All-zero state — `NOROLE`, no perms, no allowed perms. Default
     /// for `#[derive(Default)]`-shaped construction; useful as a base
@@ -367,11 +422,12 @@ impl Permissions {
     };
 
     /// `BOOTSTRAP` role with every class set on both `perms` and
-    /// `allowed_perms`. Used as the pre-enforcement default during the
-    /// PR2 migration and in host tests; production spawn sites should
-    /// resolve `default_perms` / `default_allowed` through the registry
-    /// (see `orbit-core::roles`) so the result matches the chosen
-    /// role's policy.
+    /// `allowed_perms`. Migration default for legacy
+    /// `CREATE_PROCESS` / `CREATE_PROCESS_EX` callers and the
+    /// shape used in host tests; `CREATE_PROCESS_V2` resolves
+    /// `default_perms` / `default_allowed` through the registry
+    /// (see `orbit-core::roles`) so the result matches the
+    /// chosen role's policy.
     pub const ALL: Self = Self {
         perms: class::raw::ALL,
         allowed_perms: class::raw::ALL,
@@ -391,15 +447,14 @@ impl Permissions {
     /// with no gate having run — for example,
     /// `process.permissions = Permissions::new(class::raw::ALL, …)`
     /// installs full perms with no `derive_child_perms` invocation.
-    /// The mitigation is *not* visibility on this constructor (boundary
-    /// code legitimately needs it), but the `Process` API surface PR2
-    /// ships: `Process::permissions` is private; the only public
-    /// setters are `Process::install_child(c: ChildPerms)` and the
-    /// PR2-only `Process::install_child_via_shadow(p: Permissions)`,
-    /// the latter deleted in PR3. Any future setter that takes raw
-    /// `Permissions` would be a regression of this property —
-    /// reviewers should treat the addition of a kernel-side
-    /// `set_permissions` overload as a security-class change.
+    /// The mitigation is *not* visibility on this constructor
+    /// (boundary code legitimately needs it), but the `Process`
+    /// API surface: the only setter is
+    /// `Process::install_permissions(Permissions)`, called only by
+    /// the `create_process_v2` handler with a witness-derived
+    /// value. Adding a wider setter would be a security-class
+    /// regression — reviewers police direct `install_permissions`
+    /// calls as part of any spawn-path change.
     pub const fn new(perms: u64, allowed_perms: u64, role: role::RoleId) -> Self {
         Self {
             perms,
@@ -470,7 +525,7 @@ impl Permissions {
             syscall::CREATE_PROCESS_EX => class::PROC_SPAWN,
             syscall::ARGV_ENVP => class::PROC_LIFE,
             syscall::CREATE_PROCESS_V2 => class::PROC_SPAWN,
-            syscall::QUERY_SHADOW_LOG => class::STATS,
+            syscall::QUERY_DENIAL_LOG => class::STATS,
             syscall::CREATE_THREAD => class::PROC_SPAWN,
             syscall::GETPID => class::PROC_LIFE,
             syscall::GETTID => class::PROC_LIFE,
@@ -480,6 +535,7 @@ impl Permissions {
             syscall::FS_OPEN => class::FS_RO,
             syscall::FS_READ => class::FS_RO,
             syscall::FS_STAT => class::FS_RO,
+            syscall::FS_READDIR => class::FS_RO,
             _ => ClassMask::EMPTY,
         }
     }
@@ -492,10 +548,10 @@ impl Permissions {
     ///
     /// **Use [`can_call`](Self::can_call) instead at production
     /// dispatch sites.** This bare check doesn't push a
-    /// [`ShadowEvent`](crate::shadow::ShadowEvent) on denial, so a
-    /// shadow-mode failure won't show up in `query_shadow_log` or
-    /// the `shadow_perm_denials` counter. `allows` is for tests and
-    /// for the rare context where the caller already knows a denial
+    /// [`DenialEvent`](crate::denial::DenialEvent) on denial, so the
+    /// audit log won't show up in `query_denial_log` or the
+    /// `perm_denials` counter. `allows` is for tests and for the
+    /// rare context where the caller already knows a denial
     /// shouldn't be recorded (e.g. a speculative check).
     pub const fn allows(&self, sysno: usize) -> bool {
         let cls = Self::class_for(sysno);
@@ -506,18 +562,19 @@ impl Permissions {
     }
 
     /// Dispatch-gate entrypoint. Equivalent to
-    /// [`allows`](Self::allows) plus a [`ShadowEvent::PermDeny`]
-    /// push to `sink` on denial. The return value is what `allows`
-    /// would have returned — the caller decides what to do with it
-    /// (PR2 shadow: ignore the bool, fall through to the handler;
-    /// PR3 enforcement: return EPERM on `false`).
+    /// [`allows`](Self::allows) plus a [`DenialEvent::PermDeny`]
+    /// push to `sink` on denial. Returns `true` if the syscall is
+    /// allowed; `false` (with the audit event already pushed) if
+    /// denied — the caller is expected to short-circuit with
+    /// `-EPERM`.
     ///
-    /// "You can't shadow without recording" is type-enforced here:
+    /// "You can't gate without recording" is type-enforced here:
     /// the gate function takes the sink by mutable reference, so
     /// any code path that wants to invoke the gate must have a
     /// sink in scope. The kernel's production sink is the bounded
-    /// `ShadowRing` in `orbit-core::roles`; tests pass a Vec-backed
-    /// sink (or `()` for "no recording, I'm checking idempotently").
+    /// `DenialRing` in `orbit-core::denial_ring`; tests pass a
+    /// Vec-backed sink (or `()` for "no recording, I'm checking
+    /// idempotently").
     ///
     /// `ctx` carries the caller-side metadata (pid/tid/time_ticks)
     /// that lands in the event's matching fields. The dispatch site
@@ -526,13 +583,13 @@ impl Permissions {
     pub fn can_call(
         &self,
         sysno: usize,
-        ctx: crate::shadow::GateContext,
-        sink: &mut impl crate::shadow::ShadowSink,
+        ctx: crate::denial::GateContext,
+        sink: &mut impl crate::denial::DenialSink,
     ) -> bool {
         if self.allows(sysno) {
             return true;
         }
-        sink.push(crate::shadow::ShadowEvent::PermDeny {
+        sink.push(crate::denial::DenialEvent::PermDeny {
             required_class: Self::class_for(sysno).raw(),
             perms: self.perms,
             time_ticks: ctx.time_ticks,
@@ -732,7 +789,7 @@ mod tests {
             CREATE_PROCESS_EX,
             ARGV_ENVP,
             CREATE_PROCESS_V2,
-            QUERY_SHADOW_LOG,
+            QUERY_DENIAL_LOG,
             CREATE_THREAD,
             GETPID,
             GETTID,
@@ -742,6 +799,7 @@ mod tests {
             FS_OPEN,
             FS_READ,
             FS_STAT,
+            FS_READDIR,
         ];
         for s in all {
             let cls = Permissions::class_for(s);
@@ -1125,22 +1183,22 @@ mod tests {
         assert_eq!(r.allowed_perms_mask(), class::ALL);
     }
 
-    /// Vec-backed ShadowSink for can_call() tests. Captures pushed
+    /// Vec-backed DenialSink for can_call() tests. Captures pushed
     /// events for inspection — the production sink is in orbit-core
     /// (the bounded ring) and isn't reachable from this crate's tests.
     #[derive(Default)]
-    struct CapturingSink(alloc::vec::Vec<crate::shadow::ShadowEvent>);
+    struct CapturingSink(alloc::vec::Vec<crate::denial::DenialEvent>);
 
-    impl crate::shadow::ShadowSink for CapturingSink {
-        fn push(&mut self, event: crate::shadow::ShadowEvent) {
+    impl crate::denial::DenialSink for CapturingSink {
+        fn push(&mut self, event: crate::denial::DenialEvent) {
             self.0.push(event);
         }
     }
 
     extern crate alloc;
 
-    fn ctx() -> crate::shadow::GateContext {
-        crate::shadow::GateContext {
+    fn ctx() -> crate::denial::GateContext {
+        crate::denial::GateContext {
             pid: 7,
             tid: 11,
             time_ticks: 99_000,
@@ -1163,7 +1221,7 @@ mod tests {
         // Pledge away NETCH, then attempt CREATE_NETCH — gate returns
         // false AND pushes one PermDeny carrying the right class /
         // perms / sysno / pid / tid / time_ticks.
-        use crate::shadow::ShadowEvent;
+        use crate::denial::DenialEvent;
         let p = Permissions::ALL.pledge(PermsRequest {
             perms: ClassMask::from_raw(class::raw::ALL & !class::raw::NETCH),
             allowed_perms: class::ALL,
@@ -1173,7 +1231,7 @@ mod tests {
         assert!(!ok, "denied call must return false");
         assert_eq!(sink.0.len(), 1, "exactly one event per denied call");
         match sink.0[0] {
-            ShadowEvent::PermDeny {
+            DenialEvent::PermDeny {
                 required_class, perms, time_ticks, tid, sysno, source_role, pid,
             } => {
                 assert_eq!(required_class, class::raw::NETCH);
@@ -1196,14 +1254,14 @@ mod tests {
         // Unknown sysno → class_for returns EMPTY, allows returns false.
         // The gate still pushes a PermDeny so reviewers can spot the
         // "syscall N has no class — extend class_for" miss in the log.
-        use crate::shadow::ShadowEvent;
+        use crate::denial::DenialEvent;
         let p = Permissions::ALL;
         let mut sink = CapturingSink::default();
         let ok = p.can_call(99_999, ctx(), &mut sink);
         assert!(!ok);
         assert_eq!(sink.0.len(), 1);
         match sink.0[0] {
-            ShadowEvent::PermDeny { required_class, sysno, source_role, .. } => {
+            DenialEvent::PermDeny { required_class, sysno, source_role, .. } => {
                 assert_eq!(required_class, 0);
                 assert_eq!(sysno, 99_999);
                 // Even on unknown-sysno path the source role is captured.
@@ -1215,7 +1273,7 @@ mod tests {
 
     #[test]
     fn can_call_with_unit_sink_compiles_and_returns_correct_bool() {
-        // `()` is a no-op ShadowSink — the gate still computes the
+        // `()` is a no-op DenialSink — the gate still computes the
         // bool correctly under enforcement-shaped contexts where
         // logging is redundant.
         let p = Permissions::ALL;
@@ -1265,7 +1323,7 @@ mod tests {
             CREATE_PROCESS_EX,
             ARGV_ENVP,
             CREATE_PROCESS_V2,
-            QUERY_SHADOW_LOG,
+            QUERY_DENIAL_LOG,
             CREATE_THREAD,
             GETPID,
             GETTID,

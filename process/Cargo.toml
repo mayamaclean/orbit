@@ -7,4 +7,5 @@ edition = "2024"
 mmu = { path = "../mmu" }
 riscv = { version = "0.16.0", features = ["rt"] }
 device = { path = "../device" }
+orbit-abi = { path = "../orbit-abi", features = ["kernel-policy"] }
 smoltcp = { path = "../../smoltcp", default-features = false, features = ["log", "verbose", "socket-raw", "socket-udp", "socket-tcp", "socket-icmp", "socket-dhcpv4", "socket-dns", "proto-ipv4"] }

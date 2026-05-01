@@ -162,6 +162,32 @@ pub struct FutexWakeReq {
     pub n: u32,
 }
 
+/// `pledge(req)` request. Carried by `PendingWork::Pledge` so the
+/// manager — sole writer of `Process.permissions` — can apply the
+/// narrowing under MANAGER_LOCK and propagate the new value to every
+/// live `Thread.permissions` snapshot. Pure narrowing (`ClassMask`
+/// has no widening operation), so the manager never EPERMs a
+/// well-formed pledge today.
+#[derive(Debug, Clone, Copy)]
+pub struct PledgeReq {
+    /// User VA of the [`orbit_abi::perms::PermsRequest`] struct.
+    /// Bound-checked at the syscall boundary; manager copies the
+    /// 16-byte payload via the standard boundary path.
+    pub req_vaddr: usize,
+}
+
+/// `create_process_v2(args)` request — the role-aware spawn. Same
+/// async shape as the older `CreateProcess` variants: park the
+/// caller, queue manager work, return the resolved pid (or a
+/// negative errno) on signal. The args struct lives in user memory
+/// at `args_vaddr`; the manager copies it once on entry.
+#[derive(Debug, Clone, Copy)]
+pub struct CreateProcessV2Req {
+    /// User VA of the [`orbit_abi::perms::CreateProcessV2Args`]
+    /// struct. Bound-checked at the syscall boundary.
+    pub args_vaddr: usize,
+}
+
 /// `CreateProcessReq` plus a packed argv blob and (optionally) a
 /// packed envp blob. The two share a wire format (`orbit_abi::argv`
 /// / `orbit_abi::envp` — header + offsets + strings) so the kernel
@@ -300,6 +326,30 @@ pub enum PendingWork {
         /// Caller's handle. Signaled synchronously with the count of
         /// waiters actually woken (≤ `req.n`) or a negative errno on
         /// translation failure.
+        handle: CompletionHandle,
+    },
+    /// `pledge(*const PermsRequest)` — narrow this process's
+    /// effective + cap masks. Manager copies the request struct from
+    /// user memory under the caller's satp, applies the narrowing to
+    /// `Process.permissions`, then walks every live thread of the
+    /// process and rewrites its `Thread.permissions` snapshot so the
+    /// dispatch-site gate sees the new mask without locking.
+    Pledge {
+        req: PledgeReq,
+        pid: u16,
+        root_pa: u64,
+        handle: CompletionHandle,
+    },
+    /// `create_process_v2(*const CreateProcessV2Args)` — role-aware
+    /// spawn. Manager copies the args struct, runs the role
+    /// transition gate (logs a `RoleDeny` audit event and returns
+    /// `-EPERM` on `Err`), copies the ELF, calls `derive_child_perms`,
+    /// and installs the resulting `Permissions` on the freshly-
+    /// spawned `Process` via `install_permissions`.
+    CreateProcessV2 {
+        req: CreateProcessV2Req,
+        pid: u16,
+        root_pa: u64,
         handle: CompletionHandle,
     },
 }

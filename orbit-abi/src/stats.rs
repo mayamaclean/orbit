@@ -87,31 +87,25 @@ pub struct ProcessStats {
     pub hart_scheduler_ticks: u64,
     pub hart_idle_ticks: u64,
 
-    // ─── per-process shadow-mode counters (PR2+) ─────────────────────
-    /// Number of times the dispatch-site bitmask gate would have
-    /// EPERMed a syscall from this process under enforcement.
-    /// Monotonic; the smoke-test fast path ("did the gate fire at
-    /// all since `before_delta`?") reads this delta.
+    // ─── per-process denial counters ─────────────────────────────────
+    /// Number of times the dispatch-site bitmask gate has EPERMed a
+    /// syscall from this process. Monotonic; the smoke-test fast
+    /// path ("did the gate fire at all since `before_delta`?")
+    /// reads this delta.
     ///
-    /// Bookkeeping is kernel-side: after `Permissions::can_call`
-    /// returns `false`, the dispatch handler increments this field.
-    /// `can_call` itself only knows about the
-    /// [`ShadowSink`](crate::shadow::ShadowSink) — it has no handle
-    /// on the per-process counter, so counter/ring agreement is a
-    /// dispatch-handler discipline, not a type-level invariant.
-    /// Pairs with the kernel-wide
-    /// [`ShadowEvent`](crate::shadow::ShadowEvent) ring — this
+    /// Bookkeeping is kernel-side: the manager-side
+    /// `drain_denial_events` pass increments this field as it
+    /// folds `PermDeny` events off the lock-free producer queue
+    /// into the kernel-wide ring. Pairs with the
+    /// [`DenialEvent`](crate::denial::DenialEvent) ring — this
     /// counter answers "how many?", the ring answers "which?".
-    pub shadow_perm_denials: u64,
+    pub perm_denials: u64,
     /// Number of times `create_process_v2`'s role-transition gate
-    /// would have EPERMed a spawn from this process under
-    /// enforcement. Same kernel-side bookkeeping shape as
-    /// `shadow_perm_denials`: the `create_process_v2` handler
-    /// increments after `install_child_shadow` returns; the function
-    /// itself only pushes the
-    /// [`RoleDeny`](crate::shadow::ShadowEvent::RoleDeny) event into
-    /// the sink.
-    pub shadow_role_denials: u64,
+    /// has EPERMed a spawn from this process. Same per-process
+    /// shape as `perm_denials`. The `create_process_v2` handler
+    /// records the audit event and bumps this counter inline
+    /// (under MANAGER_LOCK) before returning `-EPERM`.
+    pub role_denials: u64,
 }
 
 #[cfg(test)]
@@ -122,8 +116,9 @@ mod tests {
     fn layout_is_144_bytes() {
         // Pinning the size keeps reviewers honest about ABI growth.
         // Bump only when appending fields (and update the kernel's
-        // matching write path in lockstep). PR2 added two u64 shadow
-        // counters: 128 + 16 = 144.
+        // matching write path in lockstep). The trailing two u64s
+        // (`perm_denials` + `role_denials`) bring the size from
+        // 128 to 144.
         assert_eq!(core::mem::size_of::<ProcessStats>(), 144);
     }
 
@@ -232,7 +227,7 @@ mod tests {
         assert_eq!(&s.hart_kernel_ticks      as *const _ as usize - base, 104);
         assert_eq!(&s.hart_scheduler_ticks   as *const _ as usize - base, 112);
         assert_eq!(&s.hart_idle_ticks        as *const _ as usize - base, 120);
-        assert_eq!(&s.shadow_perm_denials    as *const _ as usize - base, 128);
-        assert_eq!(&s.shadow_role_denials    as *const _ as usize - base, 136);
+        assert_eq!(&s.perm_denials    as *const _ as usize - base, 128);
+        assert_eq!(&s.role_denials    as *const _ as usize - base, 136);
     }
 }

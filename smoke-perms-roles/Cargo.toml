@@ -1,0 +1,31 @@
+[package]
+name = "smoke-perms-roles"
+version = "0.1.0"
+edition = "2024"
+
+# PR2 bracket smoke for the permissions/roles surface. Exercises
+# both gates in one run:
+#
+# - Dispatch-site bitmask gate (PermDeny): `pledge` away NETCH, then
+#   call `create_netch` and observe the gate's effect on the per-
+#   process counter + ring + return value.
+# - Role transition gate (RoleDeny): `create_process_v2` targeting a
+#   role the parent's `transitions` bitset doesn't include.
+#
+# Self-asserts pass/fail with PR2 (shadow: counter+ring update, syscall
+# falls through) vs PR3 (enforcement: -EPERM return) detected from the
+# observed return value, so the same binary works against either mode.
+#
+# Built and shipped to a running guest via `send-payload.py`. Build
+# order: `smoke-stub-child` first (its ELF is `include_bytes!`'d as
+# the v2 spawn blob), then this crate.
+
+[dependencies]
+orbit-abi = { path = "../orbit-abi" }
+orbit-rt  = { path = "../orbit-rt" }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

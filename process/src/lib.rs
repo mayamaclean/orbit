@@ -11,6 +11,8 @@ use alloc::collections::{btree_map::BTreeMap, btree_set::BTreeSet};
 use alloc::vec::Vec;
 use device::{Stack, TrapFrame};
 use mmu::sv48::PhysAddr;
+use orbit_abi::perms::{Permissions, PermsRequest};
+use orbit_abi::roles::ChildPerms;
 use riscv::register::{satp::Satp, sstatus::SPP};
 use smoltcp::iface::SocketHandle;
 
@@ -332,6 +334,17 @@ pub struct Thread {
     /// Cumulative kernel service ticks across this thread's syscalls
     /// (excludes time spent parked on a `ThreadBlockReason`).
     pub syscall_ticks: AtomicU64,
+    /// Snapshot of the owning process's [`Permissions`] at the time
+    /// the thread was created. Refreshed when the process pledges
+    /// (manager-side: walks every thread of the process under
+    /// MANAGER_LOCK and rewrites this field).
+    ///
+    /// The dispatch site reads this snapshot without locking, calls
+    /// `permissions.allows(sysno)`, and on `false` records to the
+    /// kernel-wide `DenialRing` + bumps the owning process's
+    /// `perm_denials` counter, then short-circuits the syscall with
+    /// `-EPERM`.
+    pub permissions: Permissions,
 }
 
 impl Thread {
@@ -418,6 +431,47 @@ pub struct Process {
     pub tls_template: Option<Vec<u8>>,
     pub tls_memsz: usize,
     pub tls_align: usize,
+
+    /// Authoritative process permissions. Mutated by the manager
+    /// under MANAGER_LOCK on `pledge` (narrowing-only) and at child
+    /// install time during `create_process_v2`. Each thread of the
+    /// process holds a snapshot in [`Thread::permissions`] which the
+    /// dispatch-site permission gate reads without locking; pledge
+    /// propagates by walking every live thread.
+    ///
+    /// Default at construct time is [`Permissions::ZERO`] — fail
+    /// closed, NOROLE with empty masks. Construction sites that need
+    /// real perms (`create_new_process` stamps BOOTSTRAP-shaped
+    /// `Permissions::ALL` so legacy `CREATE_PROCESS` /
+    /// `CREATE_PROCESS_EX` callers keep working; the
+    /// role-resolved `create_process_v2` path installs the
+    /// witness-derived mask) must call
+    /// [`Process::install_permissions`] explicitly. A new spawn
+    /// path that forgets to set perms produces an unprivileged
+    /// process rather than a fully-trusted one — the safer failure
+    /// mode.
+    pub permissions: Permissions,
+    /// Advisory uid. Not used for authentication or authorization —
+    /// roles + permissions own that surface. Carried for Unix-compat
+    /// observability (`getuid`, `ps`-style diagnostics) and for
+    /// fs ownership metadata once writes land.
+    pub uid: u32,
+    /// Advisory gid. Same caveats as [`uid`](Self::uid).
+    pub gid: u32,
+    /// Count of times the dispatch-site bitmask gate has EPERMed a
+    /// syscall from this process. Surfaced via `query_stats`'s
+    /// `perm_denials` field. Incremented by the manager-side
+    /// `drain_denial_events` pass after consuming a `PermDeny`
+    /// event off the lock-free producer queue. Atomic so
+    /// foreign-hart reads (e.g. from the stats snapshot path) are
+    /// tear-safe.
+    pub perm_denials: AtomicU64,
+    /// Count of times `create_process_v2`'s role-transition gate
+    /// has EPERMed a spawn from this process. Surfaced via
+    /// `query_stats`'s `role_denials`. Incremented inline by the
+    /// manager-side `create_process_v2` handler before it returns
+    /// `-EPERM`.
+    pub role_denials: AtomicU64,
 }
 
 impl Process {
@@ -442,7 +496,51 @@ impl Process {
             tls_template: None,
             tls_memsz: 0,
             tls_align: 0,
+            // Fail closed: NOROLE + no perms. Spawn-path callers
+            // (`create_new_process`, future role-resolved spawns)
+            // override via `install_permissions` so a missed
+            // assignment produces an unprivileged process rather
+            // than a fully-trusted one.
+            permissions: Permissions::ZERO,
+            uid: 0,
+            gid: 0,
+            perm_denials: AtomicU64::new(0),
+            role_denials: AtomicU64::new(0),
         }
+    }
+
+    /// Pledge-narrow this process's permissions in place. Caller must
+    /// also propagate the new value to every live [`Thread`] of this
+    /// process (each thread caches a snapshot for the lock-free
+    /// dispatch path). The two-step caller responsibility lives at
+    /// the manager: only it has the thread registry needed to walk
+    /// siblings. See `run_pledge_req` in kmain.
+    pub fn pledge(&mut self, request: PermsRequest) {
+        self.permissions = self.permissions.pledge(request);
+    }
+
+    /// Install perms on a freshly-spawned child via the witness
+    /// path. Only [`ChildPerms`] can be constructed by
+    /// [`derive_child_perms`](orbit_abi::roles::derive_child_perms),
+    /// which itself requires a [`TransitionAllowed`] from
+    /// [`check_transition`](orbit_abi::roles::check_transition) — so
+    /// reaching this method type-enforces "both gates ran." The
+    /// `create_process_v2` handler is the only caller.
+    ///
+    /// [`ChildPerms`]: orbit_abi::roles::ChildPerms
+    /// [`TransitionAllowed`]: orbit_abi::roles::TransitionAllowed
+    pub fn install_child(&mut self, c: ChildPerms) {
+        self.permissions = c.into_permissions();
+    }
+
+    /// Migration backstop. Stamps `Permissions` directly without
+    /// requiring a witness — used by the legacy
+    /// `CREATE_PROCESS` / `CREATE_PROCESS_EX` spawn paths to install
+    /// the BOOTSTRAP-shaped default. Wider than [`install_child`];
+    /// reviewers police new call sites. Deletes when the legacy
+    /// syscalls retire.
+    pub fn install_permissions(&mut self, p: Permissions) {
+        self.permissions = p;
     }
 
     /// Find the mapping (if any) whose range contains `vaddr`.

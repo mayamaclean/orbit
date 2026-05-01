@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 device      = { path = "../device" }
 net_channel = { path = "../net_channel" }
-orbit-abi   = { path = "../orbit-abi" }
+orbit-abi   = { path = "../orbit-abi", features = ["kernel-policy"] }
 process     = { path = "../process" }
 # Used for SPP (privilege-mode enum) in the trap mode-gate. Compiles on
 # host target; we only touch the type, never a CSR.

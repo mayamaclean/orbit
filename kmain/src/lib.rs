@@ -137,6 +137,66 @@ pub fn release_manager() {
     MANAGER_LOCK.store(false, Ordering::Release);
 }
 
+/// Dispatch-site permission gate. Called by `s_trap`'s cause=8 arm
+/// (the U-mode ecall path) before the syscall dispatch match runs.
+/// Returns `true` if the syscall is allowed under the calling
+/// thread's snapshotted [`Permissions`]; on `false` the gate has
+/// queued a [`DenialEvent::PermDeny`] audit event for the manager
+/// to fold into the kernel-wide ring, and the caller is expected
+/// to short-circuit the dispatch with `-EPERM`.
+///
+/// Lock-free hot path. The thread's `Permissions` is read without
+/// synchronisation (manager-side pledge propagation walks every
+/// live thread under MANAGER_LOCK; we accept the brief window where
+/// a sibling sees a not-yet-narrowed snapshot). Denials push onto
+/// [`crate::kernel::DENIAL_EVENT_QUEUE`] — a `try_push` so the trap
+/// path never spins on a full queue; a full queue drops the event
+/// and bumps [`crate::kernel::DENIAL_EVENTS_DROPPED`] for diagnostics.
+///
+/// [`DenialEvent::PermDeny`]: orbit_abi::denial::DenialEvent::PermDeny
+/// [`Permissions`]: orbit_abi::perms::Permissions
+pub fn perm_gate_check(thread: &Thread, syscall: usize) -> bool {
+    let perms = thread.permissions;
+    if perms.allows(syscall) {
+        return true;
+    }
+
+    // Build the would-be-denial event. `now_ticks` reads the time
+    // CSR directly — same domain as `query_stats` so log readers can
+    // align timelines without a conversion.
+    let now_ticks = riscv::register::time::read64();
+    let event = orbit_abi::denial::DenialEvent::PermDeny {
+        required_class: orbit_abi::perms::Permissions::class_for(syscall).raw(),
+        perms: perms.perms,
+        time_ticks: now_ticks,
+        tid: thread.tid,
+        sysno: syscall as u32,
+        source_role: perms.role,
+        pid: thread.pid,
+    };
+
+    tracing::warn!("[{}.{}] {event:?}", thread.pid, thread.tid);
+
+    if crate::kernel::DENIAL_EVENT_QUEUE.push(Some(event)).is_err() {
+        crate::kernel::DENIAL_EVENTS_DROPPED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    false
+}
+
+/// Short-circuit the syscall dispatch with `-EPERM`. Used by
+/// `s_trap`'s cause=8 arm when [`perm_gate_check`] returns `false`:
+/// the audit event is already queued, and this commits the EPERM
+/// return value into the frame + advances pc past the ecall via
+/// the same `dispatch_syscall` shim that the regular handlers use.
+pub fn enforce_eperm(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
+    dispatch_syscall(epc, hart_context, frame, |_t, _f| {
+        orbit_core::SyscallOutcome::Return {
+            ret: -(orbit_abi::errno::EPERM as isize),
+        }
+    });
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn k_hart_loop() -> ! {
     let hart_context = unsafe {
@@ -188,6 +248,13 @@ pub extern "C" fn k_hart_loop() -> ! {
 
             orbit.cleanup_threads_and_processes();
             orbit.drain_pending_work();
+            // Drain denial events queued by the dispatch-site gate —
+            // best-effort audit logging into the kernel-wide ring +
+            // per-process counters. Cheap (lock-free MPSC pop), runs
+            // before assign_threads so a thread that ecall'd a denied
+            // syscall has its counter visible to a same-pass
+            // query_stats from another hart.
+            orbit.drain_denial_events();
             // Drain wake events *before* assign_threads so any thread
             // whose wake_time was just bumped to 0 is observed Ready
             // by the next scheduler scan in this same critical section.
@@ -803,6 +870,114 @@ pub fn handle_nc_yield(epc: usize, hart_context: &'static HartContext, frame: &m
 pub fn handle_create_process_req(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
     dispatch_syscall(epc, hart_context, frame, |t, f| {
         orbit_core::syscall::create_process_req(t, f, &mut crate::hw::RiscvHardware)
+    });
+}
+
+/// `pledge(*const PermsRequest)`. Async manager round-trip: the
+/// syscall layer parks the caller, the manager copies the request
+/// struct from user memory, applies the narrowing to
+/// `Process.permissions`, and propagates to every live thread's
+/// snapshot before signaling. Wired into `s_trap` at syscall
+/// number `9`.
+#[unsafe(no_mangle)]
+pub fn handle_pledge(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
+    dispatch_syscall(epc, hart_context, frame, |t, f| {
+        orbit_core::syscall::pledge_req(t, f, &mut crate::hw::RiscvHardware)
+    });
+}
+
+/// `create_process_v2(*const CreateProcessV2Args)`. Role-aware
+/// spawn: the manager runs the role-transition gate; on failure it
+/// logs a `DenialEvent::RoleDeny` audit event, bumps the parent's
+/// `role_denials` counter, and returns `-EPERM`. On success the
+/// witness-derived perms are installed on the freshly-spawned
+/// child. Wired into `s_trap` at syscall number `4105`.
+#[unsafe(no_mangle)]
+pub fn handle_create_process_v2(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
+    dispatch_syscall(epc, hart_context, frame, |t, f| {
+        orbit_core::syscall::create_process_v2_req(t, f, &mut crate::hw::RiscvHardware)
+    });
+}
+
+/// `query_denial_log(buf_ptr, buf_len) → bytes | -errno`. Synchronous
+/// read of the kernel-wide denial event ring into a user buffer.
+/// Acquires `MANAGER_LOCK` briefly for the snapshot — events are
+/// otherwise mutated by `drain_denial_events` under the same lock.
+/// Wired into `s_trap` at syscall number `4106`.
+///
+/// Lives in kmain (not orbit-core) for the same reason as
+/// `query_stats`: the ring is owned by `Orbit`, which `Hardware`
+/// deliberately doesn't expose.
+#[unsafe(no_mangle)]
+pub fn handle_query_denial_log(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
+    use orbit_abi::errno::{EFAULT, EINVAL};
+    use orbit_abi::layout::user_range_ok;
+    use orbit_abi::denial::{DenialEvent, DENIAL_RING_CAPACITY};
+
+    let orbit = unsafe { (hart_context.cscratch as *mut kernel::Orbit).as_mut_unchecked() };
+
+    dispatch_syscall(epc, hart_context, frame, |t, f| {
+        let buf_va = f.regs[11] as u64;
+        let buf_len = f.regs[12];
+
+        let event_size = core::mem::size_of::<DenialEvent>();
+        if buf_len < event_size {
+            return orbit_core::SyscallOutcome::Return {
+                ret: -(EINVAL as isize),
+            };
+        }
+        if !user_range_ok(buf_va, buf_len as u64) {
+            return orbit_core::SyscallOutcome::Return {
+                ret: -(EFAULT as isize),
+            };
+        }
+        use orbit_core::Hardware;
+        if !crate::hw::RiscvHardware
+            .user_va_translates(t.root_table_addr() as u64, buf_va)
+        {
+            return orbit_core::SyscallOutcome::Return {
+                ret: -(EFAULT as isize),
+            };
+        }
+
+        // Snapshot under the manager lock — short critical section,
+        // bounded by DENIAL_RING_CAPACITY events. Drain the producer
+        // queue first so any PermDeny the dispatch gate has pushed
+        // since the last manager pass lands in the ring before we
+        // snapshot. Without this drain, a caller racing the manager
+        // can read the ring before its own gate-induced PermDeny
+        // gets folded in — the lock-free queue lets the gate-side
+        // push race the read. Doesn't eliminate the race (a new
+        // event from another hart between drain and snapshot still
+        // beats us) but makes "any denial I caused is visible" hold
+        // for the calling thread.
+        let mut tmp = [DenialEvent::PermDeny {
+            required_class: 0, perms: 0, time_ticks: 0, tid: 0,
+            sysno: 0, source_role: 0, pid: 0,
+        }; DENIAL_RING_CAPACITY];
+        while !try_acquire_manager() {
+            core::hint::spin_loop();
+        }
+        orbit.drain_denial_events();
+        let n = orbit.denial_ring_snapshot(&mut tmp);
+        release_manager();
+
+        let max_events = buf_len / event_size;
+        let to_emit = core::cmp::min(n, max_events);
+        let to_write = to_emit * event_size;
+
+        let guard = UserAccess::enter();
+        unsafe {
+            let dst = guard.slice_mut(buf_va, to_write);
+            let src = core::slice::from_raw_parts(
+                tmp.as_ptr() as *const u8,
+                to_write,
+            );
+            dst.copy_from_slice(src);
+        }
+        drop(guard);
+
+        orbit_core::SyscallOutcome::Return { ret: to_write as isize }
     });
 }
 

@@ -8,7 +8,9 @@ pub mod layout;
 pub mod mmap;
 pub mod net;
 pub mod perms;
-pub mod shadow;
+pub mod denial;
+#[cfg(feature = "kernel-policy")]
+pub mod roles;
 pub mod stats;
 pub mod syscall;
 pub mod syscall_stats;

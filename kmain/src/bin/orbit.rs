@@ -224,112 +224,148 @@ extern "C" fn s_trap(
                 // the right semantic since "service time" stops when
                 // the handler hands control back to the trap path.
                 let syscall_start_ticks = riscv::register::time::read64();
-                match syscall {
-                    // exit
-                    0 => {
-                        unsafe {
-                            kmain::update_thread_and_trap_frame(epc, hart_context, frame, from_user);
-                            kmain::kernel::context::exit_thread_with_state(ThreadState::Exited);
-                        }
-                    },
-                    1 => {
-                        //debug!("orbit handling u mode ecall({syscall})");
-                        kmain::handle_serial_print(epc, hart_context, frame);
-                    }
-                    2 => {
-                        kmain::handle_ms_sleep(epc, hart_context, frame);
-                    }
-                    3 => {
-                        kmain::handle_console_write(epc, hart_context, frame);
-                    }
-                    4 => {
-                        kmain::handle_read_stdin(epc, hart_context, frame);
-                    }
-                    5 => {
-                        kmain::handle_set_affinity(epc, hart_context, frame);
-                    }
-                    6 => {
-                        kmain::handle_get_affinity(epc, hart_context, frame);
-                    }
-                    7 => {
-                        kmain::handle_get_hart_id(epc, hart_context, frame);
-                    }
-                    8 => {
-                        kmain::handle_get_micros(epc, hart_context, frame);
-                    }
-                    4096 => {
-                        debug!("orbit handling u mode ecall({syscall})");
-                        kmain::handle_mmap_req(epc, hart_context, frame);
-                    }
-                    4097 => {
-                        debug!("orbit handling u mode ecall({syscall})");
-                        kmain::handle_nc_create_req(epc, hart_context, frame);
-                    }
-                    4098 => {
-                        debug!("orbit handling u mode ecall({syscall})");
-                        kmain::handle_close_req(epc, hart_context, frame);
-                    }
-                    4099 => {
-                        debug!("orbit handling u mode ecall({syscall})");
-                        kmain::handle_create_process_req(epc, hart_context, frame);
-                    }
-                    4100 => {
-                        kmain::handle_nc_yield(epc, hart_context, frame);
-                    }
-                    4101 => {
-                        kmain::handle_query_stats(epc, hart_context, frame);
-                    }
-                    4102 => {
-                        kmain::handle_query_syscall_stats(epc, hart_context, frame);
-                    }
-                    4103 => {
-                        debug!("orbit handling u mode ecall({syscall})");
-                        kmain::handle_create_process_ex(epc, hart_context, frame);
-                    }
-                    4104 => {
-                        kmain::handle_argv_envp(epc, hart_context, frame);
-                    }
-                    5000 => {
-                        debug!("orbit handling u mode ecall({syscall})");
-                        kmain::handle_create_thread(epc, hart_context, frame);
-                    }
-                    5001 => {
-                        kmain::handle_getpid(epc, hart_context, frame);
-                    }
-                    5002 => {
-                        kmain::handle_gettid(epc, hart_context, frame);
-                    }
-                    5003 => {
-                        debug!("orbit handling u mode ecall({syscall})");
-                        kmain::handle_wait_pid(epc, hart_context, frame);
-                    }
-                    5004 => {
-                        kmain::handle_futex_wait(epc, hart_context, frame);
-                    }
-                    5005 => {
-                        kmain::handle_futex_wake(epc, hart_context, frame);
-                    }
-                    6000 => {
-                        debug!("orbit handling u mode ecall({syscall})");
-                        kmain::handle_fs_open(epc, hart_context, frame);
-                    }
-                    6001 => {
-                        debug!("orbit handling u mode ecall({syscall})");
-                        kmain::handle_fs_read(epc, hart_context, frame);
-                    }
-                    6002 => {
-                        debug!("orbit handling u mode ecall({syscall})");
-                        kmain::handle_fs_stat(epc, hart_context, frame);
-                    }
-                    6003 => {
-                        debug!("orbit handling u mode ecall({syscall})");
-                        kmain::handle_fs_readdir(epc, hart_context, frame);
-                    }
-                    _ => {
-                        debug!("orbit handling u mode ecall({syscall})");
-                        kmain::update_thread_and_trap_frame(epc + 4, hart_context, frame, from_user);
-                    }
+
+                // Dispatch-site permission gate: lock-free check
+                // against the calling thread's permission snapshot.
+                // On allow: fall through to the dispatch match. On
+                // deny: the gate has already queued a DenialEvent
+                // audit record; short-circuit the syscall with
+                // -EPERM via `enforce_eperm` (commits the frame +
+                // pc the same way a regular handler would).
+                let cur = hart_context.current.load(Ordering::Acquire) as *const Thread;
+                let allowed = if !cur.is_null() {
+                    let t: &Thread = unsafe { cur.as_ref_unchecked() };
+                    kmain::perm_gate_check(t, syscall)
                 }
+                else {
+                    // Null current shouldn't happen on cause=8, but
+                    // if it does, fall through to the dispatch match
+                    // — `dispatch_syscall` itself short-circuits a
+                    // null current with `regs[10] = -1`.
+                    true
+                };
+
+                if !allowed {
+                    kmain::enforce_eperm(epc, hart_context, frame);
+                }
+                else {
+                    match syscall {
+                        // exit
+                        0 => {
+                            unsafe {
+                                kmain::update_thread_and_trap_frame(epc, hart_context, frame, from_user);
+                                kmain::kernel::context::exit_thread_with_state(ThreadState::Exited);
+                            }
+                        },
+                        1 => {
+                            //debug!("orbit handling u mode ecall({syscall})");
+                            kmain::handle_serial_print(epc, hart_context, frame);
+                        }
+                        2 => {
+                            kmain::handle_ms_sleep(epc, hart_context, frame);
+                        }
+                        3 => {
+                            kmain::handle_console_write(epc, hart_context, frame);
+                        }
+                        4 => {
+                            kmain::handle_read_stdin(epc, hart_context, frame);
+                        }
+                        5 => {
+                            kmain::handle_set_affinity(epc, hart_context, frame);
+                        }
+                        6 => {
+                            kmain::handle_get_affinity(epc, hart_context, frame);
+                        }
+                        7 => {
+                            kmain::handle_get_hart_id(epc, hart_context, frame);
+                        }
+                        8 => {
+                            kmain::handle_get_micros(epc, hart_context, frame);
+                        }
+                        9 => {
+                            kmain::handle_pledge(epc, hart_context, frame);
+                        }
+                        4096 => {
+                            debug!("orbit handling u mode ecall({syscall})");
+                            kmain::handle_mmap_req(epc, hart_context, frame);
+                        }
+                        4097 => {
+                            debug!("orbit handling u mode ecall({syscall})");
+                            kmain::handle_nc_create_req(epc, hart_context, frame);
+                        }
+                        4098 => {
+                            debug!("orbit handling u mode ecall({syscall})");
+                            kmain::handle_close_req(epc, hart_context, frame);
+                        }
+                        4099 => {
+                            debug!("orbit handling u mode ecall({syscall})");
+                            kmain::handle_create_process_req(epc, hart_context, frame);
+                        }
+                        4100 => {
+                            kmain::handle_nc_yield(epc, hart_context, frame);
+                        }
+                        4101 => {
+                            kmain::handle_query_stats(epc, hart_context, frame);
+                        }
+                        4102 => {
+                            kmain::handle_query_syscall_stats(epc, hart_context, frame);
+                        }
+                        4103 => {
+                            debug!("orbit handling u mode ecall({syscall})");
+                            kmain::handle_create_process_ex(epc, hart_context, frame);
+                        }
+                        4104 => {
+                            kmain::handle_argv_envp(epc, hart_context, frame);
+                        }
+                        4105 => {
+                            debug!("orbit handling u mode ecall({syscall})");
+                            kmain::handle_create_process_v2(epc, hart_context, frame);
+                        }
+                        4106 => {
+                            kmain::handle_query_denial_log(epc, hart_context, frame);
+                        }
+                        5000 => {
+                            debug!("orbit handling u mode ecall({syscall})");
+                            kmain::handle_create_thread(epc, hart_context, frame);
+                        }
+                        5001 => {
+                            kmain::handle_getpid(epc, hart_context, frame);
+                        }
+                        5002 => {
+                            kmain::handle_gettid(epc, hart_context, frame);
+                        }
+                        5003 => {
+                            debug!("orbit handling u mode ecall({syscall})");
+                            kmain::handle_wait_pid(epc, hart_context, frame);
+                        }
+                        5004 => {
+                            kmain::handle_futex_wait(epc, hart_context, frame);
+                        }
+                        5005 => {
+                            kmain::handle_futex_wake(epc, hart_context, frame);
+                        }
+                        6000 => {
+                            debug!("orbit handling u mode ecall({syscall})");
+                            kmain::handle_fs_open(epc, hart_context, frame);
+                        }
+                        6001 => {
+                            debug!("orbit handling u mode ecall({syscall})");
+                            kmain::handle_fs_read(epc, hart_context, frame);
+                        }
+                        6002 => {
+                            debug!("orbit handling u mode ecall({syscall})");
+                            kmain::handle_fs_stat(epc, hart_context, frame);
+                        }
+                        6003 => {
+                            debug!("orbit handling u mode ecall({syscall})");
+                            kmain::handle_fs_readdir(epc, hart_context, frame);
+                        }
+                        _ => {
+                            debug!("orbit handling u mode ecall({syscall})");
+                            kmain::update_thread_and_trap_frame(epc + 4, hart_context, frame, from_user);
+                        }
+                    }
+                } // close the `if allowed` arm
                 // Close the bracket: handlers that returned hit this;
                 // long-jumping ones (exit, blocking SyscallOutcome)
                 // skipped past it. `current` may be null if the

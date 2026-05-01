@@ -110,6 +110,31 @@ pub static MANAGER_WORK: StaticThingBuf<PendingWork, 32> = StaticThingBuf::new()
 /// Default slot is `WakeEvent::None` (the Default impl returns it).
 pub static WAKE_QUEUE: StaticThingBuf<WakeEvent, 64> = StaticThingBuf::new();
 
+/// Lock-free MPSC ring of denial events produced by the dispatch-
+/// site gate. Producers: any hart's `s_trap` cause=8 arm on syscall
+/// denial. Consumer: the manager drains this alongside
+/// `MANAGER_WORK` and folds each event into the kernel-wide
+/// [`Orbit::denial_ring`] + the owning process's `perm_denials` /
+/// `role_denials` counter.
+///
+/// Lock-free is the load-bearing property: the trap path must not
+/// spin on `MANAGER_LOCK` to log a denial. Push-on-full drops the
+/// event and bumps [`DENIAL_EVENTS_DROPPED`] — best-effort retention,
+/// matching the ring's "what was denied recently" semantics rather
+/// than a "every denial since boot" guarantee.
+///
+/// Default slot is `None` — `Option<DenialEvent>::default()` returns
+/// `None`, satisfying thingbuf's `T: Default` requirement without
+/// adding a kernel-internal sentinel variant to the wire-shape
+/// `DenialEvent` enum.
+pub static DENIAL_EVENT_QUEUE: StaticThingBuf<Option<orbit_abi::denial::DenialEvent>, 64> =
+    StaticThingBuf::new();
+
+/// Count of denial events dropped due to a full [`DENIAL_EVENT_QUEUE`].
+/// Surfaces queue-pressure issues for diagnostics. Atomic so any
+/// hart's gate can bump it without coordination.
+pub static DENIAL_EVENTS_DROPPED: AtomicU64 = AtomicU64::new(0);
+
 /// Targeted wake-up event. See [`WAKE_QUEUE`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WakeEvent {
@@ -366,6 +391,15 @@ pub struct Orbit {
     /// captured but ignored (waiters block until woken or until
     /// their owning process exits).
     futex_waiters: BTreeMap<u64, Vec<FutexWaiter>>,
+
+    /// Kernel-wide denial event ring. Receives `DenialEvent::PermDeny`
+    /// from the manager-side `drain_denial_events` pass (which folds
+    /// events off [`DENIAL_EVENT_QUEUE`]) and `DenialEvent::RoleDeny`
+    /// from `create_process_v2`'s role-transition gate (manager-side
+    /// inline push). Both pushers hold `MANAGER_LOCK`. Snapshotted
+    /// by `query_denial_log` under the same lock. Bounded at
+    /// `DENIAL_RING_CAPACITY` (50).
+    denial_ring: orbit_core::denial_ring::DenialRing,
 }
 
 /// One slot on a futex wait queue. Captured at `futex_wait` request
@@ -492,6 +526,8 @@ impl Orbit {
             hart_kernel_ticks,
             hart_scheduler_ticks,
             hart_idle_ticks,
+            perm_denials: proc.perm_denials.load(Ordering::Relaxed),
+            role_denials: proc.role_denials.load(Ordering::Relaxed),
         })
     }
 
@@ -541,7 +577,26 @@ impl Orbit {
             ready: ReadyQueue::new(),
             process_handles: BTreeMap::new(),
             futex_waiters: BTreeMap::new(),
+            denial_ring: orbit_core::denial_ring::DenialRing::new(),
         }
+    }
+
+    /// Push a `DenialEvent` onto the kernel-wide ring. Caller must
+    /// already hold `MANAGER_LOCK` — the ring is not internally
+    /// synchronised. Used by `drain_denial_events` (folding events
+    /// off [`DENIAL_EVENT_QUEUE`]) and by `create_process_v2`'s
+    /// role-transition gate when it logs a `RoleDeny` inline.
+    pub fn push_denial_event(&mut self, event: orbit_abi::denial::DenialEvent) {
+        use orbit_abi::denial::DenialSink;
+        self.denial_ring.push(event);
+    }
+
+    /// Snapshot the denial ring into `buf` in chronological order
+    /// (oldest first). Returns the number of events written. Caller
+    /// must hold `MANAGER_LOCK` since the ring is mutated by the
+    /// manager-side handlers without per-ring synchronisation.
+    pub fn denial_ring_snapshot(&self, buf: &mut [orbit_abi::denial::DenialEvent]) -> usize {
+        self.denial_ring.snapshot(buf)
     }
 
     /// Allocate a kthread stack. Kernel-accessible (Shared pool) so the
@@ -655,6 +710,12 @@ impl Orbit {
             context_switches: AtomicU64::new(0),
             syscall_count: AtomicU64::new(0),
             syscall_ticks: AtomicU64::new(0),
+            // Kernel threads run in S-mode and never reach the
+            // dispatch-site permission gate (cause=8 is U-mode by
+            // construction). Stamp ZERO so a future bug that did
+            // route a kthread through the gate fails closed rather
+            // than silently running with full caps.
+            permissions: orbit_abi::perms::Permissions::ZERO,
         };
 
         // TODO: figure out why pin<box<thread>> doesnt work
@@ -1347,6 +1408,244 @@ impl Orbit {
         pid as isize
     }
 
+    /// `pledge(*const PermsRequest)`. Manager-side: copies the
+    /// request struct from user memory, applies the narrowing to
+    /// `Process.permissions`, and propagates the new value to every
+    /// live thread of the process so the lock-free dispatch-site
+    /// gate sees the narrower mask.
+    ///
+    /// Returns `0` on success; `-EFAULT` if the request VA doesn't
+    /// translate; `-ESRCH` if the process record vanished mid-flight
+    /// (defensive — can't happen on the live path since the caller
+    /// is one of the process's threads).
+    fn run_pledge_req(
+        &mut self,
+        req: orbit_core::PledgeReq,
+        pid: u16,
+        root_pa: u64,
+    ) -> isize {
+        use orbit_abi::perms::PermsRequest;
+
+        let root_table = unsafe { memmap::kernel_root_from_pa(root_pa) };
+
+        // Resolve the request VA to a PA and read the 16-byte struct
+        // out via a single UserPageWindow. The struct is u64-aligned
+        // so a misaligned read can't straddle the page boundary
+        // unless `req_vaddr` itself was bad — the syscall layer
+        // already enforced 8-byte alignment.
+        let page_base = (req.req_vaddr as u64) & !(PAGE_SIZE as u64 - 1);
+        let page_off = (req.req_vaddr as u64 - page_base) as usize;
+        let pa = match unsafe {
+            mmu::mmap::virt_to_phys(&root_table, VirtAddr::new(page_base))
+        } {
+            Some(p) => p as u64,
+            None => {
+                error!("pledge: req va 0x{:X} does not translate", req.req_vaddr);
+                return Errno::new(EFAULT).to_ret();
+            }
+        };
+
+        let request: PermsRequest = unsafe {
+            let mut w = user_page::UserPageWindow::map(pa, PAGE_SIZE);
+            let page = w.as_mut_slice();
+            let req_ptr = page.as_ptr().add(page_off) as *const PermsRequest;
+            core::ptr::read_unaligned(req_ptr)
+        };
+
+        // Apply the pledge to the authoritative copy on Process,
+        // snapshot the result, then walk every live thread of the
+        // process to refresh its `Thread.permissions` cache. The
+        // two-step is needed because we can't hold &mut Process
+        // while iterating `self.threads`.
+        let new_perms = {
+            let proc = match self.processes.get_mut(&pid) {
+                Some(p) => p,
+                None => {
+                    error!("pledge: pid={pid} vanished");
+                    return Errno::new(ESRCH).to_ret();
+                }
+            };
+            proc.pledge(request);
+            proc.permissions
+        };
+
+        let tids: alloc::vec::Vec<u32> = self.processes.get(&pid)
+            .map(|p| p.threads.iter().copied().collect())
+            .unwrap_or_default();
+        for tid in tids {
+            if let Some(pt) = self.threads.get(&tid) {
+                let t = unsafe { (pt.0 as *mut Thread).as_mut_unchecked() };
+                t.permissions = new_perms;
+            }
+        }
+
+        0
+    }
+
+    /// `create_process_v2(*const CreateProcessV2Args)`. Role-aware
+    /// spawn: validate the role transition; on success derive the
+    /// child's perms through the witness path and proceed with the
+    /// ELF copy + spawn. On failure record an audit event into the
+    /// kernel-wide `DenialRing`, bump the parent's `role_denials`
+    /// counter, and return `-EPERM` — no fall-through, no child.
+    fn run_create_process_v2_req(
+        &mut self,
+        req: orbit_core::CreateProcessV2Req,
+        parent_pid: u16,
+        root_pa: u64,
+    ) -> isize {
+        use orbit_abi::denial::{DenialEvent, DenialSink};
+        use orbit_abi::perms::CreateProcessV2Args;
+        use orbit_core::roles::{check_transition, derive_child_perms, deny_reason_code};
+
+        const MAX_ELF_BYTES: usize = 4 * 1024 * 1024;
+
+        let root_table = unsafe { memmap::kernel_root_from_pa(root_pa) };
+
+        // Copy the args struct (one user page; the 8-byte alignment
+        // check at the syscall boundary guarantees no straddle).
+        let args_page_base = (req.args_vaddr as u64) & !(PAGE_SIZE as u64 - 1);
+        let args_page_off = (req.args_vaddr as u64 - args_page_base) as usize;
+        let args_pa = match unsafe {
+            mmu::mmap::virt_to_phys(&root_table, VirtAddr::new(args_page_base))
+        } {
+            Some(p) => p as u64,
+            None => {
+                error!("create_process_v2: args va 0x{:X} does not translate", req.args_vaddr);
+                return Errno::new(EFAULT).to_ret();
+            }
+        };
+        let args: CreateProcessV2Args = unsafe {
+            let mut w = user_page::UserPageWindow::map(args_pa, PAGE_SIZE);
+            let page = w.as_mut_slice();
+            let p = page.as_ptr().add(args_page_off) as *const CreateProcessV2Args;
+            core::ptr::read_unaligned(p)
+        };
+
+        if args.elf_len == 0 || args.elf_len > MAX_ELF_BYTES {
+            return Errno::new(EINVAL).to_ret();
+        }
+
+        if !user_range_ok(args.elf_vaddr as u64, args.elf_len as u64) {
+            return Errno::new(EFAULT).to_ret()
+        }
+
+        // Snapshot the parent's permissions for the gate. `Permissions`
+        // is `Copy`, so this releases the borrow on `processes`
+        // before we touch `denial_ring` (which also lives on `self`).
+        let parent_perms = match self.processes.get(&parent_pid) {
+            Some(p) => p.permissions,
+            None => {
+                error!("create_process_v2: parent pid={parent_pid} vanished");
+                return Errno::new(ESRCH).to_ret();
+            }
+        };
+
+        // Role-transition gate. Ok: derive the child's perms via the
+        // witness path; the resulting `ChildPerms` flows directly
+        // into `Process::install_child` below — no detour through
+        // raw `Permissions`. Err: record a `RoleDeny` audit event,
+        // bump the parent's counter, return -EPERM.
+        let request = args.request();
+        let child_perms = match check_transition(parent_perms.role, args.target_role) {
+            Ok(transition) => {
+                derive_child_perms(&parent_perms, transition, request)
+            }
+            Err(spawn_deny) => {
+                // The calling tid isn't carried in PendingWork — for
+                // audit logging the parent pid is the actionable
+                // identity. Stamp 0 as a sentinel; readers use `pid`
+                // for "which process tried this."
+                let now_ticks = riscv::register::time::read64();
+                self.denial_ring.push(DenialEvent::RoleDeny {
+                    time_ticks: now_ticks,
+                    _reserved: 0,
+                    tid: 0,
+                    source_role: parent_perms.role,
+                    target_role: args.target_role,
+                    deny_reason: deny_reason_code(spawn_deny),
+                    pid: parent_pid,
+                });
+                if let Some(proc) = self.processes.get(&parent_pid) {
+                    proc.role_denials.fetch_add(1, Ordering::Relaxed);
+                }
+                return Errno::new(EPERM).to_ret();
+            }
+        };
+
+        // Copy the ELF (same loop as run_create_process_req).
+        let mut blob: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(args.elf_len);
+        let mut copied = 0usize;
+        while copied < args.elf_len {
+            let cursor = args.elf_vaddr + copied;
+            let page_base = cursor & !(PAGE_SIZE - 1);
+            let page_off = cursor - page_base;
+            let take = core::cmp::min(PAGE_SIZE - page_off, args.elf_len - copied);
+            let pa = match unsafe {
+                mmu::mmap::virt_to_phys(&root_table, VirtAddr::new(page_base as u64))
+            } {
+                Some(p) => p as u64,
+                None => {
+                    error!("create_process_v2: elf va 0x{:X} does not translate", page_base);
+                    return Errno::new(EFAULT).to_ret();
+                }
+            };
+            unsafe {
+                let mut w = user_page::UserPageWindow::map(pa, PAGE_SIZE);
+                let page = w.as_mut_slice();
+                blob.extend_from_slice(&page[page_off..page_off + take]);
+            }
+            copied += take;
+        }
+
+        // Affinity validation, identical to run_create_process_req.
+        let all_harts = self.all_harts_mask();
+        let allowed = if args.allowed_affinity == 0 { all_harts } else { args.allowed_affinity };
+        let affinity = if args.affinity == 0 { allowed } else { args.affinity };
+        if allowed & !all_harts != 0 || affinity & !allowed != 0 || affinity == 0 {
+            error!("create_process_v2: affinity validation failed");
+            return Errno::new(EINVAL).to_ret();
+        }
+
+        let child_pid = match self.create_new_process(
+            &blob, UPROC_STACK_DEFAULT, allowed, affinity, parent_pid, None, None,
+        ) {
+            Ok(p) => p,
+            Err(()) => {
+                error!("create_process_v2: create_new_process failed");
+                return Errno::new(ENOEXEC).to_ret();
+            }
+        };
+
+        // Install the witness-derived perms on the child via the
+        // type-enforced path. `create_new_process` stamps BOOTSTRAP-
+        // shaped ALL by default for legacy callers; v2 overrides
+        // that with the role-resolved value here. Then walk the
+        // child's threads (just the initial one at this point) and
+        // refresh each `Thread.permissions` snapshot — that copy
+        // pulls a plain `Permissions` out of the witness via
+        // `permissions()`, which doesn't consume the `ChildPerms`.
+        if let Some(proc) = self.processes.get_mut(&child_pid) {
+            proc.install_child(child_perms);
+        }
+        let perms_snapshot = child_perms.permissions();
+        let tids: alloc::vec::Vec<u32> = self.processes.get(&child_pid)
+            .map(|p| p.threads.iter().copied().collect())
+            .unwrap_or_default();
+        for tid in tids {
+            if let Some(pt) = self.threads.get(&tid) {
+                let t = unsafe { (pt.0 as *mut Thread).as_mut_unchecked() };
+                t.permissions = perms_snapshot;
+            }
+        }
+
+        info!(
+            "create_process_v2: spawned pid={child_pid} parent={parent_pid} role={} perms={:#x}/{:#x}",
+            args.target_role, perms_snapshot.perms, perms_snapshot.allowed_perms,
+        );
+        child_pid as isize
+    }
+
     /// Allocate one kernel_pages page, copy `blob` into it with the
     /// offset → absolute-pointer fixup, and map at `USER_ARGV_BASE`
     /// in the child process's PT (R+U+S, no W/X). Stash the backing
@@ -1854,6 +2153,45 @@ impl Orbit {
         }
     }
 
+    /// Drain [`DENIAL_EVENT_QUEUE`]. Producers (the dispatch-site
+    /// permission gate on any hart) push lock-free; this consumer
+    /// runs each manager pass and folds events into the kernel-wide
+    /// [`Self::denial_ring`] + bumps the owning process's
+    /// per-event-kind counter.
+    ///
+    /// Best-effort: a process that has already exited between the
+    /// gate push and the manager drain has no `Process` record to
+    /// update — the event still lands in the ring (the syscall
+    /// number / pid / tid are still useful diagnostics) but the
+    /// counter bump is a no-op. Same shape for an unknown pid
+    /// (defensive against a future bug; can't happen on the live
+    /// path).
+    pub(crate) fn drain_denial_events(&mut self) {
+        while let Some(mut slot) = DENIAL_EVENT_QUEUE.pop_ref() {
+            let entry = core::mem::take(&mut *slot);
+            drop(slot);
+            let Some(event) = entry else { continue };
+
+            // Match each event variant once: stash the pid for the
+            // counter bump (different counter per variant) and push
+            // the event into the ring via the DenialSink trait.
+            use orbit_abi::denial::{DenialEvent, DenialSink};
+            let (pid, is_perm_deny) = match event {
+                DenialEvent::PermDeny { pid, .. } => (pid, true),
+                DenialEvent::RoleDeny { pid, .. } => (pid, false),
+            };
+            self.denial_ring.push(event);
+            if let Some(proc) = self.processes.get(&pid) {
+                let counter = if is_perm_deny {
+                    &proc.perm_denials
+                } else {
+                    &proc.role_denials
+                };
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
     /// Drain `MANAGER_WORK`. Each entry is a syscall handler bundled
     /// with its [`CompletionHandle`]; we run the handler, signal the
     /// handle with the result, and let the next scheduler scan resume
@@ -1929,6 +2267,14 @@ impl Orbit {
                 }
                 PendingWork::FutexWake { req, pid, root_pa, handle } => {
                     self.run_futex_wake_req(req, pid, root_pa, handle);
+                }
+                PendingWork::Pledge { req, pid, root_pa, handle } => {
+                    let result = self.run_pledge_req(req, pid, root_pa);
+                    handle.signal(result);
+                }
+                PendingWork::CreateProcessV2 { req, pid, root_pa, handle } => {
+                    let result = self.run_create_process_v2_req(req, pid, root_pa);
+                    handle.signal(result);
                 }
             }
         }
@@ -2802,6 +3148,11 @@ impl Orbit {
         Ok(())
     }
 
+    /// Build a fresh user thread for `pid`. Snapshots the current
+    /// `Process.permissions` into [`Thread::permissions`] so the
+    /// dispatch-site permission gate can read it without locking. If
+    /// the process pledges later, the manager re-walks all live
+    /// threads and rewrites this field.
     pub fn create_new_thread(&mut self, pid: u16, root_table: &mmu::mmap::RootTable<'_>, entrypoint: usize, slot: u16, stack_size: u64, allowed_affinity: u64, affinity: u64, arg: usize) -> Result<Thread, ()> {
         if !validate_user_stack_size(stack_size) {
             error!("invalid user stack size {stack_size}");
@@ -3025,6 +3376,18 @@ impl Orbit {
             entrypoint, frame.regs[2], frame.regs[4], root_pa.get_raw(),
         );
 
+        // Snapshot the owning process's permissions for the new
+        // thread's dispatch-gate read path. `processes.get(&pid)` was
+        // the source of truth when create_new_thread was invoked
+        // (caller holds MANAGER_LOCK across thread creation); fall
+        // back to `Permissions::ZERO` only if the process record has
+        // already been removed (impossible on the live spawn path,
+        // defensive against future refactors). Fail-closed default
+        // matches `Process::new`'s ZERO baseline.
+        let perms_snapshot = self.processes.get(&pid)
+            .map(|p| p.permissions)
+            .unwrap_or(orbit_abi::perms::Permissions::ZERO);
+
         Ok(Thread {
             pc: AtomicUsize::new(entrypoint),
             satp,
@@ -3047,6 +3410,7 @@ impl Orbit {
             context_switches: AtomicU64::new(0),
             syscall_count: AtomicU64::new(0),
             syscall_ticks: AtomicU64::new(0),
+            permissions: perms_snapshot,
         })
     }
 
@@ -3075,6 +3439,14 @@ impl Orbit {
         proc_satp.set_asid(pid as usize);
 
         let mut proc = Process::new(pid, parent_pid, proc_satp);
+        // Migration default: `Process::new()` defaults to ZERO perms
+        // (fail closed). Legacy CREATE_PROCESS / CREATE_PROCESS_EX
+        // callers stamp BOOTSTRAP-shaped Permissions::ALL here so
+        // they keep working without role-aware spawn arguments.
+        // CREATE_PROCESS_V2 resolves perms through the role registry
+        // and calls `install_permissions` itself with the
+        // witness-derived value, overwriting this default.
+        proc.install_permissions(orbit_abi::perms::Permissions::ALL);
         let slot = proc.thread_slots.alloc().ok_or(())?;
 
         // ELF segment backings are tracked on the process so dealloc_process

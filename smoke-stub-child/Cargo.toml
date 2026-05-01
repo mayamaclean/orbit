@@ -1,0 +1,21 @@
+[package]
+name = "smoke-stub-child"
+version = "0.1.0"
+edition = "2024"
+
+# Tiniest possible orbit user binary — `main()` returns immediately,
+# orbit-rt's `_start` calls it and then `exit(0)`. Used as the child
+# ELF blob for `smoke-perms-roles`'s `create_process_v2` denial test:
+# the role gate fires (PR2: logs RoleDeny + falls through; PR3: EPERM)
+# before this code matters, but the bytes have to parse as a real ELF
+# linked at USER_TEXT_BASE for the shadow-mode fall-through path.
+
+[dependencies]
+orbit-abi = { path = "../orbit-abi" }
+orbit-rt  = { path = "../orbit-rt" }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

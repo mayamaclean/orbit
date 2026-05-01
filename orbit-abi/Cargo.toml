@@ -16,5 +16,16 @@ edition = "2024"
 default = []
 rustc-dep-of-std = ["core"]
 
+# Kernel-internal policy types: the role registry, transition gating
+# functions, and the `ChildPerms` / `TransitionAllowed` witnesses.
+# Wire-shape types (`Permissions`, `RoleId`, `CreateProcessV2Args`,
+# etc.) stay unconditional. orbit-core and process enable this; user-
+# side crates (orbit-rt, net_channel, mem) DO NOT — keeping the
+# registry table out of user binaries and preserving orbit-abi's
+# "wire shape only by default" boundary. Cargo's feature unification
+# means a single user-side dep enabling this would pull it into
+# every linked binary, so guard new opt-ins.
+kernel-policy = []
+
 [dependencies]
 core = { version = "1.0.0", optional = true, package = "rustc-std-workspace-core" }

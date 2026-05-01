@@ -16,18 +16,30 @@ pub mod manager;
 pub mod net;
 pub mod pending_work;
 pub mod ready_queue;
-pub mod roles;
 pub mod sched;
-pub mod shadow_ring;
+pub mod denial_ring;
 pub mod sleep_heap;
 pub mod syscall;
 pub mod tlb_shootdown;
 pub mod trap;
 
+/// Role registry, transition gates, and witness types.
+///
+/// Moved into `orbit-abi` so the [`process`] crate can name
+/// [`ChildPerms`](orbit_abi::roles::ChildPerms) on the
+/// `Process::install_child` signature without taking an
+/// orbit-core dependency (orbit-core depends on process, not the
+/// reverse). Re-exported here for ergonomics — call sites that
+/// already import `orbit_core::roles::*` keep working.
+///
+/// Gated on the `kernel-policy` feature in orbit-abi; orbit-core
+/// enables it unconditionally.
+pub use orbit_abi::roles;
+
 pub use pending_work::{
-    CloseHandleReq, CreateProcessExReq, CreateProcessReq, CreateThreadReq, FsOpenReq, FsReadReq,
-    FsReaddirReq, FsStatReq, FutexWaitReq, FutexWakeReq, MAX_FS_PATH_LEN, MemMapReq,
-    NetChannelCreationReq, PendingWork, WaitPidReq,
+    CloseHandleReq, CreateProcessExReq, CreateProcessReq, CreateProcessV2Req, CreateThreadReq,
+    FsOpenReq, FsReadReq, FsReaddirReq, FsStatReq, FutexWaitReq, FutexWakeReq, MAX_FS_PATH_LEN,
+    MemMapReq, NetChannelCreationReq, PendingWork, PledgeReq, WaitPidReq,
 };
 
 /// Page size assumed by pure logic when bounding user-memory ranges. Must

@@ -679,6 +679,78 @@ pub fn create_process(
         .map(|p| p as u16)
 }
 
+/// `pledge(req)` narrows this process's `perms` and `allowed_perms`
+/// masks. Both axes are intersected with the corresponding
+/// [`PermsRequest`] field; bits not present in `request.*` are
+/// dropped, bits not present in the current permissions can't be
+/// added back. Always succeeds (silent clamp, matching OpenBSD's
+/// `pledge(promises, execpromises)` shape).
+///
+/// The kernel mutates `Process.permissions` and propagates the
+/// narrowed snapshot to every live thread of the process, so the
+/// dispatch-site gate EPERMs subsequent calls that needed a class
+/// the caller just pledged away.
+///
+/// [`PermsRequest`]: crate::perms::PermsRequest
+#[inline]
+pub fn pledge(request: &crate::perms::PermsRequest) -> Result<(), Errno> {
+    Errno::from_ret(unsafe {
+        ecall1(syscall::PLEDGE, request as *const _ as usize)
+    })
+    .map(|_| ())
+}
+
+/// `create_process_v2(args)` — role-aware spawn. Replaces
+/// `create_process` for callers that need a `target_role` and
+/// per-axis perms narrowing. The args struct lives in the caller's
+/// memory; the kernel reads it once on entry.
+///
+/// On a denied transition (parent role's `transitions` bitset
+/// doesn't include `target_role`) the kernel logs a `RoleDeny`
+/// event into the kernel-wide ring, bumps the parent's
+/// `role_denials` counter, and returns `-EPERM`. On success the
+/// witness-derived perms are installed on the child.
+///
+/// [`CreateProcessV2Args`]: crate::perms::CreateProcessV2Args
+#[inline]
+pub fn create_process_v2(
+    args: &crate::perms::CreateProcessV2Args,
+) -> Result<u16, Errno> {
+    Errno::from_ret(unsafe {
+        ecall1(syscall::CREATE_PROCESS_V2, args as *const _ as usize)
+    })
+    .map(|p| p as u16)
+}
+
+/// `query_denial_log(buf)` — copy the kernel-wide denial event ring
+/// into `buf` in chronological order. Returns the number of events
+/// actually written (`bytes / size_of::<DenialEvent>()`).
+///
+/// `buf` should be sized for at least
+/// [`DENIAL_RING_CAPACITY`](crate::denial::DENIAL_RING_CAPACITY)
+/// events for a complete snapshot; smaller buffers receive the
+/// oldest prefix that fits.
+///
+/// **Cross-process disclosure.** The reply contains pids, tids,
+/// syscall numbers, and (for `RoleDeny`) source/target roles for
+/// *every* denial system-wide, not just the caller's. Acceptable
+/// today (orbit is single-tenant); future multi-tenant workloads
+/// will gate this behind a separate class.
+#[inline]
+pub fn query_denial_log(
+    buf: &mut [crate::denial::DenialEvent],
+) -> Result<usize, Errno> {
+    let event_size = core::mem::size_of::<crate::denial::DenialEvent>();
+    Errno::from_ret(unsafe {
+        ecall2(
+            syscall::QUERY_DENIAL_LOG,
+            buf.as_mut_ptr() as usize,
+            buf.len() * event_size,
+        )
+    })
+    .map(|bytes| bytes / event_size)
+}
+
 /// `fs_open(path, flags)` — resolve `path` against the mounted
 /// filesystem and return an `Fd`. v1 is read-only tarfs; pass
 /// [`crate::fs::OPEN_RDONLY`] (= 0) for `flags`. Errnos: `ENOENT`
