@@ -55,7 +55,8 @@ impl<const ORDER: usize> FrameAllocator<ORDER> {
         while current_start < end {
             let lowbit = if current_start > 0 {
                 current_start & (!current_start + 1)
-            } else {
+            }
+            else {
                 32
             };
             let size = min(
@@ -65,7 +66,7 @@ impl<const ORDER: usize> FrameAllocator<ORDER> {
             total += size;
 
             self.free_list[size.trailing_zeros() as usize].insert(current_start);
-                //.expect("failed to add frame to free list");
+            //.expect("failed to add frame to free list");
 
             current_start += size;
         }
@@ -82,11 +83,15 @@ impl<const ORDER: usize> FrameAllocator<ORDER> {
     /// units the caller passed to `add_frame` / `alloc_aligned` —
     /// kmain wraps these with byte-address ranges, so for kmain users
     /// this is "bytes outstanding."
-    pub fn allocated(&self) -> usize { self.allocated }
+    pub fn allocated(&self) -> usize {
+        self.allocated
+    }
 
     /// Total capacity added via `add_frame` / `insert`. Same units as
     /// [`Self::allocated`].
-    pub fn total(&self) -> usize { self.total }
+    pub fn total(&self) -> usize {
+        self.total
+    }
 
     /// Allocate a range of frames from the allocator, returning the first frame of the allocated
     /// range.
@@ -116,13 +121,14 @@ impl<const ORDER: usize> FrameAllocator<ORDER> {
                     if let Some(block_ref) = self.free_list[j].iter().next() {
                         let block = *block_ref;
                         self.free_list[j - 1].insert(block + (1 << (j - 1)));
-                            //.expect("failed to add frame to free list");
+                        //.expect("failed to add frame to free list");
 
                         self.free_list[j - 1].insert(block);
-                            //.expect("failed to add frame to free list");
+                        //.expect("failed to add frame to free list");
 
                         self.free_list[j].remove(&block);
-                    } else {
+                    }
+                    else {
                         return None;
                     }
                 }
@@ -133,7 +139,8 @@ impl<const ORDER: usize> FrameAllocator<ORDER> {
                     self.free_list[class].remove(&result);
                     self.allocated += size;
                     return Some(result);
-                } else {
+                }
+                else {
                     return None;
                 }
             }
@@ -171,10 +178,11 @@ impl<const ORDER: usize> FrameAllocator<ORDER> {
                 // Free buddy found
                 current_ptr = min(current_ptr, buddy);
                 current_class += 1;
-            } else {
+            }
+            else {
                 self.free_list[current_class].insert(current_ptr);
-                    //.expect("failed to add frame to free list");
-                
+                //.expect("failed to add frame to free list");
+
                 break;
             }
         }

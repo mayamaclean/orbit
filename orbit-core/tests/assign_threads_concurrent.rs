@@ -95,8 +95,14 @@ fn remote_observes_state_and_ticks_via_release_acquire() {
         // Assigning hart (main): build views + invoke. The iterator
         // variant of assign_threads takes HartView by value, which is
         // Copy, so we can construct inline without retained borrows.
-        let self_view = HartView { hart_id: 0, current: &self_slot };
-        let remote_view = HartView { hart_id: 1, current: &remote_slot };
+        let self_view = HartView {
+            hart_id: 0,
+            current: &self_slot,
+        };
+        let remote_view = HartView {
+            hart_id: 1,
+            current: &remote_slot,
+        };
         let mut hw = FakeHw::default();
 
         assign_threads(&self_view, [remote_view], &mut sched, &mut hw);
@@ -174,16 +180,24 @@ fn multiple_remotes_each_observe_their_own_thread() {
             });
         }
 
-        let self_view = HartView { hart_id: 0, current: &self_slot };
-        let remotes: [HartView; N] =
-            std::array::from_fn(|i| HartView { hart_id: (i + 1), current: &slots[i] });
+        let self_view = HartView {
+            hart_id: 0,
+            current: &self_slot,
+        };
+        let remotes: [HartView; N] = std::array::from_fn(|i| HartView {
+            hart_id: (i + 1),
+            current: &slots[i],
+        });
         let mut hw = FakeHw::default();
 
         assign_threads(&self_view, remotes, &mut sched, &mut hw);
     });
 
     // Each remote should have observed a DISTINCT tid in 100..104.
-    let mut seen: Vec<usize> = observed_tids.iter().map(|a| a.load(Ordering::Acquire)).collect();
+    let mut seen: Vec<usize> = observed_tids
+        .iter()
+        .map(|a| a.load(Ordering::Acquire))
+        .collect();
     seen.sort();
     assert_eq!(seen, vec![100, 101, 102, 103]);
 }

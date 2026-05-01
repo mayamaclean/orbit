@@ -1,6 +1,7 @@
 #![no_std]
 
 pub mod argv;
+pub mod denial;
 pub mod envp;
 pub mod errno;
 pub mod fs;
@@ -8,7 +9,6 @@ pub mod layout;
 pub mod mmap;
 pub mod net;
 pub mod perms;
-pub mod denial;
 #[cfg(feature = "kernel-policy")]
 pub mod roles;
 pub mod stats;

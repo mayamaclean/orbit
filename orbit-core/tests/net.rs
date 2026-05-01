@@ -102,7 +102,10 @@ fn prune_reuses_scratch_across_calls() {
 
     let mut conns = make_conns(&[(1, true), (2, true)]);
     prune_revoked_conns(&mut conns, &mut scratch, |k| removed.push(k));
-    assert!(scratch.capacity() >= cap_before, "capacity should not shrink on drain");
+    assert!(
+        scratch.capacity() >= cap_before,
+        "capacity should not shrink on drain"
+    );
 }
 
 // ---------- drain_socket_deletions ----------
@@ -199,7 +202,10 @@ fn drain_with_duplicate_handle_only_removes_once() {
 
     assert_eq!(removed, vec![7]);
     assert!(conns.is_empty());
-    assert!(deletions.is_empty(), "both duplicate entries must be consumed");
+    assert!(
+        deletions.is_empty(),
+        "both duplicate entries must be consumed"
+    );
 }
 
 #[test]

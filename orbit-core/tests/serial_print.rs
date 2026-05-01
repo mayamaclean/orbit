@@ -3,7 +3,7 @@ mod common;
 use process::ThreadState;
 use riscv::register::sstatus::SPP;
 
-use orbit_abi::errno::{Errno, EFAULT, EINVAL, EIO};
+use orbit_abi::errno::{EFAULT, EINVAL, EIO, Errno};
 use orbit_core::{PAGE_SIZE, SyscallOutcome, syscall};
 
 use common::{FakeHw, make_frame, make_thread};
@@ -18,7 +18,10 @@ fn frame_with(len: usize) -> device::TrapFrame {
 }
 
 fn ready(ret: isize) -> SyscallOutcome {
-    SyscallOutcome::Yield { state: ThreadState::Ready, ret: Some(ret) }
+    SyscallOutcome::Yield {
+        state: ThreadState::Ready,
+        ret: Some(ret),
+    }
 }
 
 #[test]
@@ -31,7 +34,10 @@ fn prints_ascii_and_yields_ready_zero() {
     let outcome = syscall::serial_print(&t, &frame, &mut hw);
 
     assert_eq!(outcome, ready(0));
-    assert_eq!(hw.user_prints, vec![(t.pid, t.tid, "hello world!\n".to_string())]);
+    assert_eq!(
+        hw.user_prints,
+        vec![(t.pid, t.tid, "hello world!\n".to_string())]
+    );
 }
 
 #[test]
@@ -43,7 +49,10 @@ fn rejects_len_above_page() {
     let outcome = syscall::serial_print(&t, &frame, &mut hw);
 
     assert_eq!(outcome, ready(Errno::new(EINVAL).to_ret()));
-    assert!(hw.user_prints.is_empty(), "nothing should be written on reject");
+    assert!(
+        hw.user_prints.is_empty(),
+        "nothing should be written on reject"
+    );
 }
 
 #[test]
@@ -64,7 +73,10 @@ fn accepts_len_exactly_page() {
 fn bad_user_va_returns_efault() {
     let t = make_thread(ThreadState::Running, SPP::User);
     let frame = frame_with(5);
-    let mut hw = FakeHw { translates: false, ..Default::default() };
+    let mut hw = FakeHw {
+        translates: false,
+        ..Default::default()
+    };
 
     let outcome = syscall::serial_print(&t, &frame, &mut hw);
 
@@ -83,7 +95,10 @@ fn non_utf8_returns_einval() {
     let outcome = syscall::serial_print(&t, &frame, &mut hw);
 
     assert_eq!(outcome, ready(Errno::new(EINVAL).to_ret()));
-    assert!(hw.user_prints.is_empty(), "no partial write on utf8 failure");
+    assert!(
+        hw.user_prints.is_empty(),
+        "no partial write on utf8 failure"
+    );
 }
 
 #[test]
@@ -99,14 +114,20 @@ fn valid_prefix_then_invalid_byte_returns_einval() {
     let outcome = syscall::serial_print(&t, &frame, &mut hw);
 
     assert_eq!(outcome, ready(Errno::new(EINVAL).to_ret()));
-    assert!(hw.user_prints.is_empty(), "no partial write on utf8 failure");
+    assert!(
+        hw.user_prints.is_empty(),
+        "no partial write on utf8 failure"
+    );
 }
 
 #[test]
 fn serial_failure_returns_eio() {
     let t = make_thread(ThreadState::Running, SPP::User);
     let frame = frame_with(3);
-    let mut hw = FakeHw { serial_ok: false, ..Default::default() };
+    let mut hw = FakeHw {
+        serial_ok: false,
+        ..Default::default()
+    };
     hw.user_mem.insert(UVA, b"abc".to_vec());
 
     let outcome = syscall::serial_print(&t, &frame, &mut hw);
@@ -134,7 +155,10 @@ fn check_order_len_before_translate() {
     // before walking page tables.
     let t = make_thread(ThreadState::Running, SPP::User);
     let frame = frame_with(PAGE_SIZE + 100);
-    let mut hw = FakeHw { translates: false, ..Default::default() };
+    let mut hw = FakeHw {
+        translates: false,
+        ..Default::default()
+    };
 
     let outcome = syscall::serial_print(&t, &frame, &mut hw);
 

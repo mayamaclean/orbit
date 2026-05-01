@@ -14,16 +14,19 @@ pub use spsc::SpscQueue;
 /// path-depping it from `library/std` under `rustc-dep-of-std`.
 #[inline]
 fn round_usize_up(value: usize, alignment: usize) -> usize {
-    debug_assert!(alignment.is_power_of_two(), "alignment must be a power of two");
+    debug_assert!(
+        alignment.is_power_of_two(),
+        "alignment must be a power of two"
+    );
     (value + alignment - 1) & !(alignment - 1)
 }
 
 #[cfg(feature = "kernel")]
 use core::net::Ipv4Addr;
 #[cfg(feature = "kernel")]
-use smoltcp::{iface::Interface, wire::IpAddress};
-#[cfg(feature = "kernel")]
 use smoltcp::socket::tcp::State as TcpState;
+#[cfg(feature = "kernel")]
+use smoltcp::{iface::Interface, wire::IpAddress};
 
 #[cfg(feature = "kernel")]
 use tracing::{error, info};
@@ -46,21 +49,31 @@ impl<'a> VolSliceMut<'a> {
     /// `&mut [u8]` may alias this region for the `'a` lifetime.
     #[inline]
     pub unsafe fn from_raw_parts(ptr: *mut u8, len: usize) -> Self {
-        Self { ptr, len, _m: PhantomData }
+        Self {
+            ptr,
+            len,
+            _m: PhantomData,
+        }
     }
 
     #[inline]
-    pub fn len(&self) -> usize { self.len }
+    pub fn len(&self) -> usize {
+        self.len
+    }
 
     #[inline]
-    pub fn is_empty(&self) -> bool { self.len == 0 }
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
 
     /// Copy up to `self.len()` bytes from `src`, returning the number
     /// actually written.
     pub fn copy_from_slice(&self, src: &[u8]) -> usize {
         let n = core::cmp::min(self.len, src.len());
         for i in 0..n {
-            unsafe { self.ptr.add(i).write_volatile(src[i]); }
+            unsafe {
+                self.ptr.add(i).write_volatile(src[i]);
+            }
         }
         n
     }
@@ -68,29 +81,45 @@ impl<'a> VolSliceMut<'a> {
     /// Read the byte at `i`. Panics if out of bounds (matches `slice[i]`).
     #[inline]
     pub fn get(&self, i: usize) -> u8 {
-        assert!(i < self.len, "VolSliceMut::get: index {i} out of bounds (len {})", self.len);
+        assert!(
+            i < self.len,
+            "VolSliceMut::get: index {i} out of bounds (len {})",
+            self.len
+        );
         unsafe { self.ptr.add(i).read_volatile() }
     }
 
     /// Bounds-checked read. Returns `None` if out of range.
     #[inline]
     pub fn get_checked(&self, i: usize) -> Option<u8> {
-        if i >= self.len { return None; }
+        if i >= self.len {
+            return None;
+        }
         Some(unsafe { self.ptr.add(i).read_volatile() })
     }
 
     /// Write `b` at `i`. Panics if out of bounds.
     #[inline]
     pub fn set(&self, i: usize, b: u8) {
-        assert!(i < self.len, "VolSliceMut::set: index {i} out of bounds (len {})", self.len);
-        unsafe { self.ptr.add(i).write_volatile(b); }
+        assert!(
+            i < self.len,
+            "VolSliceMut::set: index {i} out of bounds (len {})",
+            self.len
+        );
+        unsafe {
+            self.ptr.add(i).write_volatile(b);
+        }
     }
 
     /// Bounds-checked write. Returns `None` if out of range.
     #[inline]
     pub fn set_checked(&self, i: usize, b: u8) -> Option<()> {
-        if i >= self.len { return None; }
-        unsafe { self.ptr.add(i).write_volatile(b); }
+        if i >= self.len {
+            return None;
+        }
+        unsafe {
+            self.ptr.add(i).write_volatile(b);
+        }
         Some(())
     }
 
@@ -104,10 +133,12 @@ impl<'a> VolSliceMut<'a> {
     /// Sub-slice `[start, end)`. Panics if out of bounds.
     pub fn sub(&self, start: usize, end: usize) -> VolSliceMut<'_> {
         assert!(start <= end, "VolSliceMut::sub: start {start} > end {end}");
-        assert!(end <= self.len, "VolSliceMut::sub: end {end} > len {}", self.len);
-        unsafe {
-            VolSliceMut::from_raw_parts(self.ptr.add(start), end - start)
-        }
+        assert!(
+            end <= self.len,
+            "VolSliceMut::sub: end {end} > len {}",
+            self.len
+        );
+        unsafe { VolSliceMut::from_raw_parts(self.ptr.add(start), end - start) }
     }
 
     /// Read-only reborrow. Useful when a function wants a `VolSlice`
@@ -133,14 +164,22 @@ impl<'a> VolSlice<'a> {
     /// `ptr` must be valid for reads of `len` bytes.
     #[inline]
     pub unsafe fn from_raw_parts(ptr: *const u8, len: usize) -> Self {
-        Self { ptr, len, _m: PhantomData }
+        Self {
+            ptr,
+            len,
+            _m: PhantomData,
+        }
     }
 
     #[inline]
-    pub fn len(&self) -> usize { self.len }
+    pub fn len(&self) -> usize {
+        self.len
+    }
 
     #[inline]
-    pub fn is_empty(&self) -> bool { self.len == 0 }
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
 
     /// Copy up to `dst.len()` bytes into `dst`, returning the number
     /// actually copied.
@@ -155,14 +194,20 @@ impl<'a> VolSlice<'a> {
     /// Read the byte at `i`. Panics if out of bounds (matches `slice[i]`).
     #[inline]
     pub fn get(&self, i: usize) -> u8 {
-        assert!(i < self.len, "VolSlice::get: index {i} out of bounds (len {})", self.len);
+        assert!(
+            i < self.len,
+            "VolSlice::get: index {i} out of bounds (len {})",
+            self.len
+        );
         unsafe { self.ptr.add(i).read_volatile() }
     }
 
     /// Bounds-checked read. Returns `None` if out of range.
     #[inline]
     pub fn get_checked(&self, i: usize) -> Option<u8> {
-        if i >= self.len { return None; }
+        if i >= self.len {
+            return None;
+        }
         Some(unsafe { self.ptr.add(i).read_volatile() })
     }
 
@@ -176,15 +221,19 @@ impl<'a> VolSlice<'a> {
     /// Sub-slice `[start, end)`. Panics if out of bounds.
     pub fn sub(&self, start: usize, end: usize) -> VolSlice<'_> {
         assert!(start <= end, "VolSlice::sub: start {start} > end {end}");
-        assert!(end <= self.len, "VolSlice::sub: end {end} > len {}", self.len);
-        unsafe {
-            VolSlice::from_raw_parts(self.ptr.add(start), end - start)
-        }
+        assert!(
+            end <= self.len,
+            "VolSlice::sub: end {end} > len {}",
+            self.len
+        );
+        unsafe { VolSlice::from_raw_parts(self.ptr.add(start), end - start) }
     }
 
     /// True if the first `prefix.len()` bytes equal `prefix`.
     pub fn starts_with(&self, prefix: &[u8]) -> bool {
-        if self.len < prefix.len() { return false; }
+        if self.len < prefix.len() {
+            return false;
+        }
         for i in 0..prefix.len() {
             if unsafe { self.ptr.add(i).read_volatile() } != prefix[i] {
                 return false;
@@ -197,7 +246,9 @@ impl<'a> VolSlice<'a> {
     /// non-compiler context (e.g. `serial_print`, whose read happens
     /// in the kernel under SUM — the compiler can't elide the syscall).
     #[inline]
-    pub fn as_ptr(&self) -> *const u8 { self.ptr }
+    pub fn as_ptr(&self) -> *const u8 {
+        self.ptr
+    }
 }
 
 // SPSC queue lives in this crate's [`spsc`] module — `pub use`
@@ -238,8 +289,8 @@ const _: () = {
         "NC_TX_OFF must be aligned for NetChannelQueue",
     );
     assert!(
-        NetChannel::queue_len_for(NC_MIN_REGION_SIZE)
-            % core::mem::align_of::<NetChannelQueue>() == 0,
+        NetChannel::queue_len_for(NC_MIN_REGION_SIZE) % core::mem::align_of::<NetChannelQueue>()
+            == 0,
         "queue_len at NC_MIN_REGION_SIZE must align the rx subregion",
     );
     assert!(
@@ -369,13 +420,13 @@ pub enum BindSpec {
     /// Connect to `(addr, port)`; reconnect after disconnects with
     /// capped exponential backoff. Channel maintains the connection
     /// from create until close.
-    ClientRetain  { addr: u32, port: u16 },
+    ClientRetain { addr: u32, port: u16 },
     /// Listen on `port`, accept one peer, then go terminal once the
     /// user disengages.
     ServerOneShot { port: u16 },
     /// Listen on `port`; after each session ends, immediately re-arm the
     /// listen so back-to-back peers don't race a closed-window.
-    ServerRetain  { port: u16 },
+    ServerRetain { port: u16 },
 }
 
 impl BindSpec {
@@ -386,14 +437,14 @@ impl BindSpec {
     /// - bits 56..64  reserved (must be 0)
     pub fn pack(self) -> usize {
         match self {
-            BindSpec::ClientOneShot { addr, port } =>
-                1 | ((port as usize) << 8) | ((addr as usize) << 24),
-            BindSpec::ClientRetain { addr, port } =>
-                2 | ((port as usize) << 8) | ((addr as usize) << 24),
-            BindSpec::ServerOneShot { port } =>
-                3 | ((port as usize) << 8),
-            BindSpec::ServerRetain { port } =>
-                4 | ((port as usize) << 8),
+            BindSpec::ClientOneShot { addr, port } => {
+                1 | ((port as usize) << 8) | ((addr as usize) << 24)
+            }
+            BindSpec::ClientRetain { addr, port } => {
+                2 | ((port as usize) << 8) | ((addr as usize) << 24)
+            }
+            BindSpec::ServerOneShot { port } => 3 | ((port as usize) << 8),
+            BindSpec::ServerRetain { port } => 4 | ((port as usize) << 8),
         }
     }
 
@@ -402,11 +453,15 @@ impl BindSpec {
     /// reserved bits — those indicate either a stale sender or a
     /// future ABI extension we don't understand.
     pub fn unpack(packed: usize) -> Option<Self> {
-        if packed >> 56 != 0 { return None; }
+        if packed >> 56 != 0 {
+            return None;
+        }
         let mode = packed & 0xff;
         let port = ((packed >> 8) & 0xffff) as u16;
         let addr = ((packed >> 24) & 0xffff_ffff) as u32;
-        if port == 0 { return None; }
+        if port == 0 {
+            return None;
+        }
         match mode {
             1 => Some(BindSpec::ClientOneShot { addr, port }),
             2 => Some(BindSpec::ClientRetain { addr, port }),
@@ -417,11 +472,17 @@ impl BindSpec {
     }
 
     pub fn is_server(self) -> bool {
-        matches!(self, BindSpec::ServerOneShot { .. } | BindSpec::ServerRetain { .. })
+        matches!(
+            self,
+            BindSpec::ServerOneShot { .. } | BindSpec::ServerRetain { .. }
+        )
     }
 
     pub fn is_retain(self) -> bool {
-        matches!(self, BindSpec::ClientRetain { .. } | BindSpec::ServerRetain { .. })
+        matches!(
+            self,
+            BindSpec::ClientRetain { .. } | BindSpec::ServerRetain { .. }
+        )
     }
 }
 
@@ -551,10 +612,10 @@ const RETAIN_BACKOFF_CAP_MS: u32 = 30_000;
 // was rejected" from "the connect failed" from "an in-flight read/write
 // hit a smoltcp error." Currently used only kernel-side (the user-side
 // netch wrapper in orbit-rt translates them when surfacing results).
-pub const EBIND_LISTEN: u16 = 1;   // smoltcp listen() rejected — bad port
-pub const EBIND_CONNECT: u16 = 2;  // connect failed (RST / timeout) — one-shot
-pub const EBIND_DONE: u16 = 3;     // one-shot session completed; binding spent
-pub const EBIND_IO: u16 = 4;       // smoltcp recv/send returned an error mid-session
+pub const EBIND_LISTEN: u16 = 1; // smoltcp listen() rejected — bad port
+pub const EBIND_CONNECT: u16 = 2; // connect failed (RST / timeout) — one-shot
+pub const EBIND_DONE: u16 = 3; // one-shot session completed; binding spent
+pub const EBIND_IO: u16 = 4; // smoltcp recv/send returned an error mid-session
 
 #[cfg(feature = "kernel")]
 fn try_connect(
@@ -584,10 +645,7 @@ fn try_connect(
 /// drop both call sites' allow-attributes.
 #[cfg(feature = "kernel")]
 #[allow(irrefutable_let_patterns)]
-fn publish_peer(
-    socket: &smoltcp::socket::tcp::Socket,
-    cur: &NetChannelCurrent,
-) {
+fn publish_peer(socket: &smoltcp::socket::tcp::Socket, cur: &NetChannelCurrent) {
     if let Some(ep) = socket.remote_endpoint() {
         if let IpAddress::Ipv4(v4) = ep.addr {
             cur.peer_addr.store(u32::from(v4), Ordering::Relaxed);
@@ -600,7 +658,8 @@ fn publish_peer(
 fn schedule_retry(ctx: &mut ChannelCtx, now_us: u64) {
     let next = if ctx.backoff_ms == 0 {
         RETAIN_BACKOFF_MIN_MS
-    } else {
+    }
+    else {
         ctx.backoff_ms.saturating_mul(2).min(RETAIN_BACKOFF_CAP_MS)
     };
     ctx.backoff_ms = next;
@@ -626,7 +685,9 @@ pub struct NetChannelQueue {
 }
 
 impl NetChannelQueue {
-    pub fn capacity(&self) -> usize { self.capacity }
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
 
     pub fn buf_ptr(&self) -> *mut u8 {
         &self.buf as *const u8 as *mut u8
@@ -644,8 +705,12 @@ impl NetChannelQueue {
         unsafe { self.slices.dequeue() }
     }
 
-    pub fn slices_is_empty(&self) -> bool { self.slices.is_empty() }
-    pub fn slices_len(&self) -> usize { self.slices.len() }
+    pub fn slices_is_empty(&self) -> bool {
+        self.slices.is_empty()
+    }
+    pub fn slices_len(&self) -> usize {
+        self.slices.len()
+    }
 
     /// # Safety
     /// Caller must be the single producer for `increments` on this queue.
@@ -659,8 +724,12 @@ impl NetChannelQueue {
         unsafe { self.increments.dequeue() }
     }
 
-    pub fn increments_is_full(&self) -> bool { self.increments.is_full() }
-    pub fn increments_len(&self) -> usize { self.increments.len() }
+    pub fn increments_is_full(&self) -> bool {
+        self.increments.is_full()
+    }
+    pub fn increments_len(&self) -> usize {
+        self.increments.len()
+    }
 }
 
 /// Control header for a NetChannel region. Self-anchored: sub-region
@@ -681,14 +750,20 @@ impl NetChannel {
     /// align so `queue_len` (half the post-header span) ends up
     /// `usize`-aligned.
     pub fn normalize_region_size(requested: usize) -> Option<usize> {
-        if requested == 0 { return None }
+        if requested == 0 {
+            return None;
+        }
         let clamped = requested.clamp(NC_MIN_REGION_SIZE, NC_MAX_REGION_SIZE);
 
         // Round up to page so each allocation fits cleanly in a whole
         // number of 4 KiB frames.
         let page_up = round_usize_up(clamped, 4096);
-        if page_up > NC_MAX_REGION_SIZE { return None }
-        if page_up < NC_MIN_REGION_SIZE { return None }
+        if page_up > NC_MAX_REGION_SIZE {
+            return None;
+        }
+        if page_up < NC_MIN_REGION_SIZE {
+            return None;
+        }
 
         // NC_TX_OFF is 16-aligned; dividing the remainder in half gives a
         // multiple of 8 as long as the region size is, which is already
@@ -738,7 +813,9 @@ impl NetChannel {
         }
     }
 
-    pub fn queue_len(&self) -> usize { self.queue_len }
+    pub fn queue_len(&self) -> usize {
+        self.queue_len
+    }
 
     fn anchor(&self) -> *const u8 {
         self as *const Self as *const u8
@@ -876,8 +953,11 @@ impl NetChannel {
                 }
             }
 
-            info!("netch[{:?}]: disengage edge → Closing (sock_state={:?})",
-                  ctx.bind, socket.state());
+            info!(
+                "netch[{:?}]: disengage edge → Closing (sock_state={:?})",
+                ctx.bind,
+                socket.state()
+            );
             // `close()` queues a FIN once the existing tx queue
             // drains; smoltcp continues to send buffered data + the
             // FIN before transitioning the socket to `Closed`.
@@ -908,14 +988,19 @@ impl NetChannel {
                 return (iface, outcome);
             }
 
-            info!("netch[{:?}]: drain complete, recycling (sock_state={:?})",
-                  ctx.bind, socket.state());
+            info!(
+                "netch[{:?}]: drain complete, recycling (sock_state={:?})",
+                ctx.bind,
+                socket.state()
+            );
             // Even a graceful Closed leaves smoltcp with empty
             // buffers — abort() is a no-op functionally but resets
             // any internal state we'd otherwise carry into the next
             // session.
             socket.abort();
-            unsafe { self.reset_kernel_side(); }
+            unsafe {
+                self.reset_kernel_side();
+            }
             ctx.pending_rx_ack = false;
             ctx.pending_tx_ack = false;
             // peer_addr/port are advisory; clear so the next session's
@@ -933,13 +1018,18 @@ impl NetChannel {
                         ctx.phase = Phase::Failed;
                         return (iface, outcome);
                     }
-                    info!("netch[ServerRetain port={port}]: re-armed listen, phase=Listening state=1");
+                    info!(
+                        "netch[ServerRetain port={port}]: re-armed listen, phase=Listening state=1"
+                    );
                     ctx.phase = Phase::Listening;
                     cur.state.store(channel_state::IN_FLIGHT, Ordering::Release);
                     outcome.session_state_changed = true;
                 }
                 BindSpec::ClientRetain { .. } => {
-                    info!("netch[{:?}]: phase=FreshIdle (retain re-dial pending)", ctx.bind);
+                    info!(
+                        "netch[{:?}]: phase=FreshIdle (retain re-dial pending)",
+                        ctx.bind
+                    );
                     ctx.phase = Phase::FreshIdle;
                     ctx.backoff_ms = 0;
                     ctx.next_attempt_at_us = 0;
@@ -970,7 +1060,10 @@ impl NetChannel {
                         ctx.phase = Phase::Failed;
                         return (iface, outcome);
                     }
-                    info!("netch[{:?}]: armed listen({port}), phase=Listening state=1", ctx.bind);
+                    info!(
+                        "netch[{:?}]: armed listen({port}), phase=Listening state=1",
+                        ctx.bind
+                    );
                     ctx.phase = Phase::Listening;
                     cur.state.store(channel_state::IN_FLIGHT, Ordering::Release);
                     outcome.session_state_changed = true;
@@ -978,26 +1071,38 @@ impl NetChannel {
                 BindSpec::ClientRetain { addr, port } => {
                     if now_us >= ctx.next_attempt_at_us {
                         if try_connect(&mut iface, socket, addr, port).is_ok() {
-                            info!("netch[ClientRetain addr={addr:#x} port={port}]: dialed, phase=Connecting state=1");
+                            info!(
+                                "netch[ClientRetain addr={addr:#x} port={port}]: dialed, phase=Connecting state=1"
+                            );
                             ctx.phase = Phase::Connecting;
                             cur.state.store(channel_state::IN_FLIGHT, Ordering::Release);
                             outcome.session_state_changed = true;
-                        } else {
+                        }
+                        else {
                             schedule_retry(ctx, now_us);
-                            info!("netch[ClientRetain addr={addr:#x} port={port}]: dial failed, retry in {}ms", ctx.backoff_ms);
+                            info!(
+                                "netch[ClientRetain addr={addr:#x} port={port}]: dial failed, retry in {}ms",
+                                ctx.backoff_ms
+                            );
                         }
                     }
                 }
                 BindSpec::ClientOneShot { addr, port } => {
                     if engaged {
                         if try_connect(&mut iface, socket, addr, port).is_ok() {
-                            info!("netch[ClientOneShot addr={addr:#x} port={port}]: dialed, phase=Connecting state=1");
+                            info!(
+                                "netch[ClientOneShot addr={addr:#x} port={port}]: dialed, phase=Connecting state=1"
+                            );
                             ctx.phase = Phase::Connecting;
                             cur.state.store(channel_state::IN_FLIGHT, Ordering::Release);
                             outcome.session_state_changed = true;
-                        } else {
-                            error!("netch[ClientOneShot addr={addr:#x} port={port}]: dial failed at bind, phase=Failed");
-                            cur.fail_cause.store(EBIND_CONNECT as i32, Ordering::Release);
+                        }
+                        else {
+                            error!(
+                                "netch[ClientOneShot addr={addr:#x} port={port}]: dial failed at bind, phase=Failed"
+                            );
+                            cur.fail_cause
+                                .store(EBIND_CONNECT as i32, Ordering::Release);
                             cur.state.store(channel_state::FAILED, Ordering::Release);
                             outcome.session_state_changed = true;
                             ctx.phase = Phase::Failed;
@@ -1009,14 +1114,17 @@ impl NetChannel {
         }
 
         // ── Listening: peer has connected once smoltcp is past Established
-        if matches!(ctx.phase, Phase::Listening)
-            && (socket.may_send() || socket.may_recv())
-        {
+        if matches!(ctx.phase, Phase::Listening) && (socket.may_send() || socket.may_recv()) {
             publish_peer(socket, cur);
             let pa = cur.peer_addr.load(Ordering::Relaxed);
             let pp = cur.peer_port.load(Ordering::Relaxed);
-            info!("netch[{:?}]: peer connected addr={:#x} port={} sock_state={:?}, phase=Active state=2",
-                  ctx.bind, pa, pp, socket.state());
+            info!(
+                "netch[{:?}]: peer connected addr={:#x} port={} sock_state={:?}, phase=Active state=2",
+                ctx.bind,
+                pa,
+                pp,
+                socket.state()
+            );
             ctx.phase = Phase::Active;
             cur.state.store(channel_state::ACTIVE, Ordering::Release);
             outcome.session_state_changed = true;
@@ -1028,18 +1136,28 @@ impl NetChannel {
                 publish_peer(socket, cur);
                 let pa = cur.peer_addr.load(Ordering::Relaxed);
                 let pp = cur.peer_port.load(Ordering::Relaxed);
-                info!("netch[{:?}]: handshake complete peer={:#x}:{} sock_state={:?}, phase=Active state=2",
-                      ctx.bind, pa, pp, socket.state());
+                info!(
+                    "netch[{:?}]: handshake complete peer={:#x}:{} sock_state={:?}, phase=Active state=2",
+                    ctx.bind,
+                    pa,
+                    pp,
+                    socket.state()
+                );
                 ctx.phase = Phase::Active;
                 ctx.backoff_ms = 0;
                 ctx.next_attempt_at_us = 0;
                 cur.state.store(channel_state::ACTIVE, Ordering::Release);
                 outcome.session_state_changed = true;
-            } else if socket.state() == TcpState::Closed {
+            }
+            else if socket.state() == TcpState::Closed {
                 match ctx.bind {
                     BindSpec::ClientOneShot { .. } => {
-                        info!("netch[{:?}]: connect failed (RST/timeout), phase=Failed", ctx.bind);
-                        cur.fail_cause.store(EBIND_CONNECT as i32, Ordering::Release);
+                        info!(
+                            "netch[{:?}]: connect failed (RST/timeout), phase=Failed",
+                            ctx.bind
+                        );
+                        cur.fail_cause
+                            .store(EBIND_CONNECT as i32, Ordering::Release);
                         cur.state.store(channel_state::FAILED, Ordering::Release);
                         outcome.session_state_changed = true;
                         ctx.phase = Phase::Failed;
@@ -1050,7 +1168,10 @@ impl NetChannel {
                         schedule_retry(ctx, now_us);
                         cur.state.store(channel_state::IDLE, Ordering::Release);
                         outcome.session_state_changed = true;
-                        info!("netch[{:?}]: connect failed, retry in {}ms", ctx.bind, ctx.backoff_ms);
+                        info!(
+                            "netch[{:?}]: connect failed, retry in {}ms",
+                            ctx.bind, ctx.backoff_ms
+                        );
                     }
                     _ => {}
                 }
@@ -1126,7 +1247,8 @@ impl NetChannel {
 
     #[cfg(not(feature = "kernel"))]
     pub fn send_tcp<F>(&self, f: F) -> Result<usize, isize>
-        where F: FnOnce(&VolSliceMut) -> usize
+    where
+        F: FnOnce(&VolSliceMut) -> usize,
     {
         let cur = self.current();
 
@@ -1139,29 +1261,27 @@ impl NetChannel {
         // user side must not write more.
         let channel_state = cur.state.load(Ordering::Acquire);
         if channel_state != channel_state::ACTIVE {
-            return Err(channel_state as isize)
+            return Err(channel_state as isize);
         }
 
         let tx = self.tx();
 
         if tx.slices_is_empty() {
-            return Err(-4)
+            return Err(-4);
         }
 
         if tx.increments_is_full() {
-            return Err(-5)
+            return Err(-5);
         }
 
         // SAFETY: user is the sole consumer of tx.slices and sole
         // producer of tx.increments.
         let (offset, len) = unsafe { tx.dequeue_slice() }.ok_or(-4isize)?;
-        let buf = unsafe {
-            VolSliceMut::from_raw_parts(tx.buf_ptr().add(offset), len)
-        };
+        let buf = unsafe { VolSliceMut::from_raw_parts(tx.buf_ptr().add(offset), len) };
 
         let written = f(&buf);
         if written == 0 {
-            return Ok(0)
+            return Ok(0);
         }
 
         unsafe {
@@ -1175,35 +1295,34 @@ impl NetChannel {
 
     #[cfg(not(feature = "kernel"))]
     pub fn recv_tcp<F>(&self, f: F) -> Result<usize, isize>
-        where F: FnOnce(&VolSlice) -> usize
+    where
+        F: FnOnce(&VolSlice) -> usize,
     {
         let cur = self.current();
 
         let channel_state = cur.state.load(Ordering::Acquire);
         if channel_state < 2 {
-            return Err(channel_state as isize)
+            return Err(channel_state as isize);
         }
 
         let rx = self.rx();
 
         if rx.slices_is_empty() {
-            return Err(-4)
+            return Err(-4);
         }
 
         if rx.increments_is_full() {
-            return Err(-5)
+            return Err(-5);
         }
 
         // SAFETY: user is the sole consumer of rx.slices and sole
         // producer of rx.increments.
         let (offset, len) = unsafe { rx.dequeue_slice() }.ok_or(-4isize)?;
-        let buf = unsafe {
-            VolSlice::from_raw_parts(rx.buf_ptr().add(offset), len)
-        };
+        let buf = unsafe { VolSlice::from_raw_parts(rx.buf_ptr().add(offset), len) };
 
         let written = f(&buf);
         if written == 0 {
-            return Ok(0)
+            return Ok(0);
         }
 
         unsafe {
@@ -1282,7 +1401,9 @@ mod vol_slice_tests {
     }
     #[cfg(miri)]
     unsafe fn register_root(ptr: *const u8) {
-        unsafe { miri_static_root(ptr); }
+        unsafe {
+            miri_static_root(ptr);
+        }
     }
     #[cfg(not(miri))]
     unsafe fn register_root(_ptr: *const u8) {}
@@ -1298,7 +1419,9 @@ mod vol_slice_tests {
         // `Vec::new().into_boxed_slice()` yields a dangling sentinel, not
         // a real allocation; only register real allocations with miri.
         if len > 0 {
-            unsafe { register_root(ptr as *const u8); }
+            unsafe {
+                register_root(ptr as *const u8);
+            }
         }
         ptr
     }
@@ -1523,9 +1646,18 @@ mod netchannel_layout_tests {
     fn init_stamps_queue_len_and_capacities() {
         let region = OwnedRegion::new(NC_MIN_REGION_SIZE);
         let nc = region.nc();
-        assert_eq!(nc.queue_len(), NetChannel::queue_len_for(NC_MIN_REGION_SIZE));
-        assert_eq!(nc.tx().capacity(), NetChannel::capacity_for(NC_MIN_REGION_SIZE));
-        assert_eq!(nc.rx().capacity(), NetChannel::capacity_for(NC_MIN_REGION_SIZE));
+        assert_eq!(
+            nc.queue_len(),
+            NetChannel::queue_len_for(NC_MIN_REGION_SIZE)
+        );
+        assert_eq!(
+            nc.tx().capacity(),
+            NetChannel::capacity_for(NC_MIN_REGION_SIZE)
+        );
+        assert_eq!(
+            nc.rx().capacity(),
+            NetChannel::capacity_for(NC_MIN_REGION_SIZE)
+        );
     }
 
     #[test]
@@ -1565,8 +1697,10 @@ mod netchannel_layout_tests {
         let (tx, rx) = nc.rings();
         let tx_start = tx.as_ptr() as usize;
         let rx_end = rx.as_ptr() as usize + rx.len();
-        assert!(base <= tx_start && rx_end <= end,
-            "rings escape region: base={base:#x} end={end:#x} tx_start={tx_start:#x} rx_end={rx_end:#x}");
+        assert!(
+            base <= tx_start && rx_end <= end,
+            "rings escape region: base={base:#x} end={end:#x} tx_start={tx_start:#x} rx_end={rx_end:#x}"
+        );
     }
 
     #[test]
@@ -1631,13 +1765,23 @@ mod netchannel_layout_tests {
     #[test]
     fn bind_spec_round_trips_through_pack() {
         let cases = [
-            BindSpec::ClientOneShot { addr: 0xC0A8_4C02, port: 65535 },
-            BindSpec::ClientRetain  { addr: 0x0A00_0001, port: 80 },
+            BindSpec::ClientOneShot {
+                addr: 0xC0A8_4C02,
+                port: 65535,
+            },
+            BindSpec::ClientRetain {
+                addr: 0x0A00_0001,
+                port: 80,
+            },
             BindSpec::ServerOneShot { port: 7777 },
-            BindSpec::ServerRetain  { port: 22 },
+            BindSpec::ServerRetain { port: 22 },
         ];
         for &c in &cases {
-            assert_eq!(BindSpec::unpack(c.pack()), Some(c), "round-trip failed for {c:?}");
+            assert_eq!(
+                BindSpec::unpack(c.pack()),
+                Some(c),
+                "round-trip failed for {c:?}"
+            );
         }
     }
 
@@ -1649,12 +1793,12 @@ mod netchannel_layout_tests {
         // Port 0 isn't a valid TCP endpoint here.
         assert_eq!(BindSpec::unpack(1 | (0 << 8)), None);
         // Server with a non-zero addr — that'd be a stale or malformed sender.
-        assert_eq!(
-            BindSpec::unpack(3 | (80 << 8) | (0xC0A8_0001 << 24)),
-            None,
-        );
+        assert_eq!(BindSpec::unpack(3 | (80 << 8) | (0xC0A8_0001 << 24)), None,);
         // Reserved high bits set.
-        assert_eq!(BindSpec::unpack(BindSpec::ServerRetain { port: 22 }.pack() | (1usize << 56)), None);
+        assert_eq!(
+            BindSpec::unpack(BindSpec::ServerRetain { port: 22 }.pack() | (1usize << 56)),
+            None
+        );
     }
 
     #[test]
@@ -1708,7 +1852,9 @@ mod netchannel_layout_tests {
         // entire region — miri validates each access.
         let region = OwnedRegion::new(NC_MIN_REGION_SIZE);
         for off in 0..NC_MIN_REGION_SIZE {
-            unsafe { region.base.add(off).write(0xA5); }
+            unsafe {
+                region.base.add(off).write(0xA5);
+            }
         }
         for off in 0..NC_MIN_REGION_SIZE {
             assert_eq!(unsafe { *region.base.add(off) }, 0xA5);
@@ -1770,22 +1916,20 @@ mod region_sizing_tests {
     #[test]
     fn mid_range_rounds_up_to_page() {
         // 8192 + 1 should round to 12288 (still in [min, max])
-        assert_eq!(
-            NetChannel::normalize_region_size(8193),
-            Some(12288)
-        );
+        assert_eq!(NetChannel::normalize_region_size(8193), Some(12288));
         // Already page-aligned passes through.
-        assert_eq!(
-            NetChannel::normalize_region_size(8192),
-            Some(8192)
-        );
+        assert_eq!(NetChannel::normalize_region_size(8192), Some(8192));
     }
 
     #[test]
     fn result_is_always_page_aligned() {
         for &req in &[1usize, 100, 4095, 4096, 5000, 8192, 100_000] {
             let r = NetChannel::normalize_region_size(req).unwrap();
-            assert_eq!(r % 4096, 0, "normalized size for {req} should be page-aligned, got {r}");
+            assert_eq!(
+                r % 4096,
+                0,
+                "normalized size for {req} should be page-aligned, got {r}"
+            );
             assert!(r >= NC_MIN_REGION_SIZE && r <= NC_MAX_REGION_SIZE);
         }
     }

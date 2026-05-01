@@ -52,12 +52,12 @@ pub mod wake_reason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(usize)]
 pub enum ThreadState {
-    Ready     = 0,
-    Blocking  = 1,
-    Assigned  = 2,
-    Running   = 3,
-    Exited    = 4,
-    Suspended = 5
+    Ready = 0,
+    Blocking = 1,
+    Assigned = 2,
+    Running = 3,
+    Exited = 4,
+    Suspended = 5,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -80,7 +80,9 @@ impl SlotAlloc {
     const WORDS: usize = (Self::CAPACITY as usize) / 64;
 
     pub const fn new() -> Self {
-        Self { bits: [0; Self::WORDS] }
+        Self {
+            bits: [0; Self::WORDS],
+        }
     }
 
     pub fn alloc(&mut self) -> Option<u16> {
@@ -96,13 +98,13 @@ impl SlotAlloc {
 
     pub fn free(&mut self, slot: u16) {
         let word = (slot / 64) as usize;
-        let bit  = slot % 64;
+        let bit = slot % 64;
         self.bits[word] &= !(1u64 << bit);
     }
 
     pub fn is_allocated(&self, slot: u16) -> bool {
         let word = (slot / 64) as usize;
-        let bit  = slot % 64;
+        let bit = slot % 64;
         (self.bits[word] & (1u64 << bit)) != 0
     }
 
@@ -125,19 +127,34 @@ pub trait Pool: Copy + fmt::Debug + 'static {
 /// can be dereferenced from supervisor code. Use for kernel-owned
 /// allocations (trap frames, rings) and for shared user memory the
 /// kernel must dereference after creation (NetChannel).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)] pub struct Shared;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Shared;
 /// User-private pool. Mapped only under the owning user satp. Kernel
 /// writes at setup time have to go through a temporary window
 /// (`UserPageWindow`) — there is no `to_kdmap` conversion.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)] pub struct UserOnly;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UserOnly;
 /// Page-table pool. Shares KDMAP-visibility with [`Shared`] but is
 /// distinct so that returning a table to `kernel_pages` (or vice versa)
 /// is a compile error.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)] pub struct Table;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Table;
 
-impl Pool for Shared   { fn name() -> &'static str { "Shared" } }
-impl Pool for UserOnly { fn name() -> &'static str { "UserOnly" } }
-impl Pool for Table    { fn name() -> &'static str { "Table" } }
+impl Pool for Shared {
+    fn name() -> &'static str {
+        "Shared"
+    }
+}
+impl Pool for UserOnly {
+    fn name() -> &'static str {
+        "UserOnly"
+    }
+}
+impl Pool for Table {
+    fn name() -> &'static str {
+        "Table"
+    }
+}
 
 /// A physical address tagged with the pool it was drawn from. `Frame<P>`
 /// is the tagged counterpart of [`mmu::sv48::PhysAddr`]: the walker
@@ -156,10 +173,17 @@ pub struct Frame<P: Pool> {
 
 impl<P: Pool> Frame<P> {
     pub const fn new(pa: PhysAddr) -> Self {
-        Self { pa, _p: PhantomData }
+        Self {
+            pa,
+            _p: PhantomData,
+        }
     }
-    pub fn raw(&self) -> PhysAddr { self.pa }
-    pub fn get_raw(&self) -> u64 { self.pa.get_raw() }
+    pub fn raw(&self) -> PhysAddr {
+        self.pa
+    }
+    pub fn get_raw(&self) -> u64 {
+        self.pa.get_raw()
+    }
 }
 
 impl<P: Pool> fmt::Debug for Frame<P> {
@@ -174,27 +198,33 @@ impl<P: Pool> fmt::Debug for Frame<P> {
 /// to dispatch to the right typed allocator.
 #[derive(Debug)]
 pub enum PhysBacking {
-    Shared { frame: Frame<Shared>,   layout: Layout },
-    User   { frame: Frame<UserOnly>, layout: Layout },
+    Shared {
+        frame: Frame<Shared>,
+        layout: Layout,
+    },
+    User {
+        frame: Frame<UserOnly>,
+        layout: Layout,
+    },
 }
 
 impl PhysBacking {
     pub fn pa(&self) -> PhysAddr {
         match self {
             Self::Shared { frame, .. } => frame.raw(),
-            Self::User   { frame, .. } => frame.raw(),
+            Self::User { frame, .. } => frame.raw(),
         }
     }
     pub fn layout(&self) -> Layout {
         match self {
             Self::Shared { layout, .. } => *layout,
-            Self::User   { layout, .. } => *layout,
+            Self::User { layout, .. } => *layout,
         }
     }
     pub fn pool_name(&self) -> &'static str {
         match self {
             Self::Shared { .. } => Shared::name(),
-            Self::User   { .. } => UserOnly::name(),
+            Self::User { .. } => UserOnly::name(),
         }
     }
 }
@@ -206,16 +236,16 @@ pub enum MappingKind {
     /// Anonymous user mmap.
     Anon,
     /// Thread stack (readable/writeable region above its guard).
-    Stack     { slot: u16 },
+    Stack { slot: u16 },
     /// Reserved vaddr range with no backing — a fault here signals an overflow
     /// into an adjacent stack/TLS/etc.
-    Guard     { slot: u16 },
+    Guard { slot: u16 },
     /// Per-thread trap frame, kernel-owned and mapped read-only into user.
     TrapFrame { slot: u16 },
     /// Per-thread TLS block; the TCB sits at the low end.
-    Tls       { slot: u16 },
+    Tls { slot: u16 },
     /// Kernel-allocated NetChannel region shared with the net thread.
-    NetCh     { fd: u32 },
+    NetCh { fd: u32 },
 }
 
 impl MappingKind {
@@ -234,15 +264,17 @@ impl MappingKind {
 /// Keyed by `vaddr` in [`Process::maps`]; ranges never overlap.
 #[derive(Debug)]
 pub struct UserMapping {
-    pub vaddr:   u64,
-    pub len:     u64,
-    pub perms:   u64,
+    pub vaddr: u64,
+    pub len: u64,
+    pub perms: u64,
     pub backing: Option<PhysBacking>,
-    pub kind:    MappingKind,
+    pub kind: MappingKind,
 }
 
 impl UserMapping {
-    pub fn end(&self) -> u64 { self.vaddr + self.len }
+    pub fn end(&self) -> u64 {
+        self.vaddr + self.len
+    }
 
     pub fn contains(&self, v: u64) -> bool {
         self.vaddr <= v && v < self.end()
@@ -368,7 +400,7 @@ pub struct PThread(pub *mut Thread);
 pub enum ProcessState {
     Running,
     Waiting,
-    Broken
+    Broken,
 }
 
 #[derive(Debug)]
@@ -552,7 +584,8 @@ impl Process {
 
     /// Find the mapping (if any) whose range contains `vaddr`.
     pub fn find_mapping(&self, vaddr: u64) -> Option<&UserMapping> {
-        self.maps.range(..=vaddr)
+        self.maps
+            .range(..=vaddr)
             .next_back()
             .map(|(_, m)| m)
             .filter(|m| m.contains(vaddr))
@@ -565,20 +598,31 @@ impl Process {
     pub fn pick_user_vaddr(&self, len: u64, align: u64, top: u64) -> Option<u64> {
         let mut candidate = round_up(self.mmap_cursor, align);
         for (_, m) in self.maps.range(candidate..) {
-            if candidate + len <= m.vaddr { return Some(candidate); }
+            if candidate + len <= m.vaddr {
+                return Some(candidate);
+            }
             candidate = round_up(m.end(), align);
         }
-        if candidate + len <= top { Some(candidate) } else { None }
+        if candidate + len <= top {
+            Some(candidate)
+        }
+        else {
+            None
+        }
     }
 
     /// Check that `[vaddr, vaddr+len)` overlaps no existing mapping. Used by
     /// MAP_FIXED-style requests where the caller chose the address.
     pub fn validate_free_range(&self, vaddr: u64, len: u64) -> Result<(), OverlapErr> {
         if let Some((_, prev)) = self.maps.range(..=vaddr).next_back() {
-            if prev.end() > vaddr { return Err(OverlapErr); }
+            if prev.end() > vaddr {
+                return Err(OverlapErr);
+            }
         }
         if let Some((_, next)) = self.maps.range(vaddr..).next() {
-            if vaddr + len > next.vaddr { return Err(OverlapErr); }
+            if vaddr + len > next.vaddr {
+                return Err(OverlapErr);
+            }
         }
         Ok(())
     }
@@ -589,7 +633,9 @@ impl Process {
 
     /// Iterate mappings owned by a specific thread slot. Used by teardown.
     pub fn mappings_for_slot(&self, slot: u16) -> impl Iterator<Item = &UserMapping> {
-        self.maps.values().filter(move |m| m.kind.slot() == Some(slot))
+        self.maps
+            .values()
+            .filter(move |m| m.kind.slot() == Some(slot))
     }
 }
 

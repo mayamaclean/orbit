@@ -47,7 +47,11 @@ where
         }
         let version = mmio.version();
         if version != mmio::VERSION_MODERN {
-            error!("virtio: unsupported version {} (need {})", version, mmio::VERSION_MODERN);
+            error!(
+                "virtio: unsupported version {} (need {})",
+                version,
+                mmio::VERSION_MODERN
+            );
             return Err(InitError::UnsupportedVersion(version));
         }
         let device_id = mmio.device_id();
@@ -94,7 +98,9 @@ where
 
         info!(
             "virtio: device_id={} vendor={:#x} feats={:#x} accepted",
-            device_id, mmio.vendor_id(), driver_features
+            device_id,
+            mmio.vendor_id(),
+            driver_features
         );
 
         Ok(driver_features)
@@ -103,7 +109,9 @@ where
 
 /// Flip DRIVER_OK after queue setup. Spec §3.1.1 step 8.
 pub unsafe fn set_driver_ok(mmio: &Mmio) {
-    unsafe { mmio.add_status(STATUS_DRIVER_OK); }
+    unsafe {
+        mmio.add_status(STATUS_DRIVER_OK);
+    }
 }
 
 /// Read + ack InterruptStatus. Returns which interrupt kinds fired.

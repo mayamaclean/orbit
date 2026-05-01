@@ -120,11 +120,11 @@ fn non_runnable_state_skips_snapshot() {
 #[test]
 fn state_mode_from_user_matrix_is_exhaustive() {
     const STATES: &[(ThreadState, bool)] = &[
-        (ThreadState::Ready,     false),
-        (ThreadState::Blocking,  true),
-        (ThreadState::Assigned,  false),
-        (ThreadState::Running,   true),
-        (ThreadState::Exited,    false),
+        (ThreadState::Ready, false),
+        (ThreadState::Blocking, true),
+        (ThreadState::Assigned, false),
+        (ThreadState::Running, true),
+        (ThreadState::Exited, false),
         (ThreadState::Suspended, true),
     ];
     const MODES: &[SPP] = &[SPP::User, SPP::Supervisor];
@@ -156,16 +156,19 @@ fn state_mode_from_user_matrix_is_exhaustive() {
 
                 if expected_snapshot {
                     assert_eq!(
-                        t.pc.load(Ordering::Acquire), 0x2000,
+                        t.pc.load(Ordering::Acquire),
+                        0x2000,
                         "pc should advance (state={state:?}, mode={mode:?}, from_user={from_user})"
                     );
                     assert_eq!(
                         t.frame.regs[10], 0xBB,
                         "frame should snapshot (state={state:?}, mode={mode:?}, from_user={from_user})"
                     );
-                } else {
+                }
+                else {
                     assert_eq!(
-                        t.pc.load(Ordering::Acquire), 0xDEAD,
+                        t.pc.load(Ordering::Acquire),
+                        0xDEAD,
                         "pc must NOT move (state={state:?}, mode={mode:?}, from_user={from_user})"
                     );
                     assert_eq!(

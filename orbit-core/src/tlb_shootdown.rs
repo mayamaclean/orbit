@@ -130,7 +130,11 @@ where
     for (hart_id, ring) in targets {
         match ring.push_ref() {
             Ok(mut slot) => {
-                *slot = ShootdownEntry::Req { va, len, ack: ack.clone() };
+                *slot = ShootdownEntry::Req {
+                    va,
+                    len,
+                    ack: ack.clone(),
+                };
                 drop(slot); // publishes the slot to the consumer
                 hw.wake_hart(hart_id);
             }
@@ -148,7 +152,8 @@ where
 
     if failed != 0 {
         Err(ShootdownErr::RingFull { failed })
-    } else {
+    }
+    else {
         Ok(())
     }
 }
@@ -168,10 +173,7 @@ where
 /// (it shouldn't — kernel sfence is infallible), the ack stays
 /// outstanding and the sender deadlocks. The kmain caller must keep
 /// `apply` straight-line and panic-free.
-pub fn drain_shootdown_ring(
-    ring: &'static ShootdownRing,
-    mut apply: impl FnMut(u64, u64),
-) -> u32 {
+pub fn drain_shootdown_ring(ring: &'static ShootdownRing, mut apply: impl FnMut(u64, u64)) -> u32 {
     let mut serviced = 0u32;
     while let Some(mut slot) = ring.pop_ref() {
         let entry = core::mem::take(&mut *slot);

@@ -7,25 +7,25 @@
 //! failure returns `-(errno as isize)`. Callers use [`Errno::from_ret`] to
 //! split the return value.
 
-pub const EPERM:   i32 =  1;
-pub const ENOENT:  i32 =  2;
-pub const ESRCH:   i32 =  3;
-pub const EIO:     i32 =  5;
-pub const ENOEXEC: i32 =  8;
-pub const EBADF:   i32 =  9;
-pub const ECHILD:  i32 = 10;
-pub const EAGAIN:  i32 = 11;
-pub const ENOMEM:  i32 = 12;
-pub const EACCES:  i32 = 13;
-pub const EFAULT:  i32 = 14;
-pub const EBUSY:   i32 = 16;
-pub const EEXIST:  i32 = 17;
-pub const ENODEV:  i32 = 19;
+pub const EPERM: i32 = 1;
+pub const ENOENT: i32 = 2;
+pub const ESRCH: i32 = 3;
+pub const EIO: i32 = 5;
+pub const ENOEXEC: i32 = 8;
+pub const EBADF: i32 = 9;
+pub const ECHILD: i32 = 10;
+pub const EAGAIN: i32 = 11;
+pub const ENOMEM: i32 = 12;
+pub const EACCES: i32 = 13;
+pub const EFAULT: i32 = 14;
+pub const EBUSY: i32 = 16;
+pub const EEXIST: i32 = 17;
+pub const ENODEV: i32 = 19;
 pub const ENOTDIR: i32 = 20;
-pub const EISDIR:  i32 = 21;
-pub const EINVAL:  i32 = 22;
-pub const ENFILE:  i32 = 23;
-pub const ENOSYS:  i32 = 38;
+pub const EISDIR: i32 = 21;
+pub const EINVAL: i32 = 22;
+pub const ENFILE: i32 = 23;
+pub const ENOSYS: i32 = 38;
 pub const ETIMEDOUT: i32 = 110;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,15 +33,24 @@ pub const ETIMEDOUT: i32 = 110;
 pub struct Errno(pub i32);
 
 impl Errno {
-    pub const fn new(code: i32) -> Self { Self(code) }
+    pub const fn new(code: i32) -> Self {
+        Self(code)
+    }
 
     /// Decode a syscall return value. Non-negative = Ok, negative = Err(errno).
     pub const fn from_ret(r: isize) -> Result<usize, Self> {
-        if r < 0 { Err(Self((-r) as i32)) } else { Ok(r as usize) }
+        if r < 0 {
+            Err(Self((-r) as i32))
+        }
+        else {
+            Ok(r as usize)
+        }
     }
 
     /// Encode an errno back into a syscall return value.
-    pub const fn to_ret(self) -> isize { -(self.0 as isize) }
+    pub const fn to_ret(self) -> isize {
+        -(self.0 as isize)
+    }
 }
 
 #[cfg(test)]
@@ -65,8 +74,10 @@ mod tests {
 
     #[test]
     fn to_ret_round_trips_through_from_ret() {
-        for &code in &[EPERM, ENOENT, EIO, EAGAIN, ENOMEM, EFAULT, EBUSY,
-                       EEXIST, ENODEV, EINVAL, ENFILE, ENOSYS] {
+        for &code in &[
+            EPERM, ENOENT, EIO, EAGAIN, ENOMEM, EFAULT, EBUSY, EEXIST, ENODEV, EINVAL, ENFILE,
+            ENOSYS,
+        ] {
             let ret = Errno::new(code).to_ret();
             assert!(ret < 0, "errno {code} encoded as non-negative {ret}");
             assert_eq!(Errno::from_ret(ret), Err(Errno(code)));

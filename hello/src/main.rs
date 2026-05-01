@@ -10,7 +10,7 @@ use core::panic::PanicInfo;
 
 use orbit_abi::{
     serialln,
-    user::{exit, SerialWriter},
+    user::{SerialWriter, exit},
 };
 use orbit_rt as _;
 

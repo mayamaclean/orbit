@@ -27,10 +27,13 @@ use orbit_rt as _;
 
 use core::panic::PanicInfo;
 
-use orbit_abi::errno::{Errno, EAGAIN};
+use net_channel::{BindSpec, NC_MAX_REGION_SIZE, NetChannel};
+use orbit_abi::errno::{EAGAIN, Errno};
 use orbit_abi::net::SockType;
-use orbit_abi::{logln, user::{exit, get_micros, sleep_ms, ConsoleWriter}};
-use net_channel::{BindSpec, NetChannel, NC_MAX_REGION_SIZE};
+use orbit_abi::{
+    logln,
+    user::{ConsoleWriter, exit, get_micros, sleep_ms},
+};
 use orbit_rt::netch::NetCh;
 
 /// Listener port on the host gateway (192.168.76.2 in QEMU's user-mode
@@ -124,7 +127,8 @@ fn run_round(round: usize) -> bool {
     // avoid overflow on big transfers.
     let bps = if elapsed_us == 0 {
         0
-    } else {
+    }
+    else {
         ((sent as u128) * (MICROS_PER_SECOND as u128) / (elapsed_us as u128)) as u64
     };
     let mib_per_sec_x100 = (bps * 100) / (1024 * 1024);

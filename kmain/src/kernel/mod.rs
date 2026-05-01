@@ -2524,7 +2524,8 @@ impl Orbit {
                     self.kernel_pages.free(frame, Self::THREAD_STACK_LAYOUT);
                 }
                 if let Some(frame) = thread.kernel_trap_frame.take() {
-                    self.kernel_pages.free(frame, Self::THREAD_TRAP_FRAME_LAYOUT);
+                    self.kernel_pages
+                        .free(frame, Self::THREAD_TRAP_FRAME_LAYOUT);
                 }
             }
             (Some(slot), 0) => error!(

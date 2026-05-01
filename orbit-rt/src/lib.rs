@@ -188,7 +188,9 @@ unsafe impl Send for PrivMmapAllocator {}
 
 unsafe impl dlmalloc::Allocator for PrivMmapAllocator {
     fn alloc(&self, size: usize) -> (*mut u8, usize, u32) {
-        let need = size.max(PRIV_GROWTH_CHUNK).next_multiple_of(PAGE_SIZE_USIZE);
+        let need = size
+            .max(PRIV_GROWTH_CHUNK)
+            .next_multiple_of(PAGE_SIZE_USIZE);
         let va = PRIV_NEXT_VA.fetch_add(need, Ordering::Relaxed);
 
         // SAFETY: monotonic cursor + kernel-side bound check guarantees
@@ -275,9 +277,7 @@ unsafe impl GlobalAlloc for OrbitHeap {
     #[inline]
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         let _g = HEAP_LOCK.lock();
-        unsafe {
-            (*DLMALLOC.0.get()).realloc(ptr, layout.size(), layout.align(), new_size)
-        }
+        unsafe { (*DLMALLOC.0.get()).realloc(ptr, layout.size(), layout.align(), new_size) }
     }
 }
 
@@ -304,12 +304,12 @@ static ORBIT_HEAP: OrbitHeap = OrbitHeap;
 // =====================================================================
 #[cfg(feature = "full-runtime")]
 mod shared_va {
-    use super::{PERMS_RW_U, PAGE_SIZE_USIZE, SpinFlag};
+    use super::{PAGE_SIZE_USIZE, PERMS_RW_U, SpinFlag};
     use core::alloc::Layout;
     use core::cell::UnsafeCell;
     use mem::frame::FrameAllocator;
     use orbit_abi::{
-        errno::{Errno, EINVAL, ENOMEM},
+        errno::{EINVAL, ENOMEM, Errno},
         layout::{UPROC_SHARED_BASE, UPROC_SHARED_END},
         user,
     };
@@ -381,7 +381,9 @@ mod shared_va {
                 // Byte-addressed: the buddy tracks the raw VA range
                 // [UPROC_SHARED_BASE, UPROC_SHARED_END), same convention as
                 // kmain's pool wrappers.
-                inner.fa.insert(UPROC_SHARED_BASE as usize..UPROC_SHARED_END as usize);
+                inner
+                    .fa
+                    .insert(UPROC_SHARED_BASE as usize..UPROC_SHARED_END as usize);
                 inner.initialized = true;
             }
             f(&mut inner.fa)
@@ -433,10 +435,14 @@ mod shared_va {
             // The buddy returns a byte-address from the
             // [UPROC_SHARED_BASE, UPROC_SHARED_END) range we seeded; cast
             // straight to a VA. `with` takes the spinlock internally.
-            let va = SHARED_VA.with(|fa| fa.alloc_aligned(aligned))
+            let va = SHARED_VA
+                .with(|fa| fa.alloc_aligned(aligned))
                 .ok_or(Errno::new(ENOMEM))?;
 
-            Ok(Self { va, layout: aligned })
+            Ok(Self {
+                va,
+                layout: aligned,
+            })
         }
 
         /// Starting VA of the reservation. Page-aligned.
@@ -501,4 +507,4 @@ mod shared_va {
 }
 
 #[cfg(feature = "full-runtime")]
-pub use shared_va::{SharedRegion, SharedVa, SHARED_VA, shared_mmap};
+pub use shared_va::{SHARED_VA, SharedRegion, SharedVa, shared_mmap};

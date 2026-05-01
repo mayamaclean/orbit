@@ -37,10 +37,7 @@ const USER_PC: usize = 0x2_2000_0554;
 /// Drive the dispatch_syscall pattern against whatever pointer is
 /// currently in the slot. Returns `Some(action)` if a thread was
 /// observed, `None` if the slot was null.
-unsafe fn dispatch_against_slot(
-    slot: &AtomicPtr<()>,
-    epc: usize,
-) -> Option<ShimAction> {
+unsafe fn dispatch_against_slot(slot: &AtomicPtr<()>, epc: usize) -> Option<ShimAction> {
     let p = slot.load(Ordering::Acquire);
     if p.is_null() {
         return None;
@@ -147,7 +144,9 @@ fn concurrent_retarget_never_corrupts_kthread() {
     struct SendPtr(*mut ());
     unsafe impl Send for SendPtr {}
     impl SendPtr {
-        fn raw(self) -> *mut () { self.0 }
+        fn raw(self) -> *mut () {
+            self.0
+        }
     }
 
     let user_p = SendPtr(user as *mut ());
@@ -158,7 +157,12 @@ fn concurrent_retarget_never_corrupts_kthread() {
         // Retargeter: alternate the slot.
         s.spawn(move || {
             for i in 0..ITERS {
-                let target = if i % 2 == 0 { kthread_p.raw() } else { user_p.raw() };
+                let target = if i % 2 == 0 {
+                    kthread_p.raw()
+                }
+                else {
+                    user_p.raw()
+                };
                 slot_ref.store(target, Ordering::Release);
                 thread::yield_now();
             }

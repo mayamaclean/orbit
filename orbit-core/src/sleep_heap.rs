@@ -99,7 +99,8 @@ impl Ord for SleepEntry {
         // Owned-field comparison only. Tie-break on sleep_seq so two
         // pushes with identical wake_time have a deterministic order
         // (matters for tests; doesn't matter for dispatch).
-        self.wake_time.cmp(&other.wake_time)
+        self.wake_time
+            .cmp(&other.wake_time)
             .then(self.sleep_seq.cmp(&other.sleep_seq))
     }
 }
@@ -116,7 +117,9 @@ pub struct SleepHeap {
 
 impl SleepHeap {
     pub const fn new() -> Self {
-        Self { inner: BinaryHeap::new() }
+        Self {
+            inner: BinaryHeap::new(),
+        }
     }
 
     /// Push a park entry. Caller has just transitioned `thread` into
@@ -127,7 +130,11 @@ impl SleepHeap {
     /// `wake_time` is the absolute tick value the thread should wake
     /// at, in the same units as `riscv::register::time::read()`.
     pub fn push(&mut self, thread: *mut Thread, wake_time: u64, sleep_seq: u64) {
-        self.inner.push(Reverse(SleepEntry { wake_time, sleep_seq, thread }));
+        self.inner.push(Reverse(SleepEntry {
+            wake_time,
+            sleep_seq,
+            thread,
+        }));
     }
 
     /// Earliest deadline currently in the heap, or `None` if empty.
@@ -181,7 +188,9 @@ impl SleepHeap {
                     break;
                 }
                 Verdict::Live => {
-                    if top.wake_time > now { break; }
+                    if top.wake_time > now {
+                        break;
+                    }
                     let entry = self.inner.pop().unwrap();
                     cb(entry.0.thread);
                 }
@@ -225,9 +234,15 @@ fn classify(live_seq: u64, live_state: usize, entry_seq: u64) -> Verdict {
     if live_seq != entry_seq {
         return Verdict::Stale;
     }
-    if live_state == ThreadState::Suspended as usize { return Verdict::Live; }
-    if live_state == ThreadState::Ready as usize     { return Verdict::Stale; }
-    if live_state == ThreadState::Exited as usize    { return Verdict::Stale; }
+    if live_state == ThreadState::Suspended as usize {
+        return Verdict::Live;
+    }
+    if live_state == ThreadState::Ready as usize {
+        return Verdict::Stale;
+    }
+    if live_state == ThreadState::Exited as usize {
+        return Verdict::Stale;
+    }
     // Running / Assigned / Blocking with matching seq: park is in
     // flight, asm handoff hasn't published Suspended yet.
     Verdict::Transient

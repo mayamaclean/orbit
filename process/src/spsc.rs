@@ -53,7 +53,9 @@ impl<T: Copy, const N: usize> SpscQueue<T, N> {
         if next == self.head.load(Ordering::Acquire) {
             return Err(val);
         }
-        unsafe { self.buffer[tail].get().write_volatile(val); }
+        unsafe {
+            self.buffer[tail].get().write_volatile(val);
+        }
         self.tail.store(next, Ordering::Release);
         Ok(())
     }

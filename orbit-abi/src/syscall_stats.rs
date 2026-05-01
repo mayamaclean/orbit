@@ -56,8 +56,7 @@ pub struct SyscallEntry {
 /// can size its receive buffer to this; if its local COUNT is smaller
 /// the kernel writes more than this, the prefix is still valid.
 pub const fn payload_size() -> usize {
-    core::mem::size_of::<SyscallStatsHeader>()
-        + Sysno::COUNT * core::mem::size_of::<SyscallEntry>()
+    core::mem::size_of::<SyscallStatsHeader>() + Sysno::COUNT * core::mem::size_of::<SyscallEntry>()
 }
 
 #[cfg(test)]
@@ -107,7 +106,8 @@ mod tests {
         // floor((100-8)/16) = 5 full entries + header = 88 bytes
         // written, header declares count=5. Trailing 12 bytes of user
         // buffer untouched.
-        let kernel_total = SYSCALL_STATS_MIN_LEN + Sysno::COUNT * core::mem::size_of::<SyscallEntry>();
+        let kernel_total =
+            SYSCALL_STATS_MIN_LEN + Sysno::COUNT * core::mem::size_of::<SyscallEntry>();
         assert_eq!(kernel_total, 8 + Sysno::COUNT * 16);
 
         let user_buf_len: usize = 100;
@@ -115,7 +115,8 @@ mod tests {
             (user_buf_len - SYSCALL_STATS_MIN_LEN) / core::mem::size_of::<SyscallEntry>();
         assert_eq!(entries_capacity, 5);
 
-        let written = SYSCALL_STATS_MIN_LEN + entries_capacity * core::mem::size_of::<SyscallEntry>();
+        let written =
+            SYSCALL_STATS_MIN_LEN + entries_capacity * core::mem::size_of::<SyscallEntry>();
         assert_eq!(written, 88);
         assert!(written <= user_buf_len);
     }
@@ -145,11 +146,12 @@ mod tests {
         // header but zero entries. count=0 is a valid response — the
         // user learns nothing about syscalls but the version
         // handshake works.
-        let entries_capacity = (SYSCALL_STATS_MIN_LEN - SYSCALL_STATS_MIN_LEN)
-            / core::mem::size_of::<SyscallEntry>();
+        let entries_capacity =
+            (SYSCALL_STATS_MIN_LEN - SYSCALL_STATS_MIN_LEN) / core::mem::size_of::<SyscallEntry>();
         assert_eq!(entries_capacity, 0);
 
-        let written = SYSCALL_STATS_MIN_LEN + entries_capacity * core::mem::size_of::<SyscallEntry>();
+        let written =
+            SYSCALL_STATS_MIN_LEN + entries_capacity * core::mem::size_of::<SyscallEntry>();
         assert_eq!(written, SYSCALL_STATS_MIN_LEN);
     }
 }

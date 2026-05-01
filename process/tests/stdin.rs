@@ -97,11 +97,7 @@ fn no_byte_loss_under_concurrent_push_drain() {
         prod.join().unwrap();
         let received = cons.join().unwrap();
 
-        assert_eq!(
-            received.len(),
-            BYTES_PER_ITER,
-            "iter {iter}: lost bytes"
-        );
+        assert_eq!(received.len(), BYTES_PER_ITER, "iter {iter}: lost bytes");
         for (i, &b) in received.iter().enumerate() {
             assert_eq!(b, i as u8, "iter {iter}: SPSC order broken at {i}");
         }

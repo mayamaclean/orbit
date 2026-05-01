@@ -11,7 +11,7 @@
 
 use tracing::{error, info};
 use virtio::mmio::Mmio;
-use virtio::queue::{Buf, Virtqueue, VirtqBacking};
+use virtio::queue::{Buf, VirtqBacking, Virtqueue};
 use virtio::transport::{self, InitError};
 
 use crate::proto::InputEvent;
@@ -32,7 +32,9 @@ pub enum InputError {
 }
 
 impl From<InitError> for InputError {
-    fn from(e: InitError) -> Self { InputError::Init(e) }
+    fn from(e: InitError) -> Self {
+        InputError::Init(e)
+    }
 }
 
 /// Backing handed to [`Input::new`]. The arena is one contiguous region
@@ -76,7 +78,10 @@ impl Input {
         let queue_size = backing.eventq.size;
         let needed = queue_size as usize * EVENT_SIZE;
         if backing.arena_size < needed {
-            return Err(InputError::ArenaTooSmall { needed, got: backing.arena_size });
+            return Err(InputError::ArenaTooSmall {
+                needed,
+                got: backing.arena_size,
+            });
         }
 
         let mmio = backing.mmio;
@@ -92,7 +97,10 @@ impl Input {
             mmio.select_queue(EVENT_QUEUE);
             let qmax = mmio.queue_num_max();
             if qmax < queue_size as u32 {
-                return Err(InputError::QueueTooSmall { wanted: queue_size, got: qmax });
+                return Err(InputError::QueueTooSmall {
+                    wanted: queue_size,
+                    got: qmax,
+                });
             }
             mmio.set_queue_num(queue_size as u32);
             mmio.set_queue_desc(eventq.desc_pa());
@@ -109,7 +117,11 @@ impl Input {
         for i in 0..queue_size {
             let pa = backing.arena_pa + (i as u64) * EVENT_SIZE as u64;
             let head = eventq
-                .push_chain(&[Buf { pa, len: EVENT_SIZE as u32, write: true }])
+                .push_chain(&[Buf {
+                    pa,
+                    len: EVENT_SIZE as u32,
+                    write: true,
+                }])
                 .map_err(|_| InputError::PrefillFailed)?;
             assert!(
                 head == i,
@@ -157,7 +169,11 @@ impl Input {
         // hands back the same descriptor index — assert in case the
         // queue impl ever changes.
         let pa = self.arena_pa + (head as u64) * EVENT_SIZE as u64;
-        match self.eventq.push_chain(&[Buf { pa, len: EVENT_SIZE as u32, write: true }]) {
+        match self.eventq.push_chain(&[Buf {
+            pa,
+            len: EVENT_SIZE as u32,
+            write: true,
+        }]) {
             Ok(reused) => debug_assert!(
                 reused == head,
                 "virtio-input: re-queue head drift {head} → {reused}",
@@ -167,7 +183,9 @@ impl Input {
                 error!("virtio-input: re-queue push_chain returned Full");
             }
         }
-        unsafe { self.mmio.notify_queue(EVENT_QUEUE); }
+        unsafe {
+            self.mmio.notify_queue(EVENT_QUEUE);
+        }
 
         Some(slot)
     }
@@ -183,5 +201,7 @@ impl Input {
         bits.used_ring
     }
 
-    pub fn queue_size(&self) -> u16 { self.queue_size }
+    pub fn queue_size(&self) -> u16 {
+        self.queue_size
+    }
 }

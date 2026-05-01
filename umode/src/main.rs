@@ -9,13 +9,18 @@ use core::cell::Cell;
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
-use orbit_abi::errno::{Errno, EBADF, ECHILD, EFAULT, EINVAL, ENOENT, ENOTDIR, EPERM};
-use orbit_abi::fs::{
-    DIRENT_HDR_LEN, DT_DIR, DT_REG, DirEntry, S_IFDIR, S_IFMT, S_IFREG, Stat,
-};
-use orbit_abi::net::SockType;
-use orbit_abi::{logln, user::{close_handle, create_process_with_argv, create_thread, exit, fs_open, fs_read, fs_readdir, fs_stat, futex_wait, futex_wake, get_affinity, get_hart_id, getpid, gettid, set_affinity, sleep_ms, console_write, serial_print, wait_pid, ConsoleWriter}};
 use net_channel::BindSpec;
+use orbit_abi::errno::{EBADF, ECHILD, EFAULT, EINVAL, ENOENT, ENOTDIR, EPERM, Errno};
+use orbit_abi::fs::{DIRENT_HDR_LEN, DT_DIR, DT_REG, DirEntry, S_IFDIR, S_IFMT, S_IFREG, Stat};
+use orbit_abi::net::SockType;
+use orbit_abi::{
+    logln,
+    user::{
+        ConsoleWriter, close_handle, console_write, create_process_with_argv, create_thread, exit,
+        fs_open, fs_read, fs_readdir, fs_stat, futex_wait, futex_wake, get_affinity, get_hart_id,
+        getpid, gettid, serial_print, set_affinity, sleep_ms, wait_pid,
+    },
+};
 use orbit_rt::netch::NetCh;
 
 // =====================================================================
@@ -101,7 +106,9 @@ fn run_tls_isolation_probe() {
 
     let mut ok = true;
     if worker_init != 0xC0FFEE {
-        logln!("FAIL: TLS probe worker saw 0x{worker_init:x} (want 0xc0ffee — main's write should not have been visible)");
+        logln!(
+            "FAIL: TLS probe worker saw 0x{worker_init:x} (want 0xc0ffee — main's write should not have been visible)"
+        );
         ok = false;
     }
     if worker_tick != 5 {
@@ -109,7 +116,9 @@ fn run_tls_isolation_probe() {
         ok = false;
     }
     if main_sentinel != 0xDEAD_BEEF {
-        logln!("FAIL: TLS probe main sentinel = 0x{main_sentinel:x} (want 0xdeadbeef — worker overwrote main's TLS)");
+        logln!(
+            "FAIL: TLS probe main sentinel = 0x{main_sentinel:x} (want 0xdeadbeef — worker overwrote main's TLS)"
+        );
         ok = false;
     }
     if main_tick != 110 {
@@ -118,7 +127,9 @@ fn run_tls_isolation_probe() {
     }
 
     if ok {
-        logln!("PASS: TLS isolation — main(sentinel=0x{main_sentinel:x},tick={main_tick}) worker(init=0x{worker_init:x},tick={worker_tick})");
+        logln!(
+            "PASS: TLS isolation — main(sentinel=0x{main_sentinel:x},tick={main_tick}) worker(init=0x{worker_init:x},tick={worker_tick})"
+        );
     }
 }
 
@@ -227,7 +238,10 @@ fn run_shootdown_probe() {
     let nc = match NetCh::open(
         0,
         SockType::Tcp,
-        BindSpec::ClientOneShot { addr: 0x0100_007F, port: 1 },
+        BindSpec::ClientOneShot {
+            addr: 0x0100_007F,
+            port: 1,
+        },
     ) {
         Ok(n) => n,
         Err(Errno(e)) => {
@@ -277,9 +291,12 @@ fn run_shootdown_probe() {
     let _ = sleep_ms(200);
 
     if SD_WORKER_SURVIVED.load(Ordering::Acquire) == 1 {
-        logln!("FAIL: shootdown probe — worker survived post-revoke read \
-               (cross-hart TLB still cached the translation)");
-    } else {
+        logln!(
+            "FAIL: shootdown probe — worker survived post-revoke read \
+               (cross-hart TLB still cached the translation)"
+        );
+    }
+    else {
         logln!("PASS: shootdown probe — worker faulted on post-revoke read");
     }
 
@@ -334,7 +351,8 @@ fn run_create_thread_probe() {
     let observed = WORKER_HART.load(Ordering::Acquire);
     if observed == 1 {
         logln!("PASS: create_thread worker ran on hart 1 (target_bit=0x{target_bit:x})");
-    } else {
+    }
+    else {
         logln!("FAIL: create_thread worker ran on hart {observed} (want 1)");
     }
 }
@@ -460,7 +478,8 @@ fn run_futex_probe() {
     let r = FUTEX_WORKER_RESULT.load(Ordering::Acquire);
     if r == 0 {
         logln!("PASS: futex_wait worker resumed (code=0)");
-    } else {
+    }
+    else {
         logln!("FAIL: futex_wait worker code={r} (want 0)");
         return;
     }
@@ -481,7 +500,8 @@ fn check(name: &str, got: isize, want: isize) {
     let mut w = ConsoleWriter::new();
     if got == want {
         let _ = writeln!(w, "PASS: {name} got {got}");
-    } else {
+    }
+    else {
         let _ = writeln!(w, "FAIL: {name} want {want} got {got}");
     }
     w.flush();
@@ -533,14 +553,24 @@ fn run_heap_smoke() {
     w.flush();
 
     let mut v: Vec<u32> = Vec::new();
-    for i in 0..1024 { v.push(i); }
+    for i in 0..1024 {
+        v.push(i);
+    }
     let sum: u64 = v.iter().map(|&x| x as u64).sum();
     let mut w = ConsoleWriter::new();
-    let _ = writeln!(w, "heap Vec sum: {sum} (want {})", (0u64..1024).sum::<u64>());
+    let _ = writeln!(
+        w,
+        "heap Vec sum: {sum} (want {})",
+        (0u64..1024).sum::<u64>()
+    );
     w.flush();
 
     check("heap Box value", *b as isize, 0xABCD);
-    check("heap Vec sum",   sum as isize, (0u64..1024).sum::<u64>() as isize);
+    check(
+        "heap Vec sum",
+        sum as isize,
+        (0u64..1024).sum::<u64>() as isize,
+    );
 }
 
 /// Exercise syscall error paths that QEMU smoke otherwise never hits.
@@ -550,13 +580,13 @@ fn run_error_path_tests() {
 
     // --- sleep_ms edge cases ---
     // The kernel caps sleep at 60*60*1000 ms. `>=` MAX returns EINVAL.
-    check_err("sleep_ms at cap",    sleep_ms(60 * 60 * 1000),     EINVAL);
+    check_err("sleep_ms at cap", sleep_ms(60 * 60 * 1000), EINVAL);
     check_err("sleep_ms above cap", sleep_ms(60 * 60 * 1000 + 1), EINVAL);
 
     // --- console_write / serial_print error paths ---
     // NULL-region VA (inside USER_NULL_GUARD_END) never translates → EFAULT.
     check_err("console_write null VA", console_write(0x1000, 5), EFAULT);
-    check_err("serial_print null VA",  serial_print(0x1000, 5),  EFAULT);
+    check_err("serial_print null VA", serial_print(0x1000, 5), EFAULT);
 
     // len > PAGE_SIZE rejected with EINVAL before any memory is
     // touched, so the pointer just needs to be plausible.
@@ -601,11 +631,16 @@ fn run_error_path_tests() {
         use core::fmt::Write;
         let mut w = ConsoleWriter::new();
         if cur != 0 && cur == allowed {
-            let _ = writeln!(w,
-                "PASS: get_affinity initial cur=0x{cur:x} allowed=0x{allowed:x}");
-        } else {
-            let _ = writeln!(w,
-                "FAIL: get_affinity initial cur=0x{cur:x} allowed=0x{allowed:x}");
+            let _ = writeln!(
+                w,
+                "PASS: get_affinity initial cur=0x{cur:x} allowed=0x{allowed:x}"
+            );
+        }
+        else {
+            let _ = writeln!(
+                w,
+                "FAIL: get_affinity initial cur=0x{cur:x} allowed=0x{allowed:x}"
+            );
         }
         w.flush();
     }
@@ -633,9 +668,16 @@ fn run_error_path_tests() {
         use core::fmt::Write;
         let mut w = ConsoleWriter::new();
         if pinned_to == 0 {
-            let _ = writeln!(w, "PASS: set_affinity pinned to hart 0 (got hart {pinned_to})");
-        } else {
-            let _ = writeln!(w, "FAIL: set_affinity pinned to hart 0 (got hart {pinned_to})");
+            let _ = writeln!(
+                w,
+                "PASS: set_affinity pinned to hart 0 (got hart {pinned_to})"
+            );
+        }
+        else {
+            let _ = writeln!(
+                w,
+                "FAIL: set_affinity pinned to hart 0 (got hart {pinned_to})"
+            );
         }
         w.flush();
     }
@@ -664,12 +706,18 @@ fn run_fs_smoke() {
             if kind == S_IFREG && st.st_size == 217 && st.st_blksize == 512 {
                 logln!(
                     "PASS: fs_stat /README size={} mode={:#o} ino={} blocks={}",
-                    st.st_size, st.st_mode, st.st_ino, st.st_blocks,
+                    st.st_size,
+                    st.st_mode,
+                    st.st_ino,
+                    st.st_blocks,
                 );
-            } else {
+            }
+            else {
                 logln!(
                     "FAIL: fs_stat /README unexpected size={} mode={:#o} blksize={}",
-                    st.st_size, st.st_mode, st.st_blksize,
+                    st.st_size,
+                    st.st_mode,
+                    st.st_blksize,
                 );
             }
         }
@@ -682,7 +730,8 @@ fn run_fs_smoke() {
         Ok(()) => {
             if sd.st_mode & S_IFMT == S_IFDIR {
                 logln!("PASS: fs_stat /bin dir mode={:#o}", sd.st_mode);
-            } else {
+            }
+            else {
                 logln!("FAIL: fs_stat /bin not a dir, mode={:#o}", sd.st_mode);
             }
         }
@@ -790,7 +839,8 @@ fn run_fs_readdir_smoke() {
     }
     if saw_readme_reg && saw_bin_dir && count_root == 2 {
         logln!("PASS: fs_readdir / count=2 README+bin with right d_type");
-    } else {
+    }
+    else {
         logln!(
             "FAIL: fs_readdir / count={count_root} readme_reg={saw_readme_reg} bin_dir={saw_bin_dir}",
         );
@@ -842,7 +892,8 @@ fn run_fs_readdir_smoke() {
     // names this smoke pins.
     if saw_hello && saw_hello_txt && count_bin >= 2 {
         logln!("PASS: fs_readdir /bin contains hello+hello.txt (count={count_bin})");
-    } else {
+    }
+    else {
         logln!(
             "FAIL: fs_readdir /bin count={count_bin} hello={saw_hello} hello_txt={saw_hello_txt}",
         );
@@ -871,18 +922,13 @@ fn run_fs_readdir_smoke() {
 /// `visit(name, d_type, d_ino)` for each entry. Returns `false` if the
 /// stream is malformed (header runs off the end, name overflows the
 /// record, non-utf8 name, d_reclen smaller than header+name).
-fn walk_dirents(
-    buf: &[u8],
-    mut visit: impl FnMut(&str, u8, u64),
-) -> bool {
+fn walk_dirents(buf: &[u8], mut visit: impl FnMut(&str, u8, u64)) -> bool {
     let mut p = 0usize;
     while p < buf.len() {
         if p + DIRENT_HDR_LEN > buf.len() {
             return false;
         }
-        let hdr = unsafe {
-            core::ptr::read_unaligned(buf[p..].as_ptr() as *const DirEntry)
-        };
+        let hdr = unsafe { core::ptr::read_unaligned(buf[p..].as_ptr() as *const DirEntry) };
         // Copy out packed fields by value (taking refs into a packed
         // struct is UB; copies are fine).
         let reclen = hdr.d_reclen as usize;
@@ -919,7 +965,8 @@ fn run_identity_probe() {
     let pid = getpid();
     if pid > 0 {
         logln!("PASS: getpid main got {pid}");
-    } else {
+    }
+    else {
         logln!("FAIL: getpid main got {pid} (want >0)");
     }
 
@@ -927,7 +974,8 @@ fn run_identity_probe() {
     let tid_b = gettid();
     if tid_a > 0 && tid_a == tid_b {
         logln!("PASS: gettid main got {tid_a} (stable across calls)");
-    } else {
+    }
+    else {
         logln!("FAIL: gettid main got {tid_a} then {tid_b}");
     }
 }
@@ -947,24 +995,34 @@ fn run_env_probe() {
     // entry should round-trip verbatim through the kernel + loader.
     match env::var(b"PATH") {
         Some(v) if v == b"/bin" => logln!("PASS: env PATH=/bin"),
-        Some(v) => logln!("FAIL: env PATH got {:?}", core::str::from_utf8(&v).unwrap_or("<non-utf8>")),
-        None    => logln!("FAIL: env PATH missing"),
+        Some(v) => logln!(
+            "FAIL: env PATH got {:?}",
+            core::str::from_utf8(&v).unwrap_or("<non-utf8>")
+        ),
+        None => logln!("FAIL: env PATH missing"),
     }
     match env::var(b"HOME") {
         Some(v) if v == b"/" => logln!("PASS: env HOME=/"),
-        Some(v) => logln!("FAIL: env HOME got {:?}", core::str::from_utf8(&v).unwrap_or("<non-utf8>")),
-        None    => logln!("FAIL: env HOME missing"),
+        Some(v) => logln!(
+            "FAIL: env HOME got {:?}",
+            core::str::from_utf8(&v).unwrap_or("<non-utf8>")
+        ),
+        None => logln!("FAIL: env HOME missing"),
     }
     match env::var(b"TERM") {
         Some(v) if v == b"dumb" => logln!("PASS: env TERM=dumb"),
-        Some(v) => logln!("FAIL: env TERM got {:?}", core::str::from_utf8(&v).unwrap_or("<non-utf8>")),
-        None    => logln!("FAIL: env TERM missing"),
+        Some(v) => logln!(
+            "FAIL: env TERM got {:?}",
+            core::str::from_utf8(&v).unwrap_or("<non-utf8>")
+        ),
+        None => logln!("FAIL: env TERM missing"),
     }
 
     let count = env::vars().len();
     if count == 3 {
         logln!("PASS: env vars count=3");
-    } else {
+    }
+    else {
         logln!("FAIL: env vars count={count} (want 3)");
     }
 
@@ -975,14 +1033,20 @@ fn run_env_probe() {
     env::set_var(b"FOO", b"bar");
     match env::var(b"FOO") {
         Some(v) if v == b"bar" => logln!("PASS: env set_var/var round trip"),
-        Some(v) => logln!("FAIL: env set_var/var got {:?}", core::str::from_utf8(&v).unwrap_or("<non-utf8>")),
-        None    => logln!("FAIL: env set_var/var read-back missing"),
+        Some(v) => logln!(
+            "FAIL: env set_var/var got {:?}",
+            core::str::from_utf8(&v).unwrap_or("<non-utf8>")
+        ),
+        None => logln!("FAIL: env set_var/var read-back missing"),
     }
 
     env::remove_var(b"FOO");
     match env::var(b"FOO") {
-        None    => logln!("PASS: env remove_var clears entry"),
-        Some(v) => logln!("FAIL: env remove_var still returns {:?}", core::str::from_utf8(&v).unwrap_or("<non-utf8>")),
+        None => logln!("PASS: env remove_var clears entry"),
+        Some(v) => logln!(
+            "FAIL: env remove_var still returns {:?}",
+            core::str::from_utf8(&v).unwrap_or("<non-utf8>")
+        ),
     }
 }
 
@@ -1040,7 +1104,10 @@ fn run_exec_smoke() {
     let _ = close_handle(fd);
 
     if elf.len() != total {
-        logln!("FAIL: exec_smoke read {} bytes, expected {total}", elf.len());
+        logln!(
+            "FAIL: exec_smoke read {} bytes, expected {total}",
+            elf.len()
+        );
         return;
     }
     logln!("PASS: exec_smoke read {total} bytes from /bin/hello");
@@ -1057,8 +1124,8 @@ fn run_exec_smoke() {
     // packs whatever umode hands in). Spawn via create_process_ex.
     let mut argv_buf = [0u8; 256];
     let argv_args: [&[u8]; 3] = [b"/bin/hello", b"world", b"peace"];
-    let argv_len = orbit_abi::argv::pack(&argv_args, &mut argv_buf)
-        .expect("argv blob fits in 256 bytes");
+    let argv_len =
+        orbit_abi::argv::pack(&argv_args, &mut argv_buf).expect("argv blob fits in 256 bytes");
     let argv_blob = &argv_buf[..argv_len];
 
     let child_pid = match create_process_with_argv(elf.as_ptr(), elf.len(), 0, 0, argv_blob) {

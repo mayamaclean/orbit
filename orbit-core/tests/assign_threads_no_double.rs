@@ -62,8 +62,14 @@ fn second_pass_skips_already_assigned_thread() {
     let mut hw = FakeHw::default();
 
     // Pass 1: hart A is the manager. Picks thread for remote B.
-    let self_a = HartView { hart_id: 0, current: &slot_self_a };
-    let remote_b = HartView { hart_id: 1, current: &slot_b };
+    let self_a = HartView {
+        hart_id: 0,
+        current: &slot_self_a,
+    };
+    let remote_b = HartView {
+        hart_id: 1,
+        current: &slot_b,
+    };
     assign_threads(&self_a, [remote_b], &mut sched, &mut hw);
 
     // Thread should be sitting on slot_b with state=Assigned.
@@ -79,8 +85,14 @@ fn second_pass_skips_already_assigned_thread() {
     // thread if it existed, the only thread is in state=Assigned, so
     // the StateAwareSched correctly returns None and nothing gets
     // double-published.
-    let self_c = HartView { hart_id: 2, current: &slot_self_c };
-    let remote_d = HartView { hart_id: 3, current: &slot_d };
+    let self_c = HartView {
+        hart_id: 2,
+        current: &slot_self_c,
+    };
+    let remote_d = HartView {
+        hart_id: 3,
+        current: &slot_d,
+    };
     assign_threads(&self_c, [remote_d], &mut sched, &mut hw);
 
     assert!(
@@ -114,15 +126,23 @@ fn busy_remote_protects_against_overwrite() {
         t
     }));
 
-    let mut sched = StateAwareSched { threads: vec![ready_thread] };
+    let mut sched = StateAwareSched {
+        threads: vec![ready_thread],
+    };
 
     let slot_self = AtomicPtr::new(null_mut());
     // Hart B is already running busy_thread — its current points there.
     let slot_b = AtomicPtr::new(busy_thread as *mut ());
     let mut hw = FakeHw::default();
 
-    let self_view = HartView { hart_id: 0, current: &slot_self };
-    let remote_b = HartView { hart_id: 1, current: &slot_b };
+    let self_view = HartView {
+        hart_id: 0,
+        current: &slot_self,
+    };
+    let remote_b = HartView {
+        hart_id: 1,
+        current: &slot_b,
+    };
     assign_threads(&self_view, [remote_b], &mut sched, &mut hw);
 
     // Hart B's current must STILL be busy_thread — no overwrite.
@@ -160,14 +180,22 @@ fn affinity_pin_blocks_unwanted_assignment() {
         t
     }));
 
-    let mut sched = StateAwareSched { threads: vec![pinned] };
+    let mut sched = StateAwareSched {
+        threads: vec![pinned],
+    };
 
     let slot_self = AtomicPtr::new(null_mut()); // hart 1 is self
     let slot_remote = AtomicPtr::new(null_mut()); // hart 2 is remote
     let mut hw = FakeHw::default();
 
-    let self_view = HartView { hart_id: 1, current: &slot_self };
-    let remote = HartView { hart_id: 2, current: &slot_remote };
+    let self_view = HartView {
+        hart_id: 1,
+        current: &slot_self,
+    };
+    let remote = HartView {
+        hart_id: 2,
+        current: &slot_remote,
+    };
     assign_threads(&self_view, [remote], &mut sched, &mut hw);
 
     assert!(
@@ -198,12 +226,17 @@ fn no_runnables_leaves_all_slots_null() {
     let assigned = Box::into_raw(Box::new(make_thread(ThreadState::Assigned, SPP::User)));
     let suspended = Box::into_raw(Box::new(make_thread(ThreadState::Suspended, SPP::User)));
 
-    let mut sched = StateAwareSched { threads: vec![running, assigned, suspended] };
+    let mut sched = StateAwareSched {
+        threads: vec![running, assigned, suspended],
+    };
 
     let slots: [AtomicPtr<()>; 4] = std::array::from_fn(|_| AtomicPtr::new(null_mut()));
     let mut hw = FakeHw::default();
 
-    let self_view = HartView { hart_id: 0, current: &slots[0] };
+    let self_view = HartView {
+        hart_id: 0,
+        current: &slots[0],
+    };
     let remotes: [HartView; 3] = std::array::from_fn(|i| HartView {
         hart_id: (i + 1),
         current: &slots[i + 1],

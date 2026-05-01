@@ -196,7 +196,7 @@ mod tests {
         // still zero — caller-side discipline keeps the unwritten
         // suffix safely default-valued.
         assert!(user_bytes.iter().all(|&b| b == 0));
-        assert_eq!(user_buf.size, 0);  // signals "kernel didn't write"
+        assert_eq!(user_buf.size, 0); // signals "kernel didn't write"
     }
 
     #[test]
@@ -208,26 +208,26 @@ mod tests {
         let s = ProcessStats::default();
         let base = &s as *const _ as usize;
 
-        assert_eq!(&s.size                   as *const _ as usize - base,   0);
-        assert_eq!(&s._reserved              as *const _ as usize - base,   4);
-        assert_eq!(&s.pid                    as *const _ as usize - base,   8);
-        assert_eq!(&s.thread_count           as *const _ as usize - base,  10);
-        assert_eq!(&s._pad0                  as *const _ as usize - base,  12);
-        assert_eq!(&s.cpu_ticks              as *const _ as usize - base,  16);
-        assert_eq!(&s.context_switches       as *const _ as usize - base,  24);
-        assert_eq!(&s.syscalls               as *const _ as usize - base,  32);
-        assert_eq!(&s.resident_bytes         as *const _ as usize - base,  40);
-        assert_eq!(&s.heap_bytes             as *const _ as usize - base,  48);
-        assert_eq!(&s.kernel_kpages_bytes    as *const _ as usize - base,  56);
+        assert_eq!(&s.size as *const _ as usize - base, 0);
+        assert_eq!(&s._reserved as *const _ as usize - base, 4);
+        assert_eq!(&s.pid as *const _ as usize - base, 8);
+        assert_eq!(&s.thread_count as *const _ as usize - base, 10);
+        assert_eq!(&s._pad0 as *const _ as usize - base, 12);
+        assert_eq!(&s.cpu_ticks as *const _ as usize - base, 16);
+        assert_eq!(&s.context_switches as *const _ as usize - base, 24);
+        assert_eq!(&s.syscalls as *const _ as usize - base, 32);
+        assert_eq!(&s.resident_bytes as *const _ as usize - base, 40);
+        assert_eq!(&s.heap_bytes as *const _ as usize - base, 48);
+        assert_eq!(&s.kernel_kpages_bytes as *const _ as usize - base, 56);
         assert_eq!(&s.kernel_user_pages_bytes as *const _ as usize - base, 64);
-        assert_eq!(&s.kernel_ktables_bytes   as *const _ as usize - base,  72);
-        assert_eq!(&s.kernel_heap_bytes      as *const _ as usize - base,  80);
-        assert_eq!(&s.syscall_ticks          as *const _ as usize - base,  88);
-        assert_eq!(&s.hart_user_ticks        as *const _ as usize - base,  96);
-        assert_eq!(&s.hart_kernel_ticks      as *const _ as usize - base, 104);
-        assert_eq!(&s.hart_scheduler_ticks   as *const _ as usize - base, 112);
-        assert_eq!(&s.hart_idle_ticks        as *const _ as usize - base, 120);
-        assert_eq!(&s.perm_denials    as *const _ as usize - base, 128);
-        assert_eq!(&s.role_denials    as *const _ as usize - base, 136);
+        assert_eq!(&s.kernel_ktables_bytes as *const _ as usize - base, 72);
+        assert_eq!(&s.kernel_heap_bytes as *const _ as usize - base, 80);
+        assert_eq!(&s.syscall_ticks as *const _ as usize - base, 88);
+        assert_eq!(&s.hart_user_ticks as *const _ as usize - base, 96);
+        assert_eq!(&s.hart_kernel_ticks as *const _ as usize - base, 104);
+        assert_eq!(&s.hart_scheduler_ticks as *const _ as usize - base, 112);
+        assert_eq!(&s.hart_idle_ticks as *const _ as usize - base, 120);
+        assert_eq!(&s.perm_denials as *const _ as usize - base, 128);
+        assert_eq!(&s.role_denials as *const _ as usize - base, 136);
     }
 }

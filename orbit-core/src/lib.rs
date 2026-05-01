@@ -14,12 +14,12 @@ use orbit_abi::layout::UserVa;
 use process::ThreadState;
 
 pub mod accounting;
+pub mod denial_ring;
 pub mod manager;
 pub mod net;
 pub mod pending_work;
 pub mod ready_queue;
 pub mod sched;
-pub mod denial_ring;
 pub mod sleep_heap;
 pub mod syscall;
 pub mod tlb_shootdown;
@@ -127,7 +127,10 @@ pub enum SyscallOutcome {
     /// sees that value; `None` means "leave the frame alone" for
     /// manager-completed syscalls (mmap, nc_create, close) whose return
     /// value is written into `thread.frame.regs[10]` at unblock time.
-    Yield { state: ThreadState, ret: Option<isize> },
+    Yield {
+        state: ThreadState,
+        ret: Option<isize>,
+    },
 
     /// Write `ret` into `regs[10]`, commit the frame snapshot + pc bump
     /// (so the thread resumes past the ecall with `ret` visible), and

@@ -14,8 +14,8 @@
 //! manager involvement.
 
 use mmu::sv48::PhysAddr;
-use orbit_abi::layout::UserVa;
 use net_channel::BindSpec;
+use orbit_abi::layout::UserVa;
 use process::CompletionHandle;
 
 #[derive(Debug, Clone, Copy)]

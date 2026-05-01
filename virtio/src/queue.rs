@@ -26,7 +26,7 @@ pub struct VirtqAvail {
     pub flags: u16,
     pub idx: u16,
     pub ring: [u16; 0], // trailing array, queue_size entries
-    // pub used_event: u16 — after ring, when EVENT_IDX feature negotiated
+                        // pub used_event: u16 — after ring, when EVENT_IDX feature negotiated
 }
 
 #[repr(C)]
@@ -125,10 +125,18 @@ impl Virtqueue {
         }
     }
 
-    pub fn size(&self) -> u16 { self.size }
-    pub fn desc_pa(&self) -> u64 { self.desc_pa }
-    pub fn avail_pa(&self) -> u64 { self.avail_pa }
-    pub fn used_pa(&self) -> u64 { self.used_pa }
+    pub fn size(&self) -> u16 {
+        self.size
+    }
+    pub fn desc_pa(&self) -> u64 {
+        self.desc_pa
+    }
+    pub fn avail_pa(&self) -> u64 {
+        self.avail_pa
+    }
+    pub fn used_pa(&self) -> u64 {
+        self.used_pa
+    }
 
     /// Build a descriptor chain from `bufs`, publish the head on the
     /// avail ring, and return the head index. Caller must call
@@ -261,7 +269,8 @@ impl Virtqueue {
     pub fn peek_free_head(&self) -> Option<u16> {
         if self.num_free == 0 {
             None
-        } else {
+        }
+        else {
             Some(self.free_head)
         }
     }

@@ -26,7 +26,10 @@ use orbit_rt as _;
 use core::fmt::Write;
 use core::panic::PanicInfo;
 
-use orbit_abi::{logln, user::{exit, get_micros, sleep_ms, ConsoleWriter}};
+use orbit_abi::{
+    logln,
+    user::{ConsoleWriter, exit, get_micros, sleep_ms},
+};
 
 /// Sleep durations to characterize, in milliseconds. 1ms is the
 /// classic "sub-heartbeat" case; 10/100ms are above the heartbeat
@@ -37,9 +40,9 @@ const TARGETS_MS: &[usize] = &[1, 5, 10, 100];
 /// wallclock bounded — at 100ms × 100 iterations = ~10s per sweep.
 fn iterations_for(target_ms: usize) -> usize {
     match target_ms {
-        0..=2   => 500,
-        3..=20  => 200,
-        _       => 50,
+        0..=2 => 500,
+        3..=20 => 200,
+        _ => 50,
     }
 }
 
@@ -72,8 +75,12 @@ impl Stats {
         }
         let v = overshoot_us as u64;
         self.sum_us += v;
-        if self.n == 1 || v < self.min_us { self.min_us = v; }
-        if v > self.max_us { self.max_us = v; }
+        if self.n == 1 || v < self.min_us {
+            self.min_us = v;
+        }
+        if v > self.max_us {
+            self.max_us = v;
+        }
         for (i, &bound) in BUCKET_BOUNDS_US.iter().enumerate() {
             if v < bound {
                 self.buckets[i] += 1;
@@ -109,15 +116,26 @@ fn print_stats(target_ms: usize, s: &Stats) {
     let _ = write!(
         w,
         "SLEEP target_ms={} n={} under={} min_us={} mean_us={} max_us={} buckets=[",
-        target_ms, s.n, s.under_target, s.min_us, s.mean_us(), s.max_us,
+        target_ms,
+        s.n,
+        s.under_target,
+        s.min_us,
+        s.mean_us(),
+        s.max_us,
     );
     // Bucket label format: "<100=N <500=N <1000=N ... >=10000=N".
     for (i, &bound) in BUCKET_BOUNDS_US.iter().enumerate() {
-        if i > 0 { let _ = write!(w, " "); }
+        if i > 0 {
+            let _ = write!(w, " ");
+        }
         let _ = write!(w, "<{}us={}", bound, s.buckets[i]);
     }
-    let _ = write!(w, " >={}us={}", BUCKET_BOUNDS_US[BUCKET_BOUNDS_US.len() - 1],
-                   s.buckets[NUM_BUCKETS - 1]);
+    let _ = write!(
+        w,
+        " >={}us={}",
+        BUCKET_BOUNDS_US[BUCKET_BOUNDS_US.len() - 1],
+        s.buckets[NUM_BUCKETS - 1]
+    );
     let _ = writeln!(w, "]");
     w.flush();
 }

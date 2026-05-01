@@ -22,12 +22,7 @@ use riscv::register::sstatus::SPP;
 /// `enter_hart_context_asm`). In that case `epc` points into kernel
 /// `.text` and saving it as `thread.pc` would break `sret` on resume —
 /// see [docs/trap-mode-guard.md](../../docs/trap-mode-guard.md).
-pub fn update_trap_frame(
-    thread: &mut Thread,
-    epc: usize,
-    frame: &mut TrapFrame,
-    from_user: bool,
-) {
+pub fn update_trap_frame(thread: &mut Thread, epc: usize, frame: &mut TrapFrame, from_user: bool) {
     frame.asid = thread.pid as usize;
 
     let trap_was_in_thread = (thread.mode == SPP::User) == from_user;

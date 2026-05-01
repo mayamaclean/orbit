@@ -24,9 +24,14 @@ mod common;
 /// raw tag, and the eventual `drain_woken` reborrow would fail.
 unsafe fn park(thread: *mut process::Thread, wake_time: usize) -> u64 {
     unsafe {
-        let seq = (*thread).sleep_seq.fetch_add(1, Ordering::Release).wrapping_add(1);
+        let seq = (*thread)
+            .sleep_seq
+            .fetch_add(1, Ordering::Release)
+            .wrapping_add(1);
         (*thread).wake_time = wake_time;
-        (*thread).state.store(ThreadState::Suspended as usize, Ordering::Release);
+        (*thread)
+            .state
+            .store(ThreadState::Suspended as usize, Ordering::Release);
         seq
     }
 }
@@ -111,7 +116,8 @@ fn stale_entry_state_changed_to_ready() {
 
     // Eager promotion: state → Ready, no seq change. Mirrors what
     // set_wake_reason_where does in kmain.
-    t.state.store(ThreadState::Ready as usize, Ordering::Release);
+    t.state
+        .store(ThreadState::Ready as usize, Ordering::Release);
 
     let mut woken = Vec::new();
     h.drain_woken(150, |p| woken.push(p));
@@ -127,7 +133,8 @@ fn stale_entry_state_exited() {
     let mut h = SleepHeap::new();
     h.push(tp, 100, seq);
 
-    t.state.store(ThreadState::Exited as usize, Ordering::Release);
+    t.state
+        .store(ThreadState::Exited as usize, Ordering::Release);
 
     let mut woken = Vec::new();
     h.drain_woken(150, |p| woken.push(p));
@@ -144,7 +151,8 @@ fn stale_entry_seq_mismatch_after_repark() {
     h.push(tp, 100, seq1);
 
     // Eager wake → re-park with new deadline. seq increments.
-    t.state.store(ThreadState::Ready as usize, Ordering::Release);
+    t.state
+        .store(ThreadState::Ready as usize, Ordering::Release);
     let seq2 = unsafe { park(tp, 500) };
     h.push(tp, 500, seq2);
     assert_eq!(h.len(), 2);
@@ -173,9 +181,14 @@ fn transient_state_running_with_matching_seq() {
     // Pre-park sequence: fetch_add seq, set wake_time, but state is
     // still Running (asm handoff hasn't published Suspended yet).
     let seq = unsafe {
-        let s = (*tp).sleep_seq.fetch_add(1, Ordering::Release).wrapping_add(1);
+        let s = (*tp)
+            .sleep_seq
+            .fetch_add(1, Ordering::Release)
+            .wrapping_add(1);
         (*tp).wake_time = 100;
-        (*tp).state.store(ThreadState::Running as usize, Ordering::Release);
+        (*tp)
+            .state
+            .store(ThreadState::Running as usize, Ordering::Release);
         s
     };
     let mut h = SleepHeap::new();
@@ -189,7 +202,8 @@ fn transient_state_running_with_matching_seq() {
     assert_eq!(h.len(), 1, "transient entry must stay in heap");
 
     // Once state commits to Suspended, next pass fires normally.
-    t.state.store(ThreadState::Suspended as usize, Ordering::Release);
+    t.state
+        .store(ThreadState::Suspended as usize, Ordering::Release);
     h.drain_woken(500, |p| woken.push(p));
     assert_eq!(woken, vec![tp]);
     assert!(h.is_empty());
@@ -212,11 +226,16 @@ fn mix_of_live_stale_and_pending() {
     h.push(tp3, 300, s3);
 
     // Eagerly wake t1 (stale). t2 deadline-elapsed at drain time. t3 future.
-    t1.state.store(ThreadState::Ready as usize, Ordering::Release);
+    t1.state
+        .store(ThreadState::Ready as usize, Ordering::Release);
 
     let mut woken = Vec::new();
     h.drain_woken(250, |p| woken.push(p));
-    assert_eq!(woken, vec![tp2], "t1 stale (popped silently), t2 woken, t3 future");
+    assert_eq!(
+        woken,
+        vec![tp2],
+        "t1 stale (popped silently), t2 woken, t3 future"
+    );
     assert_eq!(h.len(), 1);
     assert_eq!(h.next_wake(), Some(300));
 }

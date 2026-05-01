@@ -34,11 +34,15 @@
 
 extern crate alloc;
 
-use core::{alloc::Layout, ptr::NonNull, sync::atomic::{AtomicBool, Ordering}};
+use core::{
+    alloc::Layout,
+    ptr::NonNull,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use alloc::vec::Vec;
 
-use net_channel::{BindSpec, NetChannel, NC_MAX_REGION_SIZE, NC_MIN_REGION_SIZE, channel_state};
+use net_channel::{BindSpec, NC_MAX_REGION_SIZE, NC_MIN_REGION_SIZE, NetChannel, channel_state};
 use orbit_abi::{
     Errno, Fd,
     errno::{EAGAIN, EBUSY, EINVAL, EIO},
@@ -96,11 +100,11 @@ impl NetCh {
         sock_type: SockType,
         spec: BindSpec,
     ) -> Result<Self, Errno> {
-        let region_size =
-            pick_region_size(desired_ring_capacity).ok_or(Errno::new(EINVAL))?;
+        let region_size = pick_region_size(desired_ring_capacity).ok_or(Errno::new(EINVAL))?;
         let align = if region_size >= LARGE_PAGE as usize {
             LARGE_PAGE as usize
-        } else {
+        }
+        else {
             PAGE_SIZE as usize
         };
         let layout = Layout::from_size_align(region_size, align).map_err(|_| Errno::new(EINVAL))?;
@@ -108,9 +112,8 @@ impl NetCh {
         let region = SharedRegion::reserve(layout)?;
         let vaddr_hint = region.va();
 
-        let (mapped_va, descriptor) = create_netch(
-            vaddr_hint, region_size, sock_type as usize, spec.pack(),
-        )?;
+        let (mapped_va, descriptor) =
+            create_netch(vaddr_hint, region_size, sock_type as usize, spec.pack())?;
         if mapped_va != vaddr_hint {
             // Best-effort cleanup: tell the kernel to drop the mapping it
             // just installed elsewhere, then let `region` drop and return
@@ -122,8 +125,8 @@ impl NetCh {
         // SAFETY: the kernel installed a NetChannel at `vaddr_hint`,
         // initialized via NetChannel::init, and the VA is in our address
         // space — same satp as everything else in this thread.
-        let base = NonNull::new(vaddr_hint as *mut NetChannel)
-            .expect("create_netch returned non-null VA");
+        let base =
+            NonNull::new(vaddr_hint as *mut NetChannel).expect("create_netch returned non-null VA");
 
         Ok(Self {
             region: Some(region),
@@ -155,10 +158,7 @@ impl NetCh {
     /// Mostly useful for diagnostics; normal callers go through
     /// [`next_session`].
     pub fn current_state(&self) -> i32 {
-        self.channel()
-            .current()
-            .state
-            .load(Ordering::Acquire)
+        self.channel().current().state.load(Ordering::Acquire)
     }
 
     /// Sticky cause from [`current_state`](Self::current_state) when it
@@ -267,7 +267,8 @@ impl<'a> Session<'a> {
     /// no data is currently available, `EIO` if the channel transitions
     /// to a non-active state.
     pub fn read(&self, dst: &mut [u8]) -> Result<usize, Errno> {
-        self.nc.channel()
+        self.nc
+            .channel()
             .recv_tcp(|src| {
                 let n = src.len().min(dst.len());
                 if n == 0 {
@@ -283,7 +284,8 @@ impl<'a> Session<'a> {
     /// than `src.len()` if the ring is partially full), `EAGAIN` if no
     /// space is currently available, `EIO` on non-active state.
     pub fn write(&self, src: &[u8]) -> Result<usize, Errno> {
-        self.nc.channel()
+        self.nc
+            .channel()
             .send_tcp(|dst| {
                 let n = dst.len().min(src.len());
                 if n == 0 {
@@ -311,7 +313,11 @@ impl<'a> Session<'a> {
     /// Block until at least one byte transfers (or the channel breaks).
     /// Convenience over [`Self::read`] for callers that don't have
     /// their own poll loop.
-    pub fn read_some_with_poll_timeout(&self, dst: &mut [u8], poll_ms: usize) -> Result<usize, Errno> {
+    pub fn read_some_with_poll_timeout(
+        &self,
+        dst: &mut [u8],
+        poll_ms: usize,
+    ) -> Result<usize, Errno> {
         loop {
             match self.read(dst) {
                 Ok(0) => nc_yield(poll_ms)?,
@@ -335,12 +341,9 @@ impl<'a> Session<'a> {
     /// `read` clamps to `dst.len()` which the caller fixed up-front.
     /// Slice-granularity drain needs the closure to see `src.len()` and
     /// size the destination accordingly — that's what this method does.
-    pub fn read_into_vec(
-        &self,
-        dst: &mut Vec<u8>,
-        cap_bytes: usize,
-    ) -> Result<usize, Errno> {
-        self.nc.channel()
+    pub fn read_into_vec(&self, dst: &mut Vec<u8>, cap_bytes: usize) -> Result<usize, Errno> {
+        self.nc
+            .channel()
             .recv_tcp(|src| {
                 let n = src.len().min(cap_bytes);
                 if n == 0 {
@@ -359,11 +362,7 @@ impl<'a> Session<'a> {
     /// Block until at least one byte is appended to `dst` (or the
     /// channel breaks). Convenience over [`Self::read_into_vec`] for
     /// drain-everything callers like the loader.
-    pub fn read_into_vec_some(
-        &self,
-        dst: &mut Vec<u8>,
-        cap_bytes: usize,
-    ) -> Result<usize, Errno> {
+    pub fn read_into_vec_some(&self, dst: &mut Vec<u8>, cap_bytes: usize) -> Result<usize, Errno> {
         loop {
             match self.read_into_vec(dst, cap_bytes) {
                 Ok(0) => nc_yield(DEFAULT_POLL_MS)?,
@@ -394,12 +393,20 @@ impl<'a> Session<'a> {
     /// client bindings: redundant with the bind params, exposed for
     /// symmetry.
     pub fn peer_addr(&self) -> u32 {
-        self.nc.channel().current().peer_addr.load(Ordering::Acquire)
+        self.nc
+            .channel()
+            .current()
+            .peer_addr
+            .load(Ordering::Acquire)
     }
 
     /// Peer's TCP port (paired with [`peer_addr`](Self::peer_addr)).
     pub fn peer_port(&self) -> u16 {
-        self.nc.channel().current().peer_port.load(Ordering::Acquire)
+        self.nc
+            .channel()
+            .current()
+            .peer_port
+            .load(Ordering::Acquire)
     }
 }
 
@@ -441,7 +448,9 @@ impl Drop for Session<'_> {
         // it was alive, and the state-out-of-2 wait above observed
         // the kernel's recycle. Kernel has reset_kernel_side'd in the
         // disengage edge handler before flipping state away from 2.
-        unsafe { nc.channel().reset_user_side(); }
+        unsafe {
+            nc.channel().reset_user_side();
+        }
 
         nc.in_session.store(false, Ordering::Release);
     }
@@ -466,8 +475,8 @@ impl Drop for Session<'_> {
 fn map_io_err(e: isize) -> Errno {
     match e {
         -4 | -5 => Errno::new(EAGAIN),
-        0 | 1   => Errno::new(EAGAIN),
-        _       => Errno::new(EIO),
+        0 | 1 => Errno::new(EAGAIN),
+        _ => Errno::new(EIO),
     }
 }
 
@@ -483,6 +492,8 @@ fn pick_region_size(desired: usize) -> Option<usize> {
     if desired > max_capacity {
         return None;
     }
-    let approx = desired.saturating_mul(2).next_multiple_of(PAGE_SIZE as usize);
+    let approx = desired
+        .saturating_mul(2)
+        .next_multiple_of(PAGE_SIZE as usize);
     NetChannel::normalize_region_size(approx)
 }

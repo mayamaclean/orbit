@@ -29,10 +29,18 @@ pub struct MappingGeometry {
 /// caller and the manager doesn't touch allocators.
 pub fn select_mapping_geometry(vaddr: usize, size: usize) -> Option<MappingGeometry> {
     if vaddr % MEGAPAGE_SIZE == 0 && size % MEGAPAGE_SIZE == 0 {
-        Some(MappingGeometry { align: MEGAPAGE_SIZE, levels: 3_usize })
-    } else if vaddr % PAGE_SIZE == 0 && size % PAGE_SIZE == 0 {
-        Some(MappingGeometry { align: PAGE_SIZE, levels: 4_usize })
-    } else {
+        Some(MappingGeometry {
+            align: MEGAPAGE_SIZE,
+            levels: 3_usize,
+        })
+    }
+    else if vaddr % PAGE_SIZE == 0 && size % PAGE_SIZE == 0 {
+        Some(MappingGeometry {
+            align: PAGE_SIZE,
+            levels: 4_usize,
+        })
+    }
+    else {
         None
     }
 }

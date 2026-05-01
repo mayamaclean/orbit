@@ -5,7 +5,7 @@
 
 use tracing::{error, info, warn};
 use virtio::mmio::Mmio;
-use virtio::queue::{Buf, Virtqueue, VirtqBacking};
+use virtio::queue::{Buf, VirtqBacking, Virtqueue};
 use virtio::transport::{self, InitError};
 
 use crate::proto::*;
@@ -28,7 +28,9 @@ pub enum GpuError {
 }
 
 impl From<InitError> for GpuError {
-    fn from(e: InitError) -> Self { GpuError::Init(e) }
+    fn from(e: InitError) -> Self {
+        GpuError::Init(e)
+    }
 }
 
 pub struct DisplayInfo {
@@ -89,7 +91,8 @@ impl Gpu {
             if qmax < ctrl.size() as u32 {
                 warn!(
                     "virtio-gpu: QueueNumMax={} smaller than requested {}",
-                    qmax, ctrl.size()
+                    qmax,
+                    ctrl.size()
                 );
                 return Err(GpuError::Init(InitError::FailedHandshake));
             }
@@ -137,18 +140,20 @@ impl Gpu {
             core::ptr::write_bytes(resp_kva, 0, 1);
             req_kva.write_volatile(req);
 
-            self.ctrl.push_chain(&[
-                Buf {
-                    pa: self.arena_pa + REQ_OFFSET as u64,
-                    len: core::mem::size_of::<Req>() as u32,
-                    write: false,
-                },
-                Buf {
-                    pa: self.arena_pa + RESP_OFFSET as u64,
-                    len: core::mem::size_of::<Resp>() as u32,
-                    write: true,
-                },
-            ]).map_err(|_| GpuError::QueueFull)?;
+            self.ctrl
+                .push_chain(&[
+                    Buf {
+                        pa: self.arena_pa + REQ_OFFSET as u64,
+                        len: core::mem::size_of::<Req>() as u32,
+                        write: false,
+                    },
+                    Buf {
+                        pa: self.arena_pa + RESP_OFFSET as u64,
+                        len: core::mem::size_of::<Resp>() as u32,
+                        write: true,
+                    },
+                ])
+                .map_err(|_| GpuError::QueueFull)?;
 
             self.mmio.notify_queue(CTRL_QUEUE);
 
@@ -194,7 +199,10 @@ impl Gpu {
         format: u32,
     ) -> Result<(), GpuError> {
         let req = ResourceCreate2d {
-            hdr: CtrlHdr { ty: CMD_RESOURCE_CREATE_2D, ..CtrlHdr::default() },
+            hdr: CtrlHdr {
+                ty: CMD_RESOURCE_CREATE_2D,
+                ..CtrlHdr::default()
+            },
             resource_id,
             format,
             width,
@@ -211,7 +219,10 @@ impl Gpu {
         backing_len: u32,
     ) -> Result<(), GpuError> {
         let req = ResourceAttachBacking {
-            hdr: CtrlHdr { ty: CMD_RESOURCE_ATTACH_BACKING, ..CtrlHdr::default() },
+            hdr: CtrlHdr {
+                ty: CMD_RESOURCE_ATTACH_BACKING,
+                ..CtrlHdr::default()
+            },
             resource_id,
             nr_entries: 1,
             entry: MemEntry {
@@ -232,8 +243,16 @@ impl Gpu {
         height: u32,
     ) -> Result<(), GpuError> {
         let req = SetScanout {
-            hdr: CtrlHdr { ty: CMD_SET_SCANOUT, ..CtrlHdr::default() },
-            r: Rect { x: 0, y: 0, width, height },
+            hdr: CtrlHdr {
+                ty: CMD_SET_SCANOUT,
+                ..CtrlHdr::default()
+            },
+            r: Rect {
+                x: 0,
+                y: 0,
+                width,
+                height,
+            },
             scanout_id,
             resource_id,
         };
@@ -250,8 +269,16 @@ impl Gpu {
         height: u32,
     ) -> Result<(), GpuError> {
         let req = TransferToHost2d {
-            hdr: CtrlHdr { ty: CMD_TRANSFER_TO_HOST_2D, ..CtrlHdr::default() },
-            r: Rect { x, y, width, height },
+            hdr: CtrlHdr {
+                ty: CMD_TRANSFER_TO_HOST_2D,
+                ..CtrlHdr::default()
+            },
+            r: Rect {
+                x,
+                y,
+                width,
+                height,
+            },
             offset: 0,
             resource_id,
             _padding: 0,
@@ -269,8 +296,16 @@ impl Gpu {
         height: u32,
     ) -> Result<(), GpuError> {
         let req = ResourceFlush {
-            hdr: CtrlHdr { ty: CMD_RESOURCE_FLUSH, ..CtrlHdr::default() },
-            r: Rect { x, y, width, height },
+            hdr: CtrlHdr {
+                ty: CMD_RESOURCE_FLUSH,
+                ..CtrlHdr::default()
+            },
+            r: Rect {
+                x,
+                y,
+                width,
+                height,
+            },
             resource_id,
             _padding: 0,
         };
@@ -282,7 +317,8 @@ impl Gpu {
 fn check_ok(ty: u32) -> Result<(), GpuError> {
     if ty == RESP_OK_NODATA {
         Ok(())
-    } else {
+    }
+    else {
         Err(GpuError::DeviceError(ty))
     }
 }

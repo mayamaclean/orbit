@@ -35,7 +35,9 @@ pub struct ReadyQueue {
 
 impl ReadyQueue {
     pub const fn new() -> Self {
-        Self { inner: VecDeque::new() }
+        Self {
+            inner: VecDeque::new(),
+        }
     }
 
     /// Append a thread to the back of the queue. Caller has ensured
@@ -59,9 +61,10 @@ impl ReadyQueue {
         // registry only frees from `cleanup_threads_and_processes`,
         // which runs on the manager hart in the same critical
         // section as queue mutation — no use-after-free window.
-        let idx = self.inner.iter().position(|&t| unsafe {
-            (*t).affinity.load(Ordering::Relaxed) & hart_mask != 0
-        })?;
+        let idx = self
+            .inner
+            .iter()
+            .position(|&t| unsafe { (*t).affinity.load(Ordering::Relaxed) & hart_mask != 0 })?;
         self.inner.remove(idx)
     }
 

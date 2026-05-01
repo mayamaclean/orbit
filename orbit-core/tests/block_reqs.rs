@@ -3,10 +3,10 @@ mod common;
 use process::ThreadState;
 use riscv::register::sstatus::SPP;
 
-use orbit_abi::errno::{Errno, EAGAIN, EFAULT, EINVAL};
+use orbit_abi::errno::{EAGAIN, EFAULT, EINVAL, Errno};
 use orbit_abi::layout::{
-    UPROC_PRIV_BASE, UPROC_PRIV_END, UPROC_SHARED_BASE, UPROC_SHARED_END,
-    USER_TEXT_BASE, USER_VA_END,
+    UPROC_PRIV_BASE, UPROC_PRIV_END, UPROC_SHARED_BASE, UPROC_SHARED_END, USER_TEXT_BASE,
+    USER_VA_END,
 };
 use orbit_core::{PendingWork, SyscallOutcome, syscall};
 
@@ -35,12 +35,17 @@ fn mmap_req_shared_marshals_args_and_blocks() {
 
     assert_eq!(
         outcome,
-        SyscallOutcome::Yield { state: ThreadState::Blocking, ret: None }
+        SyscallOutcome::Yield {
+            state: ThreadState::Blocking,
+            ret: None
+        }
     );
     assert!(t.handle.is_some(), "thread should be parked on a handle");
     assert_eq!(hw.pending_work.len(), 1);
     match &hw.pending_work[0] {
-        PendingWork::MemMap { req, pid, handle, .. } => {
+        PendingWork::MemMap {
+            req, pid, handle, ..
+        } => {
             assert_eq!(req.vaddr.raw(), SHARED_VA as u64);
             assert_eq!(req.size, 4096);
             assert_eq!(req.page_permissions, 0x17);
@@ -86,7 +91,12 @@ fn mmap_req_returns_eagain_when_ring_full() {
 
     let outcome = syscall::mmap_req(&mut t, &frame, &mut hw);
 
-    assert_eq!(outcome, SyscallOutcome::Return { ret: Errno::new(EAGAIN).to_ret() });
+    assert_eq!(
+        outcome,
+        SyscallOutcome::Return {
+            ret: Errno::new(EAGAIN).to_ret()
+        }
+    );
     assert!(t.handle.is_none(), "no parking on push failure");
     assert!(hw.pending_work.is_empty());
 }
@@ -106,7 +116,10 @@ fn nc_create_req_marshals_args_and_blocks() {
 
     assert_eq!(
         outcome,
-        SyscallOutcome::Yield { state: ThreadState::Blocking, ret: None }
+        SyscallOutcome::Yield {
+            state: ThreadState::Blocking,
+            ret: None
+        }
     );
     assert!(t.handle.is_some());
     match &hw.pending_work[0] {
@@ -132,13 +145,15 @@ fn nc_create_req_rejects_malformed_bind_spec() {
     frame.regs[11] = SHARED_VA;
     frame.regs[12] = 4096;
     frame.regs[13] = 0;
-    frame.regs[14] = 0;  // mode 0 = invalid
+    frame.regs[14] = 0; // mode 0 = invalid
 
     let outcome = syscall::nc_create_req(&mut t, &frame, &mut hw);
 
     assert_eq!(
         outcome,
-        SyscallOutcome::Return { ret: Errno::new(EINVAL).to_ret() }
+        SyscallOutcome::Return {
+            ret: Errno::new(EINVAL).to_ret()
+        }
     );
     assert!(t.handle.is_none());
     assert!(hw.pending_work.is_empty());
@@ -155,7 +170,10 @@ fn close_req_marshals_fd_and_blocks() {
 
     assert_eq!(
         outcome,
-        SyscallOutcome::Yield { state: ThreadState::Blocking, ret: None }
+        SyscallOutcome::Yield {
+            state: ThreadState::Blocking,
+            ret: None
+        }
     );
     assert!(t.handle.is_some());
     match &hw.pending_work[0] {
@@ -196,12 +214,17 @@ fn create_process_req_marshals_args_and_blocks() {
 
     assert_eq!(
         outcome,
-        SyscallOutcome::Yield { state: ThreadState::Blocking, ret: None }
+        SyscallOutcome::Yield {
+            state: ThreadState::Blocking,
+            ret: None
+        }
     );
     assert!(t.handle.is_some(), "thread should be parked on a handle");
     assert_eq!(hw.pending_work.len(), 1);
     match &hw.pending_work[0] {
-        PendingWork::CreateProcess { req, pid, handle, .. } => {
+        PendingWork::CreateProcess {
+            req, pid, handle, ..
+        } => {
             assert_eq!(req.elf_vaddr.raw(), 0x2_2000_0000);
             assert_eq!(req.elf_len, 0x4000);
             assert_eq!(*pid, t.pid);
@@ -219,19 +242,27 @@ fn create_thread_req_marshals_args_and_blocks() {
     let mut frame = make_frame();
     let mut hw = FakeHw::default();
     frame.regs[11] = USER_TEXT_BASE as usize + 0x100; // entry inside user text
-    frame.regs[12] = 0xF;                              // allowed_affinity
-    frame.regs[13] = 0x4;                              // affinity (subset of allowed)
+    frame.regs[12] = 0xF; // allowed_affinity
+    frame.regs[13] = 0x4; // affinity (subset of allowed)
 
     let outcome = syscall::create_thread(&mut t, &frame, &mut hw);
 
     assert_eq!(
         outcome,
-        SyscallOutcome::Yield { state: ThreadState::Blocking, ret: None }
+        SyscallOutcome::Yield {
+            state: ThreadState::Blocking,
+            ret: None
+        }
     );
     assert!(t.handle.is_some(), "thread should be parked on a handle");
     assert_eq!(hw.pending_work.len(), 1);
     match &hw.pending_work[0] {
-        PendingWork::CreateThread { req, pid, parent_allowed, handle } => {
+        PendingWork::CreateThread {
+            req,
+            pid,
+            parent_allowed,
+            handle,
+        } => {
             assert_eq!(req.entry.raw(), USER_TEXT_BASE + 0x100);
             assert_eq!(req.allowed_affinity, 0xF);
             assert_eq!(req.affinity, 0x4);
@@ -255,7 +286,12 @@ fn create_thread_req_rejects_kernel_entry() {
 
     let outcome = syscall::create_thread(&mut t, &frame, &mut hw);
 
-    assert_eq!(outcome, SyscallOutcome::Return { ret: Errno::new(EFAULT).to_ret() });
+    assert_eq!(
+        outcome,
+        SyscallOutcome::Return {
+            ret: Errno::new(EFAULT).to_ret()
+        }
+    );
     assert!(t.handle.is_none());
     assert!(hw.pending_work.is_empty());
 }
@@ -266,12 +302,17 @@ fn create_thread_req_rejects_affinity_outside_allowed() {
     let mut frame = make_frame();
     let mut hw = FakeHw::default();
     frame.regs[11] = USER_TEXT_BASE as usize + 0x100;
-    frame.regs[12] = 0x3;       // allowed = bits 0,1
-    frame.regs[13] = 0x4;       // affinity = bit 2 — outside allowed
+    frame.regs[12] = 0x3; // allowed = bits 0,1
+    frame.regs[13] = 0x4; // affinity = bit 2 — outside allowed
 
     let outcome = syscall::create_thread(&mut t, &frame, &mut hw);
 
-    assert_eq!(outcome, SyscallOutcome::Return { ret: Errno::new(EINVAL).to_ret() });
+    assert_eq!(
+        outcome,
+        SyscallOutcome::Return {
+            ret: Errno::new(EINVAL).to_ret()
+        }
+    );
     assert!(t.handle.is_none());
     assert!(hw.pending_work.is_empty());
 }
@@ -293,7 +334,10 @@ fn create_thread_req_accepts_zero_sentinel_pair() {
 
     assert_eq!(
         outcome,
-        SyscallOutcome::Yield { state: ThreadState::Blocking, ret: None }
+        SyscallOutcome::Yield {
+            state: ThreadState::Blocking,
+            ret: None
+        }
     );
     assert_eq!(hw.pending_work.len(), 1);
 }
@@ -310,7 +354,12 @@ fn create_thread_req_returns_eagain_when_ring_full() {
 
     let outcome = syscall::create_thread(&mut t, &frame, &mut hw);
 
-    assert_eq!(outcome, SyscallOutcome::Return { ret: Errno::new(EAGAIN).to_ret() });
+    assert_eq!(
+        outcome,
+        SyscallOutcome::Return {
+            ret: Errno::new(EAGAIN).to_ret()
+        }
+    );
     assert!(t.handle.is_none());
     assert!(hw.pending_work.is_empty());
 }
@@ -326,7 +375,12 @@ fn create_process_req_returns_eagain_when_ring_full() {
 
     let outcome = syscall::create_process_req(&mut t, &frame, &mut hw);
 
-    assert_eq!(outcome, SyscallOutcome::Return { ret: Errno::new(EAGAIN).to_ret() });
+    assert_eq!(
+        outcome,
+        SyscallOutcome::Return {
+            ret: Errno::new(EAGAIN).to_ret()
+        }
+    );
     assert!(t.handle.is_none(), "no parking on push failure");
     assert!(hw.pending_work.is_empty());
 }
@@ -387,7 +441,10 @@ fn mmap_req_rejects_kernel_managed_user_regions() {
     // creation; user mmap must never aim at them. Both have
     // user-accessible PTEs, so the only thing stopping a malicious
     // mmap from shadowing them is the syscall gate.
-    for vaddr in [USER_TEXT_BASE as usize, 0x1000_0000usize /* stack region */] {
+    for vaddr in [
+        USER_TEXT_BASE as usize,
+        0x1000_0000usize, /* stack region */
+    ] {
         let mut t = make_thread(ThreadState::Running, SPP::User);
         let mut frame = make_frame();
         let mut hw = FakeHw::default();
@@ -432,7 +489,7 @@ fn mmap_req_shared_rejects_exec_perm() {
     frame.regs[11] = SHARED_VA;
     frame.regs[12] = 4096;
     frame.regs[13] = 0x8; // PTE X bit
-    frame.regs[14] = 1;   // shared
+    frame.regs[14] = 1; // shared
 
     let outcome = syscall::mmap_req(&mut t, &frame, &mut hw);
 
@@ -449,13 +506,16 @@ fn mmap_req_priv_allows_exec_perm() {
     frame.regs[11] = PRIV_VA;
     frame.regs[12] = 4096;
     frame.regs[13] = 0xA; // R|X
-    frame.regs[14] = 0;   // private
+    frame.regs[14] = 0; // private
 
     let outcome = syscall::mmap_req(&mut t, &frame, &mut hw);
 
     assert_eq!(
         outcome,
-        SyscallOutcome::Yield { state: ThreadState::Blocking, ret: None }
+        SyscallOutcome::Yield {
+            state: ThreadState::Blocking,
+            ret: None
+        }
     );
     assert_eq!(hw.pending_work.len(), 1);
 }

@@ -29,7 +29,9 @@ impl<'a> HartView<'a> {
     /// Single-bit affinity mask naming this hart. The scheduler uses
     /// this when asking for the next thread runnable here.
     #[inline]
-    pub fn affinity_bit(&self) -> u64 { 1u64 << self.hart_id }
+    pub fn affinity_bit(&self) -> u64 {
+        1u64 << self.hart_id
+    }
 
     /// True if the hart already has a thread assigned.
     pub fn is_busy(&self) -> bool {
@@ -87,12 +89,8 @@ pub trait Scheduler {
 /// an IPI — it's already running. Matches the pre-migration ordering in
 /// kmain: remotes are preferred so the caller only picks up work when
 /// there's more to do than remotes to wake.
-pub fn assign_threads<'a, H, S, I>(
-    self_view: &HartView,
-    remotes: I,
-    sched: &mut S,
-    hw: &mut H,
-) where
+pub fn assign_threads<'a, H, S, I>(self_view: &HartView, remotes: I, sched: &mut S, hw: &mut H)
+where
     H: Hardware,
     S: Scheduler,
     I: IntoIterator<Item = HartView<'a>>,
@@ -106,7 +104,10 @@ pub fn assign_threads<'a, H, S, I>(
         // next iteration may have a wider permitted set, and we don't
         // want a single restrictive thread sitting at the head of the
         // ready queue to starve unrelated work.
-        let Some(t) = sched.next_runnable(hart.affinity_bit()) else { continue };
+        let Some(t) = sched.next_runnable(hart.affinity_bit())
+        else {
+            continue;
+        };
         // SAFETY: Scheduler contract guarantees `t` is a distinct,
         // non-aliased pointer; we hold no other reference to this
         // thread for the duration of the deref.

@@ -11,5 +11,5 @@
 pub mod device;
 pub mod proto;
 
-pub use device::{DisplayInfo, Gpu, GpuBacking, GpuError, ARENA_SIZE};
+pub use device::{ARENA_SIZE, DisplayInfo, Gpu, GpuBacking, GpuError};
 pub use proto::FORMAT_B8G8R8A8_UNORM;

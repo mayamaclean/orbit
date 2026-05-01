@@ -14,7 +14,7 @@
 
 use core::arch::asm;
 
-use crate::errno::{Errno, EAGAIN};
+use crate::errno::{EAGAIN, Errno};
 use crate::stats::ProcessStats;
 use crate::syscall;
 use crate::syscall_stats::{SyscallEntry, SyscallStatsHeader};
@@ -318,7 +318,12 @@ pub fn nc_yield(timeout_ms: usize) -> Result<(), Errno> {
 /// # Safety
 /// Caller must not already have a mapping covering `[hint_va, hint_va+len)`.
 #[inline]
-pub unsafe fn mmap(hint_va: usize, len: usize, perms: usize, share_with_kernel: bool) -> Result<usize, Errno> {
+pub unsafe fn mmap(
+    hint_va: usize,
+    len: usize,
+    perms: usize,
+    share_with_kernel: bool,
+) -> Result<usize, Errno> {
     Errno::from_ret(unsafe {
         ecall4(
             syscall::MMAP,
@@ -347,7 +352,13 @@ pub fn create_netch(
     bind_spec: usize,
 ) -> Result<(usize, u32), Errno> {
     let (r0, r1) = unsafe {
-        ecall4_ret2(syscall::CREATE_NETCH, vaddr_hint, region_size, sock_type, bind_spec)
+        ecall4_ret2(
+            syscall::CREATE_NETCH,
+            vaddr_hint,
+            region_size,
+            sock_type,
+            bind_spec,
+        )
     };
     Errno::from_ret(r0).map(|va| (va, r1 as u32))
 }
@@ -465,10 +476,8 @@ pub unsafe fn futex_wait(uaddr: *const u32, expected: u32, timeout_ns: u64) -> R
 /// `uaddr` must be 4-byte-aligned and resolve to a mapped word.
 #[inline]
 pub unsafe fn futex_wake(uaddr: *const u32, n: u32) -> Result<u32, Errno> {
-    Errno::from_ret(unsafe {
-        ecall2(syscall::FUTEX_WAKE, uaddr as usize, n as usize)
-    })
-    .map(|c| c as u32)
+    Errno::from_ret(unsafe { ecall2(syscall::FUTEX_WAKE, uaddr as usize, n as usize) })
+        .map(|c| c as u32)
 }
 
 /// Narrow the calling thread's per-hart eligibility mask. The new mask
@@ -533,14 +542,7 @@ pub fn create_process_with_argv(
     affinity: u64,
     argv_blob: &[u8],
 ) -> Result<u16, Errno> {
-    create_process_with_argv_envp(
-        elf_ptr,
-        elf_len,
-        allowed_affinity,
-        affinity,
-        argv_blob,
-        0,
-    )
+    create_process_with_argv_envp(elf_ptr, elf_len, allowed_affinity, affinity, argv_blob, 0)
 }
 
 /// Spawn a child process with both command-line arguments and an
@@ -669,14 +671,16 @@ pub fn create_process(
     allowed_affinity: u64,
     affinity: u64,
 ) -> Result<u16, Errno> {
-    Errno::from_ret(unsafe { ecall4(
-        syscall::CREATE_PROCESS,
-        elf_ptr as usize,
-        elf_len,
-        allowed_affinity as usize,
-        affinity as usize,
-    )})
-        .map(|p| p as u16)
+    Errno::from_ret(unsafe {
+        ecall4(
+            syscall::CREATE_PROCESS,
+            elf_ptr as usize,
+            elf_len,
+            allowed_affinity as usize,
+            affinity as usize,
+        )
+    })
+    .map(|p| p as u16)
 }
 
 /// `pledge(req)` narrows this process's `perms` and `allowed_perms`
@@ -694,10 +698,7 @@ pub fn create_process(
 /// [`PermsRequest`]: crate::perms::PermsRequest
 #[inline]
 pub fn pledge(request: &crate::perms::PermsRequest) -> Result<(), Errno> {
-    Errno::from_ret(unsafe {
-        ecall1(syscall::PLEDGE, request as *const _ as usize)
-    })
-    .map(|_| ())
+    Errno::from_ret(unsafe { ecall1(syscall::PLEDGE, request as *const _ as usize) }).map(|_| ())
 }
 
 /// `create_process_v2(args)` — role-aware spawn. Replaces
@@ -713,13 +714,9 @@ pub fn pledge(request: &crate::perms::PermsRequest) -> Result<(), Errno> {
 ///
 /// [`CreateProcessV2Args`]: crate::perms::CreateProcessV2Args
 #[inline]
-pub fn create_process_v2(
-    args: &crate::perms::CreateProcessV2Args,
-) -> Result<u16, Errno> {
-    Errno::from_ret(unsafe {
-        ecall1(syscall::CREATE_PROCESS_V2, args as *const _ as usize)
-    })
-    .map(|p| p as u16)
+pub fn create_process_v2(args: &crate::perms::CreateProcessV2Args) -> Result<u16, Errno> {
+    Errno::from_ret(unsafe { ecall1(syscall::CREATE_PROCESS_V2, args as *const _ as usize) })
+        .map(|p| p as u16)
 }
 
 /// `query_denial_log(buf)` — copy the kernel-wide denial event ring
@@ -737,9 +734,7 @@ pub fn create_process_v2(
 /// today (orbit is single-tenant); future multi-tenant workloads
 /// will gate this behind a separate class.
 #[inline]
-pub fn query_denial_log(
-    buf: &mut [crate::denial::DenialEvent],
-) -> Result<usize, Errno> {
+pub fn query_denial_log(buf: &mut [crate::denial::DenialEvent]) -> Result<usize, Errno> {
     let event_size = core::mem::size_of::<crate::denial::DenialEvent>();
     Errno::from_ret(unsafe {
         ecall2(
@@ -758,10 +753,8 @@ pub fn query_denial_log(
 /// `EFAULT` (bad pointer), `EAGAIN` (manager work ring full).
 #[inline]
 pub fn fs_open(path: &str, flags: usize) -> Result<u32, Errno> {
-    Errno::from_ret(unsafe {
-        ecall3(syscall::FS_OPEN, path.as_ptr() as usize, path.len(), flags)
-    })
-    .map(|fd| fd as u32)
+    Errno::from_ret(unsafe { ecall3(syscall::FS_OPEN, path.as_ptr() as usize, path.len(), flags) })
+        .map(|fd| fd as u32)
 }
 
 /// `fs_read(fd, buf)` — read one sector at the fd's current offset.
@@ -867,9 +860,7 @@ pub fn query_stats() -> Result<ProcessStats, Errno> {
 /// [`syscall_stats::payload_size()`](crate::syscall_stats::payload_size)
 /// bytes for a complete snapshot.
 #[inline]
-pub fn query_syscall_stats(
-    buf: &mut [u8],
-) -> Result<(SyscallStatsHeader, &[SyscallEntry]), Errno> {
+pub fn query_syscall_stats(buf: &mut [u8]) -> Result<(SyscallStatsHeader, &[SyscallEntry]), Errno> {
     let n = unsafe {
         ecall2(
             syscall::QUERY_SYSCALL_STATS,
@@ -903,7 +894,12 @@ pub struct ConsoleWriter {
 }
 
 impl ConsoleWriter {
-    pub const fn new() -> Self { Self { buf: [0u8; 256], len: 0 } }
+    pub const fn new() -> Self {
+        Self {
+            buf: [0u8; 256],
+            len: 0,
+        }
+    }
     pub fn flush(&mut self) {
         if self.len == 0 {
             return;
@@ -932,7 +928,9 @@ impl ConsoleWriter {
 impl core::fmt::Write for ConsoleWriter {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
         for &b in s.as_bytes() {
-            if self.len >= self.buf.len() { self.flush(); }
+            if self.len >= self.buf.len() {
+                self.flush();
+            }
             self.buf[self.len] = b;
             self.len += 1;
         }
@@ -954,7 +952,12 @@ pub struct SerialWriter {
 }
 
 impl SerialWriter {
-    pub const fn new() -> Self { Self { buf: [0u8; 256], len: 0 } }
+    pub const fn new() -> Self {
+        Self {
+            buf: [0u8; 256],
+            len: 0,
+        }
+    }
     pub fn flush(&mut self) {
         if self.len == 0 {
             return;
@@ -971,7 +974,9 @@ impl SerialWriter {
 impl core::fmt::Write for SerialWriter {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
         for &b in s.as_bytes() {
-            if self.len >= self.buf.len() { self.flush(); }
+            if self.len >= self.buf.len() {
+                self.flush();
+            }
             self.buf[self.len] = b;
             self.len += 1;
         }

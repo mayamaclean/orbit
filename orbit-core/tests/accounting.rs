@@ -28,7 +28,10 @@ fn switch_bucket_credits_previous_bucket() {
     assert_eq!(hart.user_ticks.load(Ordering::Relaxed), 0);
     assert_eq!(hart.scheduler_ticks.load(Ordering::Relaxed), 0);
     assert_eq!(hart.idle_ticks.load(Ordering::Relaxed), 0);
-    assert_eq!(hart.current_bucket.load(Ordering::Relaxed), HartBucket::User as u8);
+    assert_eq!(
+        hart.current_bucket.load(Ordering::Relaxed),
+        HartBucket::User as u8
+    );
     assert_eq!(hart.bucket_enter_tick.load(Ordering::Relaxed), 1500);
 }
 
@@ -40,12 +43,12 @@ fn switch_bucket_chain_partitions_correctly() {
     let hart = make_hart_context();
     init_hart_bucket(hart, HartBucket::Kernel, 0);
 
-    switch_bucket(hart, HartBucket::User, 100);      // K → U: kernel +100
-    switch_bucket(hart, HartBucket::Kernel, 250);    // U → K: user +150
+    switch_bucket(hart, HartBucket::User, 100); // K → U: kernel +100
+    switch_bucket(hart, HartBucket::Kernel, 250); // U → K: user +150
     switch_bucket(hart, HartBucket::Scheduler, 300); // K → S: kernel +50
-    switch_bucket(hart, HartBucket::Kernel, 320);    // S → K: scheduler +20
-    switch_bucket(hart, HartBucket::Idle, 400);      // K → I: kernel +80
-    switch_bucket(hart, HartBucket::Kernel, 500);    // I → K: idle +100
+    switch_bucket(hart, HartBucket::Kernel, 320); // S → K: scheduler +20
+    switch_bucket(hart, HartBucket::Idle, 400); // K → I: kernel +80
+    switch_bucket(hart, HartBucket::Kernel, 500); // I → K: idle +100
 
     assert_eq!(hart.kernel_ticks.load(Ordering::Relaxed), 100 + 50 + 80);
     assert_eq!(hart.user_ticks.load(Ordering::Relaxed), 150);
@@ -82,7 +85,8 @@ fn user_exit_credits_current_thread() {
     let thread = Box::leak(Box::new(make_thread(ThreadState::Running, SPP::User)));
 
     // Simulate the scheduler stamping `current` before the thread runs.
-    hart.current.store(thread as *const _ as *mut _, Ordering::Release);
+    hart.current
+        .store(thread as *const _ as *mut _, Ordering::Release);
 
     init_hart_bucket(hart, HartBucket::User, 1000);
     switch_bucket(hart, HartBucket::Kernel, 1750);
@@ -98,7 +102,8 @@ fn user_exit_credits_current_thread() {
 fn kernel_exit_does_not_credit_thread() {
     let hart = make_hart_context();
     let thread = Box::leak(Box::new(make_thread(ThreadState::Running, SPP::Supervisor)));
-    hart.current.store(thread as *const _ as *mut _, Ordering::Release);
+    hart.current
+        .store(thread as *const _ as *mut _, Ordering::Release);
 
     init_hart_bucket(hart, HartBucket::Kernel, 0);
     switch_bucket(hart, HartBucket::Idle, 1000);
@@ -129,16 +134,20 @@ fn user_exit_credit_accumulates_across_quanta() {
     // overwrite it.
     let hart = make_hart_context();
     let thread = Box::leak(Box::new(make_thread(ThreadState::Running, SPP::User)));
-    hart.current.store(thread as *const _ as *mut _, Ordering::Release);
+    hart.current
+        .store(thread as *const _ as *mut _, Ordering::Release);
 
     init_hart_bucket(hart, HartBucket::User, 0);
-    switch_bucket(hart, HartBucket::Kernel, 100);   // +100 user
+    switch_bucket(hart, HartBucket::Kernel, 100); // +100 user
     switch_bucket(hart, HartBucket::User, 200);
-    switch_bucket(hart, HartBucket::Kernel, 350);   // +150 user
+    switch_bucket(hart, HartBucket::Kernel, 350); // +150 user
     switch_bucket(hart, HartBucket::User, 400);
-    switch_bucket(hart, HartBucket::Idle, 500);     // +100 user
+    switch_bucket(hart, HartBucket::Idle, 500); // +100 user
 
-    assert_eq!(thread.cpu_ticks_total.load(Ordering::Relaxed), 100 + 150 + 100);
+    assert_eq!(
+        thread.cpu_ticks_total.load(Ordering::Relaxed),
+        100 + 150 + 100
+    );
     assert_eq!(hart.user_ticks.load(Ordering::Relaxed), 100 + 150 + 100);
 }
 
@@ -154,7 +163,10 @@ fn init_hart_bucket_does_not_credit() {
     assert_eq!(hart.scheduler_ticks.load(Ordering::Relaxed), 0);
     assert_eq!(hart.idle_ticks.load(Ordering::Relaxed), 0);
     assert_eq!(hart.bucket_enter_tick.load(Ordering::Relaxed), 5000);
-    assert_eq!(hart.current_bucket.load(Ordering::Relaxed), HartBucket::Kernel as u8);
+    assert_eq!(
+        hart.current_bucket.load(Ordering::Relaxed),
+        HartBucket::Kernel as u8
+    );
 }
 
 #[test]

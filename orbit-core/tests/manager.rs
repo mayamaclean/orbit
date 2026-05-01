@@ -2,11 +2,17 @@ use orbit_core::PAGE_SIZE;
 use orbit_core::manager::{MEGAPAGE_SIZE, MappingGeometry, select_mapping_geometry};
 
 fn megapage() -> MappingGeometry {
-    MappingGeometry { align: MEGAPAGE_SIZE, levels: 3 }
+    MappingGeometry {
+        align: MEGAPAGE_SIZE,
+        levels: 3,
+    }
 }
 
 fn page() -> MappingGeometry {
-    MappingGeometry { align: PAGE_SIZE, levels: 4 }
+    MappingGeometry {
+        align: PAGE_SIZE,
+        levels: 4,
+    }
 }
 
 #[test]
@@ -70,19 +76,13 @@ fn zero_size_is_aligned_to_everything() {
     // the kmain handler is what catches size=0 as an error). Tests pin
     // the pure function's behaviour so future refactors don't silently
     // flip the check.
-    assert_eq!(
-        select_mapping_geometry(MEGAPAGE_SIZE, 0),
-        Some(megapage())
-    );
+    assert_eq!(select_mapping_geometry(MEGAPAGE_SIZE, 0), Some(megapage()));
     assert_eq!(select_mapping_geometry(0, 0), Some(megapage()));
 }
 
 #[test]
 fn zero_vaddr_is_megapage_aligned() {
-    assert_eq!(
-        select_mapping_geometry(0, MEGAPAGE_SIZE),
-        Some(megapage())
-    );
+    assert_eq!(select_mapping_geometry(0, MEGAPAGE_SIZE), Some(megapage()));
 }
 
 /// 5×5 grid over boundary values, with each expected outcome computed
@@ -119,11 +119,11 @@ fn alignment_grid_matches_hand_table() {
     let n = None;
     let expected: [[Option<MappingGeometry>; 5]; 5] = [
         // size:    0   4K   2M-1  2M   2M+4K
-        /* 0     */ [m,  p,   n,   m,   p],
-        /* 4K    */ [p,  p,   n,   p,   p],
-        /* 2M-1  */ [n,  n,   n,   n,   n],
-        /* 2M    */ [m,  p,   n,   m,   p],
-        /* 2M+4K */ [p,  p,   n,   p,   p],
+        /* 0     */ [m, p, n, m, p],
+        /* 4K    */ [p, p, n, p, p],
+        /* 2M-1  */ [n, n, n, n, n],
+        /* 2M    */ [m, p, n, m, p],
+        /* 2M+4K */ [p, p, n, p, p],
     ];
 
     for (vi, &vaddr) in values.iter().enumerate() {

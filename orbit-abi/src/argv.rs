@@ -80,12 +80,12 @@ pub fn pack(args: &[&[u8]], out: &mut [u8]) -> Option<usize> {
 
     // Header.
     out[..size_of::<ArgvHeader>()].fill(0);
-    let header = ArgvHeader { argc: argc as u32, _reserved: 0 };
+    let header = ArgvHeader {
+        argc: argc as u32,
+        _reserved: 0,
+    };
     let header_bytes = unsafe {
-        core::slice::from_raw_parts(
-            &header as *const _ as *const u8,
-            size_of::<ArgvHeader>(),
-        )
+        core::slice::from_raw_parts(&header as *const _ as *const u8, size_of::<ArgvHeader>())
     };
     out[..size_of::<ArgvHeader>()].copy_from_slice(header_bytes);
 

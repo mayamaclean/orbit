@@ -1,6 +1,6 @@
 #![no_std]
 
-use core::{ops::{BitAnd, BitOr}};
+use core::ops::{BitAnd, BitOr};
 
 use crate::sv48::{PhysAddr, VirtAddr};
 
@@ -19,7 +19,7 @@ pub enum PagePermissions {
     W = 0x4,
     X = 0x8,
     U = 0x10,
-    G = 0x20
+    G = 0x20,
 }
 
 impl Into<u64> for PagePermissions {

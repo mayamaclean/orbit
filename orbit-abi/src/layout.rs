@@ -30,7 +30,7 @@
 //!   UPROC_SHARED_BASE..UPROC_SHARED_END            62 TiB shared (NetChannels, shared mmap)
 //!   USER_TRAP_FRAME_BASE..                         256 * 4 KiB TrapFrames (S-only)
 
-pub const PAGE_SIZE:  u64 = 4096;
+pub const PAGE_SIZE: u64 = 4096;
 pub const LARGE_PAGE: u64 = 2 * 1024 * 1024;
 
 /// Catches NULL-region derefs as page faults. Bumped to a megapage so the
@@ -59,20 +59,20 @@ pub const USER_NULL_GUARD_END: u64 = LARGE_PAGE;
 /// `round_up(p_memsz, PAGE_SIZE)` pages are actually mapped, so
 /// binaries with no `#[thread_local]` pay zero PA cost. See
 /// [docs/user-thread-region.md](../../docs/user-thread-region.md).
-pub const UPROC_STACK_BASE:    u64 = 0x1000_0000;
-pub const UPROC_STACK_STRIDE:  u64 = 16 * LARGE_PAGE;
-pub const UPROC_STACK_GRAIN:   u64 = LARGE_PAGE;
-pub const UPROC_STACK_MIN:     u64 = UPROC_STACK_GRAIN;
+pub const UPROC_STACK_BASE: u64 = 0x1000_0000;
+pub const UPROC_STACK_STRIDE: u64 = 16 * LARGE_PAGE;
+pub const UPROC_STACK_GRAIN: u64 = LARGE_PAGE;
+pub const UPROC_STACK_MIN: u64 = UPROC_STACK_GRAIN;
 /// One grain reserved for the guard, one for the TLS reservation —
 /// both at the slot top. Stack occupies the low remainder.
-pub const UPROC_STACK_MAX:     u64 = UPROC_STACK_STRIDE - 2 * UPROC_STACK_GRAIN;
+pub const UPROC_STACK_MAX: u64 = UPROC_STACK_STRIDE - 2 * UPROC_STACK_GRAIN;
 pub const UPROC_STACK_DEFAULT: u64 = UPROC_STACK_GRAIN;
 /// Per-slot TLS reservation immediately below the guard. Hardcoded to
 /// one `UPROC_STACK_GRAIN` so [`validate_user_stack_size`] doesn't need
 /// to consult the per-process `tls_memsz` — stack sizing stays
 /// independent of actual TLS size. ELF load rejects any binary whose
 /// PT_TLS `p_memsz` exceeds this value.
-pub const UPROC_TLS_MAX:       u64 = UPROC_STACK_GRAIN;
+pub const UPROC_TLS_MAX: u64 = UPROC_STACK_GRAIN;
 
 pub const fn user_stack_slot_base(slot: u16) -> u64 {
     UPROC_STACK_BASE + (slot as u64) * UPROC_STACK_STRIDE
@@ -123,9 +123,7 @@ pub const fn user_tls_vaddr(slot: u16) -> u64 {
 }
 
 pub const fn validate_user_stack_size(size: u64) -> bool {
-    size >= UPROC_STACK_MIN
-        && size <= UPROC_STACK_MAX
-        && size % UPROC_STACK_GRAIN == 0
+    size >= UPROC_STACK_MIN && size <= UPROC_STACK_MAX && size % UPROC_STACK_GRAIN == 0
 }
 
 /// User ELF image sits just above the 8 GiB stack region.
@@ -137,7 +135,7 @@ pub const USER_TEXT_BASE: u64 = 0x2_2000_0000;
 /// orbit-rt build script keeps below `USER_ENVP_BASE` — won't lay
 /// anything on top.
 pub const USER_ARGV_BASE: u64 = 0x2_FFFF_F000;
-pub const USER_ARGV_LEN:  u64 = PAGE_SIZE;
+pub const USER_ARGV_LEN: u64 = PAGE_SIZE;
 
 /// One-page envp blob, format identical to the argv blob (see
 /// [`crate::argv`]); entries are NUL-terminated `KEY=VALUE` byte
@@ -151,15 +149,15 @@ pub const USER_ARGV_LEN:  u64 = PAGE_SIZE;
 /// the second return slot of `argv_envp` (§13e). If non-zero, this is
 /// the value the kernel returns there.
 pub const USER_ENVP_BASE: u64 = 0x2_FFFF_E000;
-pub const USER_ENVP_LEN:  u64 = PAGE_SIZE;
+pub const USER_ENVP_LEN: u64 = PAGE_SIZE;
 
 /// User-controlled private range — `mmap(share_with_kernel=false)`
 /// must land here. Sits *above* the kernel-managed stacks (8 GiB
 /// region anchored at [`UPROC_STACK_BASE`]) and the ELF image (at
 /// [`USER_TEXT_BASE`]) so a user mmap can't aim into either. orbit-rt's
 /// global allocator uses this as the start of its heap cursor.
-pub const UPROC_PRIV_BASE: u64 = 0x3_0000_0000;             // 12 GiB
-pub const UPROC_PRIV_END:  u64 = 0x4000_0000_0000;          // 64 TiB
+pub const UPROC_PRIV_BASE: u64 = 0x3_0000_0000; // 12 GiB
+pub const UPROC_PRIV_END: u64 = 0x4000_0000_0000; // 64 TiB
 
 /// Shared user range — `mmap(share_with_kernel=true)` regions and
 /// NetChannels (anything the kernel needs a KDMAP alias for after the
@@ -167,11 +165,11 @@ pub const UPROC_PRIV_END:  u64 = 0x4000_0000_0000;          // 64 TiB
 /// private-mmap request can't be aimed into a shared VA range and vice
 /// versa.
 pub const UPROC_SHARED_BASE: u64 = UPROC_PRIV_END;
-pub const UPROC_SHARED_END:  u64 = 0x7E00_0000_0000;        // 126 TiB (= UPROC_SHARED_BASE + 62 TiB)
+pub const UPROC_SHARED_END: u64 = 0x7E00_0000_0000; // 126 TiB (= UPROC_SHARED_BASE + 62 TiB)
 
 /// Kernel-private per-thread TrapFrame region (no U bit). One page per slot.
 /// Sits at the top of the Sv48 low half above the user-shared range.
-pub const USER_TRAP_FRAME_BASE:   u64 = UPROC_SHARED_END;
+pub const USER_TRAP_FRAME_BASE: u64 = UPROC_SHARED_END;
 pub const USER_TRAP_FRAME_STRIDE: u64 = PAGE_SIZE;
 
 pub const fn user_trap_frame_vaddr(slot: u16) -> u64 {
@@ -252,7 +250,8 @@ impl UserVa {
     pub const fn new(raw: u64) -> Result<Self, u64> {
         if user_range_ok(raw, 1) {
             Ok(Self(raw))
-        } else {
+        }
+        else {
             Err(raw)
         }
     }
@@ -262,10 +261,14 @@ impl UserVa {
     /// means (e.g. PT walk results, ELF segment VAs derived from a
     /// validated source).
     #[inline]
-    pub const unsafe fn new_unchecked(raw: u64) -> Self { Self(raw) }
+    pub const unsafe fn new_unchecked(raw: u64) -> Self {
+        Self(raw)
+    }
 
     #[inline]
-    pub const fn raw(self) -> u64 { self.0 }
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
 
     /// Offset by `off` bytes. Wraps on overflow; callers that need to
     /// reject overflow validate via [`user_range_ok`].
@@ -297,7 +300,10 @@ mod tests {
     fn stack_max_leaves_room_for_tls_and_guard() {
         // Per-slot tail above the stack: one `GRAIN` for the TLS
         // reservation, one for the guard. Stack max is the rest.
-        assert_eq!(UPROC_STACK_MAX + UPROC_TLS_MAX + UPROC_STACK_GRAIN, UPROC_STACK_STRIDE);
+        assert_eq!(
+            UPROC_STACK_MAX + UPROC_TLS_MAX + UPROC_STACK_GRAIN,
+            UPROC_STACK_STRIDE
+        );
     }
 
     #[test]
@@ -351,7 +357,11 @@ mod tests {
         let slot = 3u16;
         let size = UPROC_STACK_DEFAULT;
         let stack = user_stack_vaddr(slot, size);
-        assert_eq!(stack, user_stack_slot_base(slot), "stack low end = slot base");
+        assert_eq!(
+            stack,
+            user_stack_slot_base(slot),
+            "stack low end = slot base"
+        );
         let sp = user_stack_sp_init(slot, size);
         assert_eq!(sp, (user_stack_slot_base(slot) + size - 16) & !0xF);
     }
@@ -444,7 +454,9 @@ mod tests {
 
     #[test]
     fn validate_rejects_above_max() {
-        assert!(!validate_user_stack_size(UPROC_STACK_MAX + UPROC_STACK_GRAIN));
+        assert!(!validate_user_stack_size(
+            UPROC_STACK_MAX + UPROC_STACK_GRAIN
+        ));
         assert!(!validate_user_stack_size(u64::MAX));
     }
 
@@ -486,10 +498,14 @@ mod tests {
     fn priv_and_shared_are_disjoint_and_abutting() {
         assert!(UPROC_PRIV_BASE < UPROC_PRIV_END);
         assert!(UPROC_SHARED_BASE < UPROC_SHARED_END);
-        assert_eq!(UPROC_PRIV_END, UPROC_SHARED_BASE,
-            "ranges should be adjacent so user_range_ok's union has no gap");
-        assert_eq!(USER_TRAP_FRAME_BASE, UPROC_SHARED_END,
-            "trap frame region sits right above the shared range");
+        assert_eq!(
+            UPROC_PRIV_END, UPROC_SHARED_BASE,
+            "ranges should be adjacent so user_range_ok's union has no gap"
+        );
+        assert_eq!(
+            USER_TRAP_FRAME_BASE, UPROC_SHARED_END,
+            "trap frame region sits right above the shared range"
+        );
     }
 
     #[test]
@@ -502,10 +518,14 @@ mod tests {
         // stride or slot count grows past UPROC_PRIV_BASE this assert
         // catches it before umode threads start trampling the heap.
         let stack_top = UPROC_STACK_BASE + 256u64 * UPROC_STACK_STRIDE;
-        assert!(stack_top <= USER_TEXT_BASE,
-            "stack region must end below USER_TEXT_BASE");
-        assert!(stack_top <= UPROC_PRIV_BASE,
-            "stack region must end below UPROC_PRIV_BASE");
+        assert!(
+            stack_top <= USER_TEXT_BASE,
+            "stack region must end below USER_TEXT_BASE"
+        );
+        assert!(
+            stack_top <= UPROC_PRIV_BASE,
+            "stack region must end below UPROC_PRIV_BASE"
+        );
         assert!(USER_TEXT_BASE < UPROC_PRIV_BASE);
     }
 
@@ -525,12 +545,20 @@ mod tests {
         // script caps the ELF text at USER_ENVP_BASE — anything that
         // shifts these constants past each other (or past
         // UPROC_PRIV_BASE) breaks user-binary linking.
-        assert_eq!(USER_ENVP_BASE + USER_ENVP_LEN, USER_ARGV_BASE,
-            "envp page should immediately precede argv page");
-        assert_eq!(USER_ARGV_BASE + USER_ARGV_LEN, UPROC_PRIV_BASE,
-            "argv page should sit just below UPROC_PRIV_BASE");
-        assert!(USER_TEXT_BASE < USER_ENVP_BASE,
-            "envp page must sit above the ELF region");
+        assert_eq!(
+            USER_ENVP_BASE + USER_ENVP_LEN,
+            USER_ARGV_BASE,
+            "envp page should immediately precede argv page"
+        );
+        assert_eq!(
+            USER_ARGV_BASE + USER_ARGV_LEN,
+            UPROC_PRIV_BASE,
+            "argv page should sit just below UPROC_PRIV_BASE"
+        );
+        assert!(
+            USER_TEXT_BASE < USER_ENVP_BASE,
+            "envp page must sit above the ELF region"
+        );
         assert_eq!(USER_ARGV_LEN, PAGE_SIZE);
         assert_eq!(USER_ENVP_LEN, PAGE_SIZE);
     }
@@ -577,7 +605,10 @@ mod tests {
     #[test]
     fn priv_ok_rejects_boundary_cross() {
         // Range that starts in priv and reaches into shared.
-        assert!(!user_priv_range_ok(UPROC_PRIV_END - PAGE_SIZE, 2 * PAGE_SIZE));
+        assert!(!user_priv_range_ok(
+            UPROC_PRIV_END - PAGE_SIZE,
+            2 * PAGE_SIZE
+        ));
     }
 
     #[test]
@@ -591,7 +622,10 @@ mod tests {
     #[test]
     fn shared_ok_accepts_inside_shared() {
         assert!(user_shared_range_ok(UPROC_SHARED_BASE, PAGE_SIZE));
-        assert!(user_shared_range_ok(UPROC_SHARED_END - PAGE_SIZE, PAGE_SIZE));
+        assert!(user_shared_range_ok(
+            UPROC_SHARED_END - PAGE_SIZE,
+            PAGE_SIZE
+        ));
     }
 
     #[test]

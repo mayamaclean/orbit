@@ -622,7 +622,10 @@ impl Permissions {
     pub const fn pledge(&self, request: PermsRequest) -> Self {
         Self {
             perms: self.perms_mask().narrow(request.perms).raw(),
-            allowed_perms: self.allowed_perms_mask().narrow(request.allowed_perms).raw(),
+            allowed_perms: self
+                .allowed_perms_mask()
+                .narrow(request.allowed_perms)
+                .raw(),
             role: self.role,
             _pad: self._pad,
             _reserved: self._reserved,
@@ -828,11 +831,8 @@ mod tests {
 
     #[test]
     fn allows_respects_perms_mask() {
-        let p = Permissions::from_masks(
-            union(class::STDIO, class::FS_RO),
-            class::ALL,
-            role::FS_TOOL,
-        );
+        let p =
+            Permissions::from_masks(union(class::STDIO, class::FS_RO), class::ALL, role::FS_TOOL);
         assert!(p.allows(crate::syscall::SERIAL_PRINT));
         assert!(p.allows(crate::syscall::FS_OPEN));
         assert!(!p.allows(crate::syscall::CREATE_NETCH));
@@ -876,11 +876,8 @@ mod tests {
 
     #[test]
     fn pledge_cannot_expand_perms() {
-        let p = Permissions::from_masks(
-            class::STDIO,
-            union(class::STDIO, class::VMEM),
-            role::SHELL,
-        );
+        let p =
+            Permissions::from_masks(class::STDIO, union(class::STDIO, class::VMEM), role::SHELL);
         // Asking for ALL doesn't grow the mask — only intersection.
         let q = p.pledge(PermsRequest::ALL);
         assert_eq!(q.perms_mask(), class::STDIO);
@@ -896,11 +893,7 @@ mod tests {
 
     #[test]
     fn pledge_is_idempotent() {
-        let p = Permissions::from_masks(
-            union(class::STDIO, class::VMEM),
-            class::ALL,
-            role::SHELL,
-        );
+        let p = Permissions::from_masks(union(class::STDIO, class::VMEM), class::ALL, role::SHELL);
         let req = PermsRequest {
             perms: class::STDIO,
             allowed_perms: union(class::STDIO, class::VMEM),
@@ -932,11 +925,7 @@ mod tests {
         // The two axes are orthogonal. Narrowing allowed_perms below
         // perms is legal — exactly the "I keep my own caps but won't
         // pass them to children" pattern (NET_CLIENT etc).
-        let p = Permissions::from_masks(
-            union(class::STDIO, class::NETCH),
-            class::ALL,
-            role::SHELL,
-        );
+        let p = Permissions::from_masks(union(class::STDIO, class::NETCH), class::ALL, role::SHELL);
         let q = p.pledge(PermsRequest {
             perms: class::ALL,
             allowed_perms: class::STDIO,
@@ -1240,7 +1229,13 @@ mod tests {
         assert_eq!(sink.0.len(), 1, "exactly one event per denied call");
         match sink.0[0] {
             DenialEvent::PermDeny {
-                required_class, perms, time_ticks, tid, sysno, source_role, pid,
+                required_class,
+                perms,
+                time_ticks,
+                tid,
+                sysno,
+                source_role,
+                pid,
             } => {
                 assert_eq!(required_class, class::raw::NETCH);
                 assert_eq!(perms, class::raw::ALL & !class::raw::NETCH);
@@ -1269,7 +1264,12 @@ mod tests {
         assert!(!ok);
         assert_eq!(sink.0.len(), 1);
         match sink.0[0] {
-            DenialEvent::PermDeny { required_class, sysno, source_role, .. } => {
+            DenialEvent::PermDeny {
+                required_class,
+                sysno,
+                source_role,
+                ..
+            } => {
                 assert_eq!(required_class, 0);
                 assert_eq!(sysno, 99_999);
                 // Even on unknown-sysno path the source role is captured.

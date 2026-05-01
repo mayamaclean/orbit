@@ -1,13 +1,13 @@
 mod common;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Barrier;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
 
 use orbit_core::tlb_shootdown::{
-    SHOOTDOWN_RING_CAP, ShootdownEntry, ShootdownErr, ShootdownRing,
-    drain_shootdown_ring, tlb_shootdown,
+    SHOOTDOWN_RING_CAP, ShootdownEntry, ShootdownErr, ShootdownRing, drain_shootdown_ring,
+    tlb_shootdown,
 };
 
 use common::FakeHw;
@@ -43,13 +43,7 @@ fn single_target_push_drain_ack_roundtrip() {
     // returns. (The orchestrator blocks on the ack until we pop+ack.)
     let h = thread::spawn(|| {
         let mut hw = FakeHw::default();
-        tlb_shootdown(
-            1,
-            core::iter::once((2, &RING)),
-            0x4000_0000,
-            4096,
-            &mut hw,
-        )
+        tlb_shootdown(1, core::iter::once((2, &RING)), 0x4000_0000, 4096, &mut hw)
     });
 
     // Wait for the entry to appear (push happens before wake on the
@@ -58,7 +52,9 @@ fn single_target_push_drain_ack_roundtrip() {
     let mut got = Vec::new();
     loop {
         let serviced = drain_shootdown_ring(&RING, record_into(&mut got));
-        if serviced > 0 { break; }
+        if serviced > 0 {
+            break;
+        }
         std::hint::spin_loop();
     }
 
@@ -131,7 +127,9 @@ fn ring_full_returns_failed_count_after_other_acks() {
     let mut got = Vec::new();
     loop {
         let n = drain_shootdown_ring(&OPEN_RING, record_into(&mut got));
-        if n > 0 { break; }
+        if n > 0 {
+            break;
+        }
         std::hint::spin_loop();
     }
 
@@ -175,13 +173,7 @@ fn concurrent_senders_one_target() {
                 // some pushes will fail. Recover by re-trying after
                 // the drainer has caught up.
                 loop {
-                    let r = tlb_shootdown(
-                        1,
-                        core::iter::once((0, &TARGET)),
-                        va,
-                        4096,
-                        &mut hw,
-                    );
+                    let r = tlb_shootdown(1, core::iter::once((0, &TARGET)), va, 4096, &mut hw);
                     match r {
                         Ok(()) => break,
                         Err(ShootdownErr::RingFull { .. }) => {
@@ -207,7 +199,9 @@ fn concurrent_senders_one_target() {
         }
     });
 
-    for h in sender_handles { h.join().unwrap(); }
+    for h in sender_handles {
+        h.join().unwrap();
+    }
     drainer.join().unwrap();
 
     assert_eq!(
@@ -237,16 +231,20 @@ fn one_sender_concurrent_drainers() {
         // entry, services it, exits.
         let drainers: Vec<_> = [&R0, &R1, &R2, &R3]
             .into_iter()
-            .map(|ring| thread::spawn(move || {
-                let mut got = None;
-                while got.is_none() {
-                    drain_shootdown_ring(ring, |va, len| {
-                        got = Some((va, len));
-                    });
-                    if got.is_none() { std::hint::spin_loop(); }
-                }
-                got.unwrap()
-            }))
+            .map(|ring| {
+                thread::spawn(move || {
+                    let mut got = None;
+                    while got.is_none() {
+                        drain_shootdown_ring(ring, |va, len| {
+                            got = Some((va, len));
+                        });
+                        if got.is_none() {
+                            std::hint::spin_loop();
+                        }
+                    }
+                    got.unwrap()
+                })
+            })
             .collect();
 
         let mut hw = FakeHw::default();

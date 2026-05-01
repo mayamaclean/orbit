@@ -65,7 +65,9 @@ pub enum BlockError {
 }
 
 impl From<InitError> for BlockError {
-    fn from(e: InitError) -> Self { BlockError::Init(e) }
+    fn from(e: InitError) -> Self {
+        BlockError::Init(e)
+    }
 }
 
 pub struct BlockBacking {
@@ -247,9 +249,21 @@ impl Block {
         let head = self
             .reqq
             .push_chain(&[
-                Buf { pa: hdr_pa, len: HEADER_STRIDE as u32, write: false },
-                Buf { pa: dst_pa, len, write: true },
-                Buf { pa: status_pa, len: 1, write: true },
+                Buf {
+                    pa: hdr_pa,
+                    len: HEADER_STRIDE as u32,
+                    write: false,
+                },
+                Buf {
+                    pa: dst_pa,
+                    len,
+                    write: true,
+                },
+                Buf {
+                    pa: status_pa,
+                    len: 1,
+                    write: true,
+                },
             ])
             .map_err(|_| BlockError::QueueFull)?;
         debug_assert!(
@@ -300,9 +314,7 @@ impl Block {
         for _ in 0..10_000_000 {
             if let Some((h, _len)) = self.reqq.pop_used() {
                 if h != head {
-                    error!(
-                        "virtio-blk: sync read got unexpected head {h} (expected {head})"
-                    );
+                    error!("virtio-blk: sync read got unexpected head {h} (expected {head})");
                     return Err(BlockError::Timeout);
                 }
                 let (status_kva, _) = self.status_slot(head);

@@ -87,7 +87,10 @@ impl ProcessStdin {
         while n < out.len() {
             // SAFETY: caller is the sole consumer per the SPSC
             // contract.
-            let Some(b) = (unsafe { self.ring.dequeue() }) else { break };
+            let Some(b) = (unsafe { self.ring.dequeue() })
+            else {
+                break;
+            };
             out[n] = b;
             n += 1;
         }
@@ -99,12 +102,9 @@ impl ProcessStdin {
     /// caller's responsibility, so this signals a logic bug.
     pub fn park(&self, handle: CompletionHandle) -> Result<(), CompletionHandle> {
         let raw = handle.into_raw() as *mut CompletionInner;
-        let prev = self.parked.compare_exchange(
-            null_mut(),
-            raw,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
+        let prev =
+            self.parked
+                .compare_exchange(null_mut(), raw, Ordering::AcqRel, Ordering::Acquire);
         match prev {
             Ok(_) => Ok(()),
             Err(_) => {
@@ -124,7 +124,8 @@ impl ProcessStdin {
         let raw = self.parked.swap(null_mut(), Ordering::AcqRel);
         if raw.is_null() {
             None
-        } else {
+        }
+        else {
             // SAFETY: atomic swap gives us sole ownership of the
             // raw pointer.
             Some(unsafe { CompletionHandle::from_raw(raw) })

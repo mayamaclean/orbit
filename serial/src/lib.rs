@@ -1,17 +1,25 @@
 #![no_std]
 
-use core::{cell::UnsafeCell, fmt::{Arguments, Write}, mem::MaybeUninit, sync::atomic::{AtomicU64, Ordering}};
+use core::{
+    cell::UnsafeCell,
+    fmt::{Arguments, Write},
+    mem::MaybeUninit,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use ns16550a::Uart;
 
 #[repr(align(128))]
 pub struct CriticalVal {
-    pub inner: AtomicU64
+    pub inner: AtomicU64,
 }
 
 impl CriticalVal {
     pub fn acquire(&self) {
-        while let Err(_) = self.inner.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire) {}
+        while let Err(_) = self
+            .inner
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+        {}
     }
 
     pub fn release(&self) {
@@ -22,13 +30,15 @@ impl CriticalVal {
 #[repr(align(4096))]
 pub struct MpUart {
     pub crit: CriticalVal,
-    pub uart: UnsafeCell<MaybeUninit<Uart>>
+    pub uart: UnsafeCell<MaybeUninit<Uart>>,
 }
 
 impl MpUart {
     pub fn print(&self, s: Arguments) {
         self.crit.acquire();
-        unsafe { self.print_no_crit(s); }
+        unsafe {
+            self.print_no_crit(s);
+        }
         self.crit.release();
     }
 
@@ -49,9 +59,11 @@ impl MpUart {
 
 unsafe impl Sync for MpUart {}
 
-pub static SERIAL: MpUart = MpUart{
-    crit: CriticalVal{inner:AtomicU64::new(0)},
-    uart: UnsafeCell::new(MaybeUninit::zeroed())
+pub static SERIAL: MpUart = MpUart {
+    crit: CriticalVal {
+        inner: AtomicU64::new(0),
+    },
+    uart: UnsafeCell::new(MaybeUninit::zeroed()),
 };
 
 pub fn print(s: Arguments) {
@@ -59,7 +71,9 @@ pub fn print(s: Arguments) {
 }
 
 pub unsafe fn print_no_crit(s: Arguments) {
-    unsafe { SERIAL.print_no_crit(s); }
+    unsafe {
+        SERIAL.print_no_crit(s);
+    }
 }
 
 pub unsafe fn acquire_serial() {

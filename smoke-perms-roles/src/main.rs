@@ -3,13 +3,11 @@
 
 use core::panic::PanicInfo;
 
-use orbit_abi::errno::{Errno, EPERM};
+use orbit_abi::denial::{DENIAL_RING_CAPACITY, DenialEvent, deny_reason};
+use orbit_abi::errno::{EPERM, Errno};
 use orbit_abi::layout::{UPROC_SHARED_BASE, UPROC_SHARED_END};
 use orbit_abi::net::SockType;
-use orbit_abi::perms::{
-    class, role, ClassMask, CreateProcessV2Args, PermsRequest,
-};
-use orbit_abi::denial::{deny_reason, DenialEvent, DENIAL_RING_CAPACITY};
+use orbit_abi::perms::{ClassMask, CreateProcessV2Args, PermsRequest, class, role};
 use orbit_abi::serialln;
 use orbit_abi::user::{
     create_netch, create_process_v2, exit, getpid, pledge, query_denial_log, query_stats,
@@ -52,7 +50,8 @@ enum Mode {
 fn detect_mode(rc_perm: isize) -> Mode {
     if rc_perm == -(EPERM as isize) {
         Mode::Enforcement
-    } else {
+    }
+    else {
         Mode::Shadow
     }
 }
@@ -83,7 +82,8 @@ fn finish(passed: bool, label: &str) -> ! {
     if passed {
         serialln!("PASS smoke-perms-roles: {label}");
         exit(0);
-    } else {
+    }
+    else {
         serialln!("FAIL smoke-perms-roles: {label}");
         exit(1);
     }
@@ -249,8 +249,8 @@ pub extern "C" fn main() -> i32 {
             ..
         } => {
             source_role == role::BOOTSTRAP
-            && target_role == role::WORKER
-            && deny_reason == deny_reason::TRANSITION_DENIED
+                && target_role == role::WORKER
+                && deny_reason == deny_reason::TRANSITION_DENIED
         }
         _ => false,
     });
@@ -285,22 +285,31 @@ pub extern "C" fn main() -> i32 {
             // it should be because the smoke is running against an
             // older kernel.
             if rc_role <= 0 {
-                finish(false, "shadow: create_process_v2 should have spawned a child");
+                finish(
+                    false,
+                    "shadow: create_process_v2 should have spawned a child",
+                );
             }
         }
         Mode::Enforcement => {
             // Both gates EPERM. Mode detection already saw rc_perm
             // == -EPERM; assert the role-side return matches.
             if rc_role != -(EPERM as isize) {
-                finish(false, "enforcement: create_process_v2 should have returned -EPERM");
+                finish(
+                    false,
+                    "enforcement: create_process_v2 should have returned -EPERM",
+                );
             }
         }
     }
 
-    finish(true, match mode {
-        Mode::Shadow => "shadow: counters + ring match expectations",
-        Mode::Enforcement => "enforcement: both gates returned -EPERM, counters + ring match",
-    });
+    finish(
+        true,
+        match mode {
+            Mode::Shadow => "shadow: counters + ring match expectations",
+            Mode::Enforcement => "enforcement: both gates returned -EPERM, counters + ring match",
+        },
+    );
 }
 
 #[panic_handler]

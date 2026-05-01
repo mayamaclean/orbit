@@ -66,7 +66,9 @@ impl Mmio {
     /// `base_kva` must be a KMMIO mapping covering at least
     /// `REG_CONFIG + device_config_len` bytes.
     pub const unsafe fn new(base_kva: u64) -> Self {
-        Self { base: base_kva as *mut u8 }
+        Self {
+            base: base_kva as *mut u8,
+        }
     }
 
     #[inline]
@@ -76,16 +78,32 @@ impl Mmio {
 
     #[inline]
     unsafe fn w32(&self, off: usize, val: u32) {
-        unsafe { (self.base.add(off) as *mut u32).write_volatile(val); }
+        unsafe {
+            (self.base.add(off) as *mut u32).write_volatile(val);
+        }
     }
 
-    pub unsafe fn magic(&self) -> u32 { unsafe { self.r32(REG_MAGIC) } }
-    pub unsafe fn version(&self) -> u32 { unsafe { self.r32(REG_VERSION) } }
-    pub unsafe fn device_id(&self) -> u32 { unsafe { self.r32(REG_DEVICE_ID) } }
-    pub unsafe fn vendor_id(&self) -> u32 { unsafe { self.r32(REG_VENDOR_ID) } }
+    pub unsafe fn magic(&self) -> u32 {
+        unsafe { self.r32(REG_MAGIC) }
+    }
+    pub unsafe fn version(&self) -> u32 {
+        unsafe { self.r32(REG_VERSION) }
+    }
+    pub unsafe fn device_id(&self) -> u32 {
+        unsafe { self.r32(REG_DEVICE_ID) }
+    }
+    pub unsafe fn vendor_id(&self) -> u32 {
+        unsafe { self.r32(REG_VENDOR_ID) }
+    }
 
-    pub unsafe fn status(&self) -> u32 { unsafe { self.r32(REG_STATUS) } }
-    pub unsafe fn set_status(&self, v: u32) { unsafe { self.w32(REG_STATUS, v); } }
+    pub unsafe fn status(&self) -> u32 {
+        unsafe { self.r32(REG_STATUS) }
+    }
+    pub unsafe fn set_status(&self, v: u32) {
+        unsafe {
+            self.w32(REG_STATUS, v);
+        }
+    }
     pub unsafe fn add_status(&self, flag: u32) {
         unsafe {
             let s = self.status();
@@ -108,12 +126,24 @@ impl Mmio {
     }
 
     pub unsafe fn select_queue(&self, idx: u32) {
-        unsafe { self.w32(REG_QUEUE_SEL, idx); }
+        unsafe {
+            self.w32(REG_QUEUE_SEL, idx);
+        }
     }
 
-    pub unsafe fn queue_num_max(&self) -> u32 { unsafe { self.r32(REG_QUEUE_NUM_MAX) } }
-    pub unsafe fn set_queue_num(&self, n: u32) { unsafe { self.w32(REG_QUEUE_NUM, n); } }
-    pub unsafe fn set_queue_ready(&self, v: u32) { unsafe { self.w32(REG_QUEUE_READY, v); } }
+    pub unsafe fn queue_num_max(&self) -> u32 {
+        unsafe { self.r32(REG_QUEUE_NUM_MAX) }
+    }
+    pub unsafe fn set_queue_num(&self, n: u32) {
+        unsafe {
+            self.w32(REG_QUEUE_NUM, n);
+        }
+    }
+    pub unsafe fn set_queue_ready(&self, v: u32) {
+        unsafe {
+            self.w32(REG_QUEUE_READY, v);
+        }
+    }
 
     pub unsafe fn set_queue_desc(&self, pa: u64) {
         unsafe {
@@ -151,7 +181,9 @@ impl Mmio {
         unsafe { self.r32(REG_INTERRUPT_STATUS) }
     }
     pub unsafe fn interrupt_ack(&self, bits: u32) {
-        unsafe { self.w32(REG_INTERRUPT_ACK, bits); }
+        unsafe {
+            self.w32(REG_INTERRUPT_ACK, bits);
+        }
     }
 
     pub unsafe fn config_generation(&self) -> u32 {

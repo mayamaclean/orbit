@@ -23,7 +23,9 @@ unsafe extern "Rust" {
 
 #[cfg(miri)]
 unsafe fn register_root(ptr: *const u8) {
-    unsafe { miri_static_root(ptr); }
+    unsafe {
+        miri_static_root(ptr);
+    }
 }
 
 #[cfg(not(miri))]
@@ -95,7 +97,10 @@ pub fn make_frame() -> TrapFrame {
 pub fn make_hart_context() -> &'static HartContext {
     unsafe {
         let ptr = alloc_zeroed(Layout::new::<HartContext>()) as *mut HartContext;
-        assert!(!ptr.is_null(), "alloc_zeroed::<HartContext>() returned null");
+        assert!(
+            !ptr.is_null(),
+            "alloc_zeroed::<HartContext>() returned null"
+        );
         register_root(ptr as *const u8);
         &*ptr
     }
@@ -212,7 +217,8 @@ impl Hardware for FakeHw {
         if self.serial_ok {
             self.user_prints.push((pid, tid, text.to_string()));
             Ok(())
-        } else {
+        }
+        else {
             Err(())
         }
     }
@@ -223,13 +229,19 @@ impl Hardware for FakeHw {
         if self.console_ok {
             self.console_writes.push((pid, bytes.to_vec()));
             Ok(())
-        } else {
+        }
+        else {
             Err(())
         }
     }
     fn read_stdin_drain(&mut self, pid: u16, user_va: UserVa, max_len: usize) -> usize {
         let head = self.stdin_ready.get_mut(&pid).and_then(|q| {
-            if q.is_empty() { None } else { Some(q.remove(0)) }
+            if q.is_empty() {
+                None
+            }
+            else {
+                Some(q.remove(0))
+            }
         });
         match head {
             Some(mut bytes) => {
@@ -242,7 +254,9 @@ impl Hardware for FakeHw {
         }
     }
     fn park_stdin_reader(&mut self, pid: u16, handle: CompletionHandle) -> bool {
-        if !self.stdin_park_ok { return false; }
+        if !self.stdin_park_ok {
+            return false;
+        }
         self.stdin_parked.push((pid, handle));
         true
     }
@@ -253,7 +267,8 @@ impl Hardware for FakeHw {
         if let Some(idx) = self.stdin_parked.iter().rposition(|(p, _)| *p == pid) {
             self.stdin_parked.remove(idx);
             true
-        } else {
+        }
+        else {
             false
         }
     }
@@ -261,7 +276,8 @@ impl Hardware for FakeHw {
         if self.pending_work_ok {
             self.pending_work.push(work);
             Ok(())
-        } else {
+        }
+        else {
             Err(work)
         }
     }

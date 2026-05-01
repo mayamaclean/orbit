@@ -27,14 +27,17 @@ use alloc::vec::Vec;
 use core::panic::PanicInfo;
 
 use minicbor::{Decode, Encode};
-use net_channel::{BindSpec, NetChannel, NC_MAX_REGION_SIZE};
+use net_channel::{BindSpec, NC_MAX_REGION_SIZE, NetChannel};
 use orbit_abi::errno::Errno;
 use orbit_abi::fs::Stat;
 use orbit_abi::net::SockType;
-use orbit_abi::{logln, user::{
-    close_handle, create_process, create_process_with_argv_envp, exit, fs_open, fs_read, fs_stat,
-    ConsoleWriter,
-}};
+use orbit_abi::{
+    logln,
+    user::{
+        ConsoleWriter, close_handle, create_process, create_process_with_argv_envp, exit, fs_open,
+        fs_read, fs_stat,
+    },
+};
 use orbit_rt::netch::{NetCh, Session};
 
 const LISTEN_PORT: u16 = 7777;
@@ -59,16 +62,23 @@ const MAX_INIT_ELF_BYTES: usize = 4 * 1024 * 1024;
 #[derive(Decode, Encode, Debug)]
 #[cbor(map)]
 struct Payload<'a> {
-    #[n(0)] #[cbor(with = "minicbor::bytes")] elf: &'a [u8],
-    #[b(1)] name: &'a str,
+    #[n(0)]
+    #[cbor(with = "minicbor::bytes")]
+    elf: &'a [u8],
+    #[b(1)]
+    name: &'a str,
     /// Optional CPU affinity cap. Sentinel `0` (also the absent-key
     /// default since minicbor leaves missing primitives at zero) tells
     /// the kernel to use the all-harts default.
-    #[n(2)] #[cbor(default)] allowed_affinity: u64,
+    #[n(2)]
+    #[cbor(default)]
+    allowed_affinity: u64,
     /// Optional initial affinity. Sentinel `0` → defaults to whatever
     /// `allowed_affinity` resolves to. Must be a subset of
     /// `allowed_affinity` once both are resolved (kernel enforces).
-    #[n(3)] #[cbor(default)] affinity: u64,
+    #[n(3)]
+    #[cbor(default)]
+    affinity: u64,
 }
 
 #[derive(Debug)]
@@ -122,7 +132,7 @@ pub extern "C" fn main() -> i32 {
     loop {
         match accept_and_load(&nc) {
             Ok((pid, name)) => logln!("orbit-loader: spawned pid={pid} name={name:?}"),
-            Err(e)          => logln!("orbit-loader: iteration failed: {e:?}"),
+            Err(e) => logln!("orbit-loader: iteration failed: {e:?}"),
         }
         // Session is dropped at end of accept_and_load — disengagement
         // and kernel-side relisten happen there.
@@ -316,8 +326,12 @@ fn recv_payload(s: &Session<'_>) -> Result<(Vec<u8>, String), LoaderErr> {
 
     let len = u32::from_le_bytes([scratch[0], scratch[1], scratch[2], scratch[3]]);
     let inv = u32::from_le_bytes([scratch[4], scratch[5], scratch[6], scratch[7]]);
-    if len ^ inv != u32::MAX { return Err(LoaderErr::Framing); }
-    if (len as usize) > MAX_ELF_BYTES { return Err(LoaderErr::TooLarge(len)); }
+    if len ^ inv != u32::MAX {
+        return Err(LoaderErr::Framing);
+    }
+    if (len as usize) > MAX_ELF_BYTES {
+        return Err(LoaderErr::TooLarge(len));
+    }
 
     let total = 8 + len as usize;
     scratch.reserve(total.saturating_sub(scratch.len()));
@@ -344,7 +358,9 @@ fn recv_payload(s: &Session<'_>) -> Result<(Vec<u8>, String), LoaderErr> {
 /// or the channel breaks).
 fn drain_some(s: &Session<'_>, out: &mut Vec<u8>) -> Result<(), LoaderErr> {
     let mut tmp = [0u8; 128 * 1024];
-    let n = s.read_some_with_poll_timeout(&mut tmp, 100).map_err(LoaderErr::NetCh)?;
+    let n = s
+        .read_some_with_poll_timeout(&mut tmp, 100)
+        .map_err(LoaderErr::NetCh)?;
     out.extend_from_slice(&tmp[..n]);
     Ok(())
 }
@@ -362,16 +378,22 @@ fn spawn(body_only: &[u8]) -> Result<u16, LoaderErr> {
         elf.get(2).copied().unwrap_or(0),
         elf.get(3).copied().unwrap_or(0),
     ];
-    logln!("orbit-loader: spawn ptr={:p} len={} head={:02x?} \
+    logln!(
+        "orbit-loader: spawn ptr={:p} len={} head={:02x?} \
            allowed_affinity={:#x} affinity={:#x}",
-           elf.as_ptr(), elf.len(), head,
-           payload.allowed_affinity, payload.affinity);
+        elf.as_ptr(),
+        elf.len(),
+        head,
+        payload.allowed_affinity,
+        payload.affinity
+    );
     create_process(
         elf.as_ptr(),
         elf.len(),
         payload.allowed_affinity,
         payload.affinity,
-    ).map_err(LoaderErr::Syscall)
+    )
+    .map_err(LoaderErr::Syscall)
 }
 
 #[panic_handler]

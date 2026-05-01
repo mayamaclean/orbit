@@ -33,9 +33,8 @@
 //! clamping math is pure. Host-testable in unit tests below.
 
 use crate::perms::{
-    class,
+    ClassMask, Permissions, PermsRequest, class,
     role::{self, RoleId},
-    ClassMask, Permissions, PermsRequest,
 };
 
 /// Per-role policy entry. The `ROLES` array is indexed by [`RoleId`];
@@ -118,9 +117,8 @@ const NET_CLIENT_PERMS: ClassMask = ClassMask::from_raw(
 /// network client get no network reach by default — the network
 /// capability dies at the first generation. This is the load-bearing
 /// example of role-based propagation control.
-const NET_CLIENT_ALLOWED: ClassMask = ClassMask::from_raw(
-    class::raw::STDIO | class::raw::VMEM | class::raw::PLEDGE,
-);
+const NET_CLIENT_ALLOWED: ClassMask =
+    ClassMask::from_raw(class::raw::STDIO | class::raw::VMEM | class::raw::PLEDGE);
 
 /// FS_TOOL effective: stdio + read-only filesystem + private mmap +
 /// pledge. Same shape as NET_CLIENT but with FS_RO instead of NETCH.
@@ -130,17 +128,15 @@ const FS_TOOL_PERMS: ClassMask = ClassMask::from_raw(
 
 /// FS_TOOL cap: same shape as NET_CLIENT_ALLOWED — fs reach doesn't
 /// propagate either.
-const FS_TOOL_ALLOWED: ClassMask = ClassMask::from_raw(
-    class::raw::STDIO | class::raw::VMEM | class::raw::PLEDGE,
-);
+const FS_TOOL_ALLOWED: ClassMask =
+    ClassMask::from_raw(class::raw::STDIO | class::raw::VMEM | class::raw::PLEDGE);
 
 /// WORKER effective + cap: stdio + private mmap + pledge. The "default
 /// sandbox" — no I/O, no networking, no spawn. Used as the grandchild
 /// fallthrough for NET_CLIENT and FS_TOOL since their `default_allowed`
 /// matches WORKER_PERMS exactly.
-const WORKER_PERMS: ClassMask = ClassMask::from_raw(
-    class::raw::STDIO | class::raw::VMEM | class::raw::PLEDGE,
-);
+const WORKER_PERMS: ClassMask =
+    ClassMask::from_raw(class::raw::STDIO | class::raw::VMEM | class::raw::PLEDGE);
 
 /// SERVICE effective: long-lived daemon shape — stdio + network +
 /// fs reads + futex + private mmap + pledge + stats. The "service"
@@ -157,9 +153,8 @@ const SERVICE_PERMS: ClassMask = ClassMask::from_raw(
 
 /// SERVICE cap: same as NET_CLIENT — no I/O propagation to spawned
 /// children.
-const SERVICE_ALLOWED: ClassMask = ClassMask::from_raw(
-    class::raw::STDIO | class::raw::VMEM | class::raw::PLEDGE,
-);
+const SERVICE_ALLOWED: ClassMask =
+    ClassMask::from_raw(class::raw::STDIO | class::raw::VMEM | class::raw::PLEDGE);
 
 /// Role registry, indexed by [`RoleId`]. Order is load-bearing — the
 /// indices are the `role::*` constants. Adding a role: append to the
@@ -239,8 +234,14 @@ const _: () = {
     // a future "let me give NOROLE some default perms" change has to
     // explicitly reckon with the sentinel-role contract.
     let nr = &ROLES[role::NOROLE as usize];
-    assert!(nr.default_perms.raw() == 0, "NOROLE default_perms must be 0");
-    assert!(nr.default_allowed.raw() == 0, "NOROLE default_allowed must be 0");
+    assert!(
+        nr.default_perms.raw() == 0,
+        "NOROLE default_perms must be 0"
+    );
+    assert!(
+        nr.default_allowed.raw() == 0,
+        "NOROLE default_allowed must be 0"
+    );
     assert!(nr.transitions == 0, "NOROLE must have no transitions");
 };
 
@@ -251,7 +252,8 @@ const _: () = {
 pub const fn role_def(role: RoleId) -> Option<&'static RoleDef> {
     if (role as usize) < role::COUNT {
         Some(&ROLES[role as usize])
-    } else {
+    }
+    else {
         None
     }
 }
@@ -585,7 +587,8 @@ mod tests {
             let r = try_spawn(&nc, target, full_request());
             if target == role::WORKER {
                 assert!(r.is_ok(), "NET_CLIENT → {target} should succeed; got {r:?}");
-            } else {
+            }
+            else {
                 assert!(
                     matches!(r, Err(SpawnDeny::TransitionDenied)),
                     "NET_CLIENT → {target} should be TransitionDenied; got {r:?}"
@@ -601,7 +604,8 @@ mod tests {
             let r = try_spawn(&ft, target, full_request());
             if target == role::WORKER {
                 assert!(r.is_ok(), "FS_TOOL → {target} should succeed; got {r:?}");
-            } else {
+            }
+            else {
                 assert!(
                     matches!(r, Err(SpawnDeny::TransitionDenied)),
                     "FS_TOOL → {target} should be TransitionDenied; got {r:?}"
@@ -617,7 +621,8 @@ mod tests {
             let r = try_spawn(&svc, target, full_request());
             if target == role::WORKER {
                 assert!(r.is_ok(), "SERVICE → {target} should succeed; got {r:?}");
-            } else {
+            }
+            else {
                 assert!(
                     matches!(r, Err(SpawnDeny::TransitionDenied)),
                     "SERVICE → {target} should be TransitionDenied; got {r:?}"
@@ -636,7 +641,8 @@ mod tests {
             let expected_ok = target == role::LOADER || target == role::SHELL;
             if expected_ok {
                 assert!(r.is_ok(), "BOOTSTRAP → {target} should succeed; got {r:?}");
-            } else {
+            }
+            else {
                 assert!(
                     matches!(r, Err(SpawnDeny::TransitionDenied)),
                     "BOOTSTRAP → {target} should be denied; got {r:?}"
@@ -709,9 +715,7 @@ mod tests {
                 let r = check_transition(parent, target);
                 match r {
                     Ok(_) | Err(SpawnDeny::TransitionDenied) => {}
-                    Err(other) => panic!(
-                        "unexpected variant for ({parent}, {target}): {other:?}"
-                    ),
+                    Err(other) => panic!("unexpected variant for ({parent}, {target}): {other:?}"),
                 }
             }
         }
@@ -907,8 +911,7 @@ mod tests {
         let shell_def = role_def(role::SHELL).unwrap();
         let zero_perms_parent =
             Permissions::from_masks(ClassMask::EMPTY, shell_def.default_allowed, role::SHELL);
-        let child =
-            try_spawn(&zero_perms_parent, role::WORKER, full_request()).unwrap();
+        let child = try_spawn(&zero_perms_parent, role::WORKER, full_request()).unwrap();
         let p = child.permissions();
         let worker_def = role_def(role::WORKER).unwrap();
         assert_eq!(p.perms_mask(), worker_def.default_perms);

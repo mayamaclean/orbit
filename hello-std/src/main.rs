@@ -9,7 +9,10 @@ fn main() {
 
     let now = std::time::Instant::now();
     let then = std::time::Instant::now();
-    println!("instant delta micros = {}", then.duration_since(now).as_micros());
+    println!(
+        "instant delta micros = {}",
+        then.duration_since(now).as_micros()
+    );
 
     // §13e — std::thread::spawn round trip.
     let counter = Arc::new(AtomicU32::new(0));
@@ -139,17 +142,22 @@ fn main() {
     let n_vars = std::env::vars_os().count();
     if n_vars == 3 {
         println!("PASS: std::env vars_os count=3");
-    } else {
+    }
+    else {
         println!("FAIL: std::env vars_os count={n_vars} (want 3)");
     }
     // Mutations exist solely in the in-process map — confirm round trip.
-    unsafe { std::env::set_var("FOO", "bar"); }
+    unsafe {
+        std::env::set_var("FOO", "bar");
+    }
     match std::env::var("FOO") {
         Ok(v) if v == "bar" => println!("PASS: std::env set_var/var round trip"),
         Ok(v) => println!("FAIL: std::env set_var/var got {v:?}"),
         Err(e) => println!("FAIL: std::env set_var/var: {e}"),
     }
-    unsafe { std::env::remove_var("FOO"); }
+    unsafe {
+        std::env::remove_var("FOO");
+    }
     match std::env::var("FOO") {
         Err(std::env::VarError::NotPresent) => println!("PASS: std::env remove_var clears entry"),
         Ok(v) => println!("FAIL: std::env remove_var still returns {v:?}"),
@@ -157,7 +165,9 @@ fn main() {
     }
     println!(
         "available_parallelism = {}",
-        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0)
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(0)
     );
 
     // §13e — HashMap. Backed by `hashmap_random_keys` which on orbit
@@ -180,7 +190,11 @@ fn main() {
     let mut nums: Vec<i32> = vec![5, 2, 8, 1, 9, 3];
     nums.sort();
     println!("sorted = {nums:?}");
-    let s: String = nums.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(",");
+    let s: String = nums
+        .iter()
+        .map(|n| n.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
     println!("joined = {s}");
 
     // §13e — current thread identity. ThreadId's u64 accessor is
@@ -198,10 +212,12 @@ fn main() {
             Ok(md) => {
                 if md.is_file() && md.len() == 217 {
                     println!("PASS: std::fs::metadata /README is_file size=217");
-                } else {
+                }
+                else {
                     println!(
                         "FAIL: std::fs::metadata /README is_file={} size={}",
-                        md.is_file(), md.len(),
+                        md.is_file(),
+                        md.len(),
                     );
                 }
             }
@@ -227,7 +243,8 @@ fn main() {
                 names.sort();
                 if names == ["README", "bin"] {
                     println!("PASS: std::fs::read_dir / yields [README, bin]");
-                } else {
+                }
+                else {
                     println!("FAIL: std::fs::read_dir / yields {names:?}");
                 }
             }
@@ -247,7 +264,8 @@ fn main() {
                 entries.sort_by(|a, b| a.0.cmp(&b.0));
                 if entries == [("hello".into(), true), ("hello.txt".into(), true)] {
                     println!("PASS: std::fs::read_dir /bin yields [hello(file), hello.txt(file)]");
-                } else {
+                }
+                else {
                     println!("FAIL: std::fs::read_dir /bin yields {entries:?}");
                 }
             }
@@ -296,7 +314,10 @@ fn main() {
     // peer, echo what they send. The host driver sends a single
     // line and disconnects.
     use std::net::TcpListener;
-    match TcpListener::bind(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 7778))) {
+    match TcpListener::bind(SocketAddr::V4(SocketAddrV4::new(
+        Ipv4Addr::new(0, 0, 0, 0),
+        7778,
+    ))) {
         Ok(listener) => {
             println!("listener bound on :7778");
             match listener.accept() {

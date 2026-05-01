@@ -1,5 +1,5 @@
-use core::sync::atomic::{self as atomic, AtomicU64};
 use atomic::Ordering;
+use core::sync::atomic::{self as atomic, AtomicU64};
 use riscv::register::satp::Satp;
 
 /// Atomic storage for page-table entries. Hardware page-table walkers on
@@ -19,9 +19,7 @@ impl VirtAddr {
     pub const PAGE_OFFSET_MASK: u64 = 0xFFF;
     pub const VIRT_PAGE_NUM_MASK: u64 = 0x1FF;
 
-    const VPN_OFFSETS: [u64; 4] = [
-        12, 21, 30, 39
-    ];
+    const VPN_OFFSETS: [u64; 4] = [12, 21, 30, 39];
 
     pub const fn new(raw: u64) -> Self {
         Self { a: raw }
@@ -78,9 +76,7 @@ impl PhysAddr {
     pub const PHYS_PAGE_NUM_MASK: u64 = 0x1FF;
     pub const PHYS_PAGE_NUM_MASK3: u64 = 0x1FFFF;
 
-    pub const PPN_OFFSETS: [u64; 4] = [
-        12, 21, 30, 39
-    ];
+    pub const PPN_OFFSETS: [u64; 4] = [12, 21, 30, 39];
 
     pub const fn new(raw: u64) -> Self {
         Self { a: raw }
@@ -101,7 +97,12 @@ impl PhysAddr {
 
     pub fn ppn_n(&self, n: usize) -> u64 {
         let i = Self::PPN_OFFSETS[n];
-        let pm = if n == 3 { Self::PHYS_PAGE_NUM_MASK3 } else { Self::PHYS_PAGE_NUM_MASK };
+        let pm = if n == 3 {
+            Self::PHYS_PAGE_NUM_MASK3
+        }
+        else {
+            Self::PHYS_PAGE_NUM_MASK
+        };
         let m = pm << i as u64;
         (self.a & m) >> Self::PPN_OFFSETS[n]
     }
@@ -149,26 +150,24 @@ pub struct PageTableEntry {
 impl PageTableEntry {
     pub const STATUS_BITS_MASK: u64 = 0x3FF;
 
-    pub const PPN_OFFSETS: [u64; 4] = [
-        10, 19, 28, 37
-    ];
+    pub const PPN_OFFSETS: [u64; 4] = [10, 19, 28, 37];
 
     // Single-bit flag masks. Using these (over repeated `1 << N`) keeps
     // `pack_leaf` and the atomic setters readable.
-    pub const VALID:      u64 = 1 << 0;
-    pub const READABLE:   u64 = 1 << 1;
-    pub const WRITEABLE:  u64 = 1 << 2;
+    pub const VALID: u64 = 1 << 0;
+    pub const READABLE: u64 = 1 << 1;
+    pub const WRITEABLE: u64 = 1 << 2;
     pub const EXECUTABLE: u64 = 1 << 3;
-    pub const USER_PAGE:  u64 = 1 << 4;
-    pub const GLOBAL:     u64 = 1 << 5;
-    pub const ACCESSED:   u64 = 1 << 6;
-    pub const DIRTY:      u64 = 1 << 7;
+    pub const USER_PAGE: u64 = 1 << 4;
+    pub const GLOBAL: u64 = 1 << 5;
+    pub const ACCESSED: u64 = 1 << 6;
+    pub const DIRTY: u64 = 1 << 7;
     // R|W|X|U|G — the bits PagePermissions encodes.
     pub const PERMS_MASK: u64 = 0x3E;
 
     pub const fn new(raw: u64) -> Self {
         Self {
-            e: AtomicU64::new(raw)
+            e: AtomicU64::new(raw),
         }
     }
 
@@ -223,11 +222,12 @@ impl PageTableEntry {
         let m = 1 << bit;
         if b {
             self.e.fetch_or(m, Ordering::AcqRel);
-        } else {
+        }
+        else {
             self.e.fetch_and(!m, Ordering::AcqRel);
         }
     }
-    
+
     pub fn is_valid(&self) -> bool {
         self.get_bit(0)
     }
@@ -307,9 +307,11 @@ impl PageTableEntry {
     pub fn set_supervisor_bits(&self, bits: u8) {
         const M: u64 = 3 << 8;
         let new = (bits as u64 & 3) << 8;
-        let _ = self.e.fetch_update(Ordering::AcqRel, Ordering::Acquire, |c| {
-            Some((c & !M) | new)
-        });
+        let _ = self
+            .e
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |c| {
+                Some((c & !M) | new)
+            });
     }
 
     pub fn ppn(&self) -> u64 {
@@ -351,7 +353,7 @@ pub const PAGE_TABLE_ENTRY_COUNT: usize = 4096 / core::mem::size_of::<PageTableE
 
 #[repr(C, align(4096))]
 pub struct PageTable {
-    pub entries: [PageTableEntry; PAGE_TABLE_ENTRY_COUNT]
+    pub entries: [PageTableEntry; PAGE_TABLE_ENTRY_COUNT],
 }
 
 #[cfg(test)]
@@ -374,7 +376,10 @@ mod pte_pack_tests {
         let ppn = 0x12345;
         let raw = PageTableEntry::pack_leaf(ppn, 0, 0);
         // PPN lives at bits [10..54) — shift back should recover it.
-        assert_eq!((raw >> PageTableEntry::PPN_OFFSETS[0]) & 0x0F_FFFF_FFFF_FFFF, ppn);
+        assert_eq!(
+            (raw >> PageTableEntry::PPN_OFFSETS[0]) & 0x0F_FFFF_FFFF_FFFF,
+            ppn
+        );
     }
 
     #[test]
@@ -445,7 +450,10 @@ mod pte_pack_tests {
     fn table_encodes_ppn() {
         let ppn = 0xABCDE;
         let raw = PageTableEntry::pack_table(ppn);
-        assert_eq!((raw >> PageTableEntry::PPN_OFFSETS[0]) & 0x0F_FFFF_FFFF_FFFF, ppn);
+        assert_eq!(
+            (raw >> PageTableEntry::PPN_OFFSETS[0]) & 0x0F_FFFF_FFFF_FFFF,
+            ppn
+        );
     }
 
     // ---- set_raw / get_raw ----
@@ -483,13 +491,13 @@ mod pte_pack_tests {
     #[test]
     fn flag_bit_positions_match_spec() {
         // RISC-V priv-spec layout: V=0, R=1, W=2, X=3, U=4, G=5, A=6, D=7.
-        assert_eq!(PageTableEntry::VALID,      1 << 0);
-        assert_eq!(PageTableEntry::READABLE,   1 << 1);
-        assert_eq!(PageTableEntry::WRITEABLE,  1 << 2);
+        assert_eq!(PageTableEntry::VALID, 1 << 0);
+        assert_eq!(PageTableEntry::READABLE, 1 << 1);
+        assert_eq!(PageTableEntry::WRITEABLE, 1 << 2);
         assert_eq!(PageTableEntry::EXECUTABLE, 1 << 3);
-        assert_eq!(PageTableEntry::USER_PAGE,  1 << 4);
-        assert_eq!(PageTableEntry::GLOBAL,     1 << 5);
-        assert_eq!(PageTableEntry::ACCESSED,   1 << 6);
-        assert_eq!(PageTableEntry::DIRTY,      1 << 7);
+        assert_eq!(PageTableEntry::USER_PAGE, 1 << 4);
+        assert_eq!(PageTableEntry::GLOBAL, 1 << 5);
+        assert_eq!(PageTableEntry::ACCESSED, 1 << 6);
+        assert_eq!(PageTableEntry::DIRTY, 1 << 7);
     }
 }

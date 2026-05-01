@@ -25,15 +25,15 @@ use orbit_rt as _;
 use alloc::vec::Vec;
 use core::panic::PanicInfo;
 
+use core::fmt::Write;
 use orbit_abi::{
     fs::Stat,
     syscall_stats::payload_size,
     user::{
-        close_handle, console_write, ConsoleWriter, create_process, exit, fs_open, fs_read,
+        ConsoleWriter, close_handle, console_write, create_process, exit, fs_open, fs_read,
         fs_stat, query_stats, query_syscall_stats, read_stdin, sleep_ms, wait_pid,
     },
 };
-use core::fmt::Write;
 
 const PROMPT: &[u8] = b"console@orbit $ ";
 
@@ -67,19 +67,31 @@ struct LineEditor {
 
 impl LineEditor {
     const fn new() -> Self {
-        Self { buf: Vec::new(), esc: 0 }
+        Self {
+            buf: Vec::new(),
+            esc: 0,
+        }
     }
 
     /// Feed one byte from the stdin ring. Returns `Some(line)` on `\n`
     /// (caller dispatches; the editor's buffer is reset by the take).
     fn feed(&mut self, b: u8) -> Option<Vec<u8>> {
         match self.esc {
-            1 => { self.esc = if b == b'[' { 2 } else { 0 }; return None; }
-            2 => { self.esc = 0; return None; }
+            1 => {
+                self.esc = if b == b'[' { 2 } else { 0 };
+                return None;
+            }
+            2 => {
+                self.esc = 0;
+                return None;
+            }
             _ => {}
         }
         match b {
-            0x1b => { self.esc = 1; None }
+            0x1b => {
+                self.esc = 1;
+                None
+            }
             b'\n' => {
                 let line = core::mem::take(&mut self.buf);
                 write_chunked(b"\n");
@@ -145,10 +157,26 @@ fn stats_cmd() {
     let _ = writeln!(w, "  resident         {}", HumanBytes(stats.resident_bytes));
     let _ = writeln!(w, "  heap             {}", HumanBytes(stats.heap_bytes));
     let _ = writeln!(w, "kernel pools:");
-    let _ = writeln!(w, "  kpages           {}", HumanBytes(stats.kernel_kpages_bytes));
-    let _ = writeln!(w, "  user_pages       {}", HumanBytes(stats.kernel_user_pages_bytes));
-    let _ = writeln!(w, "  ktables          {}", HumanBytes(stats.kernel_ktables_bytes));
-    let _ = writeln!(w, "  kheap            {}", HumanBytes(stats.kernel_heap_bytes));
+    let _ = writeln!(
+        w,
+        "  kpages           {}",
+        HumanBytes(stats.kernel_kpages_bytes)
+    );
+    let _ = writeln!(
+        w,
+        "  user_pages       {}",
+        HumanBytes(stats.kernel_user_pages_bytes)
+    );
+    let _ = writeln!(
+        w,
+        "  ktables          {}",
+        HumanBytes(stats.kernel_ktables_bytes)
+    );
+    let _ = writeln!(
+        w,
+        "  kheap            {}",
+        HumanBytes(stats.kernel_heap_bytes)
+    );
     let _ = writeln!(w, "harts (system-wide):");
     let _ = writeln!(w, "  user_ms          {}", ms(stats.hart_user_ticks));
     let _ = writeln!(w, "  kernel_ms        {}", ms(stats.hart_kernel_ticks));
@@ -217,7 +245,12 @@ fn syscall_stats_cmd() {
     );
     for i in 0..n {
         let e = &entries[i];
-        let avg_us = if e.count > 0 { (e.total_ticks / e.count) / 10 } else { 0 };
+        let avg_us = if e.count > 0 {
+            (e.total_ticks / e.count) / 10
+        }
+        else {
+            0
+        };
         let _ = writeln!(
             w,
             "{:<22}{:>12}{:>14}{:>12}",
@@ -241,9 +274,11 @@ impl core::fmt::Display for HumanBytes {
         const MIB: u64 = 1024 * 1024;
         if self.0 >= MIB {
             write!(f, "{} MiB", self.0 / MIB)
-        } else if self.0 >= KIB {
+        }
+        else if self.0 >= KIB {
             write!(f, "{} KiB", self.0 / KIB)
-        } else {
+        }
+        else {
             write!(f, "{} B", self.0)
         }
     }
@@ -258,7 +293,12 @@ struct LineWriter {
 }
 
 impl LineWriter {
-    const fn new() -> Self { Self { buf: [0u8; 256], len: 0 } }
+    const fn new() -> Self {
+        Self {
+            buf: [0u8; 256],
+            len: 0,
+        }
+    }
     fn flush(&mut self) {
         if self.len > 0 {
             write_chunked(&self.buf[..self.len]);
@@ -270,7 +310,9 @@ impl LineWriter {
 impl core::fmt::Write for LineWriter {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
         for &b in s.as_bytes() {
-            if self.len == self.buf.len() { self.flush(); }
+            if self.len == self.buf.len() {
+                self.flush();
+            }
             self.buf[self.len] = b;
             self.len += 1;
         }
@@ -357,9 +399,14 @@ fn exec_path(path: &str) {
 fn dispatch(line: &[u8]) {
     let s = match core::str::from_utf8(line) {
         Ok(s) => s.trim(),
-        Err(_) => { write_chunked(b"console: input was not utf-8\n"); return; }
+        Err(_) => {
+            write_chunked(b"console: input was not utf-8\n");
+            return;
+        }
     };
-    if s.is_empty() { return; }
+    if s.is_empty() {
+        return;
+    }
     // Anything starting with `/` is treated as a path to exec — no
     // PATH search yet. Matches what users type when they explicitly
     // run a file.
@@ -405,7 +452,10 @@ pub extern "C" fn main() -> i32 {
             // Blocking read shouldn't EAGAIN in practice, and other
             // errors (EFAULT/EINVAL/EBUSY) shouldn't happen with a
             // stable stack-resident buffer. Yield briefly and retry.
-            Err(_) => { let _ = sleep_ms(10); continue; }
+            Err(_) => {
+                let _ = sleep_ms(10);
+                continue;
+            }
         };
         for &b in &buf[..n] {
             if let Some(line) = editor.feed(b) {

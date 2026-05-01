@@ -9,7 +9,7 @@ mod common;
 use process::ThreadState;
 use riscv::register::sstatus::SPP;
 
-use orbit_abi::errno::{Errno, EAGAIN, EBUSY, EFAULT, EINVAL};
+use orbit_abi::errno::{EAGAIN, EBUSY, EFAULT, EINVAL, Errno};
 use orbit_core::syscall::READ_STDIN_NONBLOCK;
 use orbit_core::{PAGE_SIZE, ShimAction, SyscallOutcome, apply_syscall_outcome, syscall};
 
@@ -77,12 +77,17 @@ fn block_empty_parks_then_yields_retry() {
 
     assert!(matches!(
         outcome,
-        SyscallOutcome::YieldRetry { state: ThreadState::Blocking }
+        SyscallOutcome::YieldRetry {
+            state: ThreadState::Blocking
+        }
     ));
     assert!(t.handle.is_some(), "thread parked on a handle");
     assert_eq!(hw.stdin_parked.len(), 1, "park called exactly once");
     assert_eq!(hw.stdin_parked[0].0, PID);
-    assert!(hw.stdin_unparked.is_empty(), "no cancel on truly-empty path");
+    assert!(
+        hw.stdin_unparked.is_empty(),
+        "no cancel on truly-empty path"
+    );
 }
 
 #[test]
@@ -99,7 +104,8 @@ fn block_empty_recheck_drain_cancels_park() {
     // an empty-then-data sequence by inserting two entries: the
     // first empty Vec is consumed by the first drain (returning 0),
     // the second by the recheck.
-    hw.stdin_ready.insert(PID, vec![Vec::new(), b"x42!".to_vec()]);
+    hw.stdin_ready
+        .insert(PID, vec![Vec::new(), b"x42!".to_vec()]);
 
     let outcome = syscall::read_stdin(&mut t, &frame, &mut hw);
 
@@ -131,7 +137,10 @@ fn bad_user_va_returns_efault() {
     let mut t = make_thread(ThreadState::Running, SPP::User);
     t.pid = PID;
     let frame = frame_with(16, 0);
-    let mut hw = FakeHw { translates: false, ..Default::default() };
+    let mut hw = FakeHw {
+        translates: false,
+        ..Default::default()
+    };
 
     let outcome = syscall::read_stdin(&mut t, &frame, &mut hw);
 
@@ -174,7 +183,10 @@ fn rejects_kernel_vaddr() {
     let outcome = syscall::read_stdin(&mut t, &frame, &mut hw);
 
     assert_eq!(outcome, ready(Errno::new(EFAULT).to_ret()));
-    assert!(hw.stdin_drain_writes.is_empty(), "no drain on out-of-range va");
+    assert!(
+        hw.stdin_drain_writes.is_empty(),
+        "no drain on out-of-range va"
+    );
     assert!(hw.stdin_parked.is_empty(), "no park on out-of-range va");
 }
 
@@ -219,7 +231,10 @@ fn yield_retry_keeps_pc_so_resume_re_executes_ecall() {
         ECALL_EPC,
         "park-and-retry must keep pc at the ecall"
     );
-    assert_eq!(t.frame.regs[10], 0xDEAD_BEEF, "syscall number snapshot preserved");
+    assert_eq!(
+        t.frame.regs[10], 0xDEAD_BEEF,
+        "syscall number snapshot preserved"
+    );
     assert_eq!(t.frame.regs[11], UVA as usize, "buf ptr snapshot preserved");
     assert_eq!(t.frame.regs[12], 16, "len snapshot preserved");
 }

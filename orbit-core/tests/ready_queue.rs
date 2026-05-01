@@ -55,10 +55,10 @@ fn affinity_skip_preserves_order_for_remaining() {
     let mut t_pinned = make_ready();
     let mut t_open = make_ready();
     set_affinity(&mut t_pinned, 1 << 3); // hart 3 only
-    set_affinity(&mut t_open,   u64::MAX);
+    set_affinity(&mut t_open, u64::MAX);
 
     let tp_pinned: *mut _ = &mut *t_pinned;
-    let tp_open:   *mut _ = &mut *t_open;
+    let tp_open: *mut _ = &mut *t_open;
 
     let mut q = ReadyQueue::new();
     q.push(tp_pinned);

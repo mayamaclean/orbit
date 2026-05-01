@@ -16,10 +16,10 @@ pub const OPEN_RDONLY: usize = 0;
 
 // File-type bits for `Stat::st_mode`. POSIX-shape (octal). High bits
 // encode the type; low 12 bits are permission + setuid/setgid/sticky.
-pub const S_IFMT:   u32 = 0o170000;
-pub const S_IFREG:  u32 = 0o100000;
-pub const S_IFDIR:  u32 = 0o040000;
-pub const S_IFLNK:  u32 = 0o120000;
+pub const S_IFMT: u32 = 0o170000;
+pub const S_IFREG: u32 = 0o100000;
+pub const S_IFDIR: u32 = 0o040000;
+pub const S_IFLNK: u32 = 0o120000;
 
 /// Sector size used for `st_blocks` accounting. POSIX defines
 /// `st_blocks` as "number of 512-byte units" regardless of the

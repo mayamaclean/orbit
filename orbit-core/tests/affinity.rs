@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 use process::{Thread, ThreadState};
 use riscv::register::sstatus::SPP;
 
-use orbit_abi::errno::{Errno, EINVAL, EPERM};
+use orbit_abi::errno::{EINVAL, EPERM, Errno};
 use orbit_core::sched::{HartView, Scheduler, assign_threads};
 use orbit_core::{SyscallOutcome, syscall};
 
@@ -29,7 +29,10 @@ fn set_affinity_narrows_within_cap() {
 
     assert_eq!(
         outcome,
-        SyscallOutcome::Yield { state: ThreadState::Ready, ret: Some(0) }
+        SyscallOutcome::Yield {
+            state: ThreadState::Ready,
+            ret: Some(0)
+        }
     );
     assert_eq!(t.affinity.load(Ordering::Acquire), 0b0010);
     // Cap is immutable.
@@ -49,7 +52,10 @@ fn set_affinity_zero_mask_is_einval() {
 
     assert_eq!(
         outcome,
-        SyscallOutcome::Yield { state: ThreadState::Ready, ret: Some(Errno::new(EINVAL).to_ret()) }
+        SyscallOutcome::Yield {
+            state: ThreadState::Ready,
+            ret: Some(Errno::new(EINVAL).to_ret())
+        }
     );
     // Reject path leaves the mask untouched — checked via the cap-immutable
     // semantics of allowed_affinity and the unchanged current value.
@@ -69,7 +75,10 @@ fn set_affinity_outside_allowed_is_eperm() {
 
     assert_eq!(
         outcome,
-        SyscallOutcome::Yield { state: ThreadState::Ready, ret: Some(Errno::new(EPERM).to_ret()) }
+        SyscallOutcome::Yield {
+            state: ThreadState::Ready,
+            ret: Some(Errno::new(EPERM).to_ret())
+        }
     );
     assert_eq!(t.affinity.load(Ordering::Acquire), 0b0001);
 }
@@ -89,7 +98,10 @@ fn set_affinity_partial_overlap_outside_cap_is_eperm() {
 
     assert_eq!(
         outcome,
-        SyscallOutcome::Yield { state: ThreadState::Ready, ret: Some(Errno::new(EPERM).to_ret()) }
+        SyscallOutcome::Yield {
+            state: ThreadState::Ready,
+            ret: Some(Errno::new(EPERM).to_ret())
+        }
     );
 }
 
@@ -106,7 +118,10 @@ fn set_affinity_to_full_cap_is_ok() {
 
     assert_eq!(
         outcome,
-        SyscallOutcome::Yield { state: ThreadState::Ready, ret: Some(0) }
+        SyscallOutcome::Yield {
+            state: ThreadState::Ready,
+            ret: Some(0)
+        }
     );
     assert_eq!(t.affinity.load(Ordering::Acquire), 0b0011);
 }
@@ -121,7 +136,10 @@ fn get_affinity_returns_current_and_allowed_in_a0_a1() {
 
     assert_eq!(
         outcome,
-        SyscallOutcome::Return2 { ret0: 0b0010, ret1: 0b1111 }
+        SyscallOutcome::Return2 {
+            ret0: 0b0010,
+            ret1: 0b1111
+        }
     );
 }
 
@@ -156,7 +174,10 @@ struct AffSched {
 impl AffSched {
     fn new(threads: Vec<Thread>) -> Self {
         let n = threads.len();
-        Self { threads, taken: vec![false; n] }
+        Self {
+            threads,
+            taken: vec![false; n],
+        }
     }
 }
 
@@ -181,7 +202,10 @@ fn make_slots(n: usize) -> Vec<AtomicPtr<()>> {
 }
 
 fn views<'a>(slots: &'a [AtomicPtr<()>]) -> (HartView<'a>, Vec<HartView<'a>>) {
-    let self_view = HartView { hart_id: 0, current: &slots[0] };
+    let self_view = HartView {
+        hart_id: 0,
+        current: &slots[0],
+    };
     let remotes = slots[1..]
         .iter()
         .enumerate()
@@ -209,10 +233,22 @@ fn affinity_pinned_thread_only_lands_on_permitted_hart() {
     assign_threads(&self_view, remotes, &mut sched, &mut hw);
 
     // Only hart 2's slot should be populated.
-    assert!(slots[0].load(Ordering::Acquire).is_null(), "self (hart 0) untouched");
-    assert!(slots[1].load(Ordering::Acquire).is_null(), "hart 1 untouched");
-    assert!(!slots[2].load(Ordering::Acquire).is_null(), "hart 2 received the thread");
-    assert!(slots[3].load(Ordering::Acquire).is_null(), "hart 3 untouched");
+    assert!(
+        slots[0].load(Ordering::Acquire).is_null(),
+        "self (hart 0) untouched"
+    );
+    assert!(
+        slots[1].load(Ordering::Acquire).is_null(),
+        "hart 1 untouched"
+    );
+    assert!(
+        !slots[2].load(Ordering::Acquire).is_null(),
+        "hart 2 received the thread"
+    );
+    assert!(
+        slots[3].load(Ordering::Acquire).is_null(),
+        "hart 3 untouched"
+    );
 
     // And hart 2 specifically got the IPI.
     assert_eq!(hw.wakes, vec![2]);
@@ -244,7 +280,10 @@ fn restrictive_thread_does_not_starve_unrelated_harts() {
     // bit-3 only). Hart 3 picks up t1.
     assert!(slots[0].load(Ordering::Acquire).is_null());
     assert!(!slots[1].load(Ordering::Acquire).is_null(), "hart 1 got t2");
-    assert!(slots[2].load(Ordering::Acquire).is_null(), "hart 2 has no compatible work");
+    assert!(
+        slots[2].load(Ordering::Acquire).is_null(),
+        "hart 2 has no compatible work"
+    );
     assert!(!slots[3].load(Ordering::Acquire).is_null(), "hart 3 got t1");
 
     // IPI count: harts 1 and 3.

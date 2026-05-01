@@ -121,12 +121,7 @@ impl SyscallSlot {
 /// guards with `Sysno::from_usize` so unknown sysnos don't pollute
 /// the dense ordinal table).
 #[inline]
-pub fn record_syscall(
-    slot: Option<&SyscallSlot>,
-    thread: &Thread,
-    start: u64,
-    end: u64,
-) {
+pub fn record_syscall(slot: Option<&SyscallSlot>, thread: &Thread, start: u64, end: u64) {
     let elapsed = end.wrapping_sub(start);
     if let Some(s) = slot {
         s.count.fetch_add(1, Ordering::Relaxed);

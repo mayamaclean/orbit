@@ -103,7 +103,7 @@ impl DenialSink for DenialRing {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use orbit_abi::denial::{deny_reason, GateContext, DenialEvent};
+    use orbit_abi::denial::{DenialEvent, GateContext, deny_reason};
 
     fn perm_event(seq: u64) -> DenialEvent {
         // Synthetic event with `time_ticks = seq` so tests can identify
@@ -179,7 +179,11 @@ mod tests {
         assert_eq!(r.len(), DENIAL_RING_CAPACITY);
 
         r.push(perm_event(DENIAL_RING_CAPACITY as u64));
-        assert_eq!(r.len(), DENIAL_RING_CAPACITY, "len stays at cap after eviction");
+        assert_eq!(
+            r.len(),
+            DENIAL_RING_CAPACITY,
+            "len stays at cap after eviction"
+        );
 
         let times: alloc::vec::Vec<u64> = r
             .iter()
@@ -271,14 +275,18 @@ mod tests {
         // Integration-shaped sanity: pass &mut DenialRing where a
         // DenialSink is expected (Permissions::can_call). The denied
         // call's PermDeny event should land in the ring.
-        use orbit_abi::perms::{class, ClassMask, Permissions, PermsRequest};
+        use orbit_abi::perms::{ClassMask, Permissions, PermsRequest, class};
 
         let p = Permissions::ALL.pledge(PermsRequest {
             perms: ClassMask::from_raw(class::raw::ALL & !class::raw::NETCH),
             allowed_perms: class::ALL,
         });
         let mut ring = DenialRing::new();
-        let ctx = GateContext { pid: 5, tid: 9, time_ticks: 1_000 };
+        let ctx = GateContext {
+            pid: 5,
+            tid: 9,
+            time_ticks: 1_000,
+        };
         let ok = p.can_call(orbit_abi::syscall::CREATE_NETCH, ctx, &mut ring);
         assert!(!ok);
         assert_eq!(ring.len(), 1);

@@ -39,7 +39,7 @@
 
 pub use crate::argv::ARGV_BLOB_MAX as ENVP_BLOB_MAX;
 pub use crate::argv::ARGV_OFFSETS_OFFSET as ENVP_OFFSETS_OFFSET;
-pub use crate::argv::ArgvHeader as EnvpHeader;
 pub use crate::argv::Argv as Envp;
+pub use crate::argv::ArgvHeader as EnvpHeader;
 pub use crate::argv::argv_strings_offset as envp_strings_offset;
 pub use crate::argv::pack;

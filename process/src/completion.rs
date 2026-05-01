@@ -128,7 +128,9 @@ pub struct CompletionHandle {
 impl CompletionHandle {
     /// Allocate a fresh, pending handle. Allocates one Arc.
     pub fn new() -> Self {
-        Self { inner: Arc::new(CompletionInner::new()) }
+        Self {
+            inner: Arc::new(CompletionInner::new()),
+        }
     }
 
     /// Single-register return: `result` lands in `regs[10]` (a0); a1+
@@ -157,12 +159,17 @@ impl CompletionHandle {
     /// writer commits with a Release store of `SIGNALED`, which
     /// publishes the rets/count writes to any Acquire reader.
     pub fn signal_n(&self, vals: &[isize]) {
-        if self.inner.state.compare_exchange(
-            STATE_PENDING,
-            STATE_WRITING,
-            Ordering::Acquire,
-            Ordering::Acquire,
-        ).is_err() {
+        if self
+            .inner
+            .state
+            .compare_exchange(
+                STATE_PENDING,
+                STATE_WRITING,
+                Ordering::Acquire,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
             return;
         }
         let n = core::cmp::min(vals.len(), MAX_RET_SLOTS);
@@ -238,12 +245,16 @@ impl CompletionHandle {
     /// already. The Arc strong count reverts to ownership of the
     /// returned handle.
     pub unsafe fn from_raw(raw: *const CompletionInner) -> Self {
-        Self { inner: unsafe { Arc::from_raw(raw) } }
+        Self {
+            inner: unsafe { Arc::from_raw(raw) },
+        }
     }
 }
 
 impl Default for CompletionHandle {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Refcounted counter for "1 sender / N receivers / sender spins".
@@ -261,17 +272,19 @@ impl AckCounter {
     /// Allocate a counter starting at `n`. `n == 0` is legal (waiter
     /// returns immediately).
     pub fn new(n: usize) -> Self {
-        Self { inner: Arc::new(AtomicUsize::new(n)) }
+        Self {
+            inner: Arc::new(AtomicUsize::new(n)),
+        }
     }
 
     /// Decrement by one. Saturates at zero — extra decrements are
     /// safe but should not happen in correct use. Trap-context-safe.
     pub fn decrement(&self) {
-        let _ = self.inner.fetch_update(
-            Ordering::Release,
-            Ordering::Relaxed,
-            |v| if v == 0 { None } else { Some(v - 1) },
-        );
+        let _ = self
+            .inner
+            .fetch_update(Ordering::Release, Ordering::Relaxed, |v| {
+                if v == 0 { None } else { Some(v - 1) }
+            });
     }
 
     /// Spin until the counter reaches zero. Cheap on RISC-V: just a

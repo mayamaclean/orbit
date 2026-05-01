@@ -19,7 +19,10 @@ pub struct MmioSlot {
 }
 
 fn is_virtio_mmio(n: &FdtNode<'_>) -> bool {
-    let Some(compat) = n.property("compatible") else { return false };
+    let Some(compat) = n.property("compatible")
+    else {
+        return false;
+    };
     compat.as_str_list().any(|s| s == "virtio,mmio")
 }
 
@@ -39,10 +42,7 @@ fn slot_from(n: &FdtNode<'_>) -> Option<MmioSlot> {
     let reg = regs.next()?;
     let pa_base = reg.address::<u64>().ok()?;
     let size = reg.size::<u64>().ok()?;
-    let irq = n
-        .property("interrupts")?
-        .as_u32()
-        .ok()?;
+    let irq = n.property("interrupts")?.as_u32().ok()?;
     Some(MmioSlot { pa_base, size, irq })
 }
 
