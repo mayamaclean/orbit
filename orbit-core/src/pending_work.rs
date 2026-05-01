@@ -13,12 +13,14 @@
 //! the thread and a signaler somewhere — no work-queue entry, no
 //! manager involvement.
 
+use mmu::sv48::PhysAddr;
+use orbit_abi::layout::UserVa;
 use net_channel::BindSpec;
 use process::CompletionHandle;
 
 #[derive(Debug, Clone, Copy)]
 pub struct MemMapReq {
-    pub vaddr: usize,
+    pub vaddr: UserVa,
     pub size: usize,
     pub page_permissions: u64,
     pub share_with_kernel: bool,
@@ -26,7 +28,7 @@ pub struct MemMapReq {
 
 #[derive(Debug, Clone, Copy)]
 pub struct NetChannelCreationReq {
-    pub nc_vaddr: usize,
+    pub nc_vaddr: UserVa,
     pub region_size: usize,
     pub nc_type: usize,
     /// Sticky binding the kernel latches at channel creation. Sent
@@ -47,7 +49,7 @@ pub struct CreateThreadReq {
     /// User-VA function pointer the new thread enters at. Bound-checked
     /// against the calling process's private + ELF range at the syscall
     /// boundary; a kernel-half VA here would be a privilege escalation.
-    pub entry: usize,
+    pub entry: UserVa,
     /// Cap and initial mask for the new thread. Sentinel `0` means
     /// "inherit the parent's value." Manager validates the resolved
     /// pair against the parent's `allowed_affinity` so a thread can't
@@ -65,7 +67,7 @@ pub struct CreateThreadReq {
 #[derive(Debug, Clone, Copy)]
 pub struct FsOpenReq {
     /// User VA of the path string.
-    pub path_vaddr: usize,
+    pub path_vaddr: UserVa,
     /// Length in bytes (no NUL). Capped at [`MAX_FS_PATH_LEN`] at the
     /// syscall boundary.
     pub path_len: usize,
@@ -77,18 +79,18 @@ pub struct FsOpenReq {
 #[derive(Debug, Clone, Copy)]
 pub struct FsReadReq {
     pub fd: u32,
-    pub buf_vaddr: usize,
+    pub buf_vaddr: UserVa,
     pub len: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct FsStatReq {
-    pub path_vaddr: usize,
+    pub path_vaddr: UserVa,
     pub path_len: usize,
     /// User VA of the `Stat` out-buffer. The kernel writes
     /// `size_of::<Stat>` bytes — caller must reserve at least that
     /// much.
-    pub stat_vaddr: usize,
+    pub stat_vaddr: UserVa,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -97,7 +99,7 @@ pub struct FsReaddirReq {
     pub fd: u32,
     /// User VA of the out-buffer. Filled with packed
     /// [`orbit_abi::fs::DirEntry`] records.
-    pub buf_vaddr: usize,
+    pub buf_vaddr: UserVa,
     /// Buffer length in bytes. Capped at one page on the kernel side
     /// (single `UserPageWindow` for the copy-out, same constraint as
     /// `fs_stat`).
@@ -120,7 +122,7 @@ pub struct WaitPidReq {
 
 #[derive(Debug, Clone, Copy)]
 pub struct CreateProcessReq {
-    pub elf_vaddr: usize,
+    pub elf_vaddr: UserVa,
     pub elf_len: usize,
     /// Initial mask handed to the child's first thread. The manager
     /// substitutes the all-harts default for the sentinel value 0
@@ -146,7 +148,7 @@ pub struct CreateProcessReq {
 /// single-threaded — only one hart holds `MANAGER_LOCK`).
 #[derive(Debug, Clone, Copy)]
 pub struct FutexWaitReq {
-    pub uaddr: usize,
+    pub uaddr: UserVa,
     pub expected: u32,
     /// `0` → wait forever (current v1 contract). Reserved for the
     /// future timeout-scan path (see roadmap §13a.5).
@@ -158,7 +160,7 @@ pub struct FutexWaitReq {
 /// from `futex_waiters[PA]`, signaling each with `0`.
 #[derive(Debug, Clone, Copy)]
 pub struct FutexWakeReq {
-    pub uaddr: usize,
+    pub uaddr: UserVa,
     pub n: u32,
 }
 
@@ -173,7 +175,7 @@ pub struct PledgeReq {
     /// User VA of the [`orbit_abi::perms::PermsRequest`] struct.
     /// Bound-checked at the syscall boundary; manager copies the
     /// 16-byte payload via the standard boundary path.
-    pub req_vaddr: usize,
+    pub req_vaddr: UserVa,
 }
 
 /// `create_process_v2(args)` request — the role-aware spawn. Same
@@ -185,7 +187,7 @@ pub struct PledgeReq {
 pub struct CreateProcessV2Req {
     /// User VA of the [`orbit_abi::perms::CreateProcessV2Args`]
     /// struct. Bound-checked at the syscall boundary.
-    pub args_vaddr: usize,
+    pub args_vaddr: UserVa,
 }
 
 /// `CreateProcessReq` plus a packed argv blob and (optionally) a
@@ -202,19 +204,19 @@ pub struct CreateProcessV2Req {
 /// validation walks the header to ignore the padding.
 #[derive(Debug, Clone, Copy)]
 pub struct CreateProcessExReq {
-    pub elf_vaddr: usize,
+    pub elf_vaddr: UserVa,
     pub elf_len: usize,
     pub allowed_affinity: u64,
     pub affinity: u64,
     /// User VA of the packed argv blob (see `orbit_abi::argv`).
     /// `0` / `len == 0` means "no argv" — equivalent to
     /// `CREATE_PROCESS`.
-    pub argv_vaddr: usize,
+    pub argv_vaddr: UserVa,
     pub argv_len: usize,
     /// User VA of the packed envp blob (see `orbit_abi::envp`); `0`
     /// means "no envp." Must be page-aligned and page-resident; the
     /// kernel always copies one page from this VA.
-    pub envp_vaddr: usize,
+    pub envp_vaddr: UserVa,
 }
 
 /// One slot in the manager's MPSC work ring. Fixed-size by virtue of
@@ -231,25 +233,25 @@ pub enum PendingWork {
     MemMap {
         req: MemMapReq,
         pid: u16,
-        root_pa: u64,
+        root_pa: PhysAddr,
         handle: CompletionHandle,
     },
     NetChannelCreation {
         req: NetChannelCreationReq,
         pid: u16,
-        root_pa: u64,
+        root_pa: PhysAddr,
         handle: CompletionHandle,
     },
     CloseHandle {
         req: CloseHandleReq,
         pid: u16,
-        root_pa: u64,
+        root_pa: PhysAddr,
         handle: CompletionHandle,
     },
     CreateProcess {
         req: CreateProcessReq,
         pid: u16,
-        root_pa: u64,
+        root_pa: PhysAddr,
         handle: CompletionHandle,
     },
     CreateThread {
@@ -265,13 +267,13 @@ pub enum PendingWork {
     FsOpen {
         req: FsOpenReq,
         pid: u16,
-        root_pa: u64,
+        root_pa: PhysAddr,
         handle: CompletionHandle,
     },
     FsRead {
         req: FsReadReq,
         pid: u16,
-        root_pa: u64,
+        root_pa: PhysAddr,
         /// User thread's handle. The manager hands a clone to the
         /// virtio-blk IRQ slot, so the IRQ signals it directly with
         /// `bytes_read` (success) or `-EIO` (failure). On submit
@@ -282,13 +284,13 @@ pub enum PendingWork {
     FsStat {
         req: FsStatReq,
         pid: u16,
-        root_pa: u64,
+        root_pa: PhysAddr,
         handle: CompletionHandle,
     },
     FsReaddir {
         req: FsReaddirReq,
         pid: u16,
-        root_pa: u64,
+        root_pa: PhysAddr,
         handle: CompletionHandle,
     },
     WaitPid {
@@ -306,13 +308,13 @@ pub enum PendingWork {
     CreateProcessEx {
         req: CreateProcessExReq,
         pid: u16,
-        root_pa: u64,
+        root_pa: PhysAddr,
         handle: CompletionHandle,
     },
     FutexWait {
         req: FutexWaitReq,
         pid: u16,
-        root_pa: u64,
+        root_pa: PhysAddr,
         /// Caller's handle. The manager either signals it
         /// synchronously with `-EAGAIN` (value mismatch) or installs
         /// it on the per-PA wait queue; a later `futex_wake` (or
@@ -322,7 +324,7 @@ pub enum PendingWork {
     FutexWake {
         req: FutexWakeReq,
         pid: u16,
-        root_pa: u64,
+        root_pa: PhysAddr,
         /// Caller's handle. Signaled synchronously with the count of
         /// waiters actually woken (≤ `req.n`) or a negative errno on
         /// translation failure.
@@ -337,7 +339,7 @@ pub enum PendingWork {
     Pledge {
         req: PledgeReq,
         pid: u16,
-        root_pa: u64,
+        root_pa: PhysAddr,
         handle: CompletionHandle,
     },
     /// `create_process_v2(*const CreateProcessV2Args)` — role-aware
@@ -349,7 +351,7 @@ pub enum PendingWork {
     CreateProcessV2 {
         req: CreateProcessV2Req,
         pid: u16,
-        root_pa: u64,
+        root_pa: PhysAddr,
         handle: CompletionHandle,
     },
 }

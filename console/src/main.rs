@@ -27,7 +27,6 @@ use core::panic::PanicInfo;
 
 use orbit_abi::{
     fs::Stat,
-    logln,
     syscall_stats::payload_size,
     user::{
         close_handle, console_write, ConsoleWriter, create_process, exit, fs_open, fs_read,

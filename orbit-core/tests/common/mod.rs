@@ -7,6 +7,8 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize};
 
 use device::{HartContext, Stack, TrapFrame};
+use mmu::sv48::PhysAddr;
+use orbit_abi::layout::UserVa;
 use process::{Thread, ThreadState};
 use riscv::register::satp::Satp;
 use riscv::register::sstatus::SPP;
@@ -190,13 +192,13 @@ impl Hardware for FakeHw {
     fn ticks_per_ms(&self) -> u64 {
         self.ticks_per_ms
     }
-    fn user_va_translates(&self, _root_table_pa: u64, _user_va: u64) -> bool {
+    fn user_va_translates(&self, _root_table_pa: PhysAddr, _user_va: UserVa) -> bool {
         self.translates
     }
-    fn copy_from_user(&mut self, user_va: u64, dst: &mut [u8]) {
+    fn copy_from_user(&mut self, user_va: UserVa, dst: &mut [u8]) {
         let bytes = self
             .user_mem
-            .get(&user_va)
+            .get(&user_va.raw())
             .expect("FakeHw::copy_from_user: no user_mem registered at user_va");
         dst.copy_from_slice(&bytes[..dst.len()]);
     }
@@ -219,7 +221,7 @@ impl Hardware for FakeHw {
             Err(())
         }
     }
-    fn read_stdin_drain(&mut self, pid: u16, user_va: u64, max_len: usize) -> usize {
+    fn read_stdin_drain(&mut self, pid: u16, user_va: UserVa, max_len: usize) -> usize {
         let head = self.stdin_ready.get_mut(&pid).and_then(|q| {
             if q.is_empty() { None } else { Some(q.remove(0)) }
         });
@@ -227,7 +229,7 @@ impl Hardware for FakeHw {
             Some(mut bytes) => {
                 bytes.truncate(max_len);
                 let n = bytes.len();
-                self.stdin_drain_writes.push((pid, user_va, bytes));
+                self.stdin_drain_writes.push((pid, user_va.raw(), bytes));
                 n
             }
             None => 0,

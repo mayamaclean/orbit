@@ -9,6 +9,8 @@
 
 extern crate alloc;
 
+use mmu::sv48::PhysAddr;
+use orbit_abi::layout::UserVa;
 use process::ThreadState;
 
 pub mod accounting;
@@ -60,12 +62,12 @@ pub trait Hardware {
     /// `root_table_pa` (`thread.root_table_addr()`). Only the starting VA
     /// is checked — callers bound `len` at the [`PAGE_SIZE`] level so the
     /// range can't straddle an unchecked second page.
-    fn user_va_translates(&self, root_table_pa: u64, user_va: u64) -> bool;
+    fn user_va_translates(&self, root_table_pa: PhysAddr, user_va: UserVa) -> bool;
 
     /// Copy `dst.len()` bytes from user space starting at `user_va` into
     /// `dst`. Impl toggles SUM around the read. Caller must have validated
     /// the range with [`Hardware::user_va_translates`] first.
-    fn copy_from_user(&mut self, user_va: u64, dst: &mut [u8]);
+    fn copy_from_user(&mut self, user_va: UserVa, dst: &mut [u8]);
 
     /// Write user-originated text to the kernel serial console, prefixed
     /// with the standard `{now_ticks}t USER[{pid}.{tid}]: ` tag so user
@@ -96,7 +98,7 @@ pub trait Hardware {
     /// into the user buffer at `user_va`, performing the SUM-gated
     /// copy on the user's satp. Returns the count actually drained
     /// (0 if the ring is empty or `pid` isn't registered).
-    fn read_stdin_drain(&mut self, pid: u16, user_va: u64, max_len: usize) -> usize;
+    fn read_stdin_drain(&mut self, pid: u16, user_va: UserVa, max_len: usize) -> usize;
 
     /// Park `handle` on `pid`'s stdin slot. Returns `false` if a
     /// reader was already parked (caller emits EBUSY) or `pid` isn't

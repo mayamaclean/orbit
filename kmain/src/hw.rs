@@ -4,7 +4,8 @@
 //! to the real CSRs / MMIO sites.
 
 use mmu::PAGE_SIZE;
-use mmu::sv48::VirtAddr;
+use mmu::sv48::{PhysAddr, VirtAddr};
+use orbit_abi::layout::UserVa;
 use orbit_core::{Hardware, PendingWork};
 use process::CompletionHandle;
 
@@ -22,14 +23,14 @@ impl Hardware for RiscvHardware {
         10_000
     }
 
-    fn user_va_translates(&self, root_table_pa: u64, user_va: u64) -> bool {
+    fn user_va_translates(&self, root_table_pa: PhysAddr, user_va: UserVa) -> bool {
         unsafe {
             let root = crate::kernel::memmap::kernel_root_from_pa(root_table_pa);
-            mmu::mmap::virt_to_phys(&root, VirtAddr::new(user_va)).is_some()
+            mmu::mmap::virt_to_phys(&root, VirtAddr::new(user_va.raw())).is_some()
         }
     }
 
-    fn copy_from_user(&mut self, user_va: u64, dst: &mut [u8]) {
+    fn copy_from_user(&mut self, user_va: UserVa, dst: &mut [u8]) {
         // Syscall path runs under the user's satp (no satp-swap at trap
         // entry), so the user VA is directly addressable while SUM is set.
         // Caller has already validated the range via `user_va_translates`.
@@ -88,7 +89,7 @@ impl Hardware for RiscvHardware {
         }
     }
 
-    fn read_stdin_drain(&mut self, pid: u16, user_va: u64, max_len: usize) -> usize {
+    fn read_stdin_drain(&mut self, pid: u16, user_va: UserVa, max_len: usize) -> usize {
         let Some(stdin) = crate::kernel::stdin::get(pid) else { return 0 };
         // Drain into a kernel-side scratch slice first so the SUM
         // window only covers the copy step (and so a partial read

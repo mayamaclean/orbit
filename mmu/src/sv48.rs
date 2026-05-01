@@ -1,5 +1,6 @@
 use core::sync::atomic::{self as atomic, AtomicU64};
 use atomic::Ordering;
+use riscv::register::satp::Satp;
 
 /// Atomic storage for page-table entries. Hardware page-table walkers on
 /// any hart can race with our writes, so PTE reads/writes go through
@@ -127,6 +128,15 @@ impl PhysAddr {
         let i = Self::PPN_OFFSETS[3];
         let m = Self::PHYS_PAGE_NUM_MASK << i as u64;
         (self.a & m) >> Self::PPN_OFFSETS[3]
+    }
+}
+
+impl From<Satp> for PhysAddr {
+    /// Extract the root-table PA encoded in `satp`. The CSR holds the PPN of
+    /// the active root page table; this shifts it back into byte-address form.
+    #[inline]
+    fn from(satp: Satp) -> Self {
+        Self::new((satp.ppn() as u64) << Self::PPN_OFFSETS[0])
     }
 }
 

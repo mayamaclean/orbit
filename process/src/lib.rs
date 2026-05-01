@@ -348,8 +348,8 @@ pub struct Thread {
 }
 
 impl Thread {
-    pub fn root_table_addr(&self) -> usize {
-        self.satp.ppn() * 4096
+    pub fn root_table_addr(&self) -> PhysAddr {
+        PhysAddr::from(self.satp)
     }
 }
 

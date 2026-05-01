@@ -10,13 +10,16 @@ use core::{alloc::Layout, panic::PanicInfo};
 
 use device::{HartContext, TRAP_STACK_SIZE, find_ram};
 use kmain::ktrace::OrbitSubscriber;
-use kmain::{check_context_and_switch, supervisor_clear_ipi};
+use kmain::{ProcessComponents, check_context_and_switch, supervisor_clear_ipi};
 use kmain::kernel::Orbit;
 use kmain::kernel::context::{enter_hart_context, fault_thread};
 use kmain::kernel::memmap::{map_kernel_self, unmap_boot_only_regions};
 use mmu::mmap::PageAlloc;
 use mmu::{PAGE_SIZE, sv48::PageTable};
-use process::{FaultInfo, Thread, ThreadState};
+use orbit_abi::perms::{self, Permissions};
+use orbit_abi::perms::role::RoleId;
+use orbit_abi::roles::{ChildPerms, RoleDef};
+use process::{FaultInfo, Process, Thread, ThreadState};
 use riscv::register::satp::Satp;
 use riscv::{register::{satp::Mode, stvec::{Stvec, TrapMode}}};
 
@@ -506,18 +509,22 @@ pub extern "C" fn k_smpstart() {
         &mut envp_buf,
     )
     .expect("boot envp fits in 256 bytes");
+
     let envp_blob = &envp_buf[..envp_len];
 
-    orbit.create_new_process(
-        kmain::kernel::UMODE_TEST_ELF,
-        kmain::kernel::UPROC_STACK_DEFAULT,
-        boot_affinity,
-        boot_affinity,
-        0,
-        Some(argv_blob),
-        Some(envp_blob),
-    )
-    .expect("no test uprocess");
+    let init_compoenents = ProcessComponents {
+        elf_blob: kmain::kernel::UMODE_TEST_ELF,
+        stack_size: kmain::kernel::UPROC_STACK_DEFAULT,
+        allowed_affinity: boot_affinity,
+        affinity: boot_affinity,
+        parent_pid: 0,
+        argv_bytes: Some(argv_blob),
+        envp_bytes: Some(envp_blob),
+        perms: Some(Permissions::LOADER)
+    };
+
+    orbit.create_new_process(init_compoenents)
+        .expect("no test uprocess");
 
     // Release the secondary-hart S-mode spin in `secondary_rust_setup`.
     // Release-store; secondaries Acquire and observe the publishes

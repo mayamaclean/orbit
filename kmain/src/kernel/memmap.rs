@@ -6,6 +6,7 @@ use mem::frame::FrameAllocator;
 use mem::round_u64_up;
 use mmu::mmap::{PageAlloc, RootTable, map_va_range, reserve_va_range, unmap_range, virt_to_phys};
 use mmu::sv48::{PageTable, PageTableEntry, PhysAddr, VirtAddr};
+use orbit_abi::layout::UserVa;
 use mmu::{MappingConfig, PAGE_SIZE, PagePermissions, SupervisorTag};
 use process::{Frame, Shared, Table, UserOnly};
 use tracing::error;
@@ -42,18 +43,6 @@ impl KdmapVa {
     }
     pub fn as_mut_ptr<T>(self) -> *mut T { self.0 as *mut T }
     pub fn as_ptr<T>(self) -> *const T { self.0 as *const T }
-}
-
-/// A VA that lives in user address space. Only resolvable under the
-/// owner's satp; kernel-side use goes through [`user_va_to_kdmap`].
-#[repr(transparent)]
-#[derive(Debug, Clone, Copy)]
-pub struct UserVa(u64);
-
-impl UserVa {
-    pub const fn new(raw: u64) -> Self { Self(raw) }
-    pub const fn raw(self) -> u64 { self.0 }
-    pub fn to_virt(self) -> VirtAddr { VirtAddr::new(self.0) }
 }
 
 /// Arithmetic conversion from a physical address to its KDMAP alias.
@@ -287,7 +276,7 @@ pub fn init_layout(ram_phys: u64, ktext: u64, kdmap: u64, kmmio: u64, kscratch: 
 /// duration of the call.
 #[inline]
 pub unsafe fn user_va_to_kdmap(root_table: &RootTable<'_>, user_va: UserVa) -> Option<KdmapVa> {
-    unsafe { virt_to_phys(root_table, user_va.to_virt()) }
+    unsafe { virt_to_phys(root_table, VirtAddr::new(user_va.raw())) }
         .map(|pa| phys_to_kdmap(PhysAddr::new(pa as u64)))
 }
 
@@ -306,9 +295,9 @@ pub fn kernel_table_bias() -> u64 {
 /// `pa` must be the physical address of a page in the kernel's ktables pool,
 /// and its KDMAP alias must be currently mapped under the active satp.
 #[inline]
-pub unsafe fn kernel_root_from_pa<'a>(pa: u64) -> RootTable<'a> {
+pub unsafe fn kernel_root_from_pa<'a>(pa: PhysAddr) -> RootTable<'a> {
     let bias = kernel_table_bias();
-    let table = unsafe { (pa.wrapping_add(bias) as *const PageTable).as_ref_unchecked() };
+    let table = unsafe { (pa.get_raw().wrapping_add(bias) as *const PageTable).as_ref_unchecked() };
     RootTable::new(table, bias)
 }
 

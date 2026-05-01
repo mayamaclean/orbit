@@ -436,6 +436,14 @@ impl Permissions {
         _reserved: [0; 2],
     };
 
+    pub const LOADER: Self = Self {
+        perms: class::raw::ALL,
+        allowed_perms: class::raw::ALL,
+        role: role::LOADER,
+        _pad: 0,
+        _reserved: [0; 2],
+    };
+
     /// Construct from raw `u64` masks — the boundary-deserializer
     /// shape, used by code reading a `Permissions` off the wire. No
     /// clamping (the two axes are independent; see struct docs); the

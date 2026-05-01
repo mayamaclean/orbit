@@ -5,10 +5,12 @@
 
 use device::TrapFrame;
 use mmu::PagePermissions;
+use orbit_abi::layout::UserVa;
 use process::{CompletionHandle, Thread, ThreadState};
 
 use orbit_abi::errno::{Errno, EAGAIN, EBUSY, EFAULT, EINVAL, EIO, EPERM};
 use orbit_abi::layout::{user_priv_range_ok, user_range_ok, user_shared_range_ok};
+use tracing::{error, info};
 
 use crate::{
     CloseHandleReq, CreateProcessExReq, CreateProcessReq, CreateProcessV2Req, CreateThreadReq,
@@ -73,8 +75,11 @@ pub fn mmap_req<H: Hardware>(
     frame: &TrapFrame,
     hw: &mut H,
 ) -> SyscallOutcome {
+    let Ok(vaddr) = UserVa::new(frame.regs[11] as u64) else {
+        return SyscallOutcome::Return { ret: Errno::new(EFAULT).to_ret() };
+    };
     let req = MemMapReq {
-        vaddr: frame.regs[11],
+        vaddr,
         size: frame.regs[12],
         page_permissions: frame.regs[13] as u64,
         share_with_kernel: frame.regs[14] > 0,
@@ -87,9 +92,9 @@ pub fn mmap_req<H: Hardware>(
     // range, a shared mmap in the shared range, so the two pools never
     // share VAs.
     let range_ok = if req.share_with_kernel {
-        user_shared_range_ok(req.vaddr as u64, req.size as u64)
+        user_shared_range_ok(req.vaddr.raw(), req.size as u64)
     } else {
-        user_priv_range_ok(req.vaddr as u64, req.size as u64)
+        user_priv_range_ok(req.vaddr.raw(), req.size as u64)
     };
 
     if !range_ok {
@@ -110,7 +115,7 @@ pub fn mmap_req<H: Hardware>(
     let work = PendingWork::MemMap {
         req,
         pid: thread.pid,
-        root_pa: thread.root_table_addr() as u64,
+        root_pa: thread.root_table_addr(),
         handle: handle.clone(),
     };
     if hw.push_pending_work(work).is_err() {
@@ -140,8 +145,11 @@ pub fn nc_create_req<H: Hardware>(
         Some(b) => b,
         None => return SyscallOutcome::Return { ret: Errno::new(EINVAL).to_ret() },
     };
+    let Ok(nc_vaddr) = UserVa::new(frame.regs[11] as u64) else {
+        return SyscallOutcome::Return { ret: Errno::new(EFAULT).to_ret() };
+    };
     let req = NetChannelCreationReq {
-        nc_vaddr: frame.regs[11],
+        nc_vaddr,
         region_size: frame.regs[12],
         nc_type: frame.regs[13],
         bind,
@@ -150,14 +158,14 @@ pub fn nc_create_req<H: Hardware>(
     // drive smoltcp). Reject any VA outside the shared range so the
     // priv/shared split holds: the private heap stays free of regions
     // with kernel aliases and forced revocation semantics.
-    if !user_shared_range_ok(req.nc_vaddr as u64, req.region_size as u64) {
+    if !user_shared_range_ok(req.nc_vaddr.raw(), req.region_size as u64) {
         return SyscallOutcome::Return { ret: Errno::new(EINVAL).to_ret() };
     }
     let handle = CompletionHandle::new();
     let work = PendingWork::NetChannelCreation {
         req,
         pid: thread.pid,
-        root_pa: thread.root_table_addr() as u64,
+        root_pa: thread.root_table_addr(),
         handle: handle.clone(),
     };
     if hw.push_pending_work(work).is_err() {
@@ -185,7 +193,7 @@ pub fn close_req<H: Hardware>(
     let work = PendingWork::CloseHandle {
         req,
         pid: thread.pid,
-        root_pa: thread.root_table_addr() as u64,
+        root_pa: thread.root_table_addr(),
         handle: handle.clone(),
     };
     if hw.push_pending_work(work).is_err() {
@@ -207,8 +215,13 @@ pub fn create_process_req<H: Hardware>(
     frame: &TrapFrame,
     hw: &mut H,
 ) -> SyscallOutcome {
+    let Ok(elf_vaddr) = UserVa::new(frame.regs[11] as u64) else {
+        error!("bad elf vaddr: {:08X?}", frame.regs[11]);
+        return SyscallOutcome::Return { ret: Errno::new(EFAULT).to_ret() };
+    };
+
     let req = CreateProcessReq {
-        elf_vaddr: frame.regs[11],
+        elf_vaddr,
         elf_len: frame.regs[12],
         allowed_affinity: frame.regs[13] as u64,
         affinity: frame.regs[14] as u64,
@@ -217,14 +230,16 @@ pub fn create_process_req<H: Hardware>(
     // manager's per-page virt_to_phys would refuse a kernel VA today —
     // but only because user satps don't carry user PTEs for kernel
     // mappings. Keep the structural guarantee at the syscall boundary.
-    if !user_range_ok(req.elf_vaddr as u64, req.elf_len as u64) {
+    if !user_range_ok(req.elf_vaddr.raw(), req.elf_len as u64) {
+        error!("bad elf ranage: {:08X?}..{:08X?}", frame.regs[11], frame.regs[11] + req.elf_len);
         return SyscallOutcome::Return { ret: Errno::new(EFAULT).to_ret() };
     }
+
     let handle = CompletionHandle::new();
     let work = PendingWork::CreateProcess {
         req,
         pid: thread.pid,
-        root_pa: thread.root_table_addr() as u64,
+        root_pa: thread.root_table_addr(),
         handle: handle.clone(),
     };
     if hw.push_pending_work(work).is_err() {
@@ -279,22 +294,25 @@ pub fn fs_open_req<H: Hardware>(
     frame: &TrapFrame,
     hw: &mut H,
 ) -> SyscallOutcome {
+    let Ok(path_vaddr) = UserVa::new(frame.regs[11] as u64) else {
+        return SyscallOutcome::Return { ret: Errno::new(EFAULT).to_ret() };
+    };
     let req = FsOpenReq {
-        path_vaddr: frame.regs[11],
+        path_vaddr,
         path_len: frame.regs[12],
         flags: frame.regs[13],
     };
     if req.path_len == 0 || req.path_len > MAX_FS_PATH_LEN {
         return SyscallOutcome::Return { ret: Errno::new(EINVAL).to_ret() };
     }
-    if !user_range_ok(req.path_vaddr as u64, req.path_len as u64) {
+    if !user_range_ok(req.path_vaddr.raw(), req.path_len as u64) {
         return SyscallOutcome::Return { ret: Errno::new(EFAULT).to_ret() };
     }
     let handle = CompletionHandle::new();
     let work = PendingWork::FsOpen {
         req,
         pid: thread.pid,
-        root_pa: thread.root_table_addr() as u64,
+        root_pa: thread.root_table_addr(),
         handle: handle.clone(),
     };
     if hw.push_pending_work(work).is_err() {
@@ -321,9 +339,12 @@ pub fn fs_read_req<H: Hardware>(
     frame: &TrapFrame,
     hw: &mut H,
 ) -> SyscallOutcome {
+    let Ok(buf_vaddr) = UserVa::new(frame.regs[12] as u64) else {
+        return SyscallOutcome::Return { ret: Errno::new(EFAULT).to_ret() };
+    };
     let req = FsReadReq {
         fd: frame.regs[11] as u32,
-        buf_vaddr: frame.regs[12],
+        buf_vaddr,
         len: frame.regs[13],
     };
     // v1: exactly one sector per syscall. Larger reads chunk in user
@@ -332,14 +353,14 @@ pub fn fs_read_req<H: Hardware>(
     if req.len != SECTOR_SIZE {
         return SyscallOutcome::Return { ret: Errno::new(EINVAL).to_ret() };
     }
-    if !user_range_ok(req.buf_vaddr as u64, req.len as u64) {
+    if !user_range_ok(req.buf_vaddr.raw(), req.len as u64) {
         return SyscallOutcome::Return { ret: Errno::new(EFAULT).to_ret() };
     }
     let handle = CompletionHandle::new();
     let work = PendingWork::FsRead {
         req,
         pid: thread.pid,
-        root_pa: thread.root_table_addr() as u64,
+        root_pa: thread.root_table_addr(),
         handle: handle.clone(),
     };
     if hw.push_pending_work(work).is_err() {
@@ -361,25 +382,31 @@ pub fn fs_stat_req<H: Hardware>(
     frame: &TrapFrame,
     hw: &mut H,
 ) -> SyscallOutcome {
+    let Ok(path_vaddr) = UserVa::new(frame.regs[11] as u64) else {
+        return SyscallOutcome::Return { ret: Errno::new(EFAULT).to_ret() };
+    };
+    let Ok(stat_vaddr) = UserVa::new(frame.regs[13] as u64) else {
+        return SyscallOutcome::Return { ret: Errno::new(EFAULT).to_ret() };
+    };
     let req = FsStatReq {
-        path_vaddr: frame.regs[11],
+        path_vaddr,
         path_len: frame.regs[12],
-        stat_vaddr: frame.regs[13],
+        stat_vaddr,
     };
     if req.path_len == 0 || req.path_len > MAX_FS_PATH_LEN {
         return SyscallOutcome::Return { ret: Errno::new(EINVAL).to_ret() };
     }
-    if !user_range_ok(req.path_vaddr as u64, req.path_len as u64) {
+    if !user_range_ok(req.path_vaddr.raw(), req.path_len as u64) {
         return SyscallOutcome::Return { ret: Errno::new(EFAULT).to_ret() };
     }
-    if !user_range_ok(req.stat_vaddr as u64, core::mem::size_of::<orbit_abi::fs::Stat>() as u64) {
+    if !user_range_ok(req.stat_vaddr.raw(), core::mem::size_of::<orbit_abi::fs::Stat>() as u64) {
         return SyscallOutcome::Return { ret: Errno::new(EFAULT).to_ret() };
     }
     let handle = CompletionHandle::new();
     let work = PendingWork::FsStat {
         req,
         pid: thread.pid,
-        root_pa: thread.root_table_addr() as u64,
+        root_pa: thread.root_table_addr(),
         handle: handle.clone(),
     };
     if hw.push_pending_work(work).is_err() {
@@ -404,22 +431,25 @@ pub fn fs_readdir_req<H: Hardware>(
     frame: &TrapFrame,
     hw: &mut H,
 ) -> SyscallOutcome {
+    let Ok(buf_vaddr) = UserVa::new(frame.regs[12] as u64) else {
+        return SyscallOutcome::Return { ret: Errno::new(EFAULT).to_ret() };
+    };
     let req = FsReaddirReq {
         fd: frame.regs[11] as u32,
-        buf_vaddr: frame.regs[12],
+        buf_vaddr,
         len: frame.regs[13],
     };
     if req.len == 0 || req.len > PAGE_SIZE {
         return SyscallOutcome::Return { ret: Errno::new(EINVAL).to_ret() };
     }
-    if !user_range_ok(req.buf_vaddr as u64, req.len as u64) {
+    if !user_range_ok(req.buf_vaddr.raw(), req.len as u64) {
         return SyscallOutcome::Return { ret: Errno::new(EFAULT).to_ret() };
     }
     let handle = CompletionHandle::new();
     let work = PendingWork::FsReaddir {
         req,
         pid: thread.pid,
-        root_pa: thread.root_table_addr() as u64,
+        root_pa: thread.root_table_addr(),
         handle: handle.clone(),
     };
     if hw.push_pending_work(work).is_err() {
@@ -445,19 +475,46 @@ pub fn create_process_ex_req<H: Hardware>(
     frame: &TrapFrame,
     hw: &mut H,
 ) -> SyscallOutcome {
+    let Ok(elf_vaddr) = UserVa::new(frame.regs[11] as u64) else {
+        return SyscallOutcome::Return { ret: Errno::new(EFAULT).to_ret() };
+    };
+    // argv: skip pointer validation when len == 0. Rust hands out a
+    // dangling-but-non-null pointer for `&[]` (e.g. `as_ptr() == 1`
+    // for `&[u8]`), so a "no argv" caller would otherwise get EFAULT
+    // here even though the kernel never dereferences the pointer.
+    // envp uses an explicit `0` sentinel from userspace.
+    let argv_raw = frame.regs[15] as u64;
+    let argv_len = frame.regs[16];
+    let argv_vaddr = if argv_len == 0 {
+        unsafe { UserVa::new_unchecked(0) }
+    } else {
+        match UserVa::new(argv_raw) {
+            Ok(v) => v,
+            Err(_) => return SyscallOutcome::Return { ret: Errno::new(EFAULT).to_ret() },
+        }
+    };
+    let envp_raw = frame.regs[17] as u64;
+    let envp_vaddr = if envp_raw == 0 {
+        unsafe { UserVa::new_unchecked(0) }
+    } else {
+        match UserVa::new(envp_raw) {
+            Ok(v) => v,
+            Err(_) => return SyscallOutcome::Return { ret: Errno::new(EFAULT).to_ret() },
+        }
+    };
     let req = CreateProcessExReq {
-        elf_vaddr: frame.regs[11],
+        elf_vaddr,
         elf_len: frame.regs[12],
         allowed_affinity: frame.regs[13] as u64,
         affinity: frame.regs[14] as u64,
-        argv_vaddr: frame.regs[15],
-        argv_len: frame.regs[16],
-        envp_vaddr: frame.regs[17],
+        argv_vaddr,
+        argv_len,
+        envp_vaddr,
     };
-    if !user_range_ok(req.elf_vaddr as u64, req.elf_len as u64) {
+    if !user_range_ok(req.elf_vaddr.raw(), req.elf_len as u64) {
         return SyscallOutcome::Return { ret: Errno::new(EFAULT).to_ret() };
     }
-    if req.argv_len > 0 && !user_range_ok(req.argv_vaddr as u64, req.argv_len as u64) {
+    if req.argv_len > 0 && !user_range_ok(req.argv_vaddr.raw(), req.argv_len as u64) {
         return SyscallOutcome::Return { ret: Errno::new(EFAULT).to_ret() };
     }
     if req.argv_len > orbit_abi::argv::ARGV_BLOB_MAX {
@@ -466,11 +523,11 @@ pub fn create_process_ex_req<H: Hardware>(
     // envp blob: the kernel always copies one page, so require a
     // page-aligned, page-resident VA. Mismatch surfaces as EFAULT
     // before the manager queues the work.
-    if req.envp_vaddr != 0 {
-        if (req.envp_vaddr as u64) & (PAGE_SIZE as u64 - 1) != 0 {
+    if req.envp_vaddr.raw() != 0 {
+        if req.envp_vaddr.raw() & (PAGE_SIZE as u64 - 1) != 0 {
             return SyscallOutcome::Return { ret: Errno::new(EINVAL).to_ret() };
         }
-        if !user_range_ok(req.envp_vaddr as u64, PAGE_SIZE as u64) {
+        if !user_range_ok(req.envp_vaddr.raw(), PAGE_SIZE as u64) {
             return SyscallOutcome::Return { ret: Errno::new(EFAULT).to_ret() };
         }
     }
@@ -478,7 +535,7 @@ pub fn create_process_ex_req<H: Hardware>(
     let work = PendingWork::CreateProcessEx {
         req,
         pid: thread.pid,
-        root_pa: thread.root_table_addr() as u64,
+        root_pa: thread.root_table_addr(),
         handle: handle.clone(),
     };
     if hw.push_pending_work(work).is_err() {
@@ -505,21 +562,24 @@ pub fn futex_wait_req<H: Hardware>(
     frame: &TrapFrame,
     hw: &mut H,
 ) -> SyscallOutcome {
-    let uaddr = frame.regs[11];
+    let uaddr_raw = frame.regs[11];
     let expected = frame.regs[12] as u32;
     let timeout_ns = frame.regs[13] as u64;
-    if uaddr & 0b11 != 0 {
+    if uaddr_raw & 0b11 != 0 {
         return SyscallOutcome::Return { ret: Errno::new(EINVAL).to_ret() };
     }
-    if !user_range_ok(uaddr as u64, 4) {
+    if !user_range_ok(uaddr_raw as u64, 4) {
         return SyscallOutcome::Return { ret: Errno::new(EFAULT).to_ret() };
     }
+    let Ok(uaddr) = UserVa::new(uaddr_raw as u64) else {
+        return SyscallOutcome::Return { ret: Errno::new(EFAULT).to_ret() };
+    };
     let req = FutexWaitReq { uaddr, expected, timeout_ns };
     let handle = CompletionHandle::new();
     let work = PendingWork::FutexWait {
         req,
         pid: thread.pid,
-        root_pa: thread.root_table_addr() as u64,
+        root_pa: thread.root_table_addr(),
         handle: handle.clone(),
     };
     if hw.push_pending_work(work).is_err() {
@@ -544,20 +604,23 @@ pub fn futex_wake_req<H: Hardware>(
     frame: &TrapFrame,
     hw: &mut H,
 ) -> SyscallOutcome {
-    let uaddr = frame.regs[11];
+    let uaddr_raw = frame.regs[11];
     let n = frame.regs[12] as u32;
-    if uaddr & 0b11 != 0 {
+    if uaddr_raw & 0b11 != 0 {
         return SyscallOutcome::Return { ret: Errno::new(EINVAL).to_ret() };
     }
-    if !user_range_ok(uaddr as u64, 4) {
+    if !user_range_ok(uaddr_raw as u64, 4) {
         return SyscallOutcome::Return { ret: Errno::new(EFAULT).to_ret() };
     }
+    let Ok(uaddr) = UserVa::new(uaddr_raw as u64) else {
+        return SyscallOutcome::Return { ret: Errno::new(EFAULT).to_ret() };
+    };
     let req = FutexWakeReq { uaddr, n };
     let handle = CompletionHandle::new();
     let work = PendingWork::FutexWake {
         req,
         pid: thread.pid,
-        root_pa: thread.root_table_addr() as u64,
+        root_pa: thread.root_table_addr(),
         handle: handle.clone(),
     };
     if hw.push_pending_work(work).is_err() {
@@ -584,18 +647,20 @@ pub fn serial_print<H: Hardware>(
     frame: &TrapFrame,
     hw: &mut H,
 ) -> SyscallOutcome {
-    let user_va = frame.regs[11] as u64;
+    let Ok(user_va) = UserVa::new(frame.regs[11] as u64) else {
+        return ready(Errno::new(EFAULT).to_ret());
+    };
     let len = frame.regs[12];
 
     if len > PAGE_SIZE {
         return ready(Errno::new(EINVAL).to_ret());
     }
 
-    if !user_range_ok(user_va, len as u64) {
+    if !user_range_ok(user_va.raw(), len as u64) {
         return ready(Errno::new(EFAULT).to_ret());
     }
 
-    if !hw.user_va_translates(thread.root_table_addr() as u64, user_va) {
+    if !hw.user_va_translates(thread.root_table_addr(), user_va) {
         return ready(Errno::new(EFAULT).to_ret());
     }
 
@@ -626,16 +691,18 @@ pub fn console_write<H: Hardware>(
     frame: &TrapFrame,
     hw: &mut H,
 ) -> SyscallOutcome {
-    let user_va = frame.regs[11] as u64;
+    let Ok(user_va) = UserVa::new(frame.regs[11] as u64) else {
+        return ready(Errno::new(EFAULT).to_ret());
+    };
     let len = frame.regs[12];
 
     if len == 0 || len > PAGE_SIZE {
         return ready(Errno::new(EINVAL).to_ret());
     }
-    if !user_range_ok(user_va, len as u64) {
+    if !user_range_ok(user_va.raw(), len as u64) {
         return ready(Errno::new(EFAULT).to_ret());
     }
-    if !hw.user_va_translates(thread.root_table_addr() as u64, user_va) {
+    if !hw.user_va_translates(thread.root_table_addr(), user_va) {
         return ready(Errno::new(EFAULT).to_ret());
     }
 
@@ -668,17 +735,19 @@ pub fn read_stdin<H: Hardware>(
     frame: &TrapFrame,
     hw: &mut H,
 ) -> SyscallOutcome {
-    let user_va = frame.regs[11] as u64;
+    let Ok(user_va) = UserVa::new(frame.regs[11] as u64) else {
+        return ready(Errno::new(EFAULT).to_ret());
+    };
     let user_len = frame.regs[12];
     let flags = frame.regs[13];
 
     if user_len == 0 || user_len > PAGE_SIZE {
         return ready(Errno::new(EINVAL).to_ret());
     }
-    if !user_range_ok(user_va, user_len as u64) {
+    if !user_range_ok(user_va.raw(), user_len as u64) {
         return ready(Errno::new(EFAULT).to_ret());
     }
-    if !hw.user_va_translates(thread.root_table_addr() as u64, user_va) {
+    if !hw.user_va_translates(thread.root_table_addr(), user_va) {
         return ready(Errno::new(EFAULT).to_ret());
     }
 
@@ -739,13 +808,16 @@ pub fn create_thread<H: Hardware>(
     frame: &TrapFrame,
     hw: &mut H,
 ) -> SyscallOutcome {
+    let Ok(entry) = UserVa::new(frame.regs[11] as u64) else {
+        return SyscallOutcome::Return { ret: Errno::new(EFAULT).to_ret() };
+    };
     let req = CreateThreadReq {
-        entry: frame.regs[11],
+        entry,
         allowed_affinity: frame.regs[12] as u64,
         affinity: frame.regs[13] as u64,
         arg: frame.regs[14],
     };
-    if !user_range_ok(req.entry as u64, 1) {
+    if !user_range_ok(req.entry.raw(), 1) {
         return SyscallOutcome::Return { ret: Errno::new(EFAULT).to_ret() };
     }
     if req.allowed_affinity != 0
@@ -790,23 +862,26 @@ pub fn pledge_req<H: Hardware>(
     frame: &TrapFrame,
     hw: &mut H,
 ) -> SyscallOutcome {
-    let req_vaddr = frame.regs[11];
+    let req_vaddr_raw = frame.regs[11];
     let size = core::mem::size_of::<orbit_abi::perms::PermsRequest>();
-    if req_vaddr & 0b111 != 0 {
+    if req_vaddr_raw & 0b111 != 0 {
         return SyscallOutcome::Return { ret: Errno::new(EINVAL).to_ret() };
     }
-    if !user_range_ok(req_vaddr as u64, size as u64) {
+    if !user_range_ok(req_vaddr_raw as u64, size as u64) {
         return SyscallOutcome::Return { ret: Errno::new(EFAULT).to_ret() };
     }
-    if !struct_fits_in_one_page(req_vaddr, size) {
+    if !struct_fits_in_one_page(req_vaddr_raw, size) {
         return SyscallOutcome::Return { ret: Errno::new(EINVAL).to_ret() };
     }
+    let Ok(req_vaddr) = UserVa::new(req_vaddr_raw as u64) else {
+        return SyscallOutcome::Return { ret: Errno::new(EFAULT).to_ret() };
+    };
     let req = PledgeReq { req_vaddr };
     let handle = CompletionHandle::new();
     let work = PendingWork::Pledge {
         req,
         pid: thread.pid,
-        root_pa: thread.root_table_addr() as u64,
+        root_pa: thread.root_table_addr(),
         handle: handle.clone(),
     };
     if hw.push_pending_work(work).is_err() {
@@ -836,24 +911,30 @@ pub fn create_process_v2_req<H: Hardware>(
     frame: &TrapFrame,
     hw: &mut H,
 ) -> SyscallOutcome {
-    let args_vaddr = frame.regs[11];
+    let args_vaddr_raw = frame.regs[11];
     let size = core::mem::size_of::<orbit_abi::perms::CreateProcessV2Args>();
-    if args_vaddr & 0b111 != 0 {
+    if args_vaddr_raw & 0b111 != 0 {
         return SyscallOutcome::Return { ret: Errno::new(EINVAL).to_ret() };
     }
-    if !user_range_ok(args_vaddr as u64, size as u64) {
+    if !user_range_ok(args_vaddr_raw as u64, size as u64) {
+        error!("invalid args addr");
         return SyscallOutcome::Return { ret: Errno::new(EFAULT).to_ret() };
     }
-    if !struct_fits_in_one_page(args_vaddr, size) {
+    if !struct_fits_in_one_page(args_vaddr_raw, size) {
         return SyscallOutcome::Return { ret: Errno::new(EINVAL).to_ret() };
     }
+
+    let Ok(args_vaddr) = UserVa::new(args_vaddr_raw as u64) else {
+        error!("invalid args addr");
+        return SyscallOutcome::Return { ret: Errno::new(EFAULT).to_ret() };
+    };
 
     let req = CreateProcessV2Req { args_vaddr };
     let handle = CompletionHandle::new();
     let work = PendingWork::CreateProcessV2 {
         req,
         pid: thread.pid,
-        root_pa: thread.root_table_addr() as u64,
+        root_pa: thread.root_table_addr(),
         handle: handle.clone(),
     };
     if hw.push_pending_work(work).is_err() {

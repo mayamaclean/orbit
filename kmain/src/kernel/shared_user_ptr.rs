@@ -21,6 +21,7 @@ use alloc::sync::Arc;
 use mmu::{PAGE_SIZE, SupervisorTag};
 use mmu::mmap::{RootTable, walk_to_table};
 use mmu::sv48::VirtAddr;
+use orbit_abi::layout::UserVa;
 use process::{Frame, Shared};
 
 use crate::kernel::{memmap::FrameToKdmap, pending_frees};
@@ -57,7 +58,7 @@ struct SharedInner<T> {
     /// happens exactly once, in `Drop`.
     frame: Option<Frame<Shared>>,
     layout: Layout,
-    user_va: u64,
+    user_va: UserVa,
     len: usize,
     owner_pid: u16,
     revoked: AtomicBool,
@@ -101,10 +102,10 @@ impl<T> SharedUserPtr<T> {
     /// (which rejects unaligned VAs) and `normalize_region_size`
     /// (which page-rounds `len`), but this assert makes it explicit
     /// at the construction boundary instead of relying on callers.
-    pub fn new(frame: Frame<Shared>, layout: Layout, user_va: u64, len: usize, owner_pid: u16) -> Self {
+    pub fn new(frame: Frame<Shared>, layout: Layout, user_va: UserVa, len: usize, owner_pid: u16) -> Self {
         assert!(
-            user_va % PAGE_SIZE as u64 == 0,
-            "SharedUserPtr::new: user_va {:#x} not page-aligned", user_va,
+            user_va.raw() % PAGE_SIZE as u64 == 0,
+            "SharedUserPtr::new: user_va {:#x} not page-aligned", user_va.raw(),
         );
         assert!(
             len % PAGE_SIZE == 0 && len > 0,
@@ -152,7 +153,7 @@ impl<T> SharedUserPtr<T> {
     /// Walk the owner's user PT and invalidate every leaf covering
     /// `[user_va, user_va + len)`. `root` must be the kernel-side
     /// [`RootTable`] built from the owner's satp
-    /// (`kernel_root_from_pa(satp.ppn() * 4096)` — Orbit has the helper).
+    /// (`kernel_root_from_pa(PhysAddr::from(satp))` — Orbit has the helper).
     ///
     /// `revoked` flips `true` on every exit path that reached the walk,
     /// whether it completed or bailed mid-range. An error's `Err` tells
@@ -180,7 +181,7 @@ impl<T> SharedUserPtr<T> {
 
     fn revoke_walk(&self, root: &RootTable<'_>) -> Result<(), RevokeError> {
         let pid = self.inner.owner_pid;
-        let start = self.inner.user_va;
+        let start = self.inner.user_va.raw();
         let end = start + self.inner.len as u64;
 
         let mut va = start;
@@ -223,7 +224,7 @@ impl<T> SharedUserPtr<T> {
         self.inner.revoked.load(Ordering::Acquire)
     }
 
-    pub fn user_va(&self) -> u64 { self.inner.user_va }
+    pub fn user_va(&self) -> UserVa { self.inner.user_va }
     pub fn len(&self) -> usize { self.inner.len }
     pub fn owner_pid(&self) -> u16 { self.inner.owner_pid }
 }
@@ -231,7 +232,7 @@ impl<T> SharedUserPtr<T> {
 impl<T> core::fmt::Debug for SharedUserPtr<T> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("SharedUserPtr")
-            .field("user_va", &format_args!("{:#x}", self.inner.user_va))
+            .field("user_va", &format_args!("{:#x}", self.inner.user_va.raw()))
             .field("len", &self.inner.len)
             .field("owner_pid", &self.inner.owner_pid)
             .field("refs", &Arc::strong_count(&self.inner))

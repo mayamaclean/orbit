@@ -5,6 +5,7 @@ extern crate alloc;
 use core::{arch::asm, ptr::null_mut, sync::atomic::{AtomicBool, Ordering}};
 use alloc::{collections::btree_map::BTreeMap, vec::Vec};
 use device::{HartContext, TrapFrame};
+use orbit_abi::{layout::UserVa, perms::{Permissions, role::RoleId}};
 use net_channel::NetChannel;
 use crate::kernel::{shared_user_ptr::SharedUserPtr, shootdown::CPU_COUNT};
 use process::{Thread, ThreadState};
@@ -42,23 +43,23 @@ impl UserAccess {
     /// verified (via PT walk) that the range is mapped and user-readable.
     /// Lifetime ties the slice to this guard so it can't outlive SUM.
     #[inline]
-    pub unsafe fn slice<'s>(&'s self, vaddr: u64, len: usize) -> &'s [u8] {
-        unsafe { core::slice::from_raw_parts(vaddr as *const u8, len) }
+    pub unsafe fn slice<'s>(&'s self, vaddr: UserVa, len: usize) -> &'s [u8] {
+        unsafe { core::slice::from_raw_parts(vaddr.raw() as *const u8, len) }
     }
 
     /// Borrow a writable byte slice at a user VA. Caller must have
     /// verified the range is mapped user-writable. Lifetime ties the
     /// slice to this guard so it can't outlive SUM.
     #[inline]
-    pub unsafe fn slice_mut<'s>(&'s self, vaddr: u64, len: usize) -> &'s mut [u8] {
-        unsafe { core::slice::from_raw_parts_mut(vaddr as *mut u8, len) }
+    pub unsafe fn slice_mut<'s>(&'s self, vaddr: UserVa, len: usize) -> &'s mut [u8] {
+        unsafe { core::slice::from_raw_parts_mut(vaddr.raw() as *mut u8, len) }
     }
 
     /// Read a value of type `T` from a user VA. Caller must have verified
     /// the source is mapped and the read is size/alignment-safe.
     #[inline]
-    pub unsafe fn read_volatile<T>(&self, vaddr: u64) -> T {
-        unsafe { core::ptr::read_volatile(vaddr as *const T) }
+    pub unsafe fn read_volatile<T>(&self, vaddr: UserVa) -> T {
+        unsafe { core::ptr::read_volatile(vaddr.raw() as *const T) }
     }
 }
 
@@ -66,6 +67,17 @@ impl Drop for UserAccess {
     fn drop(&mut self) {
         unsafe { riscv::register::sstatus::clear_sum(); }
     }
+}
+
+pub struct ProcessComponents<'c> {
+    pub elf_blob: &'c [u8],
+    pub stack_size: u64,
+    pub allowed_affinity: u64,
+    pub affinity: u64,
+    pub parent_pid: u16,
+    pub argv_bytes: Option<&'c [u8]>,
+    pub envp_bytes: Option<&'c [u8]>,
+    pub perms: Option<Permissions>
 }
 
 pub fn write_sswi(hart: usize, val: u32) {
@@ -917,7 +929,11 @@ pub fn handle_query_denial_log(epc: usize, hart_context: &'static HartContext, f
     let orbit = unsafe { (hart_context.cscratch as *mut kernel::Orbit).as_mut_unchecked() };
 
     dispatch_syscall(epc, hart_context, frame, |t, f| {
-        let buf_va = f.regs[11] as u64;
+        let Ok(buf_va) = UserVa::new(f.regs[11] as u64) else {
+            return orbit_core::SyscallOutcome::Return {
+                ret: -(EFAULT as isize),
+            };
+        };
         let buf_len = f.regs[12];
 
         let event_size = core::mem::size_of::<DenialEvent>();
@@ -926,14 +942,14 @@ pub fn handle_query_denial_log(epc: usize, hart_context: &'static HartContext, f
                 ret: -(EINVAL as isize),
             };
         }
-        if !user_range_ok(buf_va, buf_len as u64) {
+        if !user_range_ok(buf_va.raw(), buf_len as u64) {
             return orbit_core::SyscallOutcome::Return {
                 ret: -(EFAULT as isize),
             };
         }
         use orbit_core::Hardware;
         if !crate::hw::RiscvHardware
-            .user_va_translates(t.root_table_addr() as u64, buf_va)
+            .user_va_translates(t.root_table_addr(), buf_va)
         {
             return orbit_core::SyscallOutcome::Return {
                 ret: -(EFAULT as isize),
@@ -1163,7 +1179,11 @@ pub fn handle_query_stats(epc: usize, hart_context: &'static HartContext, frame:
     let orbit = unsafe { (hart_context.cscratch as *mut kernel::Orbit).as_mut_unchecked() };
 
     dispatch_syscall(epc, hart_context, frame, |t, f| {
-        let buf_va = f.regs[11] as u64;
+        let Ok(buf_va) = UserVa::new(f.regs[11] as u64) else {
+            return orbit_core::SyscallOutcome::Return {
+                ret: -(EFAULT as isize),
+            };
+        };
         let buf_len = f.regs[12];
 
         if buf_len < STATS_MIN_LEN {
@@ -1173,7 +1193,7 @@ pub fn handle_query_stats(epc: usize, hart_context: &'static HartContext, frame:
         }
         // Saved-feedback rule: bound-check user VAs at the syscall
         // boundary before the kernel acts on them.
-        if !user_range_ok(buf_va, buf_len as u64) {
+        if !user_range_ok(buf_va.raw(), buf_len as u64) {
             return orbit_core::SyscallOutcome::Return {
                 ret: -(EFAULT as isize),
             };
@@ -1183,7 +1203,7 @@ pub fn handle_query_stats(epc: usize, hart_context: &'static HartContext, frame:
         // already excluded the kernel half and overflow.
         use orbit_core::Hardware;
         if !crate::hw::RiscvHardware
-            .user_va_translates(t.root_table_addr() as u64, buf_va)
+            .user_va_translates(t.root_table_addr(), buf_va)
         {
             return orbit_core::SyscallOutcome::Return {
                 ret: -(EFAULT as isize),
@@ -1252,7 +1272,11 @@ pub fn handle_query_syscall_stats(
     };
 
     dispatch_syscall(epc, hart_context, frame, |t, f| {
-        let buf_va = f.regs[11] as u64;
+        let Ok(buf_va) = UserVa::new(f.regs[11] as u64) else {
+            return orbit_core::SyscallOutcome::Return {
+                ret: -(EFAULT as isize),
+            };
+        };
         let buf_len = f.regs[12];
 
         if buf_len < SYSCALL_STATS_MIN_LEN {
@@ -1260,14 +1284,14 @@ pub fn handle_query_syscall_stats(
                 ret: -(EINVAL as isize),
             };
         }
-        if !user_range_ok(buf_va, buf_len as u64) {
+        if !user_range_ok(buf_va.raw(), buf_len as u64) {
             return orbit_core::SyscallOutcome::Return {
                 ret: -(EFAULT as isize),
             };
         }
         use orbit_core::Hardware;
         if !crate::hw::RiscvHardware
-            .user_va_translates(t.root_table_addr() as u64, buf_va)
+            .user_va_translates(t.root_table_addr(), buf_va)
         {
             return orbit_core::SyscallOutcome::Return {
                 ret: -(EFAULT as isize),
@@ -1313,7 +1337,7 @@ pub fn handle_query_syscall_stats(
                     total_ticks: slot.total_ticks.load(Ordering::Relaxed),
                 };
                 let dst = guard.slice_mut(
-                    buf_va + (hdr_size + i * entry_size) as u64,
+                    buf_va.wrapping_add((hdr_size + i * entry_size) as u64),
                     entry_size,
                 );
                 dst.copy_from_slice(core::slice::from_raw_parts(

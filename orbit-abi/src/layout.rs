@@ -233,6 +233,60 @@ pub const fn user_shared_range_ok(vaddr: u64, len: u64) -> bool {
     }
 }
 
+/// A VA that lives in user address space. Construction validates the
+/// address sits in user-mappable space via [`user_range_ok`] (single-byte
+/// gate); operations that consume a length still call the appropriate
+/// `*_range_ok` helper themselves. Distinct from raw integers so the
+/// type system tracks which satp a VA is meaningful under — only
+/// resolvable under the owner's satp; kernel-side translation goes
+/// through `kmain::kernel::memmap::user_va_to_kdmap`.
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UserVa(u64);
+
+impl UserVa {
+    /// Validate `raw` and wrap. Returns `Err(raw)` when the address falls
+    /// in the null guard, kernel half, or trap-frame region — i.e. any
+    /// VA the kernel must reject before touching.
+    #[inline]
+    pub const fn new(raw: u64) -> Result<Self, u64> {
+        if user_range_ok(raw, 1) {
+            Ok(Self(raw))
+        } else {
+            Err(raw)
+        }
+    }
+
+    /// Bypass the validation gate. For tests, format-only paths, and
+    /// kernel-internal callers that have already validated by other
+    /// means (e.g. PT walk results, ELF segment VAs derived from a
+    /// validated source).
+    #[inline]
+    pub const unsafe fn new_unchecked(raw: u64) -> Self { Self(raw) }
+
+    #[inline]
+    pub const fn raw(self) -> u64 { self.0 }
+
+    /// Offset by `off` bytes. Wraps on overflow; callers that need to
+    /// reject overflow validate via [`user_range_ok`].
+    #[inline]
+    pub const fn wrapping_add(self, off: u64) -> Self {
+        Self(self.0.wrapping_add(off))
+    }
+}
+
+impl core::fmt::LowerHex for UserVa {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        core::fmt::LowerHex::fmt(&self.0, f)
+    }
+}
+
+impl core::fmt::UpperHex for UserVa {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        core::fmt::UpperHex::fmt(&self.0, f)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -119,6 +119,6 @@ impl Drop for UserPageWindow {
 
 fn current_satp_root() -> mmu::mmap::RootTable<'static> {
     let satp = riscv::register::satp::read();
-    let root_pa = (satp.ppn() * PAGE_SIZE) as u64;
+    let root_pa = PhysAddr::from(satp);
     unsafe { memmap::kernel_root_from_pa(root_pa) }
 }

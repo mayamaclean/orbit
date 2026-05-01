@@ -54,7 +54,7 @@ use crate::drivers::e1000::{
 
 use crate::kernel::context::get_hart_context;
 use crate::kernel::pci::PciDevice;
-use crate::{NetPackage, SocketReq};
+use crate::{NetPackage, ProcessComponents, SocketReq};
 
 pub mod accounting;
 pub mod context;
@@ -732,11 +732,11 @@ impl Orbit {
         Ok(tid)
     }
 
-    fn run_mmap_req(&mut self, req: MemMapReq, pid: u16, root_pa: u64) -> isize {
+    fn run_mmap_req(&mut self, req: MemMapReq, pid: u16, root_pa: PhysAddr) -> isize {
         info!("handling mmap req {req:08X?}");
 
         let Some(orbit_core::manager::MappingGeometry { align, levels }) =
-            orbit_core::manager::select_mapping_geometry(req.vaddr, req.size)
+            orbit_core::manager::select_mapping_geometry(req.vaddr.raw() as usize, req.size)
         else {
             error!("failed to select alignment for mmap req: {req:?}");
             return Errno::new(EINVAL).to_ret();
@@ -793,13 +793,13 @@ impl Orbit {
             permissions: (req.page_permissions & 0xE) | PagePermissions::U,
             levels,
             page_size: align as u64,
-            vaddr: VirtAddr::new(req.vaddr as u64),
+            vaddr: VirtAddr::new(req.vaddr.raw()),
             paddr: PhysAddr::new(backing_pa_raw),
             log: false,
             supervisor_tag
         };
 
-        let vend = VirtAddr::new((req.vaddr + req.size) as u64);
+        let vend = VirtAddr::new(req.vaddr.raw() + req.size as u64);
         let pend = PhysAddr::new(backing_pa_raw + req.size as u64);
 
         unsafe {
@@ -831,7 +831,7 @@ impl Orbit {
         // broadcast (whole-TLB sentinel via len=0) covers every other
         // hart that may have cached a negative entry for this newly-
         // mapped range.
-        riscv::asm::sfence_vma(pid as usize, req.vaddr);
+        riscv::asm::sfence_vma(pid as usize, req.vaddr.raw() as usize);
         crate::kernel::shootdown::broadcast(0, 0);
 
         info!("fulfilled {req:?}:\n\tpa=0x{backing_pa_raw:016X} {layout:08X?}");
@@ -850,7 +850,7 @@ impl Orbit {
     /// Run an enqueued NetChannel creation. Returns `(vaddr, fd)` on
     /// success — the manager forwards both via `signal_pair`. Negative
     /// `vaddr` on the error path; `fd` is unused in that case.
-    fn run_nc_create_req(&mut self, req: NetChannelCreationReq, pid: u16, root_pa: u64) -> (isize, isize) {
+    fn run_nc_create_req(&mut self, req: NetChannelCreationReq, pid: u16, root_pa: PhysAddr) -> (isize, isize) {
         info!("handling nc creation req: {req:08X?}");
 
         let Some(region_size) = NetChannel::normalize_region_size(req.region_size) else {
@@ -858,7 +858,7 @@ impl Orbit {
             return (Errno::new(EINVAL).to_ret(), 0);
         };
 
-        if req.nc_vaddr % PAGE_SIZE != 0 {
+        if req.nc_vaddr.raw() % PAGE_SIZE as u64 != 0 {
             warn!("nc create: unaligned user vaddr 0x{:X}", req.nc_vaddr);
             return (Errno::new(EINVAL).to_ret(), 0);
         }
@@ -891,13 +891,13 @@ impl Orbit {
                 | (PagePermissions::U as u64),
             levels: 4,
             page_size: PAGE_SIZE as u64,
-            vaddr: VirtAddr::new(req.nc_vaddr as u64),
+            vaddr: VirtAddr::new(req.nc_vaddr.raw()),
             paddr: frame.raw(),
             log: false,
             supervisor_tag: SupervisorTag::SharedRevocable,
         };
 
-        let vend = VirtAddr::new((req.nc_vaddr + region_size) as u64);
+        let vend = VirtAddr::new(req.nc_vaddr.raw() + region_size as u64);
         let pend = PhysAddr::new(frame.get_raw() + region_size as u64);
 
         unsafe {
@@ -922,7 +922,7 @@ impl Orbit {
         // Arc's last drop pushes to `pending_frees`; the manager returns
         // it to `kernel_pages` during cleanup.
         let shared: SharedUserPtr<NetChannel> = SharedUserPtr::new(
-            frame, layout, req.nc_vaddr as u64, region_size, pid);
+            frame, layout, req.nc_vaddr, region_size, pid);
 
         // Register the manager's strong ref and grab the Fd. Return it
         // to the user in a1 alongside the VA in a0 — avoids taking a
@@ -957,10 +957,10 @@ impl Orbit {
 
         info!("nc created user_va=0x{:08X} kva=0x{:016X} region={} fd={}",
             req.nc_vaddr, kva.raw(), region_size, fd);
-        (req.nc_vaddr as isize, fd as isize)
+        (req.nc_vaddr.raw() as isize, fd as isize)
     }
 
-    fn run_close_req(&mut self, req: CloseHandleReq, pid: u16, root_pa: u64) -> isize {
+    fn run_close_req(&mut self, req: CloseHandleReq, pid: u16, root_pa: PhysAddr) -> isize {
         info!("handling close req: {req:?}");
 
         // Look up the handle, revoke if Shared, then drop the Arc.
@@ -1005,7 +1005,7 @@ impl Orbit {
     /// path as a `&str` borrowed from `out`, or an errno on failure.
     fn copy_user_path<'a>(
         &mut self,
-        root_pa: u64,
+        root_pa: PhysAddr,
         vaddr: u64,
         len: usize,
         out: &'a mut [u8; MAX_FS_PATH_LEN],
@@ -1032,13 +1032,13 @@ impl Orbit {
         core::str::from_utf8(&out[..len]).map_err(|_| Errno::new(EINVAL).to_ret())
     }
 
-    fn run_fs_open_req(&mut self, req: FsOpenReq, pid: u16, root_pa: u64) -> isize {
+    fn run_fs_open_req(&mut self, req: FsOpenReq, pid: u16, root_pa: PhysAddr) -> isize {
         let Some(fs) = crate::kernel::fs::mounted() else {
             warn!("fs_open: no mounted filesystem");
             return Errno::new(EIO).to_ret();
         };
         let mut path_buf = [0u8; MAX_FS_PATH_LEN];
-        let path = match self.copy_user_path(root_pa, req.path_vaddr as u64, req.path_len, &mut path_buf) {
+        let path = match self.copy_user_path(root_pa, req.path_vaddr.raw(), req.path_len, &mut path_buf) {
             Ok(p) => p,
             Err(e) => return e,
         };
@@ -1072,7 +1072,7 @@ impl Orbit {
         &mut self,
         req: FsReadReq,
         pid: u16,
-        root_pa: u64,
+        root_pa: PhysAddr,
         handle: process::CompletionHandle,
     ) -> Option<isize> {
         const SECTOR: u64 = 512;
@@ -1103,7 +1103,7 @@ impl Orbit {
         // Single-page constraint: a sector-sized buffer can straddle
         // at most one 4 KiB page boundary, and we don't bounce. User
         // aligns to 512.
-        let buf_va = req.buf_vaddr as u64;
+        let buf_va = req.buf_vaddr.raw();
         if (buf_va & (PAGE_SIZE as u64 - 1)) + req.len as u64 > PAGE_SIZE as u64 {
             return Some(Errno::new(EINVAL).to_ret());
         }
@@ -1147,12 +1147,12 @@ impl Orbit {
         }
     }
 
-    fn run_fs_stat_req(&mut self, req: FsStatReq, pid: u16, root_pa: u64) -> isize {
+    fn run_fs_stat_req(&mut self, req: FsStatReq, pid: u16, root_pa: PhysAddr) -> isize {
         let Some(fs) = crate::kernel::fs::mounted() else {
             return Errno::new(EIO).to_ret();
         };
         let mut path_buf = [0u8; MAX_FS_PATH_LEN];
-        let path = match self.copy_user_path(root_pa, req.path_vaddr as u64, req.path_len, &mut path_buf) {
+        let path = match self.copy_user_path(root_pa, req.path_vaddr.raw(), req.path_len, &mut path_buf) {
             Ok(p) => p,
             Err(e) => return e,
         };
@@ -1175,7 +1175,7 @@ impl Orbit {
                 core::mem::size_of::<orbit_abi::fs::Stat>(),
             )
         };
-        let stat_va = req.stat_vaddr as u64;
+        let stat_va = req.stat_vaddr.raw();
         if (stat_va & (PAGE_SIZE as u64 - 1)) + stat_bytes.len() as u64 > PAGE_SIZE as u64 {
             return Errno::new(EINVAL).to_ret();
         }
@@ -1205,7 +1205,7 @@ impl Orbit {
     /// fit inside one 4 KiB page so a single `UserPageWindow` covers
     /// the copy-out. The pure-syscall layer caps `len` at `PAGE_SIZE`
     /// before we get here.
-    fn run_fs_readdir_req(&mut self, req: FsReaddirReq, pid: u16, root_pa: u64) -> isize {
+    fn run_fs_readdir_req(&mut self, req: FsReaddirReq, pid: u16, root_pa: PhysAddr) -> isize {
         // Look up the file handle and snapshot what we need so we can
         // drop the &mut on `process_handles` before the page-window
         // map (which doesn't borrow the handle table, but keeping the
@@ -1224,7 +1224,7 @@ impl Orbit {
         let cursor = of.dir_cursor;
 
         // Single-page constraint: buffer must fit inside one 4 KiB page.
-        let buf_va = req.buf_vaddr as u64;
+        let buf_va = req.buf_vaddr.raw();
         if (buf_va & (PAGE_SIZE as u64 - 1)) + req.len as u64 > PAGE_SIZE as u64 {
             return Errno::new(EINVAL).to_ret();
         }
@@ -1287,7 +1287,7 @@ impl Orbit {
         &mut self,
         req: CreateProcessExReq,
         parent_pid: u16,
-        root_pa: u64,
+        root_pa: PhysAddr,
     ) -> isize {
         const MAX_ELF_BYTES: usize = 4 * 1024 * 1024;
         if req.elf_len == 0 || req.elf_len > MAX_ELF_BYTES {
@@ -1297,14 +1297,15 @@ impl Orbit {
 
         // Copy the ELF (same loop as run_create_process_req).
         let mut blob: Vec<u8> = Vec::with_capacity(req.elf_len);
-        let mut copied = 0usize;
-        while copied < req.elf_len {
-            let cursor = req.elf_vaddr + copied;
-            let page_base = cursor & !(PAGE_SIZE - 1);
-            let page_off = cursor - page_base;
-            let take = core::cmp::min(PAGE_SIZE - page_off, req.elf_len - copied);
+        let mut copied = 0u64;
+        let elf_len = req.elf_len as u64;
+        while copied < elf_len {
+            let cursor = req.elf_vaddr.raw() + copied;
+            let page_base = cursor & !(PAGE_SIZE as u64 - 1);
+            let page_off = (cursor - page_base) as usize;
+            let take = core::cmp::min(PAGE_SIZE - page_off, (elf_len - copied) as usize);
             let pa = match unsafe {
-                mmu::mmap::virt_to_phys(&root_table, VirtAddr::new(page_base as u64))
+                mmu::mmap::virt_to_phys(&root_table, VirtAddr::new(page_base))
             } {
                 Some(p) => p as u64,
                 None => {
@@ -1317,20 +1318,21 @@ impl Orbit {
                 let page = w.as_mut_slice();
                 blob.extend_from_slice(&page[page_off..page_off + take]);
             }
-            copied += take;
+            copied += take as u64;
         }
 
         // Copy argv blob (single page at most).
         let argv_bytes: Option<Vec<u8>> = if req.argv_len > 0 {
             let mut buf = Vec::with_capacity(req.argv_len);
-            let mut argv_copied = 0usize;
-            while argv_copied < req.argv_len {
-                let cursor = req.argv_vaddr + argv_copied;
-                let page_base = cursor & !(PAGE_SIZE - 1);
-                let page_off = cursor - page_base;
-                let take = core::cmp::min(PAGE_SIZE - page_off, req.argv_len - argv_copied);
+            let mut argv_copied = 0u64;
+            let argv_len = req.argv_len as u64;
+            while argv_copied < argv_len {
+                let cursor = req.argv_vaddr.raw() + argv_copied;
+                let page_base = cursor & !(PAGE_SIZE as u64 - 1);
+                let page_off = (cursor - page_base) as usize;
+                let take = core::cmp::min(PAGE_SIZE - page_off, (argv_len - argv_copied) as usize);
                 let pa = match unsafe {
-                    mmu::mmap::virt_to_phys(&root_table, VirtAddr::new(page_base as u64))
+                    mmu::mmap::virt_to_phys(&root_table, VirtAddr::new(page_base))
                 } {
                     Some(p) => p as u64,
                     None => {
@@ -1343,7 +1345,7 @@ impl Orbit {
                     let page = w.as_mut_slice();
                     buf.extend_from_slice(&page[page_off..page_off + take]);
                 }
-                argv_copied += take;
+                argv_copied += take as u64;
             }
             Some(buf)
         } else {
@@ -1352,9 +1354,9 @@ impl Orbit {
 
         // Copy envp blob (always one page; syscall layer already
         // bound-checked alignment and range when envp_vaddr != 0).
-        let envp_bytes: Option<Vec<u8>> = if req.envp_vaddr != 0 {
+        let envp_bytes: Option<Vec<u8>> = if req.envp_vaddr.raw() != 0 {
             let pa = match unsafe {
-                mmu::mmap::virt_to_phys(&root_table, VirtAddr::new(req.envp_vaddr as u64))
+                mmu::mmap::virt_to_phys(&root_table, VirtAddr::new(req.envp_vaddr.raw()))
             } {
                 Some(p) => p as u64,
                 None => {
@@ -1384,15 +1386,18 @@ impl Orbit {
             return Errno::new(EINVAL).to_ret();
         }
 
-        let pid = match self.create_new_process(
-            &blob,
-            UPROC_STACK_DEFAULT,
-            allowed,
+        let proc_components = ProcessComponents {
+            elf_blob: &blob,
+            stack_size: UPROC_STACK_DEFAULT,
+            allowed_affinity: allowed,
             affinity,
             parent_pid,
-            argv_bytes.as_deref(),
-            envp_bytes.as_deref(),
-        ) {
+            argv_bytes: argv_bytes.as_deref(),
+            envp_bytes: envp_bytes.as_deref(),
+            perms: None
+        };
+
+        let pid = match self.create_new_process(proc_components) {
             Ok(pid) => pid,
             Err(()) => {
                 error!("create_process_ex: create_new_process failed");
@@ -1422,7 +1427,7 @@ impl Orbit {
         &mut self,
         req: orbit_core::PledgeReq,
         pid: u16,
-        root_pa: u64,
+        root_pa: PhysAddr,
     ) -> isize {
         use orbit_abi::perms::PermsRequest;
 
@@ -1433,8 +1438,8 @@ impl Orbit {
         // so a misaligned read can't straddle the page boundary
         // unless `req_vaddr` itself was bad — the syscall layer
         // already enforced 8-byte alignment.
-        let page_base = (req.req_vaddr as u64) & !(PAGE_SIZE as u64 - 1);
-        let page_off = (req.req_vaddr as u64 - page_base) as usize;
+        let page_base = req.req_vaddr.raw() & !(PAGE_SIZE as u64 - 1);
+        let page_off = (req.req_vaddr.raw() - page_base) as usize;
         let pa = match unsafe {
             mmu::mmap::virt_to_phys(&root_table, VirtAddr::new(page_base))
         } {
@@ -1492,7 +1497,7 @@ impl Orbit {
         &mut self,
         req: orbit_core::CreateProcessV2Req,
         parent_pid: u16,
-        root_pa: u64,
+        root_pa: PhysAddr,
     ) -> isize {
         use orbit_abi::denial::{DenialEvent, DenialSink};
         use orbit_abi::perms::CreateProcessV2Args;
@@ -1504,8 +1509,8 @@ impl Orbit {
 
         // Copy the args struct (one user page; the 8-byte alignment
         // check at the syscall boundary guarantees no straddle).
-        let args_page_base = (req.args_vaddr as u64) & !(PAGE_SIZE as u64 - 1);
-        let args_page_off = (req.args_vaddr as u64 - args_page_base) as usize;
+        let args_page_base = req.args_vaddr.raw() & !(PAGE_SIZE as u64 - 1);
+        let args_page_off = (req.args_vaddr.raw() - args_page_base) as usize;
         let args_pa = match unsafe {
             mmu::mmap::virt_to_phys(&root_table, VirtAddr::new(args_page_base))
         } {
@@ -1607,9 +1612,18 @@ impl Orbit {
             return Errno::new(EINVAL).to_ret();
         }
 
-        let child_pid = match self.create_new_process(
-            &blob, UPROC_STACK_DEFAULT, allowed, affinity, parent_pid, None, None,
-        ) {
+        let proc_components = ProcessComponents {
+            elf_blob: &blob,
+            stack_size: UPROC_STACK_DEFAULT,
+            allowed_affinity: allowed,
+            affinity,
+            parent_pid,
+            argv_bytes: None,
+            envp_bytes: None,
+            perms: None
+        };
+
+        let child_pid = match self.create_new_process(proc_components) {
             Ok(p) => p,
             Err(()) => {
                 error!("create_process_v2: create_new_process failed");
@@ -1737,7 +1751,7 @@ impl Orbit {
 
         // Map the page R+U into the child's PT at target_va.
         let proc = self.processes.get(&pid).ok_or(())?;
-        let proc_root_pa = (proc.satp.ppn() * PAGE_SIZE) as u64;
+        let proc_root_pa = PhysAddr::from(proc.satp);
         let proc_root_table = unsafe { memmap::kernel_root_from_pa(proc_root_pa) };
         let blob_pa = match &backing {
             process::PhysBacking::Shared { frame, .. } => frame.get_raw(),
@@ -1832,12 +1846,12 @@ impl Orbit {
         &mut self,
         req: FutexWaitReq,
         pid: u16,
-        root_pa: u64,
+        root_pa: PhysAddr,
         handle: process::CompletionHandle,
     ) {
         let root_table = unsafe { memmap::kernel_root_from_pa(root_pa) };
         let pa = match unsafe {
-            mmu::mmap::virt_to_phys(&root_table, VirtAddr::new(req.uaddr as u64))
+            mmu::mmap::virt_to_phys(&root_table, VirtAddr::new(req.uaddr.raw()))
         } {
             Some(p) => p as u64,
             None => {
@@ -1883,12 +1897,12 @@ impl Orbit {
         &mut self,
         req: FutexWakeReq,
         _pid: u16,
-        root_pa: u64,
+        root_pa: PhysAddr,
         handle: process::CompletionHandle,
     ) {
         let root_table = unsafe { memmap::kernel_root_from_pa(root_pa) };
         let pa = match unsafe {
-            mmu::mmap::virt_to_phys(&root_table, VirtAddr::new(req.uaddr as u64))
+            mmu::mmap::virt_to_phys(&root_table, VirtAddr::new(req.uaddr.raw()))
         } {
             Some(p) => p as u64,
             None => {
@@ -1952,7 +1966,7 @@ impl Orbit {
         // the current max + 1 — close enough for diagnostics; the real
         // tid is read off the registry below on success.
         match self.add_new_thread_to_process(
-            pid, req.entry, UPROC_STACK_DEFAULT, allowed, affinity, req.arg,
+            pid, req.entry.raw() as usize, UPROC_STACK_DEFAULT, allowed, affinity, req.arg,
         ) {
             Ok(()) => {
                 // Find the most-recently-inserted thread for this pid:
@@ -1977,7 +1991,7 @@ impl Orbit {
         }
     }
 
-    fn run_create_process_req(&mut self, req: CreateProcessReq, parent_pid: u16, root_pa: u64) -> isize {
+    fn run_create_process_req(&mut self, req: CreateProcessReq, parent_pid: u16, root_pa: PhysAddr) -> isize {
         info!("handling create_process req: {req:?}");
 
         // Dev-loop safety cap. Well above any realistic test ELF but small
@@ -1996,15 +2010,16 @@ impl Orbit {
         // User pages come from a single contiguous mmap in practice, but
         // don't assume — translate each page independently.
         let mut blob: Vec<u8> = Vec::with_capacity(req.elf_len);
-        let mut copied = 0usize;
-        while copied < req.elf_len {
-            let cursor = req.elf_vaddr + copied;
-            let page_base = cursor & !(PAGE_SIZE - 1);
-            let page_off = cursor - page_base;
-            let take = core::cmp::min(PAGE_SIZE - page_off, req.elf_len - copied);
+        let mut copied = 0u64;
+        let elf_len = req.elf_len as u64;
+        while copied < elf_len {
+            let cursor = req.elf_vaddr.raw() + copied;
+            let page_base = cursor & !(PAGE_SIZE as u64 - 1);
+            let page_off = (cursor - page_base) as usize;
+            let take = core::cmp::min(PAGE_SIZE - page_off, (elf_len - copied) as usize);
 
             let pa = match unsafe {
-                mmu::mmap::virt_to_phys(&root_table, VirtAddr::new(page_base as u64))
+                mmu::mmap::virt_to_phys(&root_table, VirtAddr::new(page_base))
             } {
                 Some(p) => p as u64,
                 None => {
@@ -2019,7 +2034,7 @@ impl Orbit {
                 blob.extend_from_slice(&page[page_off..page_off + take]);
             }
 
-            copied += take;
+            copied += take as u64;
         }
 
         // Sentinel 0 → "default" (all harts). Otherwise validate that
@@ -2038,7 +2053,18 @@ impl Orbit {
             return Errno::new(EINVAL).to_ret();
         }
 
-        match self.create_new_process(&blob, UPROC_STACK_DEFAULT, allowed, affinity, parent_pid, None, None) {
+        let proc_components = ProcessComponents {
+            elf_blob: &blob,
+            stack_size: UPROC_STACK_DEFAULT,
+            allowed_affinity: allowed,
+            affinity,
+            parent_pid,
+            argv_bytes: None,
+            envp_bytes: None,
+            perms: None
+        };
+
+        match self.create_new_process(proc_components) {
             Ok(pid) => {
                 info!("create_process: spawned pid={pid} parent={parent_pid} from {} bytes \
                     allowed_affinity={allowed:#x} affinity={affinity:#x}", blob.len());
@@ -2313,7 +2339,7 @@ impl Orbit {
             (Some(slot), pid) => match self.processes.get_mut(&pid) {
                 Some(proc) => {
                     let root_table = unsafe {
-                        memmap::kernel_root_from_pa((proc.satp.ppn() * PAGE_SIZE) as u64)
+                        memmap::kernel_root_from_pa(PhysAddr::from(proc.satp))
                     };
 
                     // Two passes: gather the vaddrs matching this slot
@@ -2391,7 +2417,7 @@ impl Orbit {
     }
 
     fn dealloc_process(&mut self, mut process: Process) {
-        let process_root_table_pa = (process.satp.ppn() * PAGE_SIZE) as u64;
+        let process_root_table_pa = PhysAddr::from(process.satp);
 
         // §13a.2 — three exit paths:
         //  1. Parent already parked on `wait_pid` → signal the waiter
@@ -2523,7 +2549,7 @@ impl Orbit {
             // `free_page` takes a raw PA directly; the root was allocated
             // from this pool so we reconstruct a `Frame<Table>` here.
             self.table_pages.free(
-                Frame::<process::Table>::new(PhysAddr::new(process_root_table_pa)),
+                Frame::<process::Table>::new(process_root_table_pa),
                 Self::TABLE_LAYOUT);
             let ktables_after = self.table_pages.allocated_bytes();
             debug!(
@@ -2787,7 +2813,7 @@ impl Orbit {
     /// tables allocated from `table_pages`. Use this wherever walker/mapper
     /// helpers need to follow intermediate PPNs.
     fn root(&self) -> mmu::mmap::RootTable<'static> {
-        unsafe { memmap::kernel_root_from_pa((self.satp.ppn() * PAGE_SIZE) as u64) }
+        unsafe { memmap::kernel_root_from_pa(PhysAddr::from(self.satp)) }
     }
     
     fn setup_igb(&mut self, device: &PciDevice) {
@@ -3108,8 +3134,8 @@ impl Orbit {
             .ok_or(())?;
 
         let root_table = unsafe {
-            let addr = self.processes.get(&pid).unwrap().satp.ppn() * PAGE_SIZE;
-            memmap::kernel_root_from_pa(addr as u64)
+            let addr = PhysAddr::from(self.processes.get(&pid).unwrap().satp);
+            memmap::kernel_root_from_pa(addr)
         };
 
         let thread = match self.create_new_thread(pid, &root_table, entrypoint, slot, stack_size, allowed_affinity, affinity, arg) {
@@ -3421,7 +3447,7 @@ impl Orbit {
     /// process still spawns and the child sees `0` for the
     /// corresponding slot in [`orbit_abi::user::argv_envp`]. Mirrors
     /// the warn-but-continue policy in `run_create_process_ex_req`.
-    pub fn create_new_process(&mut self, elf_blob: &[u8], stack_size: u64, allowed_affinity: u64, affinity: u64, parent_pid: u16, argv_bytes: Option<&[u8]>, envp_bytes: Option<&[u8]>) -> Result<u16, ()> {
+    pub fn create_new_process(&mut self, proc_components: ProcessComponents) -> Result<u16, ()> {
         // Leak-localization: pair this with the ktables snapshots in
         // dealloc_process. `create_pid{N}: ktables consumed=B` reports the
         // total table_pages footprint installed at process-construction
@@ -3430,7 +3456,7 @@ impl Orbit {
         // a leak-free run.
         let ktables_at_create = self.table_pages.allocated_bytes();
         let (root_pa, root_table) = self.create_new_page_table()?;
-        let mut elf = self.load_elf(&root_table, elf_blob)?;
+        let mut elf = self.load_elf(&root_table, proc_components.elf_blob)?;
         let pid = self.next_pid();
 
         let mut proc_satp = Satp::from_bits(0);
@@ -3438,7 +3464,7 @@ impl Orbit {
         proc_satp.set_mode(Mode::Sv48);
         proc_satp.set_asid(pid as usize);
 
-        let mut proc = Process::new(pid, parent_pid, proc_satp);
+        let mut proc = Process::new(pid, proc_components.parent_pid, proc_satp);
         // Migration default: `Process::new()` defaults to ZERO perms
         // (fail closed). Legacy CREATE_PROCESS / CREATE_PROCESS_EX
         // callers stamp BOOTSTRAP-shaped Permissions::ALL here so
@@ -3471,7 +3497,11 @@ impl Orbit {
         // pass through — the binary's `_start` ignores a0. (argv is
         // installed at a fixed VA via `install_argv_blob`, not via
         // this register.)
-        let thread = match self.create_new_thread(pid, &root_table, elf.entrypoint, slot, stack_size, allowed_affinity, affinity, 0) {
+        let thread = match self.create_new_thread(
+            pid, &root_table, elf.entrypoint, slot,
+            proc_components.stack_size, proc_components.allowed_affinity,
+            proc_components.affinity, 0)
+        {
             Ok(t) => t,
             Err(e) => {
                 // Process was inserted before create_new_thread, with
@@ -3513,6 +3543,7 @@ impl Orbit {
 
         let proc = self.processes.get_mut(&pid)
             .expect("just inserted");
+
         proc.threads.insert(tid);
         proc.thread_count = 1;
 
@@ -3538,14 +3569,14 @@ impl Orbit {
         // Same warn-but-continue policy as `run_create_process_ex_req`:
         // the process is alive and runnable; a blob-install failure
         // just means the child observes argc=0 / envc=0.
-        if let Some(blob) = argv_bytes {
+        if let Some(blob) = proc_components.argv_bytes {
             if self.install_argv_blob(pid, blob).is_err() {
                 warn!(
                     "create_new_process: argv install failed for pid={pid}, child will see no args",
                 );
             }
         }
-        if let Some(blob) = envp_bytes {
+        if let Some(blob) = proc_components.envp_bytes {
             if self.install_envp_blob(pid, blob).is_err() {
                 warn!(
                     "create_new_process: envp install failed for pid={pid}, child will see no env",
