@@ -13,8 +13,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use orbit_abi::fs::{
-    DIRENT_ALIGN, DIRENT_HDR_LEN, DT_DIR, DT_REG, DirEntry, S_IFDIR, S_IFREG, STAT_BLOCK_UNIT,
-    Stat,
+    DIRENT_ALIGN, DIRENT_HDR_LEN, DT_DIR, DT_REG, DirEntry, S_IFDIR, S_IFREG, STAT_BLOCK_UNIT, Stat,
 };
 use process::CompletionHandle;
 use tracing::{info, warn};
@@ -165,10 +164,9 @@ impl Tarfs {
                 .unwrap_or(0) as u32;
             let gid = parse_octal(&buf[HEADER_GID_OFFSET..HEADER_GID_OFFSET + HEADER_GID_LEN])
                 .unwrap_or(0) as u32;
-            let mtime = parse_octal(
-                &buf[HEADER_MTIME_OFFSET..HEADER_MTIME_OFFSET + HEADER_MTIME_LEN],
-            )
-            .unwrap_or(0) as i64;
+            let mtime =
+                parse_octal(&buf[HEADER_MTIME_OFFSET..HEADER_MTIME_OFFSET + HEADER_MTIME_LEN])
+                    .unwrap_or(0) as i64;
             let data_lba = lba + 1;
             let data_sectors = (size + SECTOR_SIZE as u64 - 1) / SECTOR_SIZE as u64;
 
@@ -185,7 +183,12 @@ impl Tarfs {
                 inodes.push(Some(TarInode {
                     path: path.clone(),
                     kind,
-                    data_sector: if matches!(kind, Kind::Reg) { data_lba } else { 0 },
+                    data_sector: if matches!(kind, Kind::Reg) {
+                        data_lba
+                    }
+                    else {
+                        0
+                    },
                     size,
                     mode_perms,
                     uid,
@@ -316,12 +319,7 @@ impl Filesystem for Tarfs {
     /// At the "few entries per dir" scale of v1 that's fine; if dirs
     /// ever get hundreds of entries we'd pre-build a child list at
     /// mount time.
-    fn readdir(
-        &self,
-        ino: Inode,
-        cursor: u64,
-        out: &mut [u8],
-    ) -> Result<(usize, u64), FsErr> {
+    fn readdir(&self, ino: Inode, cursor: u64, out: &mut [u8]) -> Result<(usize, u64), FsErr> {
         let entry = self.entry(ino)?;
         if !matches!(entry.kind, Kind::Dir) {
             return Err(FsErr::NotADirectory);
@@ -331,7 +329,8 @@ impl Filesystem for Tarfs {
         // dirs append "/" so `/bin` lists only `/bin/<name>`.
         let prefix: String = if entry.path.is_empty() {
             String::from("/")
-        } else {
+        }
+        else {
             let mut s = String::with_capacity(entry.path.len() + 1);
             s.push_str(&entry.path);
             s.push('/');
@@ -358,7 +357,8 @@ impl Filesystem for Tarfs {
                 continue;
             }
             // We have a candidate child at index `idx` with name `suffix`.
-            let Some(child) = self.inodes.get(child_ino as usize).and_then(|e| e.as_ref()) else {
+            let Some(child) = self.inodes.get(child_ino as usize).and_then(|e| e.as_ref())
+            else {
                 idx += 1;
                 continue;
             };
@@ -394,10 +394,7 @@ impl Filesystem for Tarfs {
             // unaligned writes, which lower to byte stores.
             let base = written;
             unsafe {
-                core::ptr::write_unaligned(
-                    out[base..].as_mut_ptr() as *mut DirEntry,
-                    hdr,
-                );
+                core::ptr::write_unaligned(out[base..].as_mut_ptr() as *mut DirEntry, hdr);
             }
             let name_start = base + DIRENT_HDR_LEN;
             out[name_start..name_start + suffix.len()].copy_from_slice(suffix.as_bytes());
@@ -472,7 +469,8 @@ fn canonicalize_path(prefix: &str, name: &str) -> String {
     let mut s = joined.as_str();
     if let Some(stripped) = s.strip_prefix("./") {
         s = stripped;
-    } else if s == "." {
+    }
+    else if s == "." {
         return String::new();
     }
     let s = s.trim_end_matches('/');

@@ -82,8 +82,7 @@ pub fn init(num_harts: usize) {
     for _ in 0..num_harts {
         // Leak the Queue so the (Producer, Consumer) borrows are 'static.
         // Drop on shutdown is not a concern — the kernel doesn't shut down.
-        let queue: &'static mut Queue<FreeItem, FREE_RING_CAP> =
-            Box::leak(Box::new(Queue::new()));
+        let queue: &'static mut Queue<FreeItem, FREE_RING_CAP> = Box::leak(Box::new(Queue::new()));
         let (prod, cons) = queue.split();
         producers.push(UnsafeCell::new(prod));
         consumers.push(UnsafeCell::new(cons));

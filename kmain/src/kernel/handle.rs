@@ -66,7 +66,10 @@ pub struct ProcessHandles {
 
 impl ProcessHandles {
     pub fn new() -> Self {
-        Self { table: BTreeMap::new(), next_id: 0 }
+        Self {
+            table: BTreeMap::new(),
+            next_id: 0,
+        }
     }
 
     /// Allocate a fresh Fd and insert `handle` under it. Returns the
@@ -96,6 +99,10 @@ impl ProcessHandles {
         self.table.iter()
     }
 
-    pub fn is_empty(&self) -> bool { self.table.is_empty() }
-    pub fn len(&self) -> usize { self.table.len() }
+    pub fn is_empty(&self) -> bool {
+        self.table.is_empty()
+    }
+    pub fn len(&self) -> usize {
+        self.table.len()
+    }
 }

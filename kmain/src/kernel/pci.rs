@@ -12,7 +12,7 @@ pub struct PciDevice {
     pub class: u32,
     pub rev: u8,
     pub htype: u8,
-    pub cacheline: u8
+    pub cacheline: u8,
 }
 
 impl PciDevice {
@@ -42,10 +42,14 @@ impl PciDevice {
 
             Self {
                 address,
-                device_id, vendor_id,
-                status, command,
-                class, rev,
-                htype, cacheline
+                device_id,
+                vendor_id,
+                status,
+                command,
+                class,
+                rev,
+                htype,
+                cacheline,
             }
         }
     }
@@ -53,7 +57,7 @@ impl PciDevice {
     pub fn get_bar_size(&self, bar: usize) -> usize {
         unsafe {
             let bar_base = (self.address as *mut u32).add(4);
-            
+
             let bar_ptr = bar_base.add(bar);
             bar_ptr.write_volatile(0xFFFF_FFFF);
             (!(bar_ptr.read_volatile() & 0xFFFF_FFF0)).saturating_add(1) as usize
@@ -62,7 +66,8 @@ impl PciDevice {
 
     pub fn print_info(&self) {
         unsafe {
-            info!("vid:{:04X?},did:{:04X?},status:{:04X?},command:{:04X?},class:{:06X?},rev:{:02?},htype:{:02X?},cacheline:{:02X?}",
+            info!(
+                "vid:{:04X?},did:{:04X?},status:{:04X?},command:{:04X?},class:{:06X?},rev:{:02?},htype:{:02X?},cacheline:{:02X?}",
                 self.vendor_id,
                 self.device_id,
                 self.status,
@@ -70,16 +75,17 @@ impl PciDevice {
                 self.class,
                 self.rev,
                 self.htype,
-                self.cacheline);
+                self.cacheline
+            );
 
             let base = self.address as *mut u32;
             if self.htype == 0 {
                 let bar_base = base.add(4);
                 for bar_num in 0..6 {
                     let bar = bar_base.add(bar_num);
-                    
+
                     let bar_orig = bar.read_volatile();
-                    
+
                     bar.write_volatile(0xFFFF_FFFF);
                     let bar_len = (!(bar.read_volatile() & 0xFFFF_FFF0)).saturating_add(1);
                     let bar_val = bar.read_volatile();
@@ -108,10 +114,10 @@ pub fn scan_pci(base: usize, interests: &[(u16, u16)]) -> Vec<PciDevice> {
         for dev in 0..32 {
             for func in 0..8 {
                 // ECAM Address Formula: Base + (Bus << 20) | (Dev << 15) | (Func << 12)
-                let address = base | 
-                            ((bus as usize) << 20) | 
-                            ((dev as usize) << 15) | 
-                            ((func as usize) << 12);
+                let address = base
+                    | ((bus as usize) << 20)
+                    | ((dev as usize) << 15)
+                    | ((func as usize) << 12);
 
                 let device = PciDevice::from_address(address);
                 if interests.contains(&(device.vendor_id, device.device_id)) {

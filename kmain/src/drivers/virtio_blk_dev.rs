@@ -64,7 +64,8 @@ pub fn block_dev() -> Option<&'static mut Block> {
     let p = BLOCK_PTR.load(Ordering::Acquire);
     if p.is_null() {
         None
-    } else {
+    }
+    else {
         // SAFETY: BLOCK_PTR is set exactly once from hart 0 during
         // setup_virtio_blk. Single mutator post-init: callers must
         // serialize themselves (queue is not internally locked).
@@ -76,19 +77,24 @@ pub fn block_dev() -> Option<&'static mut Block> {
 /// prove end-to-end transport works, and arm the IRQ. Returns true on
 /// success. Requires [`virtio_probe::discover`] to have run first.
 pub fn setup_virtio_blk(kernel_pages: &mut KernelPages) -> bool {
-    let Some(found) = virtio_probe::find(VIRTIO_BLK_DEVICE_ID) else {
+    let Some(found) = virtio_probe::find(VIRTIO_BLK_DEVICE_ID)
+    else {
         info!("virtio-blk: no device-id 2 slot present");
         return false;
     };
     let slot = found.slot;
     let mmio = found.mmio;
-    info!("virtio-blk: selected slot @{:#x} irq={}", slot.pa_base, slot.irq);
+    info!(
+        "virtio-blk: selected slot @{:#x} irq={}",
+        slot.pa_base, slot.irq
+    );
 
     let queue_layout = match Layout::from_size_align(QUEUE_PAGE_SIZE, QUEUE_PAGE_SIZE) {
         Ok(l) => l,
         Err(_) => return false,
     };
-    let Some((q_frame, q_kva)) = kernel_pages.alloc_kdmap(queue_layout) else {
+    let Some((q_frame, q_kva)) = kernel_pages.alloc_kdmap(queue_layout)
+    else {
         error!("virtio-blk: queue page alloc failed");
         return false;
     };
@@ -105,7 +111,8 @@ pub fn setup_virtio_blk(kernel_pages: &mut KernelPages) -> bool {
         Ok(l) => l,
         Err(_) => return false,
     };
-    let Some((arena_frame, arena_kva)) = kernel_pages.alloc_kdmap(arena_layout) else {
+    let Some((arena_frame, arena_kva)) = kernel_pages.alloc_kdmap(arena_layout)
+    else {
         error!("virtio-blk: arena alloc failed");
         return false;
     };
@@ -252,8 +259,7 @@ pub unsafe fn submit_blk_read(
         }
         Err(e) => {
             // Reclaim the handle since the chain never went out.
-            let raw = IN_FLIGHT[head as usize]
-                .swap(core::ptr::null_mut(), Ordering::AcqRel);
+            let raw = IN_FLIGHT[head as usize].swap(core::ptr::null_mut(), Ordering::AcqRel);
             if !raw.is_null() {
                 unsafe {
                     drop(CompletionHandle::from_raw(raw));
@@ -267,7 +273,8 @@ pub unsafe fn submit_blk_read(
 /// PLIC handler. Acks the device interrupt, drains every completed
 /// chain, and signals each chain's [`CompletionHandle`].
 fn virtio_blk_handler(_src: u32) {
-    let Some(dev) = block_dev() else {
+    let Some(dev) = block_dev()
+    else {
         return;
     };
     unsafe {
@@ -284,7 +291,12 @@ fn virtio_blk_handler(_src: u32) {
             }
             let h = CompletionHandle::from_raw(raw);
             let ok_val = IN_FLIGHT_OK_VAL[head as usize].load(Ordering::Relaxed);
-            let result: isize = if status == VIRTIO_BLK_S_OK { ok_val as isize } else { -1 };
+            let result: isize = if status == VIRTIO_BLK_S_OK {
+                ok_val as isize
+            }
+            else {
+                -1
+            };
             h.signal(result);
         });
     }

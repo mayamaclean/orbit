@@ -33,11 +33,7 @@ static SLOTS: AtomicPtr<Vec<VirtioSlot>> = AtomicPtr::new(null_mut());
 /// probe its `device_id`, and stash the result. Subsequent calls are
 /// no-ops; `install_kmmio_alias` is not idempotent and a second walk
 /// would burn duplicate VA slots.
-pub fn discover(
-    fdt: &Fdt<'_>,
-    rt: &RootTable<'_>,
-    table_pages: &mut TablePages,
-) {
+pub fn discover(fdt: &Fdt<'_>, rt: &RootTable<'_>, table_pages: &mut TablePages) {
     if !SLOTS.load(Ordering::Acquire).is_null() {
         return;
     }
@@ -73,7 +69,11 @@ pub fn discover(
             "virtio_mmio@{:#x} irq={} magic={:#x} device_id={}",
             slot.pa_base, slot.irq, magic, device_id,
         );
-        out.push(VirtioSlot { slot, mmio, device_id });
+        out.push(VirtioSlot {
+            slot,
+            mmio,
+            device_id,
+        });
     }
 
     let leaked: &'static mut Vec<VirtioSlot> = Box::leak(Box::new(out));

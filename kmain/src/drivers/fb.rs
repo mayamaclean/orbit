@@ -45,11 +45,19 @@ impl FrameBuffer {
     /// `base_kva` must be a writable KDMAP VA covering at least
     /// `width * height * 4` bytes.
     pub const unsafe fn new(base_kva: u64, width: u32, height: u32) -> Self {
-        Self { base: base_kva as *mut u32, width, height }
+        Self {
+            base: base_kva as *mut u32,
+            width,
+            height,
+        }
     }
 
-    pub fn width(&self) -> u32 { self.width }
-    pub fn height(&self) -> u32 { self.height }
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+    pub fn height(&self) -> u32 {
+        self.height
+    }
     pub fn size_bytes(&self) -> usize {
         self.width as usize * self.height as usize * 4
     }
@@ -77,7 +85,9 @@ impl FrameBuffer {
         let y1 = y.saturating_add(h).min(self.height);
         for row in y.min(self.height)..y1 {
             for col in x.min(self.width)..x1 {
-                unsafe { self.put(col, row, color); }
+                unsafe {
+                    self.put(col, row, color);
+                }
             }
         }
     }
@@ -85,14 +95,7 @@ impl FrameBuffer {
     /// Blit one 8×16 glyph at pixel `(x, y)`. Pixels whose bit is set
     /// in the glyph get `fg`, unset get `bg`. Bit 7 = leftmost pixel.
     #[inline]
-    pub fn blit_glyph(
-        &self,
-        x: u32,
-        y: u32,
-        glyph: &[u8; GLYPH_H as usize],
-        fg: u32,
-        bg: u32,
-    ) {
+    pub fn blit_glyph(&self, x: u32, y: u32, glyph: &[u8; GLYPH_H as usize], fg: u32, bg: u32) {
         for (row, &byte) in glyph.iter().enumerate() {
             let py = y + row as u32;
             if py >= self.height {
@@ -105,7 +108,9 @@ impl FrameBuffer {
                 }
                 // MSB-first: bit 7 = col 0, bit 0 = col 7.
                 let on = (byte >> (7 - col)) & 1 != 0;
-                unsafe { self.put(px, py, if on { fg } else { bg }); }
+                unsafe {
+                    self.put(px, py, if on { fg } else { bg });
+                }
             }
         }
     }

@@ -18,9 +18,9 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use alloc::sync::Arc;
 
-use mmu::{PAGE_SIZE, SupervisorTag};
 use mmu::mmap::{RootTable, walk_to_table};
 use mmu::sv48::VirtAddr;
+use mmu::{PAGE_SIZE, SupervisorTag};
 use orbit_abi::layout::UserVa;
 use process::{Frame, Shared};
 
@@ -84,7 +84,9 @@ pub struct SharedUserPtr<T> {
 
 impl<T> Clone for SharedUserPtr<T> {
     fn clone(&self) -> Self {
-        Self { inner: self.inner.clone() }
+        Self {
+            inner: self.inner.clone(),
+        }
     }
 }
 
@@ -102,10 +104,17 @@ impl<T> SharedUserPtr<T> {
     /// (which rejects unaligned VAs) and `normalize_region_size`
     /// (which page-rounds `len`), but this assert makes it explicit
     /// at the construction boundary instead of relying on callers.
-    pub fn new(frame: Frame<Shared>, layout: Layout, user_va: UserVa, len: usize, owner_pid: u16) -> Self {
+    pub fn new(
+        frame: Frame<Shared>,
+        layout: Layout,
+        user_va: UserVa,
+        len: usize,
+        owner_pid: u16,
+    ) -> Self {
         assert!(
             user_va.raw() % PAGE_SIZE as u64 == 0,
-            "SharedUserPtr::new: user_va {:#x} not page-aligned", user_va.raw(),
+            "SharedUserPtr::new: user_va {:#x} not page-aligned",
+            user_va.raw(),
         );
         assert!(
             len % PAGE_SIZE == 0 && len > 0,
@@ -132,7 +141,10 @@ impl<T> SharedUserPtr<T> {
     /// `self.inner.frame` is `Some` for the whole non-Drop lifetime of
     /// the Arc; the `expect` documents that invariant.
     pub fn as_ref(&self) -> &T {
-        let kva = self.inner.frame.as_ref()
+        let kva = self
+            .inner
+            .frame
+            .as_ref()
             .expect("SharedUserPtr::as_ref after frame.take() in Drop")
             .to_kdmap();
         unsafe { &*kva.as_ptr::<T>() }
@@ -224,9 +236,15 @@ impl<T> SharedUserPtr<T> {
         self.inner.revoked.load(Ordering::Acquire)
     }
 
-    pub fn user_va(&self) -> UserVa { self.inner.user_va }
-    pub fn len(&self) -> usize { self.inner.len }
-    pub fn owner_pid(&self) -> u16 { self.inner.owner_pid }
+    pub fn user_va(&self) -> UserVa {
+        self.inner.user_va
+    }
+    pub fn len(&self) -> usize {
+        self.inner.len
+    }
+    pub fn owner_pid(&self) -> u16 {
+        self.inner.owner_pid
+    }
 }
 
 impl<T> core::fmt::Debug for SharedUserPtr<T> {

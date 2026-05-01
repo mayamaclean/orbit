@@ -293,6 +293,14 @@ pub struct Thread {
     pub sleep_seq: AtomicU64,
     pub frame: &'static mut TrapFrame,
     pub stack: &'static mut Stack,
+    /// Physical address of the kernel-thread stack and trap-frame
+    /// allocations. `Some` only for kernel threads (pid==0); user threads
+    /// track their stack/trap-frame via `Process.maps` `PhysBacking`
+    /// entries instead. Captured at allocation so `dealloc_thread` can
+    /// reconstruct typed `Frame<Shared>` for `kernel_pages.free` without
+    /// round-tripping the `&'static mut` reference through `KdmapVa`.
+    pub kernel_stack_pa: Option<PhysAddr>,
+    pub kernel_trap_frame_pa: Option<PhysAddr>,
     pub satp: Satp,
     pub mode: SPP,
     /// Wait/signal handle this thread is parked on while

@@ -36,7 +36,10 @@ impl UserPageWindow {
     /// - The caller must hold the Orbit lock (single-slot serialization) and
     ///   must not switch satp for the lifetime of the returned window.
     pub unsafe fn map(pa: u64, len: usize) -> Self {
-        assert!(pa as usize % PAGE_SIZE == 0, "UserPageWindow::map: pa not page-aligned");
+        assert!(
+            pa as usize % PAGE_SIZE == 0,
+            "UserPageWindow::map: pa not page-aligned"
+        );
         assert!(len > 0, "UserPageWindow::map: zero-length window");
         let mapped_len = round_usize_up(len, PAGE_SIZE);
         assert!(
@@ -50,9 +53,8 @@ impl UserPageWindow {
         );
 
         let base = memmap::kscratch_base();
-        let perms = (PagePermissions::R as u64)
-            | (PagePermissions::W as u64)
-            | (PagePermissions::G as u64);
+        let perms =
+            (PagePermissions::R as u64) | (PagePermissions::W as u64) | (PagePermissions::G as u64);
         let root = current_satp_root();
         let mapped_pages = mapped_len / PAGE_SIZE;
         for i in 0..mapped_pages {
@@ -66,12 +68,17 @@ impl UserPageWindow {
                     Some(PhysAddr::new(paddr)),
                     perms,
                     0,
-                ).expect("KSCRATCH intermediate missing — reserve_va_range not run?");
+                )
+                .expect("KSCRATCH intermediate missing — reserve_va_range not run?");
                 riscv::asm::sfence_vma(0, vaddr as usize);
             }
         }
 
-        Self { kva: base, len, mapped_pages }
+        Self {
+            kva: base,
+            len,
+            mapped_pages,
+        }
     }
 
     pub fn as_mut_slice(&mut self) -> &mut [u8] {

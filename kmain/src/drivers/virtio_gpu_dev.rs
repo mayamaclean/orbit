@@ -16,8 +16,8 @@ use core::sync::atomic::{AtomicPtr, Ordering};
 
 use tracing::{error, info};
 use virtio::queue::VirtqBacking;
-use virtio_gpu::{Gpu, GpuBacking, ARENA_SIZE, FORMAT_B8G8R8A8_UNORM};
 use virtio_gpu::proto::VIRTIO_GPU_DEVICE_ID;
+use virtio_gpu::{ARENA_SIZE, FORMAT_B8G8R8A8_UNORM, Gpu, GpuBacking};
 
 use crate::drivers::virtio_probe;
 use crate::kernel::memmap::KernelPages;
@@ -50,7 +50,8 @@ pub fn gpu() -> Option<&'static mut Gpu> {
     let p = GPU_PTR.load(Ordering::Acquire);
     if p.is_null() {
         None
-    } else {
+    }
+    else {
         // SAFETY: GPU_PTR is written exactly once, from hart 0 in
         // `setup_virtio_gpu`. Later accesses happen from `k_gpu`
         // (single consumer) and from boot-time init before k_gpu is
@@ -77,24 +78,29 @@ pub struct InstallOutcome {
 /// init, and return framebuffer coordinates for the caller to
 /// integrate into the display pipeline. Requires
 /// [`virtio_probe::discover`] to have run first.
-pub fn setup_virtio_gpu(
-    kernel_pages: &mut KernelPages,
-) -> Option<InstallOutcome> {
+pub fn setup_virtio_gpu(kernel_pages: &mut KernelPages) -> Option<InstallOutcome> {
     let found = virtio_probe::find(VIRTIO_GPU_DEVICE_ID)?;
     let slot = found.slot;
     let mmio = found.mmio;
-    info!("virtio-gpu: selected slot @{:#x} irq={}", slot.pa_base, slot.irq);
+    info!(
+        "virtio-gpu: selected slot @{:#x} irq={}",
+        slot.pa_base, slot.irq
+    );
 
     // Phase 3: allocate ctrl queue page + command arena page.
     let ctrl_layout = Layout::from_size_align(QUEUE_PAGE_SIZE, QUEUE_PAGE_SIZE).ok()?;
     let (ctrl_frame, ctrl_kva) = kernel_pages.alloc_kdmap(ctrl_layout)?;
     let ctrl_pa = ctrl_frame.get_raw();
-    unsafe { core::ptr::write_bytes(ctrl_kva.as_mut_ptr::<u8>(), 0, QUEUE_PAGE_SIZE); }
+    unsafe {
+        core::ptr::write_bytes(ctrl_kva.as_mut_ptr::<u8>(), 0, QUEUE_PAGE_SIZE);
+    }
 
     let arena_layout = Layout::from_size_align(ARENA_SIZE, 4096).ok()?;
     let (arena_frame, arena_kva) = kernel_pages.alloc_kdmap(arena_layout)?;
     let arena_pa = arena_frame.get_raw();
-    unsafe { core::ptr::write_bytes(arena_kva.as_mut_ptr::<u8>(), 0, ARENA_SIZE); }
+    unsafe {
+        core::ptr::write_bytes(arena_kva.as_mut_ptr::<u8>(), 0, ARENA_SIZE);
+    }
 
     let ctrl_kva_u64 = ctrl_kva.as_mut_ptr::<u8>() as u64;
     let ctrl_backing = VirtqBacking {
@@ -152,11 +158,7 @@ pub fn setup_virtio_gpu(
     // greeting so we can visually confirm the blit path works before
     // the k_gpu thread + Scrollback land.
     let fb = unsafe {
-        crate::drivers::fb::FrameBuffer::new(
-            fb_kva.as_ptr::<u8>() as u64,
-            info.width,
-            info.height,
-        )
+        crate::drivers::fb::FrameBuffer::new(fb_kva.as_ptr::<u8>() as u64, info.width, info.height)
     };
     fb.fill(crate::drivers::fb::DARK_GRAY);
     fb.blit_text(
@@ -171,7 +173,10 @@ pub fn setup_virtio_gpu(
     // contents.
     unsafe {
         if let Err(e) = gpu.create_2d_resource(
-            FB_RESOURCE_ID, info.width, info.height, FORMAT_B8G8R8A8_UNORM,
+            FB_RESOURCE_ID,
+            info.width,
+            info.height,
+            FORMAT_B8G8R8A8_UNORM,
         ) {
             error!("virtio-gpu: create_2d failed: {:?}", e);
             return None;
@@ -184,9 +189,7 @@ pub fn setup_virtio_gpu(
             error!("virtio-gpu: set_scanout failed: {:?}", e);
             return None;
         }
-        if let Err(e) = gpu.transfer_to_host_2d(
-            FB_RESOURCE_ID, 0, 0, info.width, info.height,
-        ) {
+        if let Err(e) = gpu.transfer_to_host_2d(FB_RESOURCE_ID, 0, 0, info.width, info.height) {
             error!("virtio-gpu: transfer failed: {:?}", e);
             return None;
         }

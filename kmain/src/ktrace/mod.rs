@@ -3,14 +3,12 @@ use core::fmt::{self, Write};
 use tracing::{Event, Id, Level, Metadata, Subscriber, field::Visit};
 
 pub struct OrbitSubscriber {
-    max_level: Level
+    max_level: Level,
 }
 
 impl OrbitSubscriber {
     pub const fn new(max_level: Level) -> Self {
-        Self {
-            max_level
-        }
+        Self { max_level }
     }
 }
 
@@ -24,7 +22,9 @@ impl Subscriber for OrbitSubscriber {
         event.record(&mut visitor);
     }
 
-    fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> Id { Id::from_u64(1) }
+    fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> Id {
+        Id::from_u64(1)
+    }
     fn record(&self, _span: &Id, _values: &tracing::span::Record<'_>) {}
     fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
     fn enter(&self, _span: &Id) {}
@@ -39,12 +39,16 @@ impl Visit for OrbitVisitor {
             emit(format_args!(
                 "{}t {}: {:?}\n",
                 riscv::register::time::read64(),
-                self.0, value,
+                self.0,
+                value,
             ));
-        } else {
+        }
+        else {
             emit(format_args!(
                 "{}: {}=\"{:?}\"\n",
-                self.0, field.name(), value,
+                self.0,
+                field.name(),
+                value,
             ));
         }
     }
@@ -62,7 +66,8 @@ impl log::Log for OrbitLogger {
             emit(format_args!(
                 "{}t {}: {}\n",
                 riscv::register::time::read64(),
-                record.level(), record.args(),
+                record.level(),
+                record.args(),
             ));
         }
     }
@@ -84,7 +89,10 @@ struct LineBuf {
 
 impl LineBuf {
     const fn new() -> Self {
-        Self { bytes: [0; LINE_BUF_LEN], len: 0 }
+        Self {
+            bytes: [0; LINE_BUF_LEN],
+            len: 0,
+        }
     }
 
     fn as_slice(&self) -> &[u8] {
@@ -121,9 +129,6 @@ fn emit(args: fmt::Arguments<'_>) {
     // Push to the k_gpu ring if it's initialized. Runs lock-free;
     // dropped on ring-full (the UART path already caught the line).
     if crate::drivers::k_gpu::is_ready() {
-        let _ = crate::drivers::k_gpu::push_chunk(
-            crate::drivers::display::Source::Kernel,
-            bytes,
-        );
+        let _ = crate::drivers::k_gpu::push_chunk(crate::drivers::display::Source::Kernel, bytes);
     }
 }

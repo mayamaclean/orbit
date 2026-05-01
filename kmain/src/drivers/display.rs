@@ -37,7 +37,9 @@ pub struct Scrollback {
 }
 
 impl Default for Scrollback {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Scrollback {
@@ -80,7 +82,8 @@ impl Scrollback {
             }
             let ch = if b.is_ascii_graphic() || b == b' ' || b == b'\t' {
                 if b == b'\t' { ' ' } else { b as char }
-            } else {
+            }
+            else {
                 '?'
             };
             self.pending.push(ch);
@@ -98,16 +101,13 @@ impl Scrollback {
             .iter()
             .skip(skip)
             .map(String::as_str)
-            .chain(
-                Some(self.pending.as_str())
-                    .filter(|s| !s.is_empty()),
-            )
+            .chain(Some(self.pending.as_str()).filter(|s| !s.is_empty()))
     }
 }
 
 pub struct ProcScrollback {
     pub(super) scrollback: Scrollback,
-    pub(super) title: String
+    pub(super) title: String,
 }
 
 impl ProcScrollback {
@@ -116,8 +116,8 @@ impl ProcScrollback {
             scrollback: Scrollback::new(),
             title: match src {
                 Source::Kernel => " kernel ".into(),
-                Source::Process(pid) => alloc::format!(" pid {pid} ")
-            }
+                Source::Process(pid) => alloc::format!(" pid {pid} "),
+            },
         }
     }
 }
@@ -151,7 +151,9 @@ impl Display {
 
     /// Add a new source (new process came up). Idempotent.
     pub fn insert_source(&mut self, source: Source) {
-        self.scrollbacks.entry(source).or_insert(ProcScrollback::new(source));
+        self.scrollbacks
+            .entry(source)
+            .or_insert(ProcScrollback::new(source));
     }
 
     /// Remove a source (process exited). If it was active, advance to
@@ -193,10 +195,12 @@ impl Display {
         info!("cycling pane");
 
         if self.scrollbacks.is_empty() {
-            return
+            return;
         }
 
-        let next = self.scrollbacks.keys()
+        let next = self
+            .scrollbacks
+            .keys()
             .skip_while(|src| **src != self.active)
             .nth(1)
             .copied()
@@ -222,13 +226,16 @@ impl Display {
 
         // Title bar at the top showing which source is visible.
         let title = &self.scrollbacks[&self.active].title[..];
-        self.fb.fill_rect(0, 0, self.fb.width(), GLYPH_H, fb::DARK_GRAY);
-        self.fb.blit_text(0, 0, title, fb::rgb(192, 0, 192), fb::DARK_GRAY);
+        self.fb
+            .fill_rect(0, 0, self.fb.width(), GLYPH_H, fb::DARK_GRAY);
+        self.fb
+            .blit_text(0, 0, title, fb::rgb(192, 0, 192), fb::DARK_GRAY);
 
         // Body: blit scrollback lines starting under the title bar.
         let cols = (self.fb.width() / GLYPH_W) as usize;
         let rows_avail = ((self.fb.height() - GLYPH_H) / GLYPH_H) as usize;
-        let Some(sb) = self.scrollbacks.get(&self.active) else {
+        let Some(sb) = self.scrollbacks.get(&self.active)
+        else {
             return true;
         };
 
@@ -236,7 +243,12 @@ impl Display {
             let y = GLYPH_H + row_idx as u32 * GLYPH_H;
             // blit_text also clamps per-pixel, but slicing here
             // avoids walking glyphs we'd throw away.
-            let slice = if line.len() > cols { &line[..cols] } else { line };
+            let slice = if line.len() > cols {
+                &line[..cols]
+            }
+            else {
+                line
+            };
             self.fb.blit_text(0, y, slice, fb::WHITE, fb::DARK_GRAY);
         }
 

@@ -37,8 +37,14 @@ pub const MAX_HARTS: usize = 8;
 /// orchestrator caller-agnostic — `SharedUserPtr::revoke` runs in the
 /// manager thread without `&Orbit` and still needs to broadcast.
 pub static SHOOTDOWN_RINGS: [ShootdownRing; MAX_HARTS] = [
-    ShootdownRing::new(), ShootdownRing::new(), ShootdownRing::new(), ShootdownRing::new(),
-    ShootdownRing::new(), ShootdownRing::new(), ShootdownRing::new(), ShootdownRing::new(),
+    ShootdownRing::new(),
+    ShootdownRing::new(),
+    ShootdownRing::new(),
+    ShootdownRing::new(),
+    ShootdownRing::new(),
+    ShootdownRing::new(),
+    ShootdownRing::new(),
+    ShootdownRing::new(),
 ];
 
 /// Online hart count, set by [`init`] during boot. Used to bound the
@@ -53,7 +59,8 @@ pub fn init(cpu_count: usize) {
     assert!(
         cpu_count as usize <= MAX_HARTS,
         "shootdown::init: cpu_count={} exceeds MAX_HARTS={}",
-        cpu_count, MAX_HARTS,
+        cpu_count,
+        MAX_HARTS,
     );
     CPU_COUNT.store(cpu_count, Ordering::Release);
 }

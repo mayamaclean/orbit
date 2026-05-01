@@ -2,16 +2,29 @@
 
 extern crate alloc;
 
-use core::{arch::asm, ptr::null_mut, sync::atomic::{AtomicBool, Ordering}};
-use alloc::{collections::btree_map::BTreeMap, vec::Vec};
-use device::{HartContext, TrapFrame};
-use orbit_abi::{layout::UserVa, perms::{Permissions, role::RoleId}};
-use net_channel::NetChannel;
 use crate::kernel::{shared_user_ptr::SharedUserPtr, shootdown::CPU_COUNT};
+use alloc::{collections::btree_map::BTreeMap, vec::Vec};
+use core::{
+    arch::asm,
+    ptr::null_mut,
+    sync::atomic::{AtomicBool, Ordering},
+};
+use device::{HartContext, TrapFrame};
+use net_channel::NetChannel;
+use orbit_abi::{layout::UserVa, perms::Permissions};
 use process::{Thread, ThreadState};
-use smoltcp::{iface::{PollResult, SocketHandle, SocketSet}, socket::dhcpv4, storage::RingBuffer};
+use smoltcp::{
+    iface::{PollResult, SocketHandle, SocketSet},
+    socket::dhcpv4,
+    storage::RingBuffer,
+};
 
-use crate::{drivers::e1000::E1000, kernel::context::{enter_hart_context, exit_thread_with_state, get_hart_context, hart_has_thread}};
+use crate::{
+    drivers::e1000::E1000,
+    kernel::context::{
+        enter_hart_context, exit_thread_with_state, get_hart_context, hart_has_thread,
+    },
+};
 
 pub mod channel;
 pub mod drivers;
@@ -35,7 +48,9 @@ pub struct UserAccess {
 impl UserAccess {
     #[inline]
     pub fn enter() -> Self {
-        unsafe { riscv::register::sstatus::set_sum(); }
+        unsafe {
+            riscv::register::sstatus::set_sum();
+        }
         Self { _private: () }
     }
 
@@ -65,7 +80,9 @@ impl UserAccess {
 
 impl Drop for UserAccess {
     fn drop(&mut self) {
-        unsafe { riscv::register::sstatus::clear_sum(); }
+        unsafe {
+            riscv::register::sstatus::clear_sum();
+        }
     }
 }
 
@@ -77,7 +94,7 @@ pub struct ProcessComponents<'c> {
     pub parent_pid: u16,
     pub argv_bytes: Option<&'c [u8]>,
     pub envp_bytes: Option<&'c [u8]>,
-    pub perms: Option<Permissions>
+    pub perms: Option<Permissions>,
 }
 
 pub fn write_sswi(hart: usize, val: u32) {
@@ -126,15 +143,12 @@ pub fn wait_until(target_time: u64) {
 
         while riscv::register::time::read64() < target_time {
             riscv::asm::wfi();
-        }        
+        }
     }
 }
 
 pub fn wait_for(target: u64) {
-    wait_until(
-        riscv::register::time::read64()
-            .wrapping_add(target)
-    );
+    wait_until(riscv::register::time::read64().wrapping_add(target));
 }
 
 pub static MANAGER_LOCK: AtomicBool = AtomicBool::new(false);
@@ -211,13 +225,10 @@ pub fn enforce_eperm(epc: usize, hart_context: &'static HartContext, frame: &mut
 
 #[unsafe(no_mangle)]
 pub extern "C" fn k_hart_loop() -> ! {
-    let hart_context = unsafe {
-        (riscv::register::sscratch::read() as *const HartContext).as_ref_unchecked()
-    };
+    let hart_context =
+        unsafe { (riscv::register::sscratch::read() as *const HartContext).as_ref_unchecked() };
 
-    let orbit = unsafe {
-        (hart_context.cscratch as *mut kernel::Orbit).as_mut_unchecked()
-    };
+    let orbit = unsafe { (hart_context.cscratch as *mut kernel::Orbit).as_mut_unchecked() };
 
     loop {
         // Always start a loop iteration with sstatus.SIE clear. After
@@ -227,7 +238,9 @@ pub extern "C" fn k_hart_loop() -> ! {
         // race the `arm_hart_timer` (no-SIE) variant was meant to
         // close. This single clear at the top covers both the dispatch
         // window and the manager critical section.
-        unsafe { riscv::register::sstatus::clear_sie(); }
+        unsafe {
+            riscv::register::sstatus::clear_sie();
+        }
 
         if hart_has_thread(hart_context) {
             // Arm the timer without enabling SIE: `enter_hart_context`
@@ -236,7 +249,9 @@ pub extern "C" fn k_hart_loop() -> ! {
             // the kernel-side window keeps the dispatch path
             // uninterruptible by async traps.
             arm_hart_timer(1_000_000);
-            unsafe { enter_hart_context(hart_context); }
+            unsafe {
+                enter_hart_context(hart_context);
+            }
         }
 
         // Disable sstatus.SIE around the acquire + critical section. If a
@@ -244,7 +259,9 @@ pub extern "C" fn k_hart_loop() -> ! {
         // to k_hart_loop without releasing MANAGER_LOCK, deadlocking all
         // harts. (Already off from the loop-top clear above; redundant
         // store kept for clarity / defense in depth.)
-        unsafe { riscv::register::sstatus::clear_sie(); }
+        unsafe {
+            riscv::register::sstatus::clear_sie();
+        }
         // Default WFI duration when we don't know the next sleep
         // deadline (lock contention path, or no sleepers). The
         // manager runs at least this often as a safety net for any
@@ -292,7 +309,9 @@ pub extern "C" fn k_hart_loop() -> ! {
 
             if hart_has_thread(hart_context) {
                 arm_hart_timer(1_000_000);
-                unsafe { enter_hart_context(hart_context); }
+                unsafe {
+                    enter_hart_context(hart_context);
+                }
             }
         }
 
@@ -323,7 +342,6 @@ pub extern "C" fn k_hart_loop() -> ! {
     }
 }
 
-
 #[derive(Debug)]
 pub struct SocketReq {
     /// Refcounted handle on the NetChannel. Cloned from the registry when
@@ -352,7 +370,7 @@ pub struct NetPackage {
     iface: Option<smoltcp::iface::Interface>,
     socket_reqs: Vec<heapless::spsc::Queue<SocketReq, 8>>,
     socket_associations: heapless::spsc::Queue<(usize, SocketHandle), 8>,
-    socket_deletions: heapless::spsc::Queue<SocketHandle, 8>
+    socket_deletions: heapless::spsc::Queue<SocketHandle, 8>,
 }
 
 fn set_ipv4_addr(iface: &mut smoltcp::iface::Interface, cidr: smoltcp::wire::Ipv4Cidr) {
@@ -362,7 +380,10 @@ fn set_ipv4_addr(iface: &mut smoltcp::iface::Interface, cidr: smoltcp::wire::Ipv
     });
 }
 
-fn handle_dhcp_event(mut iface: smoltcp::iface::Interface, event: dhcpv4::Event) -> smoltcp::iface::Interface {
+fn handle_dhcp_event(
+    mut iface: smoltcp::iface::Interface,
+    event: dhcpv4::Event,
+) -> smoltcp::iface::Interface {
     use tracing::{info, warn};
 
     match event {
@@ -396,7 +417,7 @@ fn handle_dhcp_event(mut iface: smoltcp::iface::Interface, event: dhcpv4::Event)
 
 #[unsafe(no_mangle)]
 pub extern "C" fn k_net(device: *mut NetPackage) {
-    use tracing::{info, error};
+    use tracing::{error, info};
 
     unsafe {
         riscv::register::sstatus::clear_sie();
@@ -406,7 +427,13 @@ pub extern "C" fn k_net(device: *mut NetPackage) {
 
     let net_package = unsafe { device.as_mut_unchecked() };
 
-    let NetPackage { phy, iface , socket_reqs, socket_associations, socket_deletions } = net_package;
+    let NetPackage {
+        phy,
+        iface,
+        socket_reqs,
+        socket_associations,
+        socket_deletions,
+    } = net_package;
     let mut phy = match phy.take() {
         Some(p) => p,
         None => {
@@ -422,7 +449,7 @@ pub extern "C" fn k_net(device: *mut NetPackage) {
             unsafe { exit_thread_with_state(ThreadState::Exited) };
         }
     };
-    
+
     let mut sockets = SocketSet::new(Vec::new());
 
     let dhcp_sock = dhcpv4::Socket::new();
@@ -438,9 +465,7 @@ pub extern "C" fn k_net(device: *mut NetPackage) {
         }
 
         let mut now = riscv::register::time::read();
-        let mut timestamp = smoltcp::time::Instant::from_micros(
-            now as i64 / 10
-        );
+        let mut timestamp = smoltcp::time::Instant::from_micros(now as i64 / 10);
 
         // Always run iface.poll on every wake. The previous
         // `now >= next_poll || phy.read_interrupt_status() > 0` gate
@@ -458,9 +483,7 @@ pub extern "C" fn k_net(device: *mut NetPackage) {
 
         while iface.poll(timestamp, &mut phy, &mut sockets) != PollResult::None {
             now = riscv::register::time::read();
-            timestamp = smoltcp::time::Instant::from_micros(
-                now as i64 / 10
-            );
+            timestamp = smoltcp::time::Instant::from_micros(now as i64 / 10);
 
             if let Some(event) = sockets.get_mut::<dhcpv4::Socket>(dhcp_handle).poll() {
                 iface = handle_dhcp_event(iface, event);
@@ -474,14 +497,14 @@ pub extern "C" fn k_net(device: *mut NetPackage) {
         orbit_core::net::drain_socket_deletions(
             &mut user_conns,
             || socket_deletions.dequeue(),
-            |h| { sockets.remove(h); },
+            |h| {
+                sockets.remove(h);
+            },
         );
 
-        orbit_core::net::prune_revoked_conns(
-            &mut user_conns,
-            &mut user_revocations,
-            |h| { sockets.remove(h); },
-        );
+        orbit_core::net::prune_revoked_conns(&mut user_conns, &mut user_revocations, |h| {
+            sockets.remove(h);
+        });
 
         // ChannelCtx wants microseconds matching the iface clock — the
         // iface is fed `Instant::from_micros(now / 10)` so the same
@@ -492,8 +515,7 @@ pub extern "C" fn k_net(device: *mut NetPackage) {
             if let Some(nc) = req.netchan.try_as_ref() {
                 if req.nc_type == 0 {
                     let socket = sockets.get_mut::<smoltcp::socket::tcp::Socket>(*sock_handle);
-                    let (iface_back, outcome) =
-                        nc.update_tcp(iface, socket, &mut req.ctx, now_us);
+                    let (iface_back, outcome) = nc.update_tcp(iface, socket, &mut req.ctx, now_us);
                     iface = iface_back;
                     // If the user-visible state of the channel just
                     // changed (state byte moved, fresh rx slice staged,
@@ -505,9 +527,8 @@ pub extern "C" fn k_net(device: *mut NetPackage) {
                     // checks its park condition and re-sleeps if not
                     // actually ready).
                     if outcome.should_wake_user() {
-                        let _ = crate::kernel::WAKE_QUEUE.push(
-                            crate::kernel::WakeEvent::Pid(req.pid),
-                        );
+                        let _ =
+                            crate::kernel::WAKE_QUEUE.push(crate::kernel::WakeEvent::Pid(req.pid));
                     }
                 }
             }
@@ -516,14 +537,13 @@ pub extern "C" fn k_net(device: *mut NetPackage) {
             }
         }
 
-        orbit_core::net::prune_revoked_conns(
-            &mut user_conns,
-            &mut user_revocations,
-            |h| { sockets.remove(h); },
-        );
-        
+        orbit_core::net::prune_revoked_conns(&mut user_conns, &mut user_revocations, |h| {
+            sockets.remove(h);
+        });
+
         let default_wake = now + 1_000_000;
-        let wake_time = iface.poll_at(timestamp, &mut sockets)
+        let wake_time = iface
+            .poll_at(timestamp, &mut sockets)
             .map(|i| i.total_micros() as usize * 10)
             .unwrap_or(default_wake);
 
@@ -535,7 +555,11 @@ pub extern "C" fn k_net(device: *mut NetPackage) {
                     let req_pid = req.pid;
                     let (txr, rxr) = req.netchan.as_ref().rings();
 
-                    info!("net: tcp socket ring lens: rx={},tx={}", rxr.len(), txr.len());
+                    info!(
+                        "net: tcp socket ring lens: rx={},tx={}",
+                        rxr.len(),
+                        txr.len()
+                    );
 
                     let tx_buffer = RingBuffer::new(txr);
                     let rx_buffer = RingBuffer::new(rxr);
@@ -573,9 +597,8 @@ pub extern "C" fn k_net(device: *mut NetPackage) {
                         // (Listening / SynSent) — wake the owner that
                         // may already be parked on `next_session`.
                         if outcome.should_wake_user() {
-                            let _ = crate::kernel::WAKE_QUEUE.push(
-                                crate::kernel::WakeEvent::Pid(req.pid),
-                            );
+                            let _ = crate::kernel::WAKE_QUEUE
+                                .push(crate::kernel::WakeEvent::Pid(req.pid));
                         }
                     }
 
@@ -592,7 +615,9 @@ pub extern "C" fn k_net(device: *mut NetPackage) {
         // access while suspended, and leaving SUM set across the
         // park widens the window in which a stray kernel deref of a
         // user VA goes silently through instead of faulting.
-        unsafe { riscv::register::sstatus::clear_sum(); }
+        unsafe {
+            riscv::register::sstatus::clear_sum();
+        }
 
         // Park until either `wake_time` ticks elapse or a producer
         // (e1000 PLIC handler, update_tcp ring-progress, nc_yield
@@ -656,10 +681,14 @@ pub fn check_context_and_switch() -> ! {
         let thread: &Thread = unsafe { (t as *mut Thread).as_ref_unchecked() };
         let thread_state = thread.state.load(Ordering::Acquire);
         if thread_state == ThreadState::Running as usize {
-            unsafe { exit_thread_with_state(ThreadState::Ready); }
+            unsafe {
+                exit_thread_with_state(ThreadState::Ready);
+            }
         }
         else if thread_state == ThreadState::Exited as usize {
-            unsafe { exit_thread_with_state(ThreadState::Exited); }
+            unsafe {
+                exit_thread_with_state(ThreadState::Exited);
+            }
         }
         else if thread_state == ThreadState::Suspended as usize {
             //serial::println!("hart{} returning suspended thread{}", c.hart_id, thread.tid);
@@ -682,7 +711,9 @@ pub fn update_thread_and_trap_frame(
     from_user: bool,
 ) {
     let cptr = hart_context.current.load(Ordering::Acquire);
-    if cptr == null_mut() { return; }
+    if cptr == null_mut() {
+        return;
+    }
     let thread: &mut Thread = unsafe { (cptr as *mut Thread).as_mut_unchecked() };
 
     // Watchdog: if the trap's from_user disagrees with the current
@@ -706,8 +737,12 @@ pub fn update_thread_and_trap_frame(
         tracing::warn!(
             "trap mode mismatch on cpu{}: tid={} mode={:?} state={} from_user={} epc={:#x} — \
              scheduler retargeted current mid-trap?",
-            hart_context.hart_id, thread.tid, thread.mode,
-            thread.state.load(Ordering::Acquire), from_user, epc,
+            hart_context.hart_id,
+            thread.tid,
+            thread.mode,
+            thread.state.load(Ordering::Acquire),
+            from_user,
+            epc,
         );
     }
 
@@ -771,8 +806,12 @@ fn dispatch_syscall<F>(
                 "dispatch_syscall mode mismatch — cpu{} epc={:#x} a0={:#x} \
                  cur=tid={} pid={} mode={:?} state={} thread.pc={:#x} \
                  last_wake_reason={:#x}",
-                hart_context.hart_id, epc, frame.regs[10],
-                thread.tid, thread.pid, thread.mode,
+                hart_context.hart_id,
+                epc,
+                frame.regs[10],
+                thread.tid,
+                thread.pid,
+                thread.mode,
                 thread.state.load(Ordering::Acquire),
                 thread.pc.load(Ordering::Acquire),
                 thread.last_wake_reason.load(Ordering::Acquire),
@@ -784,11 +823,15 @@ fn dispatch_syscall<F>(
                 let cur = hc.current.load(Ordering::Acquire) as *mut Thread;
                 if cur.is_null() {
                     tracing::error!("  cpu{}: cur=<null>", i);
-                } else {
+                }
+                else {
                     let t = cur.as_ref_unchecked();
                     tracing::error!(
                         "  cpu{}: cur=tid={} pid={} mode={:?} state={} pc={:#x}",
-                        i, t.tid, t.pid, t.mode,
+                        i,
+                        t.tid,
+                        t.pid,
+                        t.mode,
                         t.state.load(Ordering::Acquire),
                         t.pc.load(Ordering::Acquire),
                     );
@@ -872,14 +915,19 @@ pub fn handle_nc_yield(epc: usize, hart_context: &'static HartContext, frame: &m
         let timeout_ms = f.regs[11];
         if timeout_ms == 0 {
             orbit_core::SyscallOutcome::Return { ret: 0 }
-        } else {
+        }
+        else {
             orbit_core::syscall::ms_sleep(t, timeout_ms, &crate::hw::RiscvHardware)
         }
     });
 }
 
 #[unsafe(no_mangle)]
-pub fn handle_create_process_req(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
+pub fn handle_create_process_req(
+    epc: usize,
+    hart_context: &'static HartContext,
+    frame: &mut TrapFrame,
+) {
     dispatch_syscall(epc, hart_context, frame, |t, f| {
         orbit_core::syscall::create_process_req(t, f, &mut crate::hw::RiscvHardware)
     });
@@ -905,7 +953,11 @@ pub fn handle_pledge(epc: usize, hart_context: &'static HartContext, frame: &mut
 /// witness-derived perms are installed on the freshly-spawned
 /// child. Wired into `s_trap` at syscall number `4105`.
 #[unsafe(no_mangle)]
-pub fn handle_create_process_v2(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
+pub fn handle_create_process_v2(
+    epc: usize,
+    hart_context: &'static HartContext,
+    frame: &mut TrapFrame,
+) {
     dispatch_syscall(epc, hart_context, frame, |t, f| {
         orbit_core::syscall::create_process_v2_req(t, f, &mut crate::hw::RiscvHardware)
     });
@@ -921,15 +973,20 @@ pub fn handle_create_process_v2(epc: usize, hart_context: &'static HartContext, 
 /// `query_stats`: the ring is owned by `Orbit`, which `Hardware`
 /// deliberately doesn't expose.
 #[unsafe(no_mangle)]
-pub fn handle_query_denial_log(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
+pub fn handle_query_denial_log(
+    epc: usize,
+    hart_context: &'static HartContext,
+    frame: &mut TrapFrame,
+) {
+    use orbit_abi::denial::{DENIAL_RING_CAPACITY, DenialEvent};
     use orbit_abi::errno::{EFAULT, EINVAL};
     use orbit_abi::layout::user_range_ok;
-    use orbit_abi::denial::{DenialEvent, DENIAL_RING_CAPACITY};
 
     let orbit = unsafe { (hart_context.cscratch as *mut kernel::Orbit).as_mut_unchecked() };
 
     dispatch_syscall(epc, hart_context, frame, |t, f| {
-        let Ok(buf_va) = UserVa::new(f.regs[11] as u64) else {
+        let Ok(buf_va) = UserVa::new(f.regs[11] as u64)
+        else {
             return orbit_core::SyscallOutcome::Return {
                 ret: -(EFAULT as isize),
             };
@@ -948,9 +1005,7 @@ pub fn handle_query_denial_log(epc: usize, hart_context: &'static HartContext, f
             };
         }
         use orbit_core::Hardware;
-        if !crate::hw::RiscvHardware
-            .user_va_translates(t.root_table_addr(), buf_va)
-        {
+        if !crate::hw::RiscvHardware.user_va_translates(t.root_table_addr(), buf_va) {
             return orbit_core::SyscallOutcome::Return {
                 ret: -(EFAULT as isize),
             };
@@ -968,8 +1023,13 @@ pub fn handle_query_denial_log(epc: usize, hart_context: &'static HartContext, f
         // beats us) but makes "any denial I caused is visible" hold
         // for the calling thread.
         let mut tmp = [DenialEvent::PermDeny {
-            required_class: 0, perms: 0, time_ticks: 0, tid: 0,
-            sysno: 0, source_role: 0, pid: 0,
+            required_class: 0,
+            perms: 0,
+            time_ticks: 0,
+            tid: 0,
+            sysno: 0,
+            source_role: 0,
+            pid: 0,
         }; DENIAL_RING_CAPACITY];
         while !try_acquire_manager() {
             core::hint::spin_loop();
@@ -985,15 +1045,14 @@ pub fn handle_query_denial_log(epc: usize, hart_context: &'static HartContext, f
         let guard = UserAccess::enter();
         unsafe {
             let dst = guard.slice_mut(buf_va, to_write);
-            let src = core::slice::from_raw_parts(
-                tmp.as_ptr() as *const u8,
-                to_write,
-            );
+            let src = core::slice::from_raw_parts(tmp.as_ptr() as *const u8, to_write);
             dst.copy_from_slice(src);
         }
         drop(guard);
 
-        orbit_core::SyscallOutcome::Return { ret: to_write as isize }
+        orbit_core::SyscallOutcome::Return {
+            ret: to_write as isize,
+        }
     });
 }
 
@@ -1001,7 +1060,11 @@ pub fn handle_query_denial_log(epc: usize, hart_context: &'static HartContext, f
 /// `create_process` but carries an argv blob the kernel maps into
 /// the new process at `USER_ARGV_BASE`.
 #[unsafe(no_mangle)]
-pub fn handle_create_process_ex(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
+pub fn handle_create_process_ex(
+    epc: usize,
+    hart_context: &'static HartContext,
+    frame: &mut TrapFrame,
+) {
     dispatch_syscall(epc, hart_context, frame, |t, f| {
         orbit_core::syscall::create_process_ex_req(t, f, &mut crate::hw::RiscvHardware)
     });
@@ -1017,15 +1080,20 @@ pub fn handle_argv_envp(epc: usize, hart_context: &'static HartContext, frame: &
     dispatch_syscall(epc, hart_context, frame, |t, _f| {
         let argv_va = if orbit.process_has_argv(t.pid) {
             orbit_abi::layout::USER_ARGV_BASE as isize
-        } else {
+        }
+        else {
             0
         };
         let envp_va = if orbit.process_has_envp(t.pid) {
             orbit_abi::layout::USER_ENVP_BASE as isize
-        } else {
+        }
+        else {
             0
         };
-        orbit_core::SyscallOutcome::Return2 { ret0: argv_va, ret1: envp_va }
+        orbit_core::SyscallOutcome::Return2 {
+            ret0: argv_va,
+            ret1: envp_va,
+        }
     });
 }
 
@@ -1114,7 +1182,9 @@ pub fn handle_futex_wake(epc: usize, hart_context: &'static HartContext, frame: 
 #[unsafe(no_mangle)]
 pub fn handle_getpid(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
     dispatch_syscall(epc, hart_context, frame, |t, _f| {
-        orbit_core::SyscallOutcome::Return { ret: t.pid as isize }
+        orbit_core::SyscallOutcome::Return {
+            ret: t.pid as isize,
+        }
     });
 }
 
@@ -1123,7 +1193,9 @@ pub fn handle_getpid(epc: usize, hart_context: &'static HartContext, frame: &mut
 #[unsafe(no_mangle)]
 pub fn handle_gettid(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
     dispatch_syscall(epc, hart_context, frame, |t, _f| {
-        orbit_core::SyscallOutcome::Return { ret: t.tid as isize }
+        orbit_core::SyscallOutcome::Return {
+            ret: t.tid as isize,
+        }
     });
 }
 
@@ -1137,7 +1209,9 @@ pub fn handle_gettid(epc: usize, hart_context: &'static HartContext, frame: &mut
 pub fn handle_get_hart_id(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
     let hart_id = hart_context.hart_id;
     dispatch_syscall(epc, hart_context, frame, |_t, _f| {
-        orbit_core::SyscallOutcome::Return { ret: hart_id as isize }
+        orbit_core::SyscallOutcome::Return {
+            ret: hart_id as isize,
+        }
     });
 }
 
@@ -1155,7 +1229,9 @@ pub fn handle_get_micros(epc: usize, hart_context: &'static HartContext, frame: 
     // const so the compiler turns it into a multiply-shift.
     let micros = now_ticks / 10;
     dispatch_syscall(epc, hart_context, frame, |_t, _f| {
-        orbit_core::SyscallOutcome::Return { ret: micros as isize }
+        orbit_core::SyscallOutcome::Return {
+            ret: micros as isize,
+        }
     });
 }
 
@@ -1179,7 +1255,8 @@ pub fn handle_query_stats(epc: usize, hart_context: &'static HartContext, frame:
     let orbit = unsafe { (hart_context.cscratch as *mut kernel::Orbit).as_mut_unchecked() };
 
     dispatch_syscall(epc, hart_context, frame, |t, f| {
-        let Ok(buf_va) = UserVa::new(f.regs[11] as u64) else {
+        let Ok(buf_va) = UserVa::new(f.regs[11] as u64)
+        else {
             return orbit_core::SyscallOutcome::Return {
                 ret: -(EFAULT as isize),
             };
@@ -1202,9 +1279,7 @@ pub fn handle_query_stats(epc: usize, hart_context: &'static HartContext, frame:
         // serial_print/console_write convention). user_range_ok
         // already excluded the kernel half and overflow.
         use orbit_core::Hardware;
-        if !crate::hw::RiscvHardware
-            .user_va_translates(t.root_table_addr(), buf_va)
-        {
+        if !crate::hw::RiscvHardware.user_va_translates(t.root_table_addr(), buf_va) {
             return orbit_core::SyscallOutcome::Return {
                 ret: -(EFAULT as isize),
             };
@@ -1238,15 +1313,15 @@ pub fn handle_query_stats(epc: usize, hart_context: &'static HartContext, frame:
         let guard = UserAccess::enter();
         unsafe {
             let dst = guard.slice_mut(buf_va, to_write);
-            let src = core::slice::from_raw_parts(
-                &stats as *const ProcessStats as *const u8,
-                to_write,
-            );
+            let src =
+                core::slice::from_raw_parts(&stats as *const ProcessStats as *const u8, to_write);
             dst.copy_from_slice(src);
         }
         drop(guard);
 
-        orbit_core::SyscallOutcome::Return { ret: to_write as isize }
+        orbit_core::SyscallOutcome::Return {
+            ret: to_write as isize,
+        }
     });
 }
 
@@ -1267,12 +1342,11 @@ pub fn handle_query_syscall_stats(
     use orbit_abi::Sysno;
     use orbit_abi::errno::{EFAULT, EINVAL};
     use orbit_abi::layout::user_range_ok;
-    use orbit_abi::syscall_stats::{
-        SyscallEntry, SyscallStatsHeader, SYSCALL_STATS_MIN_LEN,
-    };
+    use orbit_abi::syscall_stats::{SYSCALL_STATS_MIN_LEN, SyscallEntry, SyscallStatsHeader};
 
     dispatch_syscall(epc, hart_context, frame, |t, f| {
-        let Ok(buf_va) = UserVa::new(f.regs[11] as u64) else {
+        let Ok(buf_va) = UserVa::new(f.regs[11] as u64)
+        else {
             return orbit_core::SyscallOutcome::Return {
                 ret: -(EFAULT as isize),
             };
@@ -1290,9 +1364,7 @@ pub fn handle_query_syscall_stats(
             };
         }
         use orbit_core::Hardware;
-        if !crate::hw::RiscvHardware
-            .user_va_translates(t.root_table_addr(), buf_va)
-        {
+        if !crate::hw::RiscvHardware.user_va_translates(t.root_table_addr(), buf_va) {
             return orbit_core::SyscallOutcome::Return {
                 ret: -(EFAULT as isize),
             };
@@ -1311,7 +1383,8 @@ pub fn handle_query_syscall_stats(
         // tail rather than write a partial entry.)
         let entries_capacity = if to_write >= hdr_size {
             (to_write - hdr_size) / entry_size
-        } else {
+        }
+        else {
             0
         };
         let entries_to_write = core::cmp::min(entries_capacity, Sysno::COUNT);
@@ -1349,6 +1422,8 @@ pub fn handle_query_syscall_stats(
         drop(guard);
 
         let written = hdr_size + entries_to_write * entry_size;
-        orbit_core::SyscallOutcome::Return { ret: written as isize }
+        orbit_core::SyscallOutcome::Return {
+            ret: written as isize,
+        }
     });
 }

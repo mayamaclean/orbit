@@ -1,11 +1,11 @@
+use core::arch::asm;
 use core::ptr::null_mut;
-use core::{arch::asm};
 use core::sync::atomic::Ordering;
 
 use device::{HartContext, TRAP_STACK_SIZE, TrapFrame};
 use process::{FaultInfo, Thread, ThreadState};
 use riscv::register::sstatus::SPP;
-use tracing::{error};
+use tracing::error;
 
 use crate::kernel::user_trap_frame_vaddr;
 
@@ -39,7 +39,6 @@ unsafe fn jump(context: &'static HartContext, target: usize) -> ! {
     }
 }
 
-
 unsafe extern "C" {
     unsafe fn enter_hart_context_asm(user_frame_vaddr: usize, satp: usize, asid: usize) -> !;
     unsafe fn enter_hart_kcontext_asm(trap_frame: *const ()) -> !;
@@ -71,7 +70,10 @@ unsafe extern "C" {
     ) -> !;
 }
 
-pub unsafe fn load_thread_into_hart_context_and_jump(context: &'static HartContext, thread: &'static Thread) -> ! {
+pub unsafe fn load_thread_into_hart_context_and_jump(
+    context: &'static HartContext,
+    thread: &'static Thread,
+) -> ! {
     unsafe {
         // No S-mode interrupts across the register-load → sret window. Without
         // this, a stimer/SSWI landing inside enter_hart_context_asm would
@@ -123,7 +125,9 @@ pub unsafe fn load_thread_into_hart_context_and_jump(context: &'static HartConte
         riscv::register::sepc::write(pc);
 
         //serial::println!("cpu{} marking thread{} as running", context.hart_id, thread.tid);
-        thread.state.store(ThreadState::Running as usize, Ordering::Release);
+        thread
+            .state
+            .store(ThreadState::Running as usize, Ordering::Release);
         // Per-thread context-switch tally: every Ready→Running dispatch
         // (user or kernel thread) is one switch from this thread's
         // perspective. Foreign-hart reads via `query_stats` go through
@@ -144,8 +148,7 @@ pub unsafe fn load_thread_into_hart_context_and_jump(context: &'static HartConte
 
             // The kernel-vaddr frame ptr is unreachable after the satp switch,
             // so we hand the asm the user-side mapping at slot's vaddr instead.
-            let slot = thread.slot
-                .expect("user thread missing slot");
+            let slot = thread.slot.expect("user thread missing slot");
             let user_frame_vaddr = user_trap_frame_vaddr(slot) as usize;
             enter_hart_context_asm(user_frame_vaddr, thread.satp.bits(), thread.satp.asid());
         }
@@ -161,12 +164,17 @@ pub unsafe fn enter_hart_context(context: &'static HartContext) -> ! {
     let thread_addr = context.current.load(Ordering::Acquire);
     if thread_addr != core::ptr::null_mut() {
         unsafe {
-            load_thread_into_hart_context_and_jump(context, (thread_addr as *const Thread).as_ref_unchecked());
+            load_thread_into_hart_context_and_jump(
+                context,
+                (thread_addr as *const Thread).as_ref_unchecked(),
+            );
         }
     }
 
     let kidle = context.kptr.load(Ordering::Acquire);
-    unsafe { jump(context, kidle as usize); }
+    unsafe {
+        jump(context, kidle as usize);
+    }
 }
 
 /// Park the currently-dispatched kernel thread on this hart and hand
@@ -198,7 +206,9 @@ pub fn kthread_park(state: ThreadState, wake_time: usize) {
     // this function instead of the saved resume label, observe a
     // partially-published state, and corrupt the loop. Same
     // rationale as load_thread_into_hart_context_and_jump's clear.
-    unsafe { riscv::register::sstatus::clear_sie(); }
+    unsafe {
+        riscv::register::sstatus::clear_sie();
+    }
 
     let context = get_hart_context();
     let cur = context.current.load(Ordering::Acquire);
@@ -247,7 +257,9 @@ pub fn kthread_park(state: ThreadState, wake_time: usize) {
     // Suspended (which is only published after the sp switch
     // inside `kthread_handoff_to_kidle`).
     if state == ThreadState::Suspended {
-        let seq = thread.sleep_seq.fetch_add(1, Ordering::Release)
+        let seq = thread
+            .sleep_seq
+            .fetch_add(1, Ordering::Release)
             .wrapping_add(1);
         let notice = crate::kernel::SleepNotice {
             wake_time: wake_time as u64,
@@ -267,9 +279,7 @@ pub fn kthread_park(state: ThreadState, wake_time: usize) {
     // *then* publishes current=null (Release) and state (Release)
     // — see trap.S for the ordering rationale.
     unsafe {
-        let kstack_top = context.k_stack.stack_data.as_ptr() as usize
-            + TRAP_STACK_SIZE
-            - 16;
+        let kstack_top = context.k_stack.stack_data.as_ptr() as usize + TRAP_STACK_SIZE - 16;
         let kptr = context.kptr.load(Ordering::Acquire) as usize;
         kthread_handoff_to_kidle(
             thread.state.as_ptr(),
@@ -286,8 +296,7 @@ pub fn kthread_park(state: ThreadState, wake_time: usize) {
 /// Manager-side cleanup reads `fault_info` to classify and log.
 pub unsafe fn fault_thread(info: FaultInfo) -> ! {
     unsafe {
-        let context = (riscv::register::sscratch::read()
-            as *const HartContext).as_ref_unchecked();
+        let context = (riscv::register::sscratch::read() as *const HartContext).as_ref_unchecked();
         let cur = context.current.load(Ordering::Acquire);
         if !cur.is_null() {
             (cur as *mut Thread).as_mut_unchecked().fault_info = Some(info);
@@ -316,8 +325,7 @@ pub unsafe fn fault_thread(info: FaultInfo) -> ! {
 /// repro.
 pub unsafe fn exit_thread_with_state(state: ThreadState) -> ! {
     unsafe {
-        let context = (riscv::register::sscratch::read()
-            as *const HartContext).as_ref_unchecked();
+        let context = (riscv::register::sscratch::read() as *const HartContext).as_ref_unchecked();
 
         let thread_addr = context.current.load(Ordering::Acquire);
         if thread_addr != null_mut() {
@@ -328,7 +336,9 @@ pub unsafe fn exit_thread_with_state(state: ThreadState) -> ! {
             // here for the SLEEP_INBOX push after the state release.
             let mut sleep_notice: Option<crate::kernel::SleepNotice> = None;
             if state == ThreadState::Suspended {
-                let seq = thread.sleep_seq.fetch_add(1, Ordering::Release)
+                let seq = thread
+                    .sleep_seq
+                    .fetch_add(1, Ordering::Release)
                     .wrapping_add(1);
                 sleep_notice = Some(crate::kernel::SleepNotice {
                     wake_time: thread.wake_time as u64,
@@ -393,9 +403,7 @@ pub unsafe fn exit_thread_with_state(state: ThreadState) -> ! {
                             // out of the thread, mark Ready, queue.
                             // Same shape as the wake hook (kmain
                             // has the registered fn).
-                            crate::kernel::wake_blocked_inline(
-                                thread_addr as *mut Thread,
-                            );
+                            crate::kernel::wake_blocked_inline(thread_addr as *mut Thread);
                         }
                     }
                 }

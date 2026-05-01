@@ -5,27 +5,28 @@ extern crate alloc;
 
 use core::arch::{asm, global_asm, naked_asm};
 use core::ptr::null_mut;
-use core::sync::atomic::{Ordering};
+use core::sync::atomic::Ordering;
 use core::{alloc::Layout, panic::PanicInfo};
 
 use device::{HartContext, TRAP_STACK_SIZE, find_ram};
-use kmain::ktrace::OrbitSubscriber;
-use kmain::{ProcessComponents, check_context_and_switch, supervisor_clear_ipi};
 use kmain::kernel::Orbit;
 use kmain::kernel::context::{enter_hart_context, fault_thread};
 use kmain::kernel::memmap::{map_kernel_self, unmap_boot_only_regions};
+use kmain::ktrace::OrbitSubscriber;
+use kmain::{ProcessComponents, check_context_and_switch, supervisor_clear_ipi};
 use mmu::mmap::PageAlloc;
 use mmu::{PAGE_SIZE, sv48::PageTable};
-use orbit_abi::perms::{self, Permissions};
-use orbit_abi::perms::role::RoleId;
-use orbit_abi::roles::{ChildPerms, RoleDef};
-use process::{FaultInfo, Process, Thread, ThreadState};
+use orbit_abi::perms::Permissions;
+use process::{FaultInfo, Thread, ThreadState};
 use riscv::register::satp::Satp;
-use riscv::{register::{satp::Mode, stvec::{Stvec, TrapMode}}};
+use riscv::register::{
+    satp::Mode,
+    stvec::{Stvec, TrapMode},
+};
 
 use linked_list_allocator::LockedHeap;
 
-use mem::{round_u64_up};
+use mem::round_u64_up;
 use serial::println;
 
 use tracing::{Level, debug, error, info};
@@ -36,7 +37,6 @@ global_asm!(
     ".attribute arch, \"rv64gc\"",
     include_str!("../../asm/trap.S"),
 );
-
 
 #[global_allocator]
 static KHEAP: LockedHeap = LockedHeap::empty();
@@ -79,12 +79,11 @@ extern "C" fn s_trap(
     cause: usize,
     status: usize,
     frame: &mut TrapFrame,
-    _code: usize, _sarg: usize)
-    -> usize
-{
-    let hart_context = unsafe {
-        (riscv::register::sscratch::read() as *mut HartContext).as_mut_unchecked()
-    };
+    _code: usize,
+    _sarg: usize,
+) -> usize {
+    let hart_context =
+        unsafe { (riscv::register::sscratch::read() as *mut HartContext).as_mut_unchecked() };
 
     // Bucket hook 1: trap entry. Whatever bucket the hart was in
     // (User on a syscall/timer from user-mode, Idle if a wfi just woke
@@ -97,15 +96,8 @@ extern "C" fn s_trap(
     );
 
     let cause_num = cause & 0xfff;
-	let mut return_pc = epc;
-    let is_async = {
-		if cause >> 63 & 1 == 1 {
-			true
-		}
-		else {
-			false
-		}
-	};
+    let mut return_pc = epc;
+    let is_async = { if cause >> 63 & 1 == 1 { true } else { false } };
     // sstatus.SPP (bit 8): 0 = trap from U, 1 = trap from S.
     let from_user = (status >> 8) & 1 == 0;
 
@@ -127,7 +119,7 @@ extern "C" fn s_trap(
 
                     check_context_and_switch();
                 }
-            },
+            }
             5 | 7 => {
                 unsafe {
                     // write stimecmp
@@ -175,20 +167,37 @@ extern "C" fn s_trap(
                             "S-mode fault on cpu{}: cause={} epc={:#x} stval={:#x} \
                              ra={:#x} sp={:#x} satp={:#x} kptr={:#x} \
                              tid={} pid={} mode={:?} thread.pc={:#x} state={} wake_reason={:#x}",
-                            hart_context.hart_id, cause_num, epc, tval,
-                            ra, sp, satp, kptr,
-                            t.tid, t.pid, t.mode, pc, state, wake_reason,
+                            hart_context.hart_id,
+                            cause_num,
+                            epc,
+                            tval,
+                            ra,
+                            sp,
+                            satp,
+                            kptr,
+                            t.tid,
+                            t.pid,
+                            t.mode,
+                            pc,
+                            state,
+                            wake_reason,
                         );
-                    } else {
+                    }
+                    else {
                         panic!(
                             "S-mode fault on cpu{}: cause={} epc={:#x} stval={:#x} \
                              ra={:#x} sp={:#x} satp={:#x} kptr={:#x} (no current thread)",
-                            hart_context.hart_id, cause_num, epc, tval,
-                            ra, sp, satp, kptr,
+                            hart_context.hart_id, cause_num, epc, tval, ra, sp, satp, kptr,
                         );
                     }
                 }
-                unsafe { fault_thread(FaultInfo { cause: cause_num, epc, stval: tval }); }
+                unsafe {
+                    fault_thread(FaultInfo {
+                        cause: cause_num,
+                        epc,
+                        stval: tval,
+                    });
+                }
             }
             // supervisor ebreak
             3 => {
@@ -210,9 +219,11 @@ extern "C" fn s_trap(
                         // harts simultaneously, smoltcp ring corruption).
                         hart_context.cscratch2 = 0;
                         kmain::update_thread_and_trap_frame(epc, hart_context, frame, from_user);
-                        unsafe { kmain::kernel::context::exit_thread_with_state(ThreadState::Suspended); }
-                    },
-                    _ => ()
+                        unsafe {
+                            kmain::kernel::context::exit_thread_with_state(ThreadState::Suspended);
+                        }
+                    }
+                    _ => (),
                 }
 
                 return_pc += 4;
@@ -254,11 +265,14 @@ extern "C" fn s_trap(
                 else {
                     match syscall {
                         // exit
-                        0 => {
-                            unsafe {
-                                kmain::update_thread_and_trap_frame(epc, hart_context, frame, from_user);
-                                kmain::kernel::context::exit_thread_with_state(ThreadState::Exited);
-                            }
+                        0 => unsafe {
+                            kmain::update_thread_and_trap_frame(
+                                epc,
+                                hart_context,
+                                frame,
+                                from_user,
+                            );
+                            kmain::kernel::context::exit_thread_with_state(ThreadState::Exited);
                         },
                         1 => {
                             //debug!("orbit handling u mode ecall({syscall})");
@@ -365,7 +379,12 @@ extern "C" fn s_trap(
                         }
                         _ => {
                             debug!("orbit handling u mode ecall({syscall})");
-                            kmain::update_thread_and_trap_frame(epc + 4, hart_context, frame, from_user);
+                            kmain::update_thread_and_trap_frame(
+                                epc + 4,
+                                hart_context,
+                                frame,
+                                from_user,
+                            );
                         }
                     }
                 } // close the `if allowed` arm
@@ -377,18 +396,24 @@ extern "C" fn s_trap(
                 let cur = hart_context.current.load(Ordering::Acquire);
                 if !cur.is_null() {
                     let t = unsafe { (cur as *const Thread).as_ref_unchecked() };
-                    kmain::kernel::accounting::record_syscall(
-                        syscall, t, syscall_start_ticks,
-                    );
+                    kmain::kernel::accounting::record_syscall(syscall, t, syscall_start_ticks);
                 }
                 check_context_and_switch();
             }
             _ => {
                 if !from_user {
-                    panic!("S-mode unhandled sync trap on cpu{}: cause={} epc={:#x} stval={:#x}",
-                        hart_context.hart_id, cause_num, epc, tval);
+                    panic!(
+                        "S-mode unhandled sync trap on cpu{}: cause={} epc={:#x} stval={:#x}",
+                        hart_context.hart_id, cause_num, epc, tval
+                    );
                 }
-                unsafe { fault_thread(FaultInfo { cause: cause_num, epc, stval: tval }); }
+                unsafe {
+                    fault_thread(FaultInfo {
+                        cause: cause_num,
+                        epc,
+                        stval: tval,
+                    });
+                }
             }
         }
     }
@@ -399,17 +424,20 @@ extern "C" fn s_trap(
 extern "C" fn k_harthello() {
     //println!("hey there");
 
-    let hart_context = unsafe {
-        (riscv::register::sscratch::read() as *const HartContext).as_ref_unchecked()
-    };
+    let hart_context =
+        unsafe { (riscv::register::sscratch::read() as *const HartContext).as_ref_unchecked() };
 
     unsafe {
-        info!("hart_context @ {:016X?} hartid={} kptr={:016X?}",
+        info!(
+            "hart_context @ {:016X?} hartid={} kptr={:016X?}",
             hart_context as *const _,
             hart_context.hart_id,
-            hart_context.kptr.load(Ordering::Relaxed));
+            hart_context.kptr.load(Ordering::Relaxed)
+        );
 
-        hart_context.kptr.store(kmain::k_hart_loop as *mut (), Ordering::Relaxed);
+        hart_context
+            .kptr
+            .store(kmain::k_hart_loop as *mut (), Ordering::Relaxed);
 
         let s_trap_addr = { s_trap_vector as *const () as usize };
         riscv::register::stvec::write(Stvec::new(s_trap_addr, TrapMode::Direct));
@@ -441,13 +469,10 @@ pub extern "C" fn k_smpstart() {
         serial::init_serial(kmain::kernel::memmap::kmmio_uart() as usize);
     }
 
-    let hart_context = unsafe {
-        (riscv::register::sscratch::read() as *const HartContext).as_ref_unchecked()
-    };
+    let hart_context =
+        unsafe { (riscv::register::sscratch::read() as *const HartContext).as_ref_unchecked() };
 
-    let orbit = unsafe {
-        (hart_context.cscratch as *mut kmain::kernel::Orbit).as_mut_unchecked()
-    };
+    let orbit = unsafe { (hart_context.cscratch as *mut kmain::kernel::Orbit).as_mut_unchecked() };
 
     orbit.get_environment_info();
 
@@ -489,11 +514,8 @@ pub extern "C" fn k_smpstart() {
     let init_path: &[u8] = b"/bin/hello-std";
 
     let mut argv_buf = [0u8; 256];
-    let argv_len = orbit_abi::argv::pack(
-        &[b"/bin/orbit-loader", init_path],
-        &mut argv_buf,
-    )
-    .expect("boot argv fits in 256 bytes");
+    let argv_len = orbit_abi::argv::pack(&[b"/bin/orbit-loader", init_path], &mut argv_buf)
+        .expect("boot argv fits in 256 bytes");
     let argv_blob = &argv_buf[..argv_len];
 
     // §13e — boot envp. orbit-loader inherits these from the kernel;
@@ -504,11 +526,8 @@ pub extern "C" fn k_smpstart() {
     // POSIX env doesn't need orbit-specific knowledge to find its
     // bin dir or pick a fallback termcap.
     let mut envp_buf = [0u8; 256];
-    let envp_len = orbit_abi::envp::pack(
-        &[b"PATH=/bin", b"HOME=/", b"TERM=dumb"],
-        &mut envp_buf,
-    )
-    .expect("boot envp fits in 256 bytes");
+    let envp_len = orbit_abi::envp::pack(&[b"PATH=/bin", b"HOME=/", b"TERM=dumb"], &mut envp_buf)
+        .expect("boot envp fits in 256 bytes");
 
     let envp_blob = &envp_buf[..envp_len];
 
@@ -520,10 +539,11 @@ pub extern "C" fn k_smpstart() {
         parent_pid: 0,
         argv_bytes: Some(argv_blob),
         envp_bytes: Some(envp_blob),
-        perms: Some(Permissions::LOADER)
+        perms: Some(Permissions::LOADER),
     };
 
-    orbit.create_new_process(init_compoenents)
+    orbit
+        .create_new_process(init_compoenents)
         .expect("no test uprocess");
 
     // Release the secondary-hart S-mode spin in `secondary_rust_setup`.
@@ -596,8 +616,7 @@ struct BootStacks([u8; BOOT_STACK_SIZE * MAX_HARTS]);
 
 #[unsafe(no_mangle)]
 #[used]
-static mut BOOT_STACKS: BootStacks =
-    BootStacks([0; BOOT_STACK_SIZE * MAX_HARTS]);
+static mut BOOT_STACKS: BootStacks = BootStacks([0; BOOT_STACK_SIZE * MAX_HARTS]);
 
 // Set by hart 0 in `post_trampoline_entry` *after* `apply_relocations`.
 // While zero, secondary harts spin in `_start_secondary` under bare satp —
@@ -619,7 +638,8 @@ static TRAMP_SATP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64
 // can `jr` to it under the trampoline satp.
 #[unsafe(no_mangle)]
 #[used]
-static SECONDARY_RUST_SETUP_VA: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static SECONDARY_RUST_SETUP_VA: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
 
 // Final kernel satp (KTEXT + KDMAP + KMMIO, no identity). Published at
 // the end of `rust_main` before hart 0 srets to `k_smpstart`.
@@ -819,8 +839,7 @@ unsafe extern "C" fn secondary_rust_setup(hartid: usize) -> ! {
     let hart_ctx = unsafe { &*(hart_ctx_pa as *const HartContext) };
     let kptr = hart_ctx.kptr.load(Ordering::Acquire) as usize;
     let stvec_addr = hart_ctx.s_trap_addr as usize;
-    let sp_pa = hart_ctx.k_stack.stack_data.as_ptr() as usize
-        + device::TRAP_STACK_SIZE - 16;
+    let sp_pa = hart_ctx.k_stack.stack_data.as_ptr() as usize + device::TRAP_STACK_SIZE - 16;
     let sp_kva = sp_pa.wrapping_add(kdmap_bias);
 
     // No stack access between csrw satp and `mv sp` — inline asm doesn't
@@ -868,13 +887,16 @@ unsafe extern "C" fn secondary_rust_setup(hartid: usize) -> ! {
 #[unsafe(no_mangle)]
 #[inline(never)]
 unsafe extern "C" fn early_paging_setup(pt_base: *mut u8, pt_size: usize, load_addr: u64) -> u64 {
-    use mmu::{MappingConfig, PAGE_SIZE, PagePermissions, SupervisorTag};
     use mmu::mmap::{PageAlloc, PageTableVec, RootTable, id_map_range, map_va_range};
     use mmu::sv48::{PhysAddr, VirtAddr};
+    use mmu::{MappingConfig, PAGE_SIZE, PagePermissions, SupervisorTag};
 
     let mut ptv = PageTableVec::new(pt_base as usize, pt_size);
-    let Ok(root_pa) = (unsafe { ptv.allocate_page_table() }) else {
-        loop { riscv::asm::wfi(); }
+    let Ok(root_pa) = (unsafe { ptv.allocate_page_table() })
+    else {
+        loop {
+            riscv::asm::wfi();
+        }
     };
     // Early trampoline tables live in identity-mapped RAM (bias = 0), so
     // PA == VA. Zero the freshly-allocated root before exposing it as a
@@ -887,9 +909,9 @@ unsafe extern "C" fn early_paging_setup(pt_base: *mut u8, pt_size: usize, load_a
     let mut pages = PageAlloc::PTV(&mut ptv);
 
     let perms = PagePermissions::R as u64
-              | PagePermissions::W as u64
-              | PagePermissions::X as u64
-              | PagePermissions::G as u64;
+        | PagePermissions::W as u64
+        | PagePermissions::X as u64
+        | PagePermissions::G as u64;
 
     let cfg = MappingConfig {
         permissions: perms,
@@ -903,11 +925,15 @@ unsafe extern "C" fn early_paging_setup(pt_base: *mut u8, pt_size: usize, load_a
 
     // Identity [0, 1 GiB) — low-half MMIO range
     if unsafe { id_map_range(&root, &mut pages, cfg, 0..(1u64 << 30)) }.is_err() {
-        loop { riscv::asm::wfi(); }
+        loop {
+            riscv::asm::wfi();
+        }
     }
     // Identity [2, 4 GiB) — all of RAM (kernel image, kheap, kpages, ktables, dtb)
     if unsafe { id_map_range(&root, &mut pages, cfg, (2u64 << 30)..(4u64 << 30)) }.is_err() {
-        loop { riscv::asm::wfi(); }
+        loop {
+            riscv::asm::wfi();
+        }
     }
 
     // High-half kernel image: cover [load_addr, _DYNAMIC_END) at
@@ -932,8 +958,11 @@ unsafe extern "C" fn early_paging_setup(pt_base: *mut u8, pt_size: usize, load_a
     const MEGAPAGE: u64 = 2 * 1024 * 1024;
     let raw = image_end_pa.wrapping_sub(load_addr);
     let len = (raw + (MEGAPAGE - 1)) & !(MEGAPAGE - 1);
-    if unsafe { map_va_range(&root, &mut pages, cfg, ktext, load_addr..(load_addr + len)) }.is_err() {
-        loop { riscv::asm::wfi(); }
+    if unsafe { map_va_range(&root, &mut pages, cfg, ktext, load_addr..(load_addr + len)) }.is_err()
+    {
+        loop {
+            riscv::asm::wfi();
+        }
     }
 
     // KDMAP: 2 GiB of RAM at KDMAP_NOMINAL → [2 GiB, 4 GiB). Both ends are
@@ -942,7 +971,9 @@ unsafe extern "C" fn early_paging_setup(pt_base: *mut u8, pt_size: usize, load_a
     // their KDMAP VAs before the final satp is installed.
     let kdmap = kmain::kernel::memmap::KDMAP_NOMINAL;
     if unsafe { map_va_range(&root, &mut pages, cfg, kdmap, (2u64 << 30)..(4u64 << 30)) }.is_err() {
-        loop { riscv::asm::wfi(); }
+        loop {
+            riscv::asm::wfi();
+        }
     }
 
     // satp: Sv48 (mode=9), asid=0, ppn = root / 4096. Early tables are
@@ -965,9 +996,9 @@ pub struct Elf64Rela {
 }
 
 const R_RISCV_RELATIVE: u64 = 3;
-const DT_NULL:    u64 = 0;
-const DT_RELA:    u64 = 7;
-const DT_RELASZ:  u64 = 8;
+const DT_NULL: u64 = 0;
+const DT_RELA: u64 = 7;
+const DT_RELASZ: u64 = 8;
 const DT_RELAENT: u64 = 9;
 
 /// First Rust code to run after the trampoline. PC is now at high-half. The
@@ -1027,14 +1058,14 @@ unsafe fn apply_relocations(slide: u64, dynamic_section: *const Elf64Dyn) {
     unsafe {
         let mut rela_base: *const Elf64Rela = core::ptr::null();
         let mut rela_size = 0u64;
-        let mut rela_ent  = 0u64;
+        let mut rela_ent = 0u64;
 
         let mut current = dynamic_section;
         while (*current).tag != DT_NULL {
             match (*current).tag {
-                DT_RELA    => rela_base = ((*current).val.wrapping_add(slide)) as *const Elf64Rela,
-                DT_RELASZ  => rela_size = (*current).val,
-                DT_RELAENT => rela_ent  = (*current).val,
+                DT_RELA => rela_base = ((*current).val.wrapping_add(slide)) as *const Elf64Rela,
+                DT_RELASZ => rela_size = (*current).val,
+                DT_RELAENT => rela_ent = (*current).val,
                 _ => {}
             }
             current = current.add(1);
@@ -1075,9 +1106,9 @@ extern "C" fn rust_main(_hartid: usize, dtb: usize, serial: usize, load_addr: u6
         serial::init_serial(serial_addr as usize);
 
         println!("boot! dtb @ {dtb_addr:016X?}");
-        
-        let (ram_base, ram_size) = find_ram(dtb_addr as *const u8)
-            .expect("failed to find RAM node in DTB");
+
+        let (ram_base, ram_size) =
+            find_ram(dtb_addr as *const u8).expect("failed to find RAM node in DTB");
 
         // Publish the full layout including kernel_phys_base (`load_addr` from
         // the trampoline). map_kernel_shared/self reads kernel_phys_base to
@@ -1093,21 +1124,27 @@ extern "C" fn rust_main(_hartid: usize, dtb: usize, serial: usize, load_addr: u6
         );
 
         let layout = kmain::kernel::memmap::KernelLayout::new(
-            ram_base, ram_size, dtb_addr as u64, serial_addr as u64,
+            ram_base,
+            ram_size,
+            dtb_addr as u64,
+            serial_addr as u64,
         );
 
         // Zero the page-table pool via identity (valid under the early PT).
-        core::ptr::write_bytes(layout.ktables.start as *mut u8, 0, layout.ktables.end.saturating_sub(layout.ktables.start) as usize);
+        core::ptr::write_bytes(
+            layout.ktables.start as *mut u8,
+            0,
+            layout.ktables.end.saturating_sub(layout.ktables.start) as usize,
+        );
 
         // Initialize KHEAP through its KDMAP VA. Allocator-returned pointers
         // are KDMAP VAs from here on — they stay valid after identity pools
         // are eventually dropped.
-        KHEAP.make_guard_unchecked()
-            .init(
-                kmain::kernel::memmap::phys_to_kdmap(mmu::sv48::PhysAddr::new(layout.kheap.start))
-                    .as_mut_ptr::<u8>(),
-                kmain::kernel::memmap::KHEAP_SIZE as usize,
-            );
+        KHEAP.make_guard_unchecked().init(
+            kmain::kernel::memmap::phys_to_kdmap(mmu::sv48::PhysAddr::new(layout.kheap.start))
+                .as_mut_ptr::<u8>(),
+            kmain::kernel::memmap::KHEAP_SIZE as usize,
+        );
 
         static LOGGER: kmain::ktrace::OrbitLogger = kmain::ktrace::OrbitLogger;
 
@@ -1165,11 +1202,21 @@ extern "C" fn rust_main(_hartid: usize, dtb: usize, serial: usize, load_addr: u6
             let (_orbit_pa, orbit_kva) = kpages
                 .alloc_kdmap(Layout::from_size_align_unchecked(
                     round_u64_up(core::mem::size_of::<Orbit>() as u64, 4096) as usize,
-                    4096))
+                    4096,
+                ))
                 .expect("failed to alloc space for kernel state");
             let orbit_ptr = orbit_kva.as_mut_ptr::<Orbit>().as_mut_unchecked();
 
-            *orbit_ptr = Orbit::new(dtb_addr as usize, serial_addr as usize, cpu_count, layout, kernel_tables, kpages, user_pages, satp.clone());
+            *orbit_ptr = Orbit::new(
+                dtb_addr as usize,
+                serial_addr as usize,
+                cpu_count,
+                layout,
+                kernel_tables,
+                kpages,
+                user_pages,
+                satp.clone(),
+            );
 
             orbit_ptr
         };
@@ -1193,7 +1240,10 @@ extern "C" fn rust_main(_hartid: usize, dtb: usize, serial: usize, load_addr: u6
         // no manager scan required.
         kmain::kernel::install_completion_wake_hook();
 
-        info!("allocated orbit state @ {:016X?}", &raw const *orbit as usize);
+        info!(
+            "allocated orbit state @ {:016X?}",
+            &raw const *orbit as usize
+        );
 
         let hart_root = hart_contexts as usize;
         riscv::register::sscratch::write(hart_root);
@@ -1215,8 +1265,8 @@ extern "C" fn rust_main(_hartid: usize, dtb: usize, serial: usize, load_addr: u6
             hart_context.s_trap_addr = s_trap_addr as u64;
             hart_context.cscratch2 = 0;
             hart_context.cscratch = orbit as *mut _ as u64;
-            hart_context.tsp =
-                &hart_context.trap_stack.stack_data[hart_context.trap_stack.stack_data.len() - 16]
+            hart_context.tsp = &hart_context.trap_stack.stack_data
+                [hart_context.trap_stack.stack_data.len() - 16]
                 as *const _ as usize;
             // Sentinel until plic install populates the real S-context in
             // k_smpstart. Any cause-9 that lands here before then will be
@@ -1241,7 +1291,9 @@ extern "C" fn rust_main(_hartid: usize, dtb: usize, serial: usize, load_addr: u6
             info!("setting hart context @ {ptr:016X?} to kidle hart{hart}");
         }
 
-        let this_sp = hart_contexts.as_ref_unchecked().k_stack.stack_data.as_ptr() as usize + TRAP_STACK_SIZE - 16;
+        let this_sp = hart_contexts.as_ref_unchecked().k_stack.stack_data.as_ptr() as usize
+            + TRAP_STACK_SIZE
+            - 16;
         let this_pc = k_smpstart as *const ();
 
         riscv::register::sepc::write(this_pc as usize);
@@ -1258,8 +1310,7 @@ extern "C" fn rust_main(_hartid: usize, dtb: usize, serial: usize, load_addr: u6
         HART_CTX_PA.store(hart_contexts_pa.get_raw(), Ordering::Release);
         KSATP.store(satp.bits() as u64, Ordering::Release);
 
-        unmap_boot_only_regions(&orbit_root_table)
-            .expect("failed to unmap boot-only regions");
+        unmap_boot_only_regions(&orbit_root_table).expect("failed to unmap boot-only regions");
 
         info!("jump sp={this_sp:016X} pc={this_pc:016X?}");
 
@@ -1281,7 +1332,9 @@ extern "C" fn rust_main(_hartid: usize, dtb: usize, serial: usize, load_addr: u6
 #[panic_handler]
 fn panic_time(p: &PanicInfo) -> ! {
     println!("{p:?}");
-    loop{riscv::asm::wfi();}
+    loop {
+        riscv::asm::wfi();
+    }
 }
 
 #[unsafe(no_mangle)]

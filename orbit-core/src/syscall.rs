@@ -10,7 +10,7 @@ use process::{CompletionHandle, Thread, ThreadState};
 
 use orbit_abi::errno::{Errno, EAGAIN, EBUSY, EFAULT, EINVAL, EIO, EPERM};
 use orbit_abi::layout::{user_priv_range_ok, user_range_ok, user_shared_range_ok};
-use tracing::{error, info};
+use tracing::{error};
 
 use crate::{
     CloseHandleReq, CreateProcessExReq, CreateProcessReq, CreateProcessV2Req, CreateThreadReq,

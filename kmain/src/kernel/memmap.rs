@@ -6,8 +6,8 @@ use mem::frame::FrameAllocator;
 use mem::round_u64_up;
 use mmu::mmap::{PageAlloc, RootTable, map_va_range, reserve_va_range, unmap_range, virt_to_phys};
 use mmu::sv48::{PageTable, PageTableEntry, PhysAddr, VirtAddr};
-use orbit_abi::layout::UserVa;
 use mmu::{MappingConfig, PAGE_SIZE, PagePermissions, SupervisorTag};
+use orbit_abi::layout::UserVa;
 use process::{Frame, Shared, Table, UserOnly};
 use tracing::error;
 
@@ -35,14 +35,27 @@ use tracing::error;
 pub struct KdmapVa(u64);
 
 impl KdmapVa {
-    pub const fn new(raw: u64) -> Self { Self(raw) }
-    pub const fn raw(self) -> u64 { self.0 }
-    pub fn to_virt(self) -> VirtAddr { VirtAddr::new(self.0) }
-    pub fn to_phys(self) -> PhysAddr {
-        PhysAddr::new(self.0.wrapping_sub(kdmap_base().wrapping_sub(ram_phys_base())))
+    pub const fn new(raw: u64) -> Self {
+        Self(raw)
     }
-    pub fn as_mut_ptr<T>(self) -> *mut T { self.0 as *mut T }
-    pub fn as_ptr<T>(self) -> *const T { self.0 as *const T }
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+    pub fn to_virt(self) -> VirtAddr {
+        VirtAddr::new(self.0)
+    }
+    pub fn to_phys(self) -> PhysAddr {
+        PhysAddr::new(
+            self.0
+                .wrapping_sub(kdmap_base().wrapping_sub(ram_phys_base())),
+        )
+    }
+    pub fn as_mut_ptr<T>(self) -> *mut T {
+        self.0 as *mut T
+    }
+    pub fn as_ptr<T>(self) -> *const T {
+        self.0 as *const T
+    }
 }
 
 /// Arithmetic conversion from a physical address to its KDMAP alias.
@@ -52,7 +65,10 @@ impl KdmapVa {
 /// which makes this promise a compile-time property.
 #[inline]
 pub fn phys_to_kdmap(pa: PhysAddr) -> KdmapVa {
-    KdmapVa::new(pa.get_raw().wrapping_add(kdmap_base().wrapping_sub(ram_phys_base())))
+    KdmapVa::new(
+        pa.get_raw()
+            .wrapping_add(kdmap_base().wrapping_sub(ram_phys_base())),
+    )
 }
 
 /// Extension trait adding `to_kdmap()` to frames drawn from pools with
@@ -65,12 +81,16 @@ pub trait FrameToKdmap {
 
 impl FrameToKdmap for Frame<Shared> {
     #[inline]
-    fn to_kdmap(&self) -> KdmapVa { phys_to_kdmap(self.raw()) }
+    fn to_kdmap(&self) -> KdmapVa {
+        phys_to_kdmap(self.raw())
+    }
 }
 
 impl FrameToKdmap for Frame<Table> {
     #[inline]
-    fn to_kdmap(&self) -> KdmapVa { phys_to_kdmap(self.raw()) }
+    fn to_kdmap(&self) -> KdmapVa {
+        phys_to_kdmap(self.raw())
+    }
 }
 
 // =========================================================================
@@ -91,10 +111,15 @@ pub struct TablePages {
 }
 
 impl TablePages {
-    pub const fn new() -> Self { Self { inner: FrameAllocator::new() } }
+    pub const fn new() -> Self {
+        Self {
+            inner: FrameAllocator::new(),
+        }
+    }
 
     pub fn add_pa_range(&mut self, pa_range: Range<u64>) {
-        self.inner.add_frame(pa_range.start as usize, pa_range.end as usize);
+        self.inner
+            .add_frame(pa_range.start as usize, pa_range.end as usize);
     }
 
     pub fn alloc(&mut self, layout: Layout) -> Option<(Frame<Table>, KdmapVa)> {
@@ -117,8 +142,12 @@ impl TablePages {
 
     /// Bytes outstanding from the buddy allocator. Approximates
     /// page-table memory in use across all processes.
-    pub fn allocated_bytes(&self) -> usize { self.inner.allocated() }
-    pub fn total_bytes(&self) -> usize { self.inner.total() }
+    pub fn allocated_bytes(&self) -> usize {
+        self.inner.allocated()
+    }
+    pub fn total_bytes(&self) -> usize {
+        self.inner.total()
+    }
 }
 
 /// Pool of pages that are kernel-accessible (KDMAP alias under every
@@ -130,14 +159,21 @@ pub struct KernelPages {
 }
 
 impl KernelPages {
-    pub const fn new() -> Self { Self { inner: FrameAllocator::new() } }
+    pub const fn new() -> Self {
+        Self {
+            inner: FrameAllocator::new(),
+        }
+    }
 
     pub fn add_pa_range(&mut self, pa_range: Range<u64>) {
-        self.inner.add_frame(pa_range.start as usize, pa_range.end as usize);
+        self.inner
+            .add_frame(pa_range.start as usize, pa_range.end as usize);
     }
 
     pub fn alloc_pa(&mut self, layout: Layout) -> Option<Frame<Shared>> {
-        self.inner.alloc_aligned(layout).map(|pa| Frame::<Shared>::new(PhysAddr::new(pa as u64)))
+        self.inner
+            .alloc_aligned(layout)
+            .map(|pa| Frame::<Shared>::new(PhysAddr::new(pa as u64)))
     }
 
     pub fn alloc_kdmap(&mut self, layout: Layout) -> Option<(Frame<Shared>, KdmapVa)> {
@@ -154,8 +190,12 @@ impl KernelPages {
         &mut self.inner
     }
 
-    pub fn allocated_bytes(&self) -> usize { self.inner.allocated() }
-    pub fn total_bytes(&self) -> usize { self.inner.total() }
+    pub fn allocated_bytes(&self) -> usize {
+        self.inner.allocated()
+    }
+    pub fn total_bytes(&self) -> usize {
+        self.inner.total()
+    }
 }
 
 /// Pool of pages that are user-only. No KDMAP alias under the kernel
@@ -167,22 +207,33 @@ pub struct UserPages {
 }
 
 impl UserPages {
-    pub const fn new() -> Self { Self { inner: FrameAllocator::new() } }
+    pub const fn new() -> Self {
+        Self {
+            inner: FrameAllocator::new(),
+        }
+    }
 
     pub fn add_pa_range(&mut self, pa_range: Range<u64>) {
-        self.inner.add_frame(pa_range.start as usize, pa_range.end as usize);
+        self.inner
+            .add_frame(pa_range.start as usize, pa_range.end as usize);
     }
 
     pub fn alloc_pa(&mut self, layout: Layout) -> Option<Frame<UserOnly>> {
-        self.inner.alloc_aligned(layout).map(|pa| Frame::<UserOnly>::new(PhysAddr::new(pa as u64)))
+        self.inner
+            .alloc_aligned(layout)
+            .map(|pa| Frame::<UserOnly>::new(PhysAddr::new(pa as u64)))
     }
 
     pub fn free(&mut self, frame: Frame<UserOnly>, layout: Layout) {
         self.inner.dealloc_aligned(frame.get_raw() as usize, layout);
     }
 
-    pub fn allocated_bytes(&self) -> usize { self.inner.allocated() }
-    pub fn total_bytes(&self) -> usize { self.inner.total() }
+    pub fn allocated_bytes(&self) -> usize {
+        self.inner.allocated()
+    }
+    pub fn total_bytes(&self) -> usize {
+        self.inner.total()
+    }
 }
 
 pub const KRX: u64 =
@@ -203,9 +254,9 @@ pub const LINK_BASE: u64 = 0x1000;
 // picks different values at boot and feeds them into `init_layout`. The
 // four windows are 16 GiB apart — well over the range any of them will
 // occupy — so they can't collide.
-pub const KTEXT_NOMINAL:    u64 = 0xFFFF_FFC0_0000_0000;
-pub const KDMAP_NOMINAL:    u64 = 0xFFFF_FFD0_0000_0000;
-pub const KMMIO_NOMINAL:    u64 = 0xFFFF_FFE0_0000_0000;
+pub const KTEXT_NOMINAL: u64 = 0xFFFF_FFC0_0000_0000;
+pub const KDMAP_NOMINAL: u64 = 0xFFFF_FFD0_0000_0000;
+pub const KMMIO_NOMINAL: u64 = 0xFFFF_FFE0_0000_0000;
 pub const KSCRATCH_NOMINAL: u64 = 0xFFFF_FFF0_0000_0000;
 
 // Transient per-window view into a user_pages backing for setup-time writes.
@@ -217,9 +268,18 @@ pub const KSCRATCH_SIZE: u64 = 32 * mmu::MB;
 // KMMIO window slot assignments. Three single-page fixed slots at the
 // bottom of the window — UART, CLINT MSIP, ACLINT SSWI — and an arena
 // past them for dynamically-discovered MMIO (PCI config, e1000 BAR, ...).
-#[inline] pub fn kmmio_uart()  -> u64 { kmmio_base() }
-#[inline] pub fn kmmio_clint() -> u64 { kmmio_base() + PAGE_SIZE as u64 }
-#[inline] pub fn kmmio_sswi()  -> u64 { kmmio_base() + 2 * PAGE_SIZE as u64 }
+#[inline]
+pub fn kmmio_uart() -> u64 {
+    kmmio_base()
+}
+#[inline]
+pub fn kmmio_clint() -> u64 {
+    kmmio_base() + PAGE_SIZE as u64
+}
+#[inline]
+pub fn kmmio_sswi() -> u64 {
+    kmmio_base() + 2 * PAGE_SIZE as u64
+}
 
 /// Offset within the KMMIO window past the fixed-slot pages where the
 /// dynamic arena begins. Megapage-aligned so larger regions get natural
@@ -240,17 +300,24 @@ pub fn kmmio_alloc(size: u64) -> u64 {
 // during early `rust_main` on hart 0, before any other hart is woken. Reads
 // from other harts are safe with Relaxed because the hart-wake IPI is the
 // synchronizing event.
-static RAM_PHYS_BASE:    AtomicU64 = AtomicU64::new(0);
-static KTEXT_BASE:       AtomicU64 = AtomicU64::new(0);
-static KDMAP_BASE:       AtomicU64 = AtomicU64::new(0);
-static KMMIO_BASE:       AtomicU64 = AtomicU64::new(0);
-static KSCRATCH_BASE:    AtomicU64 = AtomicU64::new(0);
+static RAM_PHYS_BASE: AtomicU64 = AtomicU64::new(0);
+static KTEXT_BASE: AtomicU64 = AtomicU64::new(0);
+static KDMAP_BASE: AtomicU64 = AtomicU64::new(0);
+static KMMIO_BASE: AtomicU64 = AtomicU64::new(0);
+static KSCRATCH_BASE: AtomicU64 = AtomicU64::new(0);
 // Physical address of `_text_start` — the base the kernel ELF was loaded at.
 // Post-trampoline `&_text_start as u64` returns the high-half VA, so helpers
 // that need the physical (PT construction, DMA setup) read this instead.
 static KERNEL_PHYS_BASE: AtomicU64 = AtomicU64::new(0);
 
-pub fn init_layout(ram_phys: u64, ktext: u64, kdmap: u64, kmmio: u64, kscratch: u64, kernel_phys: u64) {
+pub fn init_layout(
+    ram_phys: u64,
+    ktext: u64,
+    kdmap: u64,
+    kmmio: u64,
+    kscratch: u64,
+    kernel_phys: u64,
+) {
     RAM_PHYS_BASE.store(ram_phys, Ordering::Relaxed);
     KTEXT_BASE.store(ktext, Ordering::Relaxed);
     KDMAP_BASE.store(kdmap, Ordering::Relaxed);
@@ -259,12 +326,30 @@ pub fn init_layout(ram_phys: u64, ktext: u64, kdmap: u64, kmmio: u64, kscratch: 
     KERNEL_PHYS_BASE.store(kernel_phys, Ordering::Relaxed);
 }
 
-#[inline] pub fn ram_phys_base()    -> u64 { RAM_PHYS_BASE.load(Ordering::Relaxed) }
-#[inline] pub fn ktext_base()       -> u64 { KTEXT_BASE.load(Ordering::Relaxed) }
-#[inline] pub fn kdmap_base()       -> u64 { KDMAP_BASE.load(Ordering::Relaxed) }
-#[inline] pub fn kmmio_base()       -> u64 { KMMIO_BASE.load(Ordering::Relaxed) }
-#[inline] pub fn kscratch_base()    -> u64 { KSCRATCH_BASE.load(Ordering::Relaxed) }
-#[inline] pub fn kernel_phys_base() -> u64 { KERNEL_PHYS_BASE.load(Ordering::Relaxed) }
+#[inline]
+pub fn ram_phys_base() -> u64 {
+    RAM_PHYS_BASE.load(Ordering::Relaxed)
+}
+#[inline]
+pub fn ktext_base() -> u64 {
+    KTEXT_BASE.load(Ordering::Relaxed)
+}
+#[inline]
+pub fn kdmap_base() -> u64 {
+    KDMAP_BASE.load(Ordering::Relaxed)
+}
+#[inline]
+pub fn kmmio_base() -> u64 {
+    KMMIO_BASE.load(Ordering::Relaxed)
+}
+#[inline]
+pub fn kscratch_base() -> u64 {
+    KSCRATCH_BASE.load(Ordering::Relaxed)
+}
+#[inline]
+pub fn kernel_phys_base() -> u64 {
+    KERNEL_PHYS_BASE.load(Ordering::Relaxed)
+}
 
 /// Resolve a user VA under `root_table` to the kernel's KDMAP alias of
 /// the same physical backing. Lets syscall handlers dereference user
@@ -352,11 +437,11 @@ unsafe extern "C" {
 // backings, anon mmaps) once pool-split routing lands (roadmap milestone 3).
 // Reserved and tracked from day one; wiring an allocator and actually
 // drawing from it is later steps in the same milestone.
-pub const KTABLES_SIZE:    u64 = 128 * mmu::MB;
-pub const KHEAP_SIZE:      u64 = 128 * mmu::MB;
-pub const KPAGES_SIZE:     u64 = 128 * mmu::MB;
+pub const KTABLES_SIZE: u64 = 128 * mmu::MB;
+pub const KHEAP_SIZE: u64 = 128 * mmu::MB;
+pub const KPAGES_SIZE: u64 = 128 * mmu::MB;
 pub const USER_PAGES_SIZE: u64 = 128 * mmu::MB;
-pub const DTB_GUARD_SIZE:  u64 = 2   * mmu::MB;
+pub const DTB_GUARD_SIZE: u64 = 2 * mmu::MB;
 
 #[derive(Debug, Clone)]
 pub struct KernelLayout {
@@ -403,17 +488,26 @@ unsafe fn kernel_elf_regions() -> [Region; 5] {
     unsafe {
         [
             Region {
-                range: section_range(&_text_start as *const _ as u64, &_text_end as *const _ as u64),
+                range: section_range(
+                    &_text_start as *const _ as u64,
+                    &_text_end as *const _ as u64,
+                ),
                 perms: KRX,
                 name: ".text",
             },
             Region {
-                range: section_range(&_rodata_start as *const _ as u64, &_rodata_end as *const _ as u64),
+                range: section_range(
+                    &_rodata_start as *const _ as u64,
+                    &_rodata_end as *const _ as u64,
+                ),
                 perms: KRO,
                 name: ".rodata",
             },
             Region {
-                range: section_range(&_data_start as *const _ as u64, &_data_end as *const _ as u64),
+                range: section_range(
+                    &_data_start as *const _ as u64,
+                    &_data_end as *const _ as u64,
+                ),
                 perms: KRW,
                 name: ".data",
             },
@@ -617,12 +711,30 @@ unsafe fn map_kernel_high_half(
         // map_region_va calls — which would conflict with leaves
         // already installed via the shared L2.
         if is_kernel_root {
-            map_region_va(rt, pa, kmmio_uart(),
-                layout.serial..layout.serial + PAGE_SIZE as u64, KRW, "serial.hh")?;
-            map_region_va(rt, pa, kmmio_clint(),
-                CLINT_MSIP_BASE..CLINT_MSIP_BASE + PAGE_SIZE as u64, KRW, "clint.msip.hh")?;
-            map_region_va(rt, pa, kmmio_sswi(),
-                ACLINT_SSWI_BASE..ACLINT_SSWI_BASE + PAGE_SIZE as u64, KRW, "aclint.sswi.hh")?;
+            map_region_va(
+                rt,
+                pa,
+                kmmio_uart(),
+                layout.serial..layout.serial + PAGE_SIZE as u64,
+                KRW,
+                "serial.hh",
+            )?;
+            map_region_va(
+                rt,
+                pa,
+                kmmio_clint(),
+                CLINT_MSIP_BASE..CLINT_MSIP_BASE + PAGE_SIZE as u64,
+                KRW,
+                "clint.msip.hh",
+            )?;
+            map_region_va(
+                rt,
+                pa,
+                kmmio_sswi(),
+                ACLINT_SSWI_BASE..ACLINT_SSWI_BASE + PAGE_SIZE as u64,
+                KRW,
+                "aclint.sswi.hh",
+            )?;
         }
     }
     Ok(())
@@ -681,7 +793,8 @@ pub unsafe fn map_kernel_shared(
             map_kernel_high_half(rt, pa, layout, /*is_kernel_root=*/ true)?;
             cache_shared_kernel_l2(rt);
             reserve_va_range(rt, pa, kscratch_base(), kscratch_base() + KSCRATCH_SIZE)?;
-        } else {
+        }
+        else {
             // User satps: KTEXT/KDMAP/KMMIO/KSCRATCH share root slot 511
             // (16 GiB apart, all inside one 512-GiB root entry), so the
             // cached kernel Mid-1 covers the entire kernel surface in a
@@ -700,37 +813,58 @@ unsafe fn boot_only_elf_regions() -> [Region; 7] {
     unsafe {
         [
             Region {
-                range: section_range(&_reladyn_start as *const _ as u64, &_reladyn_end as *const _ as u64),
+                range: section_range(
+                    &_reladyn_start as *const _ as u64,
+                    &_reladyn_end as *const _ as u64,
+                ),
                 perms: KRO,
                 name: ".rela.dyn",
             },
             Region {
-                range: section_range(&_gnuhash_start as *const _ as u64, &_gnuhash_end as *const _ as u64),
+                range: section_range(
+                    &_gnuhash_start as *const _ as u64,
+                    &_gnuhash_end as *const _ as u64,
+                ),
                 perms: KRO,
                 name: ".gnu.hash",
             },
             Region {
-                range: section_range(&_dynsym_start as *const _ as u64, &_dynsym_end as *const _ as u64),
+                range: section_range(
+                    &_dynsym_start as *const _ as u64,
+                    &_dynsym_end as *const _ as u64,
+                ),
                 perms: KRO,
                 name: ".dynsym",
             },
             Region {
-                range: section_range(&_hash_start as *const _ as u64, &_hash_end as *const _ as u64),
+                range: section_range(
+                    &_hash_start as *const _ as u64,
+                    &_hash_end as *const _ as u64,
+                ),
                 perms: KRO,
                 name: ".hash",
             },
             Region {
-                range: section_range(&_dynstr_start as *const _ as u64, &_dynstr_end as *const _ as u64),
+                range: section_range(
+                    &_dynstr_start as *const _ as u64,
+                    &_dynstr_end as *const _ as u64,
+                ),
                 perms: KRO,
                 name: ".dynstr",
             },
             Region {
-                range: section_range(&_ehframe_start as *const _ as u64, &_ehframe_end as *const _ as u64),
+                range: section_range(
+                    &_ehframe_start as *const _ as u64,
+                    &_ehframe_end as *const _ as u64,
+                ),
                 perms: KRO,
                 name: ".eh_frame",
             },
             Region {
-                range: section_range(&_DYNAMIC as *const _ as u64, &_DYNAMIC_END as *const _ as u64),
+                range: section_range(
+                    &_DYNAMIC as *const _ as u64,
+                    &_DYNAMIC_END as *const _ as u64,
+                ),
                 perms: KRO,
                 name: ".dynamic",
             },
@@ -739,13 +873,11 @@ unsafe fn boot_only_elf_regions() -> [Region; 7] {
 }
 
 fn self_only_pool_regions(layout: &KernelLayout) -> [Region; 1] {
-    [
-        Region {
-            range: layout.dtb.clone(),
-            perms: KRO,
-            name: "dtb",
-        },
-    ]
+    [Region {
+        range: layout.dtb.clone(),
+        perms: KRO,
+        name: "dtb",
+    }]
 }
 
 /// Map every kernel region the S-mode kernel needs under its own satp. This
@@ -778,7 +910,7 @@ pub unsafe fn unmap_boot_only_regions(rt: &RootTable<'_>) -> Result<(), ()> {
         for r in boot_only_elf_regions().iter() {
             if let Err(_) = unmap_range(rt, r.range.clone()) {
                 error!("memmap: failed unmapping {} {:016X?}", r.name, r.range);
-                return Err(())
+                return Err(());
             }
         }
     }

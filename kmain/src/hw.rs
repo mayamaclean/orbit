@@ -71,7 +71,8 @@ impl Hardware for RiscvHardware {
         }
         if k_gpu::push_chunk(Source::Process(pid), bytes) {
             Ok(())
-        } else {
+        }
+        else {
             Err(())
         }
     }
@@ -90,7 +91,10 @@ impl Hardware for RiscvHardware {
     }
 
     fn read_stdin_drain(&mut self, pid: u16, user_va: UserVa, max_len: usize) -> usize {
-        let Some(stdin) = crate::kernel::stdin::get(pid) else { return 0 };
+        let Some(stdin) = crate::kernel::stdin::get(pid)
+        else {
+            return 0;
+        };
         // Drain into a kernel-side scratch slice first so the SUM
         // window only covers the copy step (and so a partial read
         // doesn't leave the user buffer half-written if the pid
@@ -98,7 +102,9 @@ impl Hardware for RiscvHardware {
         // current single-thread-per-process model).
         let mut scratch = [0u8; PAGE_SIZE];
         let n = stdin.try_drain(&mut scratch[..max_len]);
-        if n == 0 { return 0; }
+        if n == 0 {
+            return 0;
+        }
         let guard = UserAccess::enter();
         unsafe {
             let dst = guard.slice_mut(user_va, n);
@@ -109,12 +115,18 @@ impl Hardware for RiscvHardware {
     }
 
     fn park_stdin_reader(&mut self, pid: u16, handle: CompletionHandle) -> bool {
-        let Some(stdin) = crate::kernel::stdin::get(pid) else { return false };
+        let Some(stdin) = crate::kernel::stdin::get(pid)
+        else {
+            return false;
+        };
         stdin.park(handle).is_ok()
     }
 
     fn unpark_stdin_reader(&mut self, pid: u16) -> bool {
-        let Some(stdin) = crate::kernel::stdin::get(pid) else { return false };
+        let Some(stdin) = crate::kernel::stdin::get(pid)
+        else {
+            return false;
+        };
         stdin.unpark().is_some()
     }
 }

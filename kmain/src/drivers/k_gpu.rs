@@ -85,7 +85,8 @@ fn package() -> Option<&'static mut GpuPackage> {
     let p = PKG_PTR.load(Ordering::Acquire);
     if p.is_null() {
         None
-    } else {
+    }
+    else {
         // SAFETY: installed once from hart 0; only `k_gpu` reads it
         // post-install. Single-consumer invariant.
         Some(unsafe { &mut *p })
@@ -99,7 +100,8 @@ pub fn is_ready() -> bool {
 
 /// Push a single chunk command. Returns false if the ring was full.
 pub fn push_chunk(source: Source, bytes: &[u8]) -> bool {
-    let Ok(mut slot) = CONSOLE_RING.push_ref() else {
+    let Ok(mut slot) = CONSOLE_RING.push_ref()
+    else {
         return false;
     };
     let len = core::cmp::min(bytes.len(), CMD_BYTES);
@@ -112,7 +114,8 @@ pub fn push_chunk(source: Source, bytes: &[u8]) -> bool {
 
 /// Push a cycle-active command. Returns false if the ring was full.
 pub fn push_cycle_active() -> bool {
-    let Ok(mut slot) = CONSOLE_RING.push_ref() else {
+    let Ok(mut slot) = CONSOLE_RING.push_ref()
+    else {
         return false;
     };
     slot.kind = CmdKind::CycleActive;
@@ -123,7 +126,8 @@ pub fn push_cycle_active() -> bool {
 /// Push an insert-source command (new process came up). Returns false
 /// if the ring was full.
 pub fn push_insert_source(source: Source) -> bool {
-    let Ok(mut slot) = CONSOLE_RING.push_ref() else {
+    let Ok(mut slot) = CONSOLE_RING.push_ref()
+    else {
         return false;
     };
     slot.kind = CmdKind::InsertSource;
@@ -135,7 +139,8 @@ pub fn push_insert_source(source: Source) -> bool {
 /// Push a remove-source command (process exited). Returns false if the
 /// ring was full.
 pub fn push_remove_source(source: Source) -> bool {
-    let Ok(mut slot) = CONSOLE_RING.push_ref() else {
+    let Ok(mut slot) = CONSOLE_RING.push_ref()
+    else {
         return false;
     };
     slot.kind = CmdKind::RemoveSource;
@@ -148,7 +153,9 @@ pub fn push_remove_source(source: Source) -> bool {
 /// returns (exits as `ThreadState::Exited` on fatal error).
 #[unsafe(no_mangle)]
 pub extern "C" fn k_gpu(_a0: usize) {
-    unsafe { riscv::register::sstatus::clear_sie(); }
+    unsafe {
+        riscv::register::sstatus::clear_sie();
+    }
 
     let pkg = match package() {
         Some(p) => p,
@@ -161,7 +168,9 @@ pub extern "C" fn k_gpu(_a0: usize) {
     info!("k_gpu: ready, resource_id={}", pkg.fb_resource_id);
 
     loop {
-        unsafe { riscv::register::sstatus::clear_sie(); }
+        unsafe {
+            riscv::register::sstatus::clear_sie();
+        }
 
         // Drain every pending command, batching redraws.
         while let Some(cmd) = CONSOLE_RING.pop_ref() {
@@ -208,8 +217,7 @@ pub extern "C" fn k_gpu(_a0: usize) {
         // kthread_park's stack-switch-then-publish ordering closes
         // the double-dispatch race the prior cscratch2=1; ebreak
         // workaround was fencing off — see kernel::context.
-        let wake_at = riscv::register::time::read64()
-            .wrapping_add(500_000) as usize;
+        let wake_at = riscv::register::time::read64().wrapping_add(500_000) as usize;
         crate::kernel::context::kthread_park(ThreadState::Suspended, wake_at);
     }
 }

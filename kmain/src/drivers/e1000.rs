@@ -1,6 +1,10 @@
-use core::{mem::size_of, ptr::null_mut, sync::atomic::{AtomicPtr, Ordering}};
+use core::{
+    mem::size_of,
+    ptr::null_mut,
+    sync::atomic::{AtomicPtr, Ordering},
+};
 
-use mem::{round_usize_up};
+use mem::round_usize_up;
 use mmu::PAGE_SIZE;
 use smoltcp::phy::{Checksum, DeviceCapabilities, Medium};
 use tracing::{error, info, trace, warn};
@@ -76,7 +80,7 @@ const RECV_ADDR_TABLE_ADDR: usize = 0x5400 / size_of::<u32>(); // 64 bits * 8
 
 #[repr(packed)]
 pub struct E1000Pbuf {
-    b: [u8; SW_MTU]
+    b: [u8; SW_MTU],
 }
 
 // E1000 3.3.3
@@ -98,7 +102,7 @@ pub struct TxDesc {
 pub struct RxDesc {
     addr: u64,
     length: u16,
-    csum: u16, 
+    csum: u16,
     status: u8,
     errors: u8,
     special: u16,
@@ -112,19 +116,18 @@ pub struct E1000 {
 
     rx_next: usize,
     rx_ring: &'static mut [RxDesc; RX_RING_LEN],
-    rx_bufs: &'static mut [E1000Pbuf; RX_RING_LEN]
+    rx_bufs: &'static mut [E1000Pbuf; RX_RING_LEN],
 }
 
 impl E1000 {
     /// everything should be id mapped and page aligned
     pub fn new(
         bar: *mut u32,
-        tx_ring: &'static mut [TxDesc; TX_RING_LEN], 
+        tx_ring: &'static mut [TxDesc; TX_RING_LEN],
         tx_bufs: &'static mut [E1000Pbuf; TX_RING_LEN],
         rx_ring: &'static mut [RxDesc; RX_RING_LEN],
-        rx_bufs: &'static mut [E1000Pbuf; RX_RING_LEN])
-    -> Self
-    {
+        rx_bufs: &'static mut [E1000Pbuf; RX_RING_LEN],
+    ) -> Self {
         for idx in 0..RX_RING_LEN {
             let e = &mut rx_ring[idx];
 
@@ -150,23 +153,31 @@ impl E1000 {
             e.status = 0x1;
         }
 
-        unsafe { core::arch::asm!("fence iorw, iorw"); }
+        unsafe {
+            core::arch::asm!("fence iorw, iorw");
+        }
 
         Self {
             bar,
-            tx_ring, tx_bufs,
-            rx_next: 0, rx_ring, rx_bufs
+            tx_ring,
+            tx_bufs,
+            rx_next: 0,
+            rx_ring,
+            rx_bufs,
         }
     }
 
     pub fn set_mac(&mut self, mac_idx: usize, mac: [u8; 6]) {
         if mac_idx >= 8 {
             error!("e1000: attempt to set mac{mac_idx} failed: max mac_idx=7");
-            return
+            return;
         }
 
         unsafe {
-            let ral = (mac[0] as u32) | ((mac[1] as u32) << 8) | ((mac[2] as u32) << 16) | ((mac[3] as u32) << 24);
+            let ral = (mac[0] as u32)
+                | ((mac[1] as u32) << 8)
+                | ((mac[2] as u32) << 16)
+                | ((mac[3] as u32) << 24);
             let rah = 0x8000_0000u32 | (mac[4] as u32) | ((mac[5] as u32) << 8);
 
             let base = RECV_ADDR_TABLE_ADDR + mac_idx * 2;
@@ -184,13 +195,13 @@ impl E1000 {
             loop {
                 let reg = eeprom_read_reg.read_volatile();
                 if (reg & 0x10) > 0 {
-                    return Ok(((reg & 0xFFFF_0000) >> 16) as u16)
+                    return Ok(((reg & 0xFFFF_0000) >> 16) as u16);
                 }
 
                 if riscv::register::time::read64() > timeout {
-                    return Err(())
+                    return Err(());
                 }
-            };
+            }
         }
     }
 
@@ -204,7 +215,7 @@ impl E1000 {
         let m2 = self.read_eeprom(2)?;
 
         let mut mac = [0u8; 6];
-        
+
         mac[0] = m0 as u8 & 0xFF;
         mac[1] = ((m0 & 0xFF00) >> 8) as u8;
 
@@ -221,17 +232,13 @@ impl E1000 {
         unsafe {
             self.bar.add(IMS_REG_ADDR).write_volatile(mask as u32);
             if mask > 0 {
-                self.bar.add(ICR_REG_ADDR)
-                    .write_volatile(0);
+                self.bar.add(ICR_REG_ADDR).write_volatile(0);
             }
         }
     }
 
     pub fn read_interrupt_status(&mut self) -> u32 {
-        unsafe {
-            self.bar.add(ICR_REG_ADDR)
-                .read_volatile()
-        }
+        unsafe { self.bar.add(ICR_REG_ADDR).read_volatile() }
     }
 
     pub fn init_hw(&mut self, mac: [u8; 6]) -> Result<(), ()> {
@@ -241,11 +248,10 @@ impl E1000 {
             info!("e1000: svid: {svid:04X?}");
 
             if svid != 0x8086 {
-                return Err(())
+                return Err(());
             }
 
-            self.bar.add(CTRL_REG_ADDR)
-                .write_volatile(0x18000060);
+            self.bar.add(CTRL_REG_ADDR).write_volatile(0x18000060);
 
             // not using for now, just zero it
             let mta_base = self.bar.add(MTA_ADDR);
@@ -260,41 +266,40 @@ impl E1000 {
             // give device rx ring + rx ring len. self.rx_ring is a KDMAP VA;
             // the NIC expects physical, so translate at the boundary.
             let rx_phys = kdmap_ptr_to_phys(self.rx_ring.as_ptr());
-            self.bar.add(RDBA_REG_ADDR)
-                .write_volatile(rx_phys as u32);
+            self.bar.add(RDBA_REG_ADDR).write_volatile(rx_phys as u32);
 
-            self.bar.add(RDBA_REG_ADDR + 1)
+            self.bar
+                .add(RDBA_REG_ADDR + 1)
                 .write_volatile((rx_phys >> 32) as u32);
 
-            self.bar.add(RDLEN_REG_ADDR)
+            self.bar
+                .add(RDLEN_REG_ADDR)
                 .write_volatile(RX_RING_BYTES as u32);
 
             // give device tx ring + tx ring len
             let tx_phys = kdmap_ptr_to_phys(self.tx_ring.as_ptr());
-            self.bar.add(TDBA_REG_ADDR)
-                .write_volatile(tx_phys as u32);
+            self.bar.add(TDBA_REG_ADDR).write_volatile(tx_phys as u32);
 
-            self.bar.add(TDBA_REG_ADDR + 1)
+            self.bar
+                .add(TDBA_REG_ADDR + 1)
                 .write_volatile((tx_phys >> 32) as u32);
 
-            self.bar.add(TDLEN_REG_ADDR)
+            self.bar
+                .add(TDLEN_REG_ADDR)
                 .write_volatile((self.tx_ring.len() * size_of::<TxDesc>()) as u32);
 
             const IPG: u32 = 10 | (8 << 10) | (6 << 20);
-            self.bar.add(TIPG_REG_ADDR)
-                .write_volatile(IPG);
+            self.bar.add(TIPG_REG_ADDR).write_volatile(IPG);
 
-            self.bar.add(RDH_REG_ADDR)
-                .write_volatile(0);
+            self.bar.add(RDH_REG_ADDR).write_volatile(0);
 
-            self.bar.add(RDT_REG_ADDR)
+            self.bar
+                .add(RDT_REG_ADDR)
                 .write_volatile(RX_RING_LEN as u32 - 1);
 
-            self.bar.add(TDH_REG_ADDR)
-                .write_volatile(0);
+            self.bar.add(TDH_REG_ADDR).write_volatile(0);
 
-            self.bar.add(TDT_REG_ADDR)
-                .write_volatile(0);
+            self.bar.add(TDT_REG_ADDR).write_volatile(0);
 
             const RX_INT_MASK: u16 = 0x004C;
             const TX_INT_MASK: u16 = 0x0001;
@@ -307,15 +312,12 @@ impl E1000 {
             core::arch::asm!("fence iorw, iorw");
 
             const RX_CTL: u32 = 0x8002;
-            self.bar.add(RCTL_REG_ADDR)
-                .write_volatile(RX_CTL);
+            self.bar.add(RCTL_REG_ADDR).write_volatile(RX_CTL);
 
             const TX_CTL: u32 = 0b0110000000000111111000011111010; //0x100000A | (0xF << 4) | (0x40 << 12);
-            self.bar.add(TCTL_REG_ADDR)
-                .write_volatile(TX_CTL);
+            self.bar.add(TCTL_REG_ADDR).write_volatile(TX_CTL);
 
-            let status = self.bar.add(STATUS_REG_ADDR)
-                .read_volatile();
+            let status = self.bar.add(STATUS_REG_ADDR).read_volatile();
 
             info!("e1000: status={status:08X?},int={interrupts:08X?}");
         }
@@ -327,14 +329,14 @@ impl E1000 {
             let rindex = self.rx_next;
 
             if (self.rx_ring[rindex].status & 0x1u8) == 0 {
-                return None
+                return None;
             }
 
             let tindex = self.bar.add(TDT_REG_ADDR).read_volatile() as usize;
 
             if (self.tx_ring[tindex].status & 0x1u8) == 0 {
                 warn!("previous transmission request still in progress");
-                return None
+                return None;
             }
 
             self.rx_next = (rindex + 1) % RX_RING_LEN;
@@ -346,21 +348,22 @@ impl E1000 {
             let rxdesc = ((&mut self.rx_ring[rindex]) as *mut RxDesc).as_mut_unchecked();
             let txdesc = ((&mut self.tx_ring[tindex]) as *mut TxDesc).as_mut_unchecked();
             let rxbuf = core::slice::from_raw_parts_mut(self.rx_bufs[rindex].b.as_mut_ptr(), rxlen);
-            let txbuf = core::slice::from_raw_parts_mut(self.tx_bufs[tindex].b.as_mut_ptr(), SW_MTU);
+            let txbuf =
+                core::slice::from_raw_parts_mut(self.tx_bufs[tindex].b.as_mut_ptr(), SW_MTU);
 
             Some((
                 E1000RxToken {
                     bar,
                     buf: rxbuf,
                     desc: rxdesc,
-                    next_rdt: rindex as u32
+                    next_rdt: rindex as u32,
                 },
                 E1000TxToken {
                     bar,
                     buf: txbuf,
                     desc: txdesc,
-                    next_tdt
-                }
+                    next_tdt,
+                },
             ))
         }
     }
@@ -371,7 +374,7 @@ impl E1000 {
 
             if (self.tx_ring[tindex].status & 0x1u8) == 0 {
                 warn!("previous transmission request still in progress");
-                return None
+                return None;
             }
 
             let next_tdt = ((tindex + 1) % TX_RING_LEN) as u32;
@@ -383,7 +386,7 @@ impl E1000 {
                 bar: self.bar,
                 buf,
                 desc,
-                next_tdt
+                next_tdt,
             })
         }
     }
@@ -394,7 +397,7 @@ impl E1000 {
 
             if (self.rx_ring[rindex].status & 0x1u8) == 0 {
                 warn!("previous receive request still in progress");
-                return None
+                return None;
             }
 
             self.rx_next = (rindex + 1) % RX_RING_LEN;
@@ -408,7 +411,7 @@ impl E1000 {
                 bar: self.bar,
                 buf,
                 desc,
-                next_rdt: rindex as u32
+                next_rdt: rindex as u32,
             })
         }
     }
@@ -418,12 +421,13 @@ pub struct E1000TxToken<'e> {
     bar: *mut u32,
     buf: &'e mut [u8],
     desc: &'e mut TxDesc,
-    next_tdt: u32
+    next_tdt: u32,
 }
 
 impl<'e> smoltcp::phy::TxToken for E1000TxToken<'e> {
     fn consume<R, F>(self, len: usize, f: F) -> R
-        where F: FnOnce(&mut [u8]) -> R
+    where
+        F: FnOnce(&mut [u8]) -> R,
     {
         let r = f(&mut self.buf[..len]);
 
@@ -432,24 +436,23 @@ impl<'e> smoltcp::phy::TxToken for E1000TxToken<'e> {
         self.desc.cmd = 0x0B;
 
         unsafe {
-            let icr0 = self.bar.add(ICR_REG_ADDR)
-                .read_volatile();
+            let icr0 = self.bar.add(ICR_REG_ADDR).read_volatile();
 
             core::arch::asm!("fence iorw, iorw");
 
-            self.bar.add(TDT_REG_ADDR)
-                .write_volatile(self.next_tdt);
+            self.bar.add(TDT_REG_ADDR).write_volatile(self.next_tdt);
 
-            let icr1 = self.bar.add(ICR_REG_ADDR)
-                .read_volatile();
+            let icr1 = self.bar.add(ICR_REG_ADDR).read_volatile();
 
-            let status = self.bar.add(STATUS_REG_ADDR)
-                .read_volatile();
+            let status = self.bar.add(STATUS_REG_ADDR).read_volatile();
 
             let rdt = self.bar.add(RDT_REG_ADDR).read_volatile();
             let rdh = self.bar.add(RDH_REG_ADDR).read_volatile();
 
-            trace!("e1000: status={:08X?}, icr0={:08X?}, icr1={:08X?}, rdt={rdt:08X?}, rdh={rdh:08X?}", status, icr0, icr1);
+            trace!(
+                "e1000: status={:08X?}, icr0={:08X?}, icr1={:08X?}, rdt={rdt:08X?}, rdh={rdh:08X?}",
+                status, icr0, icr1
+            );
         }
         r
     }
@@ -459,12 +462,13 @@ pub struct E1000RxToken<'e> {
     bar: *mut u32,
     buf: &'e mut [u8],
     desc: &'e mut RxDesc,
-    next_rdt: u32
+    next_rdt: u32,
 }
 
 impl<'e> smoltcp::phy::RxToken for E1000RxToken<'e> {
     fn consume<R, F>(self, f: F) -> R
-        where F: FnOnce(&[u8]) -> R
+    where
+        F: FnOnce(&[u8]) -> R,
     {
         let r = f(self.buf);
 
@@ -473,19 +477,23 @@ impl<'e> smoltcp::phy::RxToken for E1000RxToken<'e> {
         unsafe {
             core::arch::asm!("fence iorw, iorw");
 
-            self.bar.add(RDT_REG_ADDR)
-                .write_volatile(self.next_rdt);
+            self.bar.add(RDT_REG_ADDR).write_volatile(self.next_rdt);
 
-            self.bar.add(STATUS_REG_ADDR)
-                .read_volatile();
+            self.bar.add(STATUS_REG_ADDR).read_volatile();
         }
         r
     }
 }
 
 impl smoltcp::phy::Device for E1000 {
-    type RxToken<'e> = E1000RxToken<'e> where Self: 'e;
-    type TxToken<'e> = E1000TxToken<'e> where Self: 'e;
+    type RxToken<'e>
+        = E1000RxToken<'e>
+    where
+        Self: 'e;
+    type TxToken<'e>
+        = E1000TxToken<'e>
+    where
+        Self: 'e;
 
     fn capabilities<'e>(&'e self) -> DeviceCapabilities {
         let mut caps = DeviceCapabilities::default();
@@ -498,7 +506,10 @@ impl smoltcp::phy::Device for E1000 {
         caps
     }
 
-    fn receive<'e>(&'e mut self, _timestamp: smoltcp::time::Instant) -> Option<(Self::RxToken<'e>, Self::TxToken<'e>)> {
+    fn receive<'e>(
+        &'e mut self,
+        _timestamp: smoltcp::time::Instant,
+    ) -> Option<(Self::RxToken<'e>, Self::TxToken<'e>)> {
         self.get_next_rxtx()
     }
 

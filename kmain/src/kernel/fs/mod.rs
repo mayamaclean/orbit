@@ -96,12 +96,7 @@ pub trait Filesystem: Send + Sync {
     /// - `BadInode` — `ino` is unknown.
     /// - `BadRange` — `out` is too small for even one entry. Caller
     ///   grows the buffer; cursor is not advanced.
-    fn readdir(
-        &self,
-        ino: Inode,
-        cursor: u64,
-        out: &mut [u8],
-    ) -> Result<(usize, u64), FsErr>;
+    fn readdir(&self, ino: Inode, cursor: u64, out: &mut [u8]) -> Result<(usize, u64), FsErr>;
 }
 
 /// Single global mount slot. Write-once at boot from hart 0; readers

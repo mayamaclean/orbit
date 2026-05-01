@@ -2,12 +2,12 @@ use core::alloc::Layout;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use core::time::Duration;
 
-use alloc::collections::{btree_map::BTreeMap};
+use alloc::collections::btree_map::BTreeMap;
 use alloc::{boxed::Box, vec::Vec};
 
 use device::{HartContext, Stack, TrapFrame};
 use dtoolkit::fdt::FdtNode;
-use dtoolkit::{Node, fdt::{Fdt}};
+use dtoolkit::{Node, fdt::Fdt};
 use elf::endian::LittleEndian;
 use mem::{round_u64_down, round_u64_up};
 use mmu::mmap::{PageAlloc, map_address_range, unmap, unmap_page};
@@ -18,21 +18,20 @@ use mmu::sv48::{PageTable, PhysAddr, VirtAddr};
 use mmu::{KB, MB, MappingConfig, PAGE_SIZE, PagePermissions, SupervisorTag};
 use net_channel::NetChannel;
 use process::{
-    Frame, MappingKind, PThread, PhysBacking, Process,
-    Shared, Thread, ThreadState,
-    UserMapping, UserOnly
+    Frame, MappingKind, PThread, PhysBacking, Process, Shared, Thread, ThreadState, UserMapping,
+    UserOnly,
 };
 
 use orbit_abi::errno::{
-    Errno, EAGAIN, EBADF, EFAULT, EINVAL, EIO, ENOEXEC, ENOMEM, ENOTDIR, EPERM, ESRCH,
+    EAGAIN, EBADF, EFAULT, EINVAL, EIO, ENOEXEC, ENOMEM, ENOTDIR, EPERM, ESRCH, Errno,
 };
+use orbit_core::ready_queue::ReadyQueue;
+use orbit_core::sleep_heap::SleepHeap;
 use orbit_core::{
     CloseHandleReq, CreateProcessExReq, CreateProcessReq, CreateThreadReq, FsOpenReq, FsReadReq,
     FsReaddirReq, FsStatReq, FutexWaitReq, FutexWakeReq, MAX_FS_PATH_LEN, MemMapReq,
     NetChannelCreationReq, PendingWork, WaitPidReq,
 };
-use orbit_core::ready_queue::ReadyQueue;
-use orbit_core::sleep_heap::SleepHeap;
 use thingbuf::StaticThingBuf;
 
 use crate::kernel::fs::FsErr;
@@ -42,14 +41,12 @@ use crate::kernel::shared_user_ptr::SharedUserPtr;
 use riscv::register::satp::{Mode, Satp};
 use riscv::register::sstatus::SPP;
 use smoltcp::iface::{Config, Interface, SocketHandle};
-use smoltcp::wire::{EthernetAddress};
+use smoltcp::wire::EthernetAddress;
 use tracing::{debug, error, info, trace, warn};
 
 use crate::drivers::e1000::{
-    E1000, E1000Pbuf, RX_RING_BUFS_BYTES,
-    RX_RING_BYTES, RX_RING_LEN, RxDesc,
-    TX_RING_BUFS_BYTES, TX_RING_BYTES,
-    TX_RING_LEN, TxDesc
+    E1000, E1000Pbuf, RX_RING_BUFS_BYTES, RX_RING_BYTES, RX_RING_LEN, RxDesc, TX_RING_BUFS_BYTES,
+    TX_RING_BYTES, TX_RING_LEN, TxDesc,
 };
 
 use crate::kernel::context::get_hart_context;
@@ -63,9 +60,9 @@ pub mod handle;
 pub mod input;
 pub mod memmap;
 pub mod orbital_elf;
+pub mod pci;
 pub mod pending_frees;
 pub mod shared_user_ptr;
-pub mod pci;
 pub mod shootdown;
 pub mod stdin;
 pub mod user_page;
@@ -82,7 +79,8 @@ pub use memmap::KernelLayout;
 // `umode` / `hello-std` directly are gone — those binaries live on
 // disk under `/bin/smoke` and `/bin/hello-std` (see
 // tools/build-disk.sh) and the loader picks them via its argv.
-pub const UMODE_TEST_ELF: &'static [u8] = include_bytes!("../../../orbit-loader/target/riscv64gc-unknown-none-elf/release/orbit-loader");
+pub const UMODE_TEST_ELF: &'static [u8] =
+    include_bytes!("../../../orbit-loader/target/riscv64gc-unknown-none-elf/release/orbit-loader");
 
 // User address-space layout lives in the canonical orbit_abi::layout module.
 // Re-exported so existing `kernel::USER_TEXT_BASE`-style call sites keep
@@ -155,7 +153,9 @@ pub enum WakeEvent {
 }
 
 impl Default for WakeEvent {
-    fn default() -> Self { WakeEvent::None }
+    fn default() -> Self {
+        WakeEvent::None
+    }
 }
 
 /// One park notification queued by a parking hart for the manager to
@@ -175,7 +175,11 @@ pub struct SleepNotice {
 
 impl Default for SleepNotice {
     fn default() -> Self {
-        Self { wake_time: 0, sleep_seq: 0, thread: core::ptr::null_mut() }
+        Self {
+            wake_time: 0,
+            sleep_seq: 0,
+            thread: core::ptr::null_mut(),
+        }
     }
 }
 
@@ -209,7 +213,9 @@ pub struct ReadyNotice {
 
 impl Default for ReadyNotice {
     fn default() -> Self {
-        Self { thread: core::ptr::null_mut() }
+        Self {
+            thread: core::ptr::null_mut(),
+        }
     }
 }
 
@@ -242,7 +248,9 @@ pub static READY_INBOXES: [StaticThingBuf<ReadyNotice, 32>; shootdown::MAX_HARTS
 /// state=Blocking and cleared its own current — so writing
 /// `t.frame.regs` doesn't race with a dispatch.
 pub fn wake_blocked_inline(thread_ptr: *mut Thread) {
-    if thread_ptr.is_null() { return; }
+    if thread_ptr.is_null() {
+        return;
+    }
     // SAFETY: signaler claimed the waiter via take_waiter; the
     // parker's set_waiter Release-ordered the prior `t.handle =
     // Some(...)` write so reading it here is safe.
@@ -259,7 +267,8 @@ pub fn wake_blocked_inline(thread_ptr: *mut Thread) {
         t.frame.regs[10 + i] = handle.ret(i) as usize;
     }
     drop(handle);
-    t.state.store(ThreadState::Ready as usize, Ordering::Release);
+    t.state
+        .store(ThreadState::Ready as usize, Ordering::Release);
     if push_ready_notice(thread_ptr).is_err() {
         error!(
             "READY_INBOX full on blocked-wake: tid={} — thread \
@@ -423,17 +432,13 @@ pub struct FutexWaiter {
 }
 
 impl Orbit {
-    const THREAD_STACK_LAYOUT: Layout = unsafe {
-        Layout::from_size_align_unchecked(2 * MB as usize, 2 * MB as usize)
-    };
+    const THREAD_STACK_LAYOUT: Layout =
+        unsafe { Layout::from_size_align_unchecked(2 * MB as usize, 2 * MB as usize) };
 
-    const THREAD_TRAP_FRAME_LAYOUT: Layout = unsafe {
-        Layout::from_size_align_unchecked(PAGE_SIZE, PAGE_SIZE)
-    };
+    const THREAD_TRAP_FRAME_LAYOUT: Layout =
+        unsafe { Layout::from_size_align_unchecked(PAGE_SIZE, PAGE_SIZE) };
 
-    const TABLE_LAYOUT: Layout = unsafe {
-        Layout::from_size_align_unchecked(PAGE_SIZE, PAGE_SIZE)
-    };
+    const TABLE_LAYOUT: Layout = unsafe { Layout::from_size_align_unchecked(PAGE_SIZE, PAGE_SIZE) };
 
     /// Physical address we program into the e1000's BAR0; the device decodes
     /// MMIO accesses to this PA on the bus. The kernel reaches the same
@@ -482,27 +487,20 @@ impl Orbit {
         for tid in &proc.threads {
             if let Some(pt) = self.threads.get(tid) {
                 let t: &Thread = unsafe { (pt.0 as *const Thread).as_ref_unchecked() };
-                cpu_ticks = cpu_ticks
-                    .wrapping_add(t.cpu_ticks_total.load(Ordering::Relaxed));
-                context_switches = context_switches
-                    .wrapping_add(t.context_switches.load(Ordering::Relaxed));
-                syscalls = syscalls
-                    .wrapping_add(t.syscall_count.load(Ordering::Relaxed));
-                syscall_ticks = syscall_ticks
-                    .wrapping_add(t.syscall_ticks.load(Ordering::Relaxed));
+                cpu_ticks = cpu_ticks.wrapping_add(t.cpu_ticks_total.load(Ordering::Relaxed));
+                context_switches =
+                    context_switches.wrapping_add(t.context_switches.load(Ordering::Relaxed));
+                syscalls = syscalls.wrapping_add(t.syscall_count.load(Ordering::Relaxed));
+                syscall_ticks = syscall_ticks.wrapping_add(t.syscall_ticks.load(Ordering::Relaxed));
             }
         }
 
         // System-wide hart-bucket sums (every hart contributes).
         use crate::kernel::accounting::sum_hart_counter;
-        let hart_user_ticks =
-            sum_hart_counter(|h| h.user_ticks.load(Ordering::Relaxed));
-        let hart_kernel_ticks =
-            sum_hart_counter(|h| h.kernel_ticks.load(Ordering::Relaxed));
-        let hart_scheduler_ticks =
-            sum_hart_counter(|h| h.scheduler_ticks.load(Ordering::Relaxed));
-        let hart_idle_ticks =
-            sum_hart_counter(|h| h.idle_ticks.load(Ordering::Relaxed));
+        let hart_user_ticks = sum_hart_counter(|h| h.user_ticks.load(Ordering::Relaxed));
+        let hart_kernel_ticks = sum_hart_counter(|h| h.kernel_ticks.load(Ordering::Relaxed));
+        let hart_scheduler_ticks = sum_hart_counter(|h| h.scheduler_ticks.load(Ordering::Relaxed));
+        let hart_idle_ticks = sum_hart_counter(|h| h.idle_ticks.load(Ordering::Relaxed));
 
         Some(orbit_abi::stats::ProcessStats {
             size: core::mem::size_of::<orbit_abi::stats::ProcessStats>() as u32,
@@ -532,7 +530,8 @@ impl Orbit {
     }
 
     pub fn runnable_thread_count(&self) -> usize {
-        self.threads.iter()
+        self.threads
+            .iter()
             .filter(|(_, t)| unsafe {
                 let thread = (t.0 as *const Thread).as_ref_unchecked();
                 thread.state.load(Ordering::Acquire) == ThreadState::Ready as usize
@@ -548,9 +547,8 @@ impl Orbit {
         table_pages: memmap::TablePages,
         kernel_pages: memmap::KernelPages,
         user_pages: memmap::UserPages,
-        satp: Satp)
-        -> Self
-    {
+        satp: Satp,
+    ) -> Self {
         Self {
             dtb_addr,
             _serial_addr,
@@ -570,7 +568,7 @@ impl Orbit {
                 iface: None,
                 socket_reqs: alloc::vec::Vec::new(),
                 socket_associations: heapless::spsc::Queue::new(),
-                socket_deletions: heapless::spsc::Queue::new()
+                socket_deletions: heapless::spsc::Queue::new(),
             },
             orphaned_sockets: Vec::new(),
             sleeping: SleepHeap::new(),
@@ -602,21 +600,26 @@ impl Orbit {
     /// Allocate a kthread stack. Kernel-accessible (Shared pool) so the
     /// kernel can write through KDMAP during setup.
     fn allocate_thread_stack(&mut self) -> Result<(Frame<Shared>, memmap::KdmapVa), ()> {
-        self.kernel_pages.alloc_kdmap(Self::THREAD_STACK_LAYOUT)
-            .ok_or_else(|| { error!("failed to allocate new thread stack"); })
+        self.kernel_pages
+            .alloc_kdmap(Self::THREAD_STACK_LAYOUT)
+            .ok_or_else(|| {
+                error!("failed to allocate new thread stack");
+            })
     }
 
     /// Allocate a user thread stack. `user_pages` has no KDMAP alias in
     /// the kernel satp — setup-time zeroing goes through `UserPageWindow`.
-    fn allocate_user_thread_stack(&mut self, stack_size: u64) -> Result<(Frame<UserOnly>, Layout), ()> {
+    fn allocate_user_thread_stack(
+        &mut self,
+        stack_size: u64,
+    ) -> Result<(Frame<UserOnly>, Layout), ()> {
         let layout = Layout::from_size_align(stack_size as usize, UPROC_STACK_GRAIN as usize)
             .map_err(|e| {
                 error!("bad user stack layout for size={stack_size}: {e:?}");
             })?;
-        let frame = self.user_pages.alloc_pa(layout)
-            .ok_or_else(|| {
-                error!("failed to allocate user thread stack size={stack_size}");
-            })?;
+        let frame = self.user_pages.alloc_pa(layout).ok_or_else(|| {
+            error!("failed to allocate user thread stack size={stack_size}");
+        })?;
 
         // Zero before the PTE install exposes the stack to user code — the
         // page may have been returned by a previous process.
@@ -630,15 +633,21 @@ impl Orbit {
 
     /// Allocate a trap-frame page (Shared pool, kernel-writable via KDMAP).
     fn allocate_trap_frame(&mut self) -> Result<(Frame<Shared>, memmap::KdmapVa), ()> {
-        self.kernel_pages.alloc_kdmap(Self::THREAD_TRAP_FRAME_LAYOUT)
-            .ok_or_else(|| { error!("failed to allocate new trap frame"); })
+        self.kernel_pages
+            .alloc_kdmap(Self::THREAD_TRAP_FRAME_LAYOUT)
+            .ok_or_else(|| {
+                error!("failed to allocate new trap frame");
+            })
     }
 
     /// Allocate a fresh page table from `table_pages` and return a
     /// `RootTable` view on it. The page is zeroed before handoff.
-    fn create_new_page_table(&mut self) -> Result<(Frame<process::Table>, mmu::mmap::RootTable<'static>), ()> {
-        let (frame, kva) = self.table_pages.alloc(Self::TABLE_LAYOUT)
-            .ok_or_else(|| { error!("failed to allocate new page table"); })?;
+    fn create_new_page_table(
+        &mut self,
+    ) -> Result<(Frame<process::Table>, mmu::mmap::RootTable<'static>), ()> {
+        let (frame, kva) = self.table_pages.alloc(Self::TABLE_LAYOUT).ok_or_else(|| {
+            error!("failed to allocate new page table");
+        })?;
         unsafe {
             core::ptr::write_bytes(kva.as_mut_ptr::<u8>(), 0, PAGE_SIZE);
             let table = kva.as_ptr::<PageTable>().as_ref_unchecked();
@@ -651,20 +660,32 @@ impl Orbit {
     /// to a single hart, future capability-style child processes) override
     /// at construction.
     pub fn all_harts_mask(&self) -> u64 {
-        if self.cpu_count >= 64 { u64::MAX } else { (1u64 << self.cpu_count) - 1 }
+        if self.cpu_count >= 64 {
+            u64::MAX
+        }
+        else {
+            (1u64 << self.cpu_count) - 1
+        }
     }
 
-    pub fn create_kernel_thread(&mut self, entrypoint: usize, a0: Option<usize>) -> Result<u32, ()> {        
+    pub fn create_kernel_thread(
+        &mut self,
+        entrypoint: usize,
+        a0: Option<usize>,
+    ) -> Result<u32, ()> {
         let (stack_frame, stack_kva) = self.allocate_thread_stack()?;
+        let stack_pa = stack_frame.raw();
 
-        let (_trap_frame_frame, trap_frame_kva) = match self.allocate_trap_frame() {
+        let (trap_frame_frame, trap_frame_kva) = match self.allocate_trap_frame() {
             Ok(p) => p,
             Err(_) => {
-                self.kernel_pages.free(stack_frame, Self::THREAD_STACK_LAYOUT);
+                self.kernel_pages
+                    .free(stack_frame, Self::THREAD_STACK_LAYOUT);
                 error!("failed to alloc trap_frame for kthread");
-                return Err(())
+                return Err(());
             }
         };
+        let trap_frame_pa = trap_frame_frame.raw();
 
         let pid = 0;
         let tid = self.next_tid();
@@ -676,10 +697,7 @@ impl Orbit {
             let s = stack_kva.as_mut_ptr::<Stack>();
             core::ptr::write_bytes(s as *mut u8, 0, 2 * MB as usize);
 
-            (
-                f.as_mut_unchecked(),
-                s.as_mut_unchecked()
-            )
+            (f.as_mut_unchecked(), s.as_mut_unchecked())
         };
 
         frame.regs[1] = entrypoint;
@@ -692,10 +710,13 @@ impl Orbit {
             pc: AtomicUsize::new(entrypoint),
             satp: self.satp,
             mode: SPP::Supervisor,
-            tid, pid,
+            tid,
+            pid,
             ticks: 0,
             frame,
             stack,
+            kernel_stack_pa: Some(stack_pa),
+            kernel_trap_frame_pa: Some(trap_frame_pa),
             state: AtomicUsize::new(ThreadState::Ready as usize),
             wake_time: 0,
             wake_override: AtomicU64::new(0),
@@ -757,8 +778,9 @@ impl Orbit {
         // Private mmaps go to user_pages; kernel has no long-lived alias.
         // The two branches produce different typed frames — normalize to
         // (backing_pa_raw, PhysBacking) at the end.
-        let (backing_pa_raw, backing) = if req.share_with_kernel {
-            let Some(frame) = self.kernel_pages.alloc_pa(layout) else {
+        let (backing_pa, backing) = if req.share_with_kernel {
+            let Some(frame) = self.kernel_pages.alloc_pa(layout)
+            else {
                 error!("failed to alloc shared pages for mmap req: {req:?}");
                 return Errno::new(ENOMEM).to_ret();
             };
@@ -768,9 +790,11 @@ impl Orbit {
                 let kva = frame.to_kdmap();
                 core::ptr::write_bytes(kva.as_mut_ptr::<u8>(), 0, layout.size());
             }
-            (frame.get_raw(), PhysBacking::Shared { frame, layout })
-        } else {
-            let Some(frame) = self.user_pages.alloc_pa(layout) else {
+            (frame.raw(), PhysBacking::Shared { frame, layout })
+        }
+        else {
+            let Some(frame) = self.user_pages.alloc_pa(layout)
+            else {
                 error!("failed to alloc user pages for mmap req: {req:?}");
                 return Errno::new(ENOMEM).to_ret();
             };
@@ -780,12 +804,13 @@ impl Orbit {
                 let mut w = user_page::UserPageWindow::map(frame.get_raw(), layout.size());
                 w.as_mut_slice().fill(0);
             }
-            (frame.get_raw(), PhysBacking::User { frame, layout })
+            (frame.raw(), PhysBacking::User { frame, layout })
         };
 
         let supervisor_tag = if req.share_with_kernel {
             SupervisorTag::SharedRevocable
-        } else {
+        }
+        else {
             SupervisorTag::None
         };
 
@@ -794,13 +819,13 @@ impl Orbit {
             levels,
             page_size: align as u64,
             vaddr: VirtAddr::new(req.vaddr.raw()),
-            paddr: PhysAddr::new(backing_pa_raw),
+            paddr: backing_pa,
             log: false,
-            supervisor_tag
+            supervisor_tag,
         };
 
         let vend = VirtAddr::new(req.vaddr.raw() + req.size as u64);
-        let pend = PhysAddr::new(backing_pa_raw + req.size as u64);
+        let pend = PhysAddr::new(backing_pa.get_raw() + req.size as u64);
 
         unsafe {
             let root_table = memmap::kernel_root_from_pa(root_pa);
@@ -834,7 +859,7 @@ impl Orbit {
         riscv::asm::sfence_vma(pid as usize, req.vaddr.raw() as usize);
         crate::kernel::shootdown::broadcast(0, 0);
 
-        info!("fulfilled {req:?}:\n\tpa=0x{backing_pa_raw:016X} {layout:08X?}");
+        info!("fulfilled {req:?}:\n\tpa={backing_pa:016X?} {layout:08X?}");
 
         0
     }
@@ -843,17 +868,23 @@ impl Orbit {
     fn free_backing(&mut self, backing: PhysBacking) {
         match backing {
             PhysBacking::Shared { frame, layout } => self.kernel_pages.free(frame, layout),
-            PhysBacking::User   { frame, layout } => self.user_pages.free(frame, layout),
+            PhysBacking::User { frame, layout } => self.user_pages.free(frame, layout),
         }
     }
 
     /// Run an enqueued NetChannel creation. Returns `(vaddr, fd)` on
     /// success — the manager forwards both via `signal_pair`. Negative
     /// `vaddr` on the error path; `fd` is unused in that case.
-    fn run_nc_create_req(&mut self, req: NetChannelCreationReq, pid: u16, root_pa: PhysAddr) -> (isize, isize) {
+    fn run_nc_create_req(
+        &mut self,
+        req: NetChannelCreationReq,
+        pid: u16,
+        root_pa: PhysAddr,
+    ) -> (isize, isize) {
         info!("handling nc creation req: {req:08X?}");
 
-        let Some(region_size) = NetChannel::normalize_region_size(req.region_size) else {
+        let Some(region_size) = NetChannel::normalize_region_size(req.region_size)
+        else {
             warn!("nc create: bad region_size {}", req.region_size);
             return (Errno::new(EINVAL).to_ret(), 0);
         };
@@ -873,7 +904,8 @@ impl Orbit {
 
         // NetChannel lives in kpages (Shared pool) so the kernel can drive
         // smoltcp through the KDMAP alias after creation.
-        let Some((frame, kva)) = self.kernel_pages.alloc_kdmap(layout) else {
+        let Some((frame, kva)) = self.kernel_pages.alloc_kdmap(layout)
+        else {
             warn!("nc create: alloc failed for {} bytes", region_size);
             return (Errno::new(ENOMEM).to_ret(), 0);
         };
@@ -921,15 +953,16 @@ impl Orbit {
         // `proc.heap_pages`, which would double-free on teardown. The
         // Arc's last drop pushes to `pending_frees`; the manager returns
         // it to `kernel_pages` during cleanup.
-        let shared: SharedUserPtr<NetChannel> = SharedUserPtr::new(
-            frame, layout, req.nc_vaddr, region_size, pid);
+        let shared: SharedUserPtr<NetChannel> =
+            SharedUserPtr::new(frame, layout, req.nc_vaddr, region_size, pid);
 
         // Register the manager's strong ref and grab the Fd. Return it
         // to the user in a1 alongside the VA in a0 — avoids taking a
         // user out-pointer, which would have to resolve through KDMAP
         // (Shared-pool only) or a transient UserPageWindow, neither of
         // which is worth the machinery for 4 bytes.
-        let fd = self.process_handles
+        let fd = self
+            .process_handles
             .entry(pid)
             .or_insert_with(ProcessHandles::new)
             .insert(Handle::NetChannel(shared.clone()));
@@ -948,15 +981,24 @@ impl Orbit {
             ctx: net_channel::ChannelCtx::new(req.bind),
         };
 
-        if let Some(np) = self.net_pkg.socket_reqs.get_mut(get_hart_context().hart_id as usize) {
+        if let Some(np) = self
+            .net_pkg
+            .socket_reqs
+            .get_mut(get_hart_context().hart_id as usize)
+        {
             if let Err(e) = np.enqueue(socket_req) {
                 warn!("nc create: failed to queue socket req {e:?}");
                 return (Errno::new(EAGAIN).to_ret(), 0);
             }
         }
 
-        info!("nc created user_va=0x{:08X} kva=0x{:016X} region={} fd={}",
-            req.nc_vaddr, kva.raw(), region_size, fd);
+        info!(
+            "nc created user_va=0x{:08X} kva=0x{:016X} region={} fd={}",
+            req.nc_vaddr,
+            kva.raw(),
+            region_size,
+            fd
+        );
         (req.nc_vaddr.raw() as isize, fd as isize)
     }
 
@@ -969,10 +1011,12 @@ impl Orbit {
         // faults, and `try_as_ref` returns None for future kernel
         // observers — close is safe to race against an in-flight
         // update_tcp on another hart.
-        let Some(ph) = self.process_handles.get_mut(&pid) else {
+        let Some(ph) = self.process_handles.get_mut(&pid)
+        else {
             return Errno::new(EBADF).to_ret();
         };
-        let Some(handle) = ph.remove(req.fd) else {
+        let Some(handle) = ph.remove(req.fd)
+        else {
             return Errno::new(EBADF).to_ret();
         };
 
@@ -981,8 +1025,10 @@ impl Orbit {
         match &handle {
             Handle::NetChannel(sup) => {
                 if let Err(e) = sup.revoke(&root_table) {
-                    warn!("close_handle: revoke failed for fd={} sup={sup:?}: {e:?}",
-                        req.fd);
+                    warn!(
+                        "close_handle: revoke failed for fd={} sup={sup:?}: {e:?}",
+                        req.fd
+                    );
                     return Errno::new(EIO).to_ret();
                 }
             }
@@ -1017,15 +1063,12 @@ impl Orbit {
             let page_base = cursor & !(PAGE_SIZE as u64 - 1);
             let page_off = (cursor - page_base) as usize;
             let take = core::cmp::min(PAGE_SIZE - page_off, len - copied);
-            let pa = unsafe {
-                mmu::mmap::virt_to_phys(&root_table, VirtAddr::new(page_base))
-            }
-            .ok_or(Errno::new(EFAULT).to_ret())?;
+            let pa = unsafe { mmu::mmap::virt_to_phys(&root_table, VirtAddr::new(page_base)) }
+                .ok_or(Errno::new(EFAULT).to_ret())?;
             unsafe {
                 let mut w = user_page::UserPageWindow::map(pa as u64, PAGE_SIZE);
                 let page = w.as_mut_slice();
-                out[copied..copied + take]
-                    .copy_from_slice(&page[page_off..page_off + take]);
+                out[copied..copied + take].copy_from_slice(&page[page_off..page_off + take]);
             }
             copied += take;
         }
@@ -1033,15 +1076,17 @@ impl Orbit {
     }
 
     fn run_fs_open_req(&mut self, req: FsOpenReq, pid: u16, root_pa: PhysAddr) -> isize {
-        let Some(fs) = crate::kernel::fs::mounted() else {
+        let Some(fs) = crate::kernel::fs::mounted()
+        else {
             warn!("fs_open: no mounted filesystem");
             return Errno::new(EIO).to_ret();
         };
         let mut path_buf = [0u8; MAX_FS_PATH_LEN];
-        let path = match self.copy_user_path(root_pa, req.path_vaddr.raw(), req.path_len, &mut path_buf) {
-            Ok(p) => p,
-            Err(e) => return e,
-        };
+        let path =
+            match self.copy_user_path(root_pa, req.path_vaddr.raw(), req.path_len, &mut path_buf) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
         let inode = match fs.open(path) {
             Ok(i) => i,
             Err(FsErr::NotFound) => return Errno::new(orbit_abi::errno::ENOENT).to_ret(),
@@ -1078,13 +1123,16 @@ impl Orbit {
         const SECTOR: u64 = 512;
 
         // Look up the file handle and snapshot what we need.
-        let Some(ph) = self.process_handles.get_mut(&pid) else {
+        let Some(ph) = self.process_handles.get_mut(&pid)
+        else {
             return Some(Errno::new(EBADF).to_ret());
         };
-        let Some(handle_ref) = ph.get_mut(req.fd) else {
+        let Some(handle_ref) = ph.get_mut(req.fd)
+        else {
             return Some(Errno::new(EBADF).to_ret());
         };
-        let Handle::File(of) = handle_ref else {
+        let Handle::File(of) = handle_ref
+        else {
             return Some(Errno::new(EBADF).to_ret());
         };
         let fs = of.fs;
@@ -1111,12 +1159,11 @@ impl Orbit {
         let root_table = unsafe { memmap::kernel_root_from_pa(root_pa) };
         let page_base = buf_va & !(PAGE_SIZE as u64 - 1);
         let page_off = buf_va - page_base;
-        let page_pa = match unsafe {
-            mmu::mmap::virt_to_phys(&root_table, VirtAddr::new(page_base))
-        } {
-            Some(p) => p as u64,
-            None => return Some(Errno::new(EFAULT).to_ret()),
-        };
+        let page_pa =
+            match unsafe { mmu::mmap::virt_to_phys(&root_table, VirtAddr::new(page_base)) } {
+                Some(p) => p as u64,
+                None => return Some(Errno::new(EFAULT).to_ret()),
+            };
         let buf_pa = page_pa + page_off;
 
         // Commit-then-submit: advance the offset before submission so
@@ -1148,14 +1195,16 @@ impl Orbit {
     }
 
     fn run_fs_stat_req(&mut self, req: FsStatReq, pid: u16, root_pa: PhysAddr) -> isize {
-        let Some(fs) = crate::kernel::fs::mounted() else {
+        let Some(fs) = crate::kernel::fs::mounted()
+        else {
             return Errno::new(EIO).to_ret();
         };
         let mut path_buf = [0u8; MAX_FS_PATH_LEN];
-        let path = match self.copy_user_path(root_pa, req.path_vaddr.raw(), req.path_len, &mut path_buf) {
-            Ok(p) => p,
-            Err(e) => return e,
-        };
+        let path =
+            match self.copy_user_path(root_pa, req.path_vaddr.raw(), req.path_len, &mut path_buf) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
         let inode = match fs.open(path) {
             Ok(i) => i,
             Err(FsErr::NotFound) => return Errno::new(orbit_abi::errno::ENOENT).to_ret(),
@@ -1182,18 +1231,20 @@ impl Orbit {
         let root_table = unsafe { memmap::kernel_root_from_pa(root_pa) };
         let page_base = stat_va & !(PAGE_SIZE as u64 - 1);
         let page_off = (stat_va - page_base) as usize;
-        let page_pa = match unsafe {
-            mmu::mmap::virt_to_phys(&root_table, VirtAddr::new(page_base))
-        } {
-            Some(p) => p as u64,
-            None => return Errno::new(EFAULT).to_ret(),
-        };
+        let page_pa =
+            match unsafe { mmu::mmap::virt_to_phys(&root_table, VirtAddr::new(page_base)) } {
+                Some(p) => p as u64,
+                None => return Errno::new(EFAULT).to_ret(),
+            };
         unsafe {
             let mut w = user_page::UserPageWindow::map(page_pa, PAGE_SIZE);
             let page = w.as_mut_slice();
             page[page_off..page_off + stat_bytes.len()].copy_from_slice(stat_bytes);
         }
-        info!("fs_stat: pid={pid} path={path} ino={inode} size={}", stat.st_size);
+        info!(
+            "fs_stat: pid={pid} path={path} ino={inode} size={}",
+            stat.st_size
+        );
         0
     }
 
@@ -1210,13 +1261,16 @@ impl Orbit {
         // drop the &mut on `process_handles` before the page-window
         // map (which doesn't borrow the handle table, but keeping the
         // borrow scope tight is consistent with run_fs_read_req).
-        let Some(ph) = self.process_handles.get_mut(&pid) else {
+        let Some(ph) = self.process_handles.get_mut(&pid)
+        else {
             return Errno::new(EBADF).to_ret();
         };
-        let Some(handle_ref) = ph.get_mut(req.fd) else {
+        let Some(handle_ref) = ph.get_mut(req.fd)
+        else {
             return Errno::new(EBADF).to_ret();
         };
-        let Handle::File(of) = handle_ref else {
+        let Handle::File(of) = handle_ref
+        else {
             return Errno::new(EBADF).to_ret();
         };
         let fs = of.fs;
@@ -1231,12 +1285,11 @@ impl Orbit {
         let root_table = unsafe { memmap::kernel_root_from_pa(root_pa) };
         let page_base = buf_va & !(PAGE_SIZE as u64 - 1);
         let page_off = (buf_va - page_base) as usize;
-        let page_pa = match unsafe {
-            mmu::mmap::virt_to_phys(&root_table, VirtAddr::new(page_base))
-        } {
-            Some(p) => p as u64,
-            None => return Errno::new(EFAULT).to_ret(),
-        };
+        let page_pa =
+            match unsafe { mmu::mmap::virt_to_phys(&root_table, VirtAddr::new(page_base)) } {
+                Some(p) => p as u64,
+                None => return Errno::new(EFAULT).to_ret(),
+            };
 
         // Pack into the user page directly. UserPageWindow gives us a
         // kernel-mapped alias for the user's frame; we slice the
@@ -1304,12 +1357,14 @@ impl Orbit {
             let page_base = cursor & !(PAGE_SIZE as u64 - 1);
             let page_off = (cursor - page_base) as usize;
             let take = core::cmp::min(PAGE_SIZE - page_off, (elf_len - copied) as usize);
-            let pa = match unsafe {
-                mmu::mmap::virt_to_phys(&root_table, VirtAddr::new(page_base))
-            } {
+            let pa = match unsafe { mmu::mmap::virt_to_phys(&root_table, VirtAddr::new(page_base)) }
+            {
                 Some(p) => p as u64,
                 None => {
-                    error!("create_process_ex: elf user va 0x{:X} does not translate", page_base);
+                    error!(
+                        "create_process_ex: elf user va 0x{:X} does not translate",
+                        page_base
+                    );
                     return Errno::new(EFAULT).to_ret();
                 }
             };
@@ -1331,15 +1386,18 @@ impl Orbit {
                 let page_base = cursor & !(PAGE_SIZE as u64 - 1);
                 let page_off = (cursor - page_base) as usize;
                 let take = core::cmp::min(PAGE_SIZE - page_off, (argv_len - argv_copied) as usize);
-                let pa = match unsafe {
-                    mmu::mmap::virt_to_phys(&root_table, VirtAddr::new(page_base))
-                } {
-                    Some(p) => p as u64,
-                    None => {
-                        error!("create_process_ex: argv va 0x{:X} does not translate", page_base);
-                        return Errno::new(EFAULT).to_ret();
-                    }
-                };
+                let pa =
+                    match unsafe { mmu::mmap::virt_to_phys(&root_table, VirtAddr::new(page_base)) }
+                    {
+                        Some(p) => p as u64,
+                        None => {
+                            error!(
+                                "create_process_ex: argv va 0x{:X} does not translate",
+                                page_base
+                            );
+                            return Errno::new(EFAULT).to_ret();
+                        }
+                    };
                 unsafe {
                     let mut w = user_page::UserPageWindow::map(pa, PAGE_SIZE);
                     let page = w.as_mut_slice();
@@ -1348,7 +1406,8 @@ impl Orbit {
                 argv_copied += take as u64;
             }
             Some(buf)
-        } else {
+        }
+        else {
             None
         };
 
@@ -1373,14 +1432,25 @@ impl Orbit {
                 buf.extend_from_slice(w.as_mut_slice());
             }
             Some(buf)
-        } else {
+        }
+        else {
             None
         };
 
         // Affinity validation, identical to run_create_process_req.
         let all_harts = self.all_harts_mask();
-        let allowed = if req.allowed_affinity == 0 { all_harts } else { req.allowed_affinity };
-        let affinity = if req.affinity == 0 { allowed } else { req.affinity };
+        let allowed = if req.allowed_affinity == 0 {
+            all_harts
+        }
+        else {
+            req.allowed_affinity
+        };
+        let affinity = if req.affinity == 0 {
+            allowed
+        }
+        else {
+            req.affinity
+        };
         if allowed & !all_harts != 0 || affinity & !allowed != 0 || affinity == 0 {
             error!("create_process_ex: affinity validation failed");
             return Errno::new(EINVAL).to_ret();
@@ -1394,7 +1464,7 @@ impl Orbit {
             parent_pid,
             argv_bytes: argv_bytes.as_deref(),
             envp_bytes: envp_bytes.as_deref(),
-            perms: None
+            perms: None,
         };
 
         let pid = match self.create_new_process(proc_components) {
@@ -1423,12 +1493,7 @@ impl Orbit {
     /// translate; `-ESRCH` if the process record vanished mid-flight
     /// (defensive — can't happen on the live path since the caller
     /// is one of the process's threads).
-    fn run_pledge_req(
-        &mut self,
-        req: orbit_core::PledgeReq,
-        pid: u16,
-        root_pa: PhysAddr,
-    ) -> isize {
+    fn run_pledge_req(&mut self, req: orbit_core::PledgeReq, pid: u16, root_pa: PhysAddr) -> isize {
         use orbit_abi::perms::PermsRequest;
 
         let root_table = unsafe { memmap::kernel_root_from_pa(root_pa) };
@@ -1440,9 +1505,7 @@ impl Orbit {
         // already enforced 8-byte alignment.
         let page_base = req.req_vaddr.raw() & !(PAGE_SIZE as u64 - 1);
         let page_off = (req.req_vaddr.raw() - page_base) as usize;
-        let pa = match unsafe {
-            mmu::mmap::virt_to_phys(&root_table, VirtAddr::new(page_base))
-        } {
+        let pa = match unsafe { mmu::mmap::virt_to_phys(&root_table, VirtAddr::new(page_base)) } {
             Some(p) => p as u64,
             None => {
                 error!("pledge: req va 0x{:X} does not translate", req.req_vaddr);
@@ -1474,7 +1537,9 @@ impl Orbit {
             proc.permissions
         };
 
-        let tids: alloc::vec::Vec<u32> = self.processes.get(&pid)
+        let tids: alloc::vec::Vec<u32> = self
+            .processes
+            .get(&pid)
             .map(|p| p.threads.iter().copied().collect())
             .unwrap_or_default();
         for tid in tids {
@@ -1501,7 +1566,7 @@ impl Orbit {
     ) -> isize {
         use orbit_abi::denial::{DenialEvent, DenialSink};
         use orbit_abi::perms::CreateProcessV2Args;
-        use orbit_core::roles::{check_transition, derive_child_perms, deny_reason_code};
+        use orbit_core::roles::{check_transition, deny_reason_code, derive_child_perms};
 
         const MAX_ELF_BYTES: usize = 4 * 1024 * 1024;
 
@@ -1511,15 +1576,17 @@ impl Orbit {
         // check at the syscall boundary guarantees no straddle).
         let args_page_base = req.args_vaddr.raw() & !(PAGE_SIZE as u64 - 1);
         let args_page_off = (req.args_vaddr.raw() - args_page_base) as usize;
-        let args_pa = match unsafe {
-            mmu::mmap::virt_to_phys(&root_table, VirtAddr::new(args_page_base))
-        } {
-            Some(p) => p as u64,
-            None => {
-                error!("create_process_v2: args va 0x{:X} does not translate", req.args_vaddr);
-                return Errno::new(EFAULT).to_ret();
-            }
-        };
+        let args_pa =
+            match unsafe { mmu::mmap::virt_to_phys(&root_table, VirtAddr::new(args_page_base)) } {
+                Some(p) => p as u64,
+                None => {
+                    error!(
+                        "create_process_v2: args va 0x{:X} does not translate",
+                        req.args_vaddr
+                    );
+                    return Errno::new(EFAULT).to_ret();
+                }
+            };
         let args: CreateProcessV2Args = unsafe {
             let mut w = user_page::UserPageWindow::map(args_pa, PAGE_SIZE);
             let page = w.as_mut_slice();
@@ -1532,7 +1599,7 @@ impl Orbit {
         }
 
         if !user_range_ok(args.elf_vaddr as u64, args.elf_len as u64) {
-            return Errno::new(EFAULT).to_ret()
+            return Errno::new(EFAULT).to_ret();
         }
 
         // Snapshot the parent's permissions for the gate. `Permissions`
@@ -1553,9 +1620,7 @@ impl Orbit {
         // bump the parent's counter, return -EPERM.
         let request = args.request();
         let child_perms = match check_transition(parent_perms.role, args.target_role) {
-            Ok(transition) => {
-                derive_child_perms(&parent_perms, transition, request)
-            }
+            Ok(transition) => derive_child_perms(&parent_perms, transition, request),
             Err(spawn_deny) => {
                 // The calling tid isn't carried in PendingWork — for
                 // audit logging the parent pid is the actionable
@@ -1591,7 +1656,10 @@ impl Orbit {
             } {
                 Some(p) => p as u64,
                 None => {
-                    error!("create_process_v2: elf va 0x{:X} does not translate", page_base);
+                    error!(
+                        "create_process_v2: elf va 0x{:X} does not translate",
+                        page_base
+                    );
                     return Errno::new(EFAULT).to_ret();
                 }
             };
@@ -1605,8 +1673,18 @@ impl Orbit {
 
         // Affinity validation, identical to run_create_process_req.
         let all_harts = self.all_harts_mask();
-        let allowed = if args.allowed_affinity == 0 { all_harts } else { args.allowed_affinity };
-        let affinity = if args.affinity == 0 { allowed } else { args.affinity };
+        let allowed = if args.allowed_affinity == 0 {
+            all_harts
+        }
+        else {
+            args.allowed_affinity
+        };
+        let affinity = if args.affinity == 0 {
+            allowed
+        }
+        else {
+            args.affinity
+        };
         if allowed & !all_harts != 0 || affinity & !allowed != 0 || affinity == 0 {
             error!("create_process_v2: affinity validation failed");
             return Errno::new(EINVAL).to_ret();
@@ -1620,7 +1698,7 @@ impl Orbit {
             parent_pid,
             argv_bytes: None,
             envp_bytes: None,
-            perms: None
+            perms: None,
         };
 
         let child_pid = match self.create_new_process(proc_components) {
@@ -1643,7 +1721,9 @@ impl Orbit {
             proc.install_child(child_perms);
         }
         let perms_snapshot = child_perms.permissions();
-        let tids: alloc::vec::Vec<u32> = self.processes.get(&child_pid)
+        let tids: alloc::vec::Vec<u32> = self
+            .processes
+            .get(&child_pid)
             .map(|p| p.threads.iter().copied().collect())
             .unwrap_or_default();
         for tid in tids {
@@ -1716,7 +1796,10 @@ impl Orbit {
         let argc = u32::from_le_bytes([blob[0], blob[1], blob[2], blob[3]]) as usize;
         let strings_off = ARGV_OFFSETS_OFFSET + argc * core::mem::size_of::<u64>();
         if strings_off > blob.len() {
-            error!("install_{tag}_blob: argc={argc} overflows blob len={}", blob.len());
+            error!(
+                "install_{tag}_blob: argc={argc} overflows blob len={}",
+                blob.len()
+            );
             return Err(());
         }
 
@@ -1753,17 +1836,14 @@ impl Orbit {
         let proc = self.processes.get(&pid).ok_or(())?;
         let proc_root_pa = PhysAddr::from(proc.satp);
         let proc_root_table = unsafe { memmap::kernel_root_from_pa(proc_root_pa) };
-        let blob_pa = match &backing {
-            process::PhysBacking::Shared { frame, .. } => frame.get_raw(),
-            process::PhysBacking::User { frame, .. } => frame.get_raw(),
-        };
+        let blob_pa = backing.pa();
 
         let config = MappingConfig {
             permissions: PagePermissions::R | PagePermissions::U,
             levels: 4,
             page_size: PAGE_SIZE as u64,
             vaddr: VirtAddr::new(target_va),
-            paddr: PhysAddr::new(blob_pa),
+            paddr: blob_pa,
             log: false,
             // No SharedRevocable tag — the page is freed via
             // dealloc_process when the process exits, not via
@@ -1772,9 +1852,11 @@ impl Orbit {
             supervisor_tag: SupervisorTag::None,
         };
         let vend = VirtAddr::new(target_va + PAGE_SIZE as u64);
-        let pend = PhysAddr::new(blob_pa + PAGE_SIZE as u64);
+        let pend = PhysAddr::new(blob_pa.get_raw() + PAGE_SIZE as u64);
         let mut pages = PageAlloc::FA(self.table_pages.frames_mut());
-        if let Err(_) = unsafe { map_address_range(&proc_root_table, &mut pages, &config, vend, pend) } {
+        if let Err(_) =
+            unsafe { map_address_range(&proc_root_table, &mut pages, &config, vend, pend) }
+        {
             error!("install_{tag}_blob: map_address_range failed");
             self.free_backing(backing);
             return Err(());
@@ -1808,7 +1890,8 @@ impl Orbit {
             return;
         }
 
-        let Some(target) = self.processes.get_mut(&req.target_pid) else {
+        let Some(target) = self.processes.get_mut(&req.target_pid)
+        else {
             // Never existed (or exited and the parent's already gone
             // / wasn't tracked) — POSIX surfaces this as ECHILD.
             handle.signal_pair(Errno::new(orbit_abi::errno::ECHILD).to_ret(), 0);
@@ -1850,15 +1933,14 @@ impl Orbit {
         handle: process::CompletionHandle,
     ) {
         let root_table = unsafe { memmap::kernel_root_from_pa(root_pa) };
-        let pa = match unsafe {
-            mmu::mmap::virt_to_phys(&root_table, VirtAddr::new(req.uaddr.raw()))
-        } {
-            Some(p) => p as u64,
-            None => {
-                handle.signal(Errno::new(EFAULT).to_ret());
-                return;
-            }
-        };
+        let pa =
+            match unsafe { mmu::mmap::virt_to_phys(&root_table, VirtAddr::new(req.uaddr.raw())) } {
+                Some(p) => p as u64,
+                None => {
+                    handle.signal(Errno::new(EFAULT).to_ret());
+                    return;
+                }
+            };
         // Read `*uaddr` through a transient KSCRATCH window. user_pages
         // has no KDMAP alias under the kernel satp (kernel only KDMAPs
         // its own pools), so a direct deref of `phys_to_kdmap(pa)`
@@ -1901,15 +1983,14 @@ impl Orbit {
         handle: process::CompletionHandle,
     ) {
         let root_table = unsafe { memmap::kernel_root_from_pa(root_pa) };
-        let pa = match unsafe {
-            mmu::mmap::virt_to_phys(&root_table, VirtAddr::new(req.uaddr.raw()))
-        } {
-            Some(p) => p as u64,
-            None => {
-                handle.signal(Errno::new(EFAULT).to_ret());
-                return;
-            }
-        };
+        let pa =
+            match unsafe { mmu::mmap::virt_to_phys(&root_table, VirtAddr::new(req.uaddr.raw())) } {
+                Some(p) => p as u64,
+                None => {
+                    handle.signal(Errno::new(EFAULT).to_ret());
+                    return;
+                }
+            };
         let n_woken = match self.futex_waiters.get_mut(&pa) {
             Some(waiters) => {
                 let take = core::cmp::min(req.n as usize, waiters.len());
@@ -1931,7 +2012,12 @@ impl Orbit {
         trace!("futex_wake: pa={pa:#x} requested={} woke={n_woken}", req.n);
     }
 
-    fn run_create_thread_req(&mut self, req: CreateThreadReq, pid: u16, parent_allowed: u64) -> isize {
+    fn run_create_thread_req(
+        &mut self,
+        req: CreateThreadReq,
+        pid: u16,
+        parent_allowed: u64,
+    ) -> isize {
         info!("handling create_thread req: {req:?} pid={pid} parent_allowed={parent_allowed:#x}");
 
         let all_harts = self.all_harts_mask();
@@ -1939,14 +2025,26 @@ impl Orbit {
         // Default for `allowed_affinity` is the parent's cap (so children
         // inherit the family reach); default for `affinity` follows the
         // resolved `allowed_affinity`.
-        let allowed = if req.allowed_affinity == 0 { parent_allowed } else { req.allowed_affinity };
-        let affinity = if req.affinity == 0 { allowed } else { req.affinity };
+        let allowed = if req.allowed_affinity == 0 {
+            parent_allowed
+        }
+        else {
+            req.allowed_affinity
+        };
+        let affinity = if req.affinity == 0 {
+            allowed
+        }
+        else {
+            req.affinity
+        };
 
         // Capability-style check: a thread can't claim reach the parent
         // doesn't have. Bits-beyond-cpu_count surfaces here too because
         // parent_allowed is itself a subset of all_harts.
         if allowed & !parent_allowed != 0 {
-            error!("create_thread: requested allowed={allowed:#x} escapes parent={parent_allowed:#x}");
+            error!(
+                "create_thread: requested allowed={allowed:#x} escapes parent={parent_allowed:#x}"
+            );
             return Errno::new(EPERM).to_ret();
         }
         if affinity & !allowed != 0 || affinity == 0 || allowed & !all_harts != 0 {
@@ -1966,7 +2064,12 @@ impl Orbit {
         // the current max + 1 — close enough for diagnostics; the real
         // tid is read off the registry below on success.
         match self.add_new_thread_to_process(
-            pid, req.entry.raw() as usize, UPROC_STACK_DEFAULT, allowed, affinity, req.arg,
+            pid,
+            req.entry.raw() as usize,
+            UPROC_STACK_DEFAULT,
+            allowed,
+            affinity,
+            req.arg,
         ) {
             Ok(()) => {
                 // Find the most-recently-inserted thread for this pid:
@@ -1980,8 +2083,10 @@ impl Orbit {
                         return Errno::new(EAGAIN).to_ret();
                     }
                 };
-                info!("create_thread: spawned tid={new_tid} in pid={pid} \
-                    allowed={allowed:#x} affinity={affinity:#x}");
+                info!(
+                    "create_thread: spawned tid={new_tid} in pid={pid} \
+                    allowed={allowed:#x} affinity={affinity:#x}"
+                );
                 new_tid as isize
             }
             Err(()) => {
@@ -1991,7 +2096,12 @@ impl Orbit {
         }
     }
 
-    fn run_create_process_req(&mut self, req: CreateProcessReq, parent_pid: u16, root_pa: PhysAddr) -> isize {
+    fn run_create_process_req(
+        &mut self,
+        req: CreateProcessReq,
+        parent_pid: u16,
+        root_pa: PhysAddr,
+    ) -> isize {
         info!("handling create_process req: {req:?}");
 
         // Dev-loop safety cap. Well above any realistic test ELF but small
@@ -2018,12 +2128,14 @@ impl Orbit {
             let page_off = (cursor - page_base) as usize;
             let take = core::cmp::min(PAGE_SIZE - page_off, (elf_len - copied) as usize);
 
-            let pa = match unsafe {
-                mmu::mmap::virt_to_phys(&root_table, VirtAddr::new(page_base))
-            } {
+            let pa = match unsafe { mmu::mmap::virt_to_phys(&root_table, VirtAddr::new(page_base)) }
+            {
                 Some(p) => p as u64,
                 None => {
-                    error!("create_process: user va 0x{:X} does not translate", page_base);
+                    error!(
+                        "create_process: user va 0x{:X} does not translate",
+                        page_base
+                    );
                     return Errno::new(EFAULT).to_ret();
                 }
             };
@@ -2045,11 +2157,23 @@ impl Orbit {
         // caller learns rather than getting a different mask than they
         // asked for.
         let all_harts = self.all_harts_mask();
-        let allowed = if req.allowed_affinity == 0 { all_harts } else { req.allowed_affinity };
-        let affinity = if req.affinity == 0 { allowed } else { req.affinity };
+        let allowed = if req.allowed_affinity == 0 {
+            all_harts
+        }
+        else {
+            req.allowed_affinity
+        };
+        let affinity = if req.affinity == 0 {
+            allowed
+        }
+        else {
+            req.affinity
+        };
         if allowed & !all_harts != 0 || affinity & !allowed != 0 || affinity == 0 {
-            error!("create_process: affinity validation failed: \
-                allowed={allowed:#x} affinity={affinity:#x} all={all_harts:#x}");
+            error!(
+                "create_process: affinity validation failed: \
+                allowed={allowed:#x} affinity={affinity:#x} all={all_harts:#x}"
+            );
             return Errno::new(EINVAL).to_ret();
         }
 
@@ -2061,13 +2185,16 @@ impl Orbit {
             parent_pid,
             argv_bytes: None,
             envp_bytes: None,
-            perms: None
+            perms: None,
         };
 
         match self.create_new_process(proc_components) {
             Ok(pid) => {
-                info!("create_process: spawned pid={pid} parent={parent_pid} from {} bytes \
-                    allowed_affinity={allowed:#x} affinity={affinity:#x}", blob.len());
+                info!(
+                    "create_process: spawned pid={pid} parent={parent_pid} from {} bytes \
+                    allowed_affinity={allowed:#x} affinity={affinity:#x}",
+                    blob.len()
+                );
                 pid as isize
             }
             Err(()) => {
@@ -2110,27 +2237,18 @@ impl Orbit {
                     // fallback is just a safety net for self-pushes
                     // during k_net's own bringup.
                     match self.net_thread_tid {
-                        Some(tid) => self.set_wake_reason_where(
-                            process::wake_reason::TICKLE,
-                            |t| t.tid == tid,
-                        ),
-                        None => self.set_wake_reason_where(
-                            process::wake_reason::TICKLE,
-                            |t| t.pid == 0,
-                        ),
+                        Some(tid) => self
+                            .set_wake_reason_where(process::wake_reason::TICKLE, |t| t.tid == tid),
+                        None => {
+                            self.set_wake_reason_where(process::wake_reason::TICKLE, |t| t.pid == 0)
+                        }
                     }
                 }
                 WakeEvent::Pid(pid) => {
-                    self.set_wake_reason_where(
-                        process::wake_reason::NET_IO,
-                        |t| t.pid == pid,
-                    );
+                    self.set_wake_reason_where(process::wake_reason::NET_IO, |t| t.pid == pid);
                 }
                 WakeEvent::Tid(tid) => {
-                    self.set_wake_reason_where(
-                        process::wake_reason::NET_IO,
-                        |t| t.tid == tid,
-                    );
+                    self.set_wake_reason_where(process::wake_reason::NET_IO, |t| t.tid == tid);
                 }
             }
         }
@@ -2154,7 +2272,9 @@ impl Orbit {
             // SAFETY: `PThread.0` is a raw ptr the registry owns; it
             // stays valid as long as the entry's in `self.threads`.
             let thread = unsafe { (p.0 as *mut Thread).as_mut_unchecked() };
-            if !pred(thread) { continue; }
+            if !pred(thread) {
+                continue;
+            }
             thread.wake_override.fetch_or(reason, Ordering::Release);
             // Eager promotion. CAS state Suspended → Ready; if state
             // is anything else (already Ready, Running, etc.) leave
@@ -2162,12 +2282,16 @@ impl Orbit {
             // that hadn't yet committed its park (Running on its way
             // to Suspended) will see the override on its next
             // dispatch via the sleep-heap path.
-            if thread.state.compare_exchange(
-                ThreadState::Suspended as usize,
-                ThreadState::Ready as usize,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ).is_ok() {
+            if thread
+                .state
+                .compare_exchange(
+                    ThreadState::Suspended as usize,
+                    ThreadState::Ready as usize,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
                 let pending = thread.wake_override.swap(0, Ordering::AcqRel);
                 thread.last_wake_reason.store(pending, Ordering::Release);
                 // Just promoted Suspended → Ready; queue it so
@@ -2196,7 +2320,10 @@ impl Orbit {
         while let Some(mut slot) = DENIAL_EVENT_QUEUE.pop_ref() {
             let entry = core::mem::take(&mut *slot);
             drop(slot);
-            let Some(event) = entry else { continue };
+            let Some(event) = entry
+            else {
+                continue;
+            };
 
             // Match each event variant once: stash the pid for the
             // counter bump (different counter per variant) and push
@@ -2210,7 +2337,8 @@ impl Orbit {
             if let Some(proc) = self.processes.get(&pid) {
                 let counter = if is_perm_deny {
                     &proc.perm_denials
-                } else {
+                }
+                else {
                     &proc.role_denials
                 };
                 counter.fetch_add(1, Ordering::Relaxed);
@@ -2228,31 +2356,66 @@ impl Orbit {
             drop(slot);
             match work {
                 PendingWork::Empty => {}
-                PendingWork::MemMap { req, pid, root_pa, handle } => {
+                PendingWork::MemMap {
+                    req,
+                    pid,
+                    root_pa,
+                    handle,
+                } => {
                     let result = self.run_mmap_req(req, pid, root_pa);
                     handle.signal(result);
                 }
-                PendingWork::NetChannelCreation { req, pid, root_pa, handle } => {
+                PendingWork::NetChannelCreation {
+                    req,
+                    pid,
+                    root_pa,
+                    handle,
+                } => {
                     let (r, e) = self.run_nc_create_req(req, pid, root_pa);
                     handle.signal_pair(r, e);
                 }
-                PendingWork::CloseHandle { req, pid, root_pa, handle } => {
+                PendingWork::CloseHandle {
+                    req,
+                    pid,
+                    root_pa,
+                    handle,
+                } => {
                     let result = self.run_close_req(req, pid, root_pa);
                     handle.signal(result);
                 }
-                PendingWork::CreateProcess { req, pid, root_pa, handle } => {
+                PendingWork::CreateProcess {
+                    req,
+                    pid,
+                    root_pa,
+                    handle,
+                } => {
                     let result = self.run_create_process_req(req, pid, root_pa);
                     handle.signal(result);
                 }
-                PendingWork::CreateThread { req, pid, parent_allowed, handle } => {
+                PendingWork::CreateThread {
+                    req,
+                    pid,
+                    parent_allowed,
+                    handle,
+                } => {
                     let result = self.run_create_thread_req(req, pid, parent_allowed);
                     handle.signal(result);
                 }
-                PendingWork::FsOpen { req, pid, root_pa, handle } => {
+                PendingWork::FsOpen {
+                    req,
+                    pid,
+                    root_pa,
+                    handle,
+                } => {
                     let result = self.run_fs_open_req(req, pid, root_pa);
                     handle.signal(result);
                 }
-                PendingWork::FsRead { req, pid, root_pa, handle } => {
+                PendingWork::FsRead {
+                    req,
+                    pid,
+                    root_pa,
+                    handle,
+                } => {
                     // The submit path takes a clone of `handle`. If
                     // submit succeeds, `run_fs_read_req` returns
                     // `None` and the IRQ will signal that clone (and
@@ -2264,11 +2427,21 @@ impl Orbit {
                         None => {}
                     }
                 }
-                PendingWork::FsStat { req, pid, root_pa, handle } => {
+                PendingWork::FsStat {
+                    req,
+                    pid,
+                    root_pa,
+                    handle,
+                } => {
                     let result = self.run_fs_stat_req(req, pid, root_pa);
                     handle.signal(result);
                 }
-                PendingWork::FsReaddir { req, pid, root_pa, handle } => {
+                PendingWork::FsReaddir {
+                    req,
+                    pid,
+                    root_pa,
+                    handle,
+                } => {
                     let result = self.run_fs_readdir_req(req, pid, root_pa);
                     handle.signal(result);
                 }
@@ -2280,32 +2453,57 @@ impl Orbit {
                     // (0, exit_code) when the child exits.
                     self.run_wait_pid_req(req, pid, handle);
                 }
-                PendingWork::CreateProcessEx { req, pid, root_pa, handle } => {
+                PendingWork::CreateProcessEx {
+                    req,
+                    pid,
+                    root_pa,
+                    handle,
+                } => {
                     let result = self.run_create_process_ex_req(req, pid, root_pa);
                     handle.signal(result);
                 }
-                PendingWork::FutexWait { req, pid, root_pa, handle } => {
+                PendingWork::FutexWait {
+                    req,
+                    pid,
+                    root_pa,
+                    handle,
+                } => {
                     // run_futex_wait_req owns the signaling — sync
                     // EAGAIN/EFAULT signal here; the async park
                     // installs the handle on `futex_waiters[pa]` and
                     // a later `futex_wake` signals it with `0`.
                     self.run_futex_wait_req(req, pid, root_pa, handle);
                 }
-                PendingWork::FutexWake { req, pid, root_pa, handle } => {
+                PendingWork::FutexWake {
+                    req,
+                    pid,
+                    root_pa,
+                    handle,
+                } => {
                     self.run_futex_wake_req(req, pid, root_pa, handle);
                 }
-                PendingWork::Pledge { req, pid, root_pa, handle } => {
+                PendingWork::Pledge {
+                    req,
+                    pid,
+                    root_pa,
+                    handle,
+                } => {
                     let result = self.run_pledge_req(req, pid, root_pa);
                     handle.signal(result);
                 }
-                PendingWork::CreateProcessV2 { req, pid, root_pa, handle } => {
+                PendingWork::CreateProcessV2 {
+                    req,
+                    pid,
+                    root_pa,
+                    handle,
+                } => {
                     let result = self.run_create_process_v2_req(req, pid, root_pa);
                     handle.signal(result);
                 }
             }
         }
     }
-    
+
     fn get_runnable_thread(&mut self, hart_mask: u64) -> Option<PThread> {
         // O(1) common case: the queue head matches the hart's
         // affinity. Misses fall through to a head-scan in `pop_for`,
@@ -2321,26 +2519,30 @@ impl Orbit {
             (None, 0) => {
                 // Kernel thread. Its stack and trap frame were allocated
                 // directly from kernel_pages with fixed layouts and aren't
-                // recorded in any proc.maps, so free them here. The
-                // Thread references them by KDMAP VA; reverse through
-                // KdmapVa → PhysAddr → Frame<Shared> at the boundary.
-                let tstack_kva = memmap::KdmapVa::new(thread.stack as *const _ as u64);
-                self.kernel_pages.free(Frame::<Shared>::new(tstack_kva.to_phys()), Self::THREAD_STACK_LAYOUT);
-
-                let trap_frame_kva = memmap::KdmapVa::new(thread.frame as *const _ as u64);
-                self.kernel_pages.free(Frame::<Shared>::new(trap_frame_kva.to_phys()), Self::THREAD_TRAP_FRAME_LAYOUT);
+                // recorded in any proc.maps, so free them here. The PAs
+                // were captured at thread creation; reconstruct typed
+                // `Frame<Shared>` for the typed allocator API.
+                if let Some(pa) = thread.kernel_stack_pa {
+                    self.kernel_pages
+                        .free(Frame::<Shared>::new(pa), Self::THREAD_STACK_LAYOUT);
+                }
+                if let Some(pa) = thread.kernel_trap_frame_pa {
+                    self.kernel_pages
+                        .free(Frame::<Shared>::new(pa), Self::THREAD_TRAP_FRAME_LAYOUT);
+                }
             }
             (Some(slot), 0) => error!(
                 "dealloc_thread: tid{} is a kernel thread but carries slot{}",
-                thread.tid, slot),
+                thread.tid, slot
+            ),
             (None, pid) => error!(
                 "dealloc_thread: tid{} user thread in pid{} is missing its slot",
-                thread.tid, pid),
+                thread.tid, pid
+            ),
             (Some(slot), pid) => match self.processes.get_mut(&pid) {
                 Some(proc) => {
-                    let root_table = unsafe {
-                        memmap::kernel_root_from_pa(PhysAddr::from(proc.satp))
-                    };
+                    let root_table =
+                        unsafe { memmap::kernel_root_from_pa(PhysAddr::from(proc.satp)) };
 
                     // Two passes: gather the vaddrs matching this slot
                     // (u64 is Copy so the collect doesn't tangle with
@@ -2350,21 +2552,26 @@ impl Orbit {
                     // can hand to `free_backing`. Single copy avoided
                     // because `PhysBacking` (and therefore UserMapping)
                     // is no longer Copy.
-                    let vaddrs: Vec<u64> = proc.mappings_for_slot(slot)
-                        .map(|m| m.vaddr)
-                        .collect();
+                    let vaddrs: Vec<u64> = proc.mappings_for_slot(slot).map(|m| m.vaddr).collect();
 
                     for v in &vaddrs {
-                        let proc = self.processes.get_mut(&pid)
+                        let proc = self
+                            .processes
+                            .get_mut(&pid)
                             .expect("proc vanished mid-teardown");
-                        let Some(m) = proc.maps.remove(v) else { continue };
+                        let Some(m) = proc.maps.remove(v)
+                        else {
+                            continue;
+                        };
 
                         match m.kind {
                             MappingKind::Stack { .. } => {
                                 // Stack is a range of 2 MiB megapages; flush
                                 // each page's TLB entry as we tear it down so
                                 // nothing survives for slots 2..N.
-                                for v in (m.vaddr..m.vaddr + m.len).step_by(UPROC_STACK_GRAIN as usize) {
+                                for v in
+                                    (m.vaddr..m.vaddr + m.len).step_by(UPROC_STACK_GRAIN as usize)
+                                {
                                     unsafe {
                                         let _ = unmap_page(&root_table, VirtAddr::new(v), 3);
                                         riscv::asm::sfence_vma(pid as usize, v as usize);
@@ -2372,13 +2579,11 @@ impl Orbit {
                                     }
                                 }
                             }
-                            MappingKind::TrapFrame { .. } => {
-                                unsafe {
-                                    let _ = unmap_page(&root_table, VirtAddr::new(m.vaddr), 4);
-                                    riscv::asm::sfence_vma(pid as usize, m.vaddr as usize);
-                                    crate::kernel::shootdown::broadcast(0, 0);
-                                }
-                            }
+                            MappingKind::TrapFrame { .. } => unsafe {
+                                let _ = unmap_page(&root_table, VirtAddr::new(m.vaddr), 4);
+                                riscv::asm::sfence_vma(pid as usize, m.vaddr as usize);
+                                crate::kernel::shootdown::broadcast(0, 0);
+                            },
                             MappingKind::Guard { .. } => {
                                 // No leaf backs the guard; only the proc.maps
                                 // entry needs clearing below.
@@ -2395,10 +2600,9 @@ impl Orbit {
                             }
                             // mappings_for_slot filters on MappingKind::slot(),
                             // which only returns Some for the arms above.
-                            MappingKind::Elf
-                            | MappingKind::Anon
-                            | MappingKind::NetCh { .. } => unreachable!(
-                                "mappings_for_slot yielded non-slot kind {:?}", m.kind),
+                            MappingKind::Elf | MappingKind::Anon | MappingKind::NetCh { .. } => {
+                                unreachable!("mappings_for_slot yielded non-slot kind {:?}", m.kind)
+                            }
                         }
 
                         if let Some(b) = m.backing {
@@ -2406,13 +2610,17 @@ impl Orbit {
                         }
                     }
 
-                    let proc = self.processes.get_mut(&pid).expect("proc vanished mid-teardown");
+                    let proc = self
+                        .processes
+                        .get_mut(&pid)
+                        .expect("proc vanished mid-teardown");
                     proc.thread_slots.free(slot);
                 }
                 None => error!(
                     "dealloc_thread: tid{} references missing pid{}",
-                    thread.tid, pid),
-            }
+                    thread.tid, pid
+                ),
+            },
         }
     }
 
@@ -2432,7 +2640,8 @@ impl Orbit {
         //     the exit code on the floor.
         if let Some(handle) = process.exit_waiter.take() {
             handle.signal_pair(0, process.exit_code as isize);
-        } else if process.parent_pid != 0
+        }
+        else if process.parent_pid != 0
             && let Some(parent) = self.processes.get_mut(&process.parent_pid)
         {
             parent.dead_children.insert(process.pid, process.exit_code);
@@ -2463,7 +2672,10 @@ impl Orbit {
 
         while let Some(socket_handle) = process.sockets.pop_last() {
             if let Err(e) = self.net_pkg.socket_deletions.enqueue(socket_handle) {
-                error!("failed to queue socket for deletion while deallocating pid{} ({e:?})", process.pid);
+                error!(
+                    "failed to queue socket for deletion while deallocating pid{} ({e:?})",
+                    process.pid
+                );
                 self.orphaned_sockets.push(socket_handle);
             }
         }
@@ -2507,8 +2719,12 @@ impl Orbit {
         let _ = self.process_handles.remove(&process.pid);
 
         while let Some(b) = process.heap_pages.pop() {
-            info!("dealloc heap page pa@{:016X} {:08X?} pool={}",
-                b.pa().get_raw(), b.layout(), b.pool_name());
+            info!(
+                "dealloc heap page pa@{:016X} {:08X?} pool={}",
+                b.pa().get_raw(),
+                b.layout(),
+                b.pool_name()
+            );
             self.free_backing(b);
         }
 
@@ -2550,7 +2766,8 @@ impl Orbit {
             // from this pool so we reconstruct a `Frame<Table>` here.
             self.table_pages.free(
                 Frame::<process::Table>::new(process_root_table_pa),
-                Self::TABLE_LAYOUT);
+                Self::TABLE_LAYOUT,
+            );
             let ktables_after = self.table_pages.allocated_bytes();
             debug!(
                 "dealloc pid{}: ktables before={}B unmap_freed={}B root_freed={}B after={}B",
@@ -2575,18 +2792,15 @@ impl Orbit {
         let mut tids_to_remove = Vec::new();
         let mut pids_to_remove = Vec::new();
         for (_tid, p) in self.threads.iter() {
-            let t = unsafe {
-                p.0.as_ref_unchecked()
-            };
+            let t = unsafe { p.0.as_ref_unchecked() };
 
             {
                 let proc = match self.processes.get_mut(&t.pid) {
                     Some(p) => p,
-                    None => continue
+                    None => continue,
                 };
 
-                let thread_alive = t.state.load(Ordering::Acquire)
-                    != ThreadState::Exited as usize;
+                let thread_alive = t.state.load(Ordering::Acquire) != ThreadState::Exited as usize;
 
                 if !thread_alive {
                     let _ = proc.threads.remove(&t.tid);
@@ -2601,12 +2815,13 @@ impl Orbit {
                         Some(f) => {
                             let label = match proc.find_mapping(f.stval as u64).map(|m| m.kind) {
                                 Some(MappingKind::Guard { .. }) => "stack overflow",
-                                Some(_)                         => "permission/range violation",
-                                None                            => "bad access",
+                                Some(_) => "permission/range violation",
+                                None => "bad access",
                             };
                             warn!(
                                 "tid{} killed: {} cause={} epc={:#x} stval={:#x}",
-                                t.tid, label, f.cause, f.epc, f.stval);
+                                t.tid, label, f.cause, f.epc, f.stval
+                            );
                             // Faulted threads carry no clean exit
                             // value; surface as -1 to wait_pid waiters.
                             // POSIX would use WIFSIGNALED here; a
@@ -2623,7 +2838,7 @@ impl Orbit {
                 }
 
                 if !proc.threads.is_empty() || t.pid == 0 {
-                    continue
+                    continue;
                 }
             }
 
@@ -2633,12 +2848,9 @@ impl Orbit {
         }
 
         for tid in tids_to_remove {
-            let p = self.threads.remove(&tid)
-                .unwrap();
+            let p = self.threads.remove(&tid).unwrap();
 
-            let thread = unsafe {
-                p.0.as_ref_unchecked()
-            };
+            let thread = unsafe { p.0.as_ref_unchecked() };
 
             self.dealloc_thread(thread);
 
@@ -2648,8 +2860,7 @@ impl Orbit {
         }
 
         for pid in pids_to_remove {
-            let proc = self.processes.remove(&pid)
-                .unwrap();
+            let proc = self.processes.remove(&pid).unwrap();
 
             self.dealloc_process(proc);
         }
@@ -2660,12 +2871,15 @@ impl Orbit {
         // under the Orbit lock, not in Drop context.
         let kpages = &mut self.kernel_pages;
         pending_frees::drain(|frame, layout| {
-            info!("dealloc shared ptr backing pa@{:016X} {:08X?}",
-                frame.get_raw(), layout);
+            info!(
+                "dealloc shared ptr backing pa@{:016X} {:08X?}",
+                frame.get_raw(),
+                layout
+            );
             kpages.free(frame, layout);
         });
     }
-    
+
     /// Drain `SLEEP_INBOX` into the heap, then promote any sleepers
     /// whose deadline has passed to `Ready`. Called from
     /// `assign_threads` so the registry walk that follows already sees
@@ -2675,7 +2889,9 @@ impl Orbit {
         while let Some(mut slot) = SLEEP_INBOX.pop_ref() {
             let notice = core::mem::take(&mut *slot);
             drop(slot);
-            if notice.thread.is_null() { continue; }
+            if notice.thread.is_null() {
+                continue;
+            }
             // Race repair: if `set_wake_reason_where` ran while this
             // thread was mid-park (state=Running on its way to
             // Suspended), the eager-promote CAS failed but the
@@ -2685,12 +2901,15 @@ impl Orbit {
             // the thread wait for its deadline.
             let t = unsafe { (notice.thread as *mut Thread).as_mut_unchecked() };
             if t.wake_override.load(Ordering::Acquire) != 0 {
-                if t.state.compare_exchange(
-                    ThreadState::Suspended as usize,
-                    ThreadState::Ready as usize,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                ).is_ok() {
+                if t.state
+                    .compare_exchange(
+                        ThreadState::Suspended as usize,
+                        ThreadState::Ready as usize,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
                     let pending = t.wake_override.swap(0, Ordering::AcqRel);
                     t.last_wake_reason.store(pending, Ordering::Release);
                     self.ready.push(notice.thread);
@@ -2704,7 +2923,8 @@ impl Orbit {
                 // staleness reason.
                 continue;
             }
-            self.sleeping.push(notice.thread, notice.wake_time, notice.sleep_seq);
+            self.sleeping
+                .push(notice.thread, notice.wake_time, notice.sleep_seq);
         }
 
         let now = riscv::register::time::read64();
@@ -2720,7 +2940,8 @@ impl Orbit {
             // why it woke (timer-only wakes leave the bitmask 0).
             let pending = t.wake_override.swap(0, Ordering::AcqRel);
             t.last_wake_reason.store(pending, Ordering::Release);
-            t.state.store(ThreadState::Ready as usize, Ordering::Release);
+            t.state
+                .store(ThreadState::Ready as usize, Ordering::Release);
             ready.push(thread_ptr);
         });
     }
@@ -2733,7 +2954,9 @@ impl Orbit {
             while let Some(mut slot) = inbox.pop_ref() {
                 let notice = core::mem::take(&mut *slot);
                 drop(slot);
-                if notice.thread.is_null() { continue; }
+                if notice.thread.is_null() {
+                    continue;
+                }
                 self.ready.push(notice.thread);
             }
         }
@@ -2775,8 +2998,7 @@ impl Orbit {
         // the array base, then index for each remote. Built lazily so no
         // per-tick allocation happens.
         let hart_root = unsafe {
-            (riscv::register::sscratch::read() as *const HartContext)
-                .sub(context.hart_id as usize)
+            (riscv::register::sscratch::read() as *const HartContext).sub(context.hart_id as usize)
         };
 
         let self_hart_id = context.hart_id as usize;
@@ -2787,13 +3009,15 @@ impl Orbit {
             current: &context.current,
         };
 
-        let remotes = (0..cpu_count).filter(move |&i| i != self_hart_id).map(move |i| {
-            let hc = unsafe { hart_root.add(i).as_ref_unchecked() };
-            HartView {
-                hart_id: hc.hart_id as usize,
-                current: &hc.current,
-            }
-        });
+        let remotes = (0..cpu_count)
+            .filter(move |&i| i != self_hart_id)
+            .map(move |i| {
+                let hc = unsafe { hart_root.add(i).as_ref_unchecked() };
+                HartView {
+                    hart_id: hc.hart_id as usize,
+                    current: &hc.current,
+                }
+            });
 
         let mut hw = crate::hw::RiscvHardware;
         orbit_core::sched::assign_threads(&self_view, remotes, self, &mut hw);
@@ -2801,11 +3025,13 @@ impl Orbit {
 
     pub fn print_threads(&self) {
         for (_, t) in self.threads.iter() {
-            let thread = unsafe {
-                (t.0 as *const Thread).as_ref_unchecked()
-            };
+            let thread = unsafe { (t.0 as *const Thread).as_ref_unchecked() };
 
-            info!("tid{}: state{}", thread.tid, thread.state.load(Ordering::Acquire));
+            info!(
+                "tid{}: state{}",
+                thread.tid,
+                thread.state.load(Ordering::Acquire)
+            );
         }
     }
 
@@ -2815,7 +3041,7 @@ impl Orbit {
     fn root(&self) -> mmu::mmap::RootTable<'static> {
         unsafe { memmap::kernel_root_from_pa(PhysAddr::from(self.satp)) }
     }
-    
+
     fn setup_igb(&mut self, device: &PciDevice) {
         device.print_info();
 
@@ -2825,7 +3051,7 @@ impl Orbit {
             let bar_size = device.get_bar_size(0) as u64;
             if bar_size > (2 * MB) {
                 error!("bar2big");
-                return
+                return;
             }
 
             let mut pages = PageAlloc::FA(self.table_pages.frames_mut());
@@ -2836,10 +3062,15 @@ impl Orbit {
             // device's BAR register so the device decodes it on the bus);
             // kernel-side accesses go through a high-half KMMIO alias.
             let kva = match memmap::install_kmmio_alias(
-                &ort, &mut pages, Self::IGB_BAR_PA..(Self::IGB_BAR_PA + bar_size)
+                &ort,
+                &mut pages,
+                Self::IGB_BAR_PA..(Self::IGB_BAR_PA + bar_size),
             ) {
                 Ok(v) => v,
-                Err(_) => { error!("failed to map bar"); return }
+                Err(_) => {
+                    error!("failed to map bar");
+                    return;
+                }
             };
 
             device.write_bar(0, Self::IGB_BAR_PA as u32);
@@ -2851,25 +3082,43 @@ impl Orbit {
         };
 
         unsafe {
-            let (_, tx_ring_kva) = self.kernel_pages.alloc_kdmap(
-                Layout::from_size_align_unchecked(TX_RING_BYTES, PAGE_SIZE))
+            let (_, tx_ring_kva) = self
+                .kernel_pages
+                .alloc_kdmap(Layout::from_size_align_unchecked(TX_RING_BYTES, PAGE_SIZE))
                 .expect("no e1000 tx ring");
-            let tx_ring = tx_ring_kva.as_mut_ptr::<[TxDesc; TX_RING_LEN]>().as_mut_unchecked();
+            let tx_ring = tx_ring_kva
+                .as_mut_ptr::<[TxDesc; TX_RING_LEN]>()
+                .as_mut_unchecked();
 
-            let (_, rx_ring_kva) = self.kernel_pages.alloc_kdmap(
-                Layout::from_size_align_unchecked(RX_RING_BYTES, PAGE_SIZE))
+            let (_, rx_ring_kva) = self
+                .kernel_pages
+                .alloc_kdmap(Layout::from_size_align_unchecked(RX_RING_BYTES, PAGE_SIZE))
                 .expect("no e1000 rx ring");
-            let rx_ring = rx_ring_kva.as_mut_ptr::<[RxDesc; RX_RING_LEN]>().as_mut_unchecked();
+            let rx_ring = rx_ring_kva
+                .as_mut_ptr::<[RxDesc; RX_RING_LEN]>()
+                .as_mut_unchecked();
 
-            let (_, tx_bufs_kva) = self.kernel_pages.alloc_kdmap(
-                Layout::from_size_align_unchecked(TX_RING_BUFS_BYTES, PAGE_SIZE))
+            let (_, tx_bufs_kva) = self
+                .kernel_pages
+                .alloc_kdmap(Layout::from_size_align_unchecked(
+                    TX_RING_BUFS_BYTES,
+                    PAGE_SIZE,
+                ))
                 .expect("no e1000 tx bufs");
-            let tx_bufs = tx_bufs_kva.as_mut_ptr::<[E1000Pbuf; TX_RING_LEN]>().as_mut_unchecked();
+            let tx_bufs = tx_bufs_kva
+                .as_mut_ptr::<[E1000Pbuf; TX_RING_LEN]>()
+                .as_mut_unchecked();
 
-            let (_, rx_bufs_kva) = self.kernel_pages.alloc_kdmap(
-                Layout::from_size_align_unchecked(RX_RING_BUFS_BYTES, PAGE_SIZE))
+            let (_, rx_bufs_kva) = self
+                .kernel_pages
+                .alloc_kdmap(Layout::from_size_align_unchecked(
+                    RX_RING_BUFS_BYTES,
+                    PAGE_SIZE,
+                ))
                 .expect("no e1000 rx bufs");
-            let rx_bufs = rx_bufs_kva.as_mut_ptr::<[E1000Pbuf; RX_RING_LEN]>().as_mut_unchecked();
+            let rx_bufs = rx_bufs_kva
+                .as_mut_ptr::<[E1000Pbuf; RX_RING_LEN]>()
+                .as_mut_unchecked();
 
             let mut e1000 = E1000::new(bar_kva as *mut u32, tx_ring, tx_bufs, rx_ring, rx_bufs);
             let mac = e1000.read_mac().unwrap();
@@ -2881,9 +3130,11 @@ impl Orbit {
             let mut config = Config::new(EthernetAddress(mac).into());
             config.random_seed = 4;
 
-            let iface = Interface::new(config, &mut e1000, smoltcp::time::Instant::from_micros(
-                riscv::register::time::read() as i64 / 10
-            ));
+            let iface = Interface::new(
+                config,
+                &mut e1000,
+                smoltcp::time::Instant::from_micros(riscv::register::time::read() as i64 / 10),
+            );
 
             let socket_reqs = (0..self.cpu_count)
                 .map(|_| heapless::spsc::Queue::<crate::SocketReq, 8>::new())
@@ -2912,10 +3163,13 @@ impl Orbit {
             let slot = (device.address >> 15) & 0x1F;
             let plic_irq = 32 + (slot as u32 % 4);
             if let Err(()) = crate::drivers::plic::plic_register(
-                plic_irq, e1000_plic_handler, self.cpu_count - 1,
+                plic_irq,
+                e1000_plic_handler,
+                self.cpu_count - 1,
             ) {
                 error!("e1000: plic_register failed for irq {}", plic_irq);
-            } else {
+            }
+            else {
                 info!("e1000: PLIC IRQ {} → wake k_net", plic_irq);
             }
 
@@ -2939,31 +3193,29 @@ impl Orbit {
             }
         }
     }
-    
+
     pub fn get_pci_info<'n>(&mut self, node: FdtNode<'n>) {
         let reg = match node.reg() {
-            Ok(Some(mut r)) => {
-                match r.nth(0) {
-                    Some(re) => re,
-                    None => return
-                }
+            Ok(Some(mut r)) => match r.nth(0) {
+                Some(re) => re,
+                None => return,
             },
-            _ => return
+            _ => return,
         };
 
         info!("reg={reg:?}");
 
         let base = match reg.address::<u64>() {
             Ok(b) => b as usize,
-            Err(_) => return
+            Err(_) => return,
         };
 
         let size = match reg.size::<u64>() {
             Ok(b) => b as usize,
-            Err(_) => return
+            Err(_) => return,
         };
 
-        info!("pci@{:08X}..{:08X}", base, base+size);
+        info!("pci@{:08X}..{:08X}", base, base + size);
 
         // PCI config space lives at a high-half KMMIO alias instead of
         // identity-mapped at its PA — keeps the kernel root free of low-half
@@ -2972,7 +3224,9 @@ impl Orbit {
             let ort = self.root();
             let mut pages = PageAlloc::FA(self.table_pages.frames_mut());
             let va = match memmap::install_kmmio_alias(
-                &ort, &mut pages, (base as u64)..((base + size) as u64)
+                &ort,
+                &mut pages,
+                (base as u64)..((base + size) as u64),
             ) {
                 Ok(v) => v,
                 Err(_) => {
@@ -2986,12 +3240,12 @@ impl Orbit {
 
         let matches = pci::scan_pci(pci_cfg_va as usize, &[(0x8086, 0x100E)]);
         if matches.is_empty() {
-            return
+            return;
         }
 
         self.setup_igb(&matches[0]);
     }
-    
+
     pub fn get_environment_info(&mut self) {
         // Access the DTB through its KDMAP alias — map_kernel_self installs
         // it at `phys_to_kdmap(dtb_phys)` and no longer identity-maps the
@@ -3011,11 +3265,11 @@ impl Orbit {
             let name = node.name();
             if name.starts_with("pci") {
                 pci_nodes.push(node);
-                continue
+                continue;
             }
             if name.starts_with("plic") {
                 self.setup_plic(&fdt);
-                continue
+                continue;
             }
 
             for child in node.children() {
@@ -3047,19 +3301,15 @@ impl Orbit {
     }
 
     fn setup_virtio_gpu(&mut self) {
-        let Some(outcome) = crate::drivers::virtio_gpu_dev::setup_virtio_gpu(
-            &mut self.kernel_pages,
-        ) else {
+        let Some(outcome) =
+            crate::drivers::virtio_gpu_dev::setup_virtio_gpu(&mut self.kernel_pages)
+        else {
             return;
         };
 
         // Build the Display + GpuPackage, hand ownership to k_gpu.
         let fb = unsafe {
-            crate::drivers::fb::FrameBuffer::new(
-                outcome.fb_kva,
-                outcome.width,
-                outcome.height,
-            )
+            crate::drivers::fb::FrameBuffer::new(outcome.fb_kva, outcome.width, outcome.height)
         };
         let pkg = crate::drivers::k_gpu::GpuPackage {
             display: crate::drivers::display::Display::new(fb),
@@ -3083,7 +3333,13 @@ impl Orbit {
 
     /// `stack_pa` is the physical base of the user stack. User PT leaves
     /// take PAs directly.
-    fn map_stack(&mut self, root_table: &mmu::mmap::RootTable<'_>, stack_pa: u64, stackv: u64, stack_size: u64) -> Result<(), ()> {
+    fn map_stack(
+        &mut self,
+        root_table: &mmu::mmap::RootTable<'_>,
+        stack_pa: PhysAddr,
+        stackv: u64,
+        stack_size: u64,
+    ) -> Result<(), ()> {
         let mut pages = PageAlloc::FA(self.table_pages.frames_mut());
         unsafe {
             map_address_range(
@@ -3091,43 +3347,61 @@ impl Orbit {
                 &mut pages,
                 &MappingConfig {
                     permissions: PagePermissions::U | PagePermissions::R | PagePermissions::W,
-                    levels: 3, page_size: UPROC_STACK_GRAIN,
+                    levels: 3,
+                    page_size: UPROC_STACK_GRAIN,
                     vaddr: VirtAddr::new(stackv),
-                    paddr: PhysAddr::new(stack_pa),
+                    paddr: stack_pa,
                     log: false,
-                    supervisor_tag: SupervisorTag::None
+                    supervisor_tag: SupervisorTag::None,
                 },
                 VirtAddr::new(stackv + stack_size),
-                PhysAddr::new(stack_pa + stack_size))
+                PhysAddr::new(stack_pa.get_raw() + stack_size),
+            )
         }
     }
 
-    fn map_trap_frame(&mut self, root_table: &mmu::mmap::RootTable<'_>, trap_frame_pa: u64, user_vaddr: u64) -> Result<(), ()> {
+    fn map_trap_frame(
+        &mut self,
+        root_table: &mmu::mmap::RootTable<'_>,
+        trap_frame_pa: PhysAddr,
+        user_vaddr: u64,
+    ) -> Result<(), ()> {
         let mut pages = PageAlloc::FA(self.table_pages.frames_mut());
-        let trap_frame = trap_frame_pa as usize;
         unsafe {
             map_address_range(
                 root_table,
                 &mut pages,
                 &MappingConfig {
                     permissions: PagePermissions::R.into(),
-                    levels: 4, page_size: PAGE_SIZE as u64,
+                    levels: 4,
+                    page_size: PAGE_SIZE as u64,
                     vaddr: VirtAddr::new(user_vaddr),
-                    paddr: PhysAddr::new(trap_frame as u64),
+                    paddr: trap_frame_pa,
                     log: false,
-                    supervisor_tag: SupervisorTag::None
+                    supervisor_tag: SupervisorTag::None,
                 },
                 VirtAddr::new(user_vaddr + PAGE_SIZE as u64),
-                PhysAddr::new((trap_frame + PAGE_SIZE) as u64))
+                PhysAddr::new(trap_frame_pa.get_raw() + PAGE_SIZE as u64),
+            )
         }
     }
-    
-    pub fn add_new_thread_to_process(&mut self, pid: u16, entrypoint: usize, stack_size: u64, allowed_affinity: u64, affinity: u64, arg: usize) -> Result<(), ()> {
+
+    pub fn add_new_thread_to_process(
+        &mut self,
+        pid: u16,
+        entrypoint: usize,
+        stack_size: u64,
+        allowed_affinity: u64,
+        affinity: u64,
+        arg: usize,
+    ) -> Result<(), ()> {
         if !self.processes.contains_key(&pid) {
-            return Err(())
+            return Err(());
         }
 
-        let slot = self.processes.get_mut(&pid)
+        let slot = self
+            .processes
+            .get_mut(&pid)
             .unwrap()
             .thread_slots
             .alloc()
@@ -3138,14 +3412,27 @@ impl Orbit {
             memmap::kernel_root_from_pa(addr)
         };
 
-        let thread = match self.create_new_thread(pid, &root_table, entrypoint, slot, stack_size, allowed_affinity, affinity, arg) {
+        let thread = match self.create_new_thread(
+            pid,
+            &root_table,
+            entrypoint,
+            slot,
+            stack_size,
+            allowed_affinity,
+            affinity,
+            arg,
+        ) {
             Ok(t) => t,
             Err(e) => {
-                self.processes.get_mut(&pid).unwrap().thread_slots.free(slot);
+                self.processes
+                    .get_mut(&pid)
+                    .unwrap()
+                    .thread_slots
+                    .free(slot);
                 return Err(e);
             }
         };
-        
+
         let tid = thread.tid;
         let rpt = thread.root_table_addr();
 
@@ -3155,17 +3442,14 @@ impl Orbit {
         let tptr = Box::into_raw(t);
         info!("created uthread@{tptr:016X?},pid={pid},tid={tid},table={rpt:016X?}");
 
-        let owning_process = self.processes.get_mut(&pid)
-            .unwrap();
-        
+        let owning_process = self.processes.get_mut(&pid).unwrap();
+
         if !owning_process.threads.insert(tid) {
-            self.dealloc_thread(unsafe {tptr.as_ref_unchecked()});
-            return Err(())
+            self.dealloc_thread(unsafe { tptr.as_ref_unchecked() });
+            return Err(());
         }
 
-        owning_process.thread_count = owning_process
-            .thread_count
-            .saturating_add(1);
+        owning_process.thread_count = owning_process.thread_count.saturating_add(1);
 
         self.threads.insert(tid, PThread(tptr));
         // Constructor sets state=Ready; queue for the scheduler.
@@ -3179,10 +3463,20 @@ impl Orbit {
     /// dispatch-site permission gate can read it without locking. If
     /// the process pledges later, the manager re-walks all live
     /// threads and rewrites this field.
-    pub fn create_new_thread(&mut self, pid: u16, root_table: &mmu::mmap::RootTable<'_>, entrypoint: usize, slot: u16, stack_size: u64, allowed_affinity: u64, affinity: u64, arg: usize) -> Result<Thread, ()> {
+    pub fn create_new_thread(
+        &mut self,
+        pid: u16,
+        root_table: &mmu::mmap::RootTable<'_>,
+        entrypoint: usize,
+        slot: u16,
+        stack_size: u64,
+        allowed_affinity: u64,
+        affinity: u64,
+        arg: usize,
+    ) -> Result<Thread, ()> {
         if !validate_user_stack_size(stack_size) {
             error!("invalid user stack size {stack_size}");
-            return Err(())
+            return Err(());
         }
 
         let (stack_frame, stack_layout) = self.allocate_user_thread_stack(stack_size)?;
@@ -3199,12 +3493,12 @@ impl Orbit {
         // also for the &mut Stack build, but the frames themselves move
         // into `PhysBacking` at the end. `&self` readers on Frame keep
         // the originals intact across these lines.
-        let stack_pa = stack_frame.get_raw();
-        let tf_pa = tf_frame.get_raw();
+        let stack_pa = stack_frame.raw();
+        let tf_pa = tf_frame.raw();
 
-        let stack_vaddr      = user_stack_vaddr(slot, stack_size);
-        let guard_vaddr      = user_stack_guard_vaddr(slot);
-        let guard_size       = user_stack_guard_size(stack_size);
+        let stack_vaddr = user_stack_vaddr(slot, stack_size);
+        let guard_vaddr = user_stack_guard_vaddr(slot);
+        let guard_size = user_stack_guard_size(stack_size);
         let trap_frame_vaddr = user_trap_frame_vaddr(slot);
 
         // Root table PA: derive directly from the borrowed `root_table`
@@ -3217,16 +3511,18 @@ impl Orbit {
 
         if let Err(_) = self.map_stack(root_table, stack_pa, stack_vaddr, stack_size) {
             self.user_pages.free(stack_frame, stack_layout);
-            self.kernel_pages.free(tf_frame, Self::THREAD_TRAP_FRAME_LAYOUT);
+            self.kernel_pages
+                .free(tf_frame, Self::THREAD_TRAP_FRAME_LAYOUT);
             error!("failed to map stack");
-            return Err(())
+            return Err(());
         }
 
         if let Err(_) = self.map_trap_frame(root_table, tf_pa, trap_frame_vaddr) {
             self.user_pages.free(stack_frame, stack_layout);
-            self.kernel_pages.free(tf_frame, Self::THREAD_TRAP_FRAME_LAYOUT);
+            self.kernel_pages
+                .free(tf_frame, Self::THREAD_TRAP_FRAME_LAYOUT);
             error!("failed to map trap frame");
-            return Err(())
+            return Err(());
         }
 
         // Per-thread TLS — only when the binary's PT_TLS had memsz > 0.
@@ -3242,27 +3538,27 @@ impl Orbit {
         // and the code stays uniform with the stack mapping.
         let (tls_template, tls_memsz) = match self.processes.get(&pid) {
             Some(p) if p.tls_memsz > 0 => (p.tls_template.clone(), p.tls_memsz),
-            _                          => (None, 0),
+            _ => (None, 0),
         };
         let tls_vaddr = user_tls_vaddr(slot);
         let tls_backing: Option<(Frame<UserOnly>, Layout)> = if tls_memsz > 0 {
-            let layout = match Layout::from_size_align(
-                UPROC_TLS_MAX as usize,
-                UPROC_STACK_GRAIN as usize,
-            ) {
-                Ok(l) => l,
-                Err(e) => {
-                    self.user_pages.free(stack_frame, stack_layout);
-                    self.kernel_pages.free(tf_frame, Self::THREAD_TRAP_FRAME_LAYOUT);
-                    error!("bad TLS layout: {e:?}");
-                    return Err(());
-                }
-            };
+            let layout =
+                match Layout::from_size_align(UPROC_TLS_MAX as usize, UPROC_STACK_GRAIN as usize) {
+                    Ok(l) => l,
+                    Err(e) => {
+                        self.user_pages.free(stack_frame, stack_layout);
+                        self.kernel_pages
+                            .free(tf_frame, Self::THREAD_TRAP_FRAME_LAYOUT);
+                        error!("bad TLS layout: {e:?}");
+                        return Err(());
+                    }
+                };
             let frame = match self.user_pages.alloc_pa(layout) {
                 Some(f) => f,
                 None => {
                     self.user_pages.free(stack_frame, stack_layout);
-                    self.kernel_pages.free(tf_frame, Self::THREAD_TRAP_FRAME_LAYOUT);
+                    self.kernel_pages
+                        .free(tf_frame, Self::THREAD_TRAP_FRAME_LAYOUT);
                     error!("failed to alloc TLS megapage");
                     return Err(());
                 }
@@ -3291,7 +3587,7 @@ impl Orbit {
                 levels: 3,
                 page_size: UPROC_STACK_GRAIN,
                 vaddr: VirtAddr::new(tls_vaddr),
-                paddr: PhysAddr::new(frame.get_raw()),
+                paddr: frame.raw(),
                 log: false,
                 supervisor_tag: SupervisorTag::None,
             };
@@ -3307,12 +3603,14 @@ impl Orbit {
             if map_result.is_err() {
                 self.user_pages.free(frame, layout);
                 self.user_pages.free(stack_frame, stack_layout);
-                self.kernel_pages.free(tf_frame, Self::THREAD_TRAP_FRAME_LAYOUT);
+                self.kernel_pages
+                    .free(tf_frame, Self::THREAD_TRAP_FRAME_LAYOUT);
                 error!("failed to map TLS into process");
                 return Err(());
             }
             Some((frame, layout))
-        } else {
+        }
+        else {
             None
         };
 
@@ -3326,33 +3624,39 @@ impl Orbit {
             // into the unmapped span there) but the entry is still
             // recorded for layout uniformity.
             proc.insert_mapping(UserMapping {
-                vaddr:   guard_vaddr,
-                len:     guard_size,
-                perms:   0,
+                vaddr: guard_vaddr,
+                len: guard_size,
+                perms: 0,
                 backing: None,
-                kind:    MappingKind::Guard { slot },
+                kind: MappingKind::Guard { slot },
             });
             proc.insert_mapping(UserMapping {
-                vaddr:   stack_vaddr,
-                len:     stack_size,
-                perms:   (PagePermissions::U | PagePermissions::R | PagePermissions::W) as u64,
-                backing: Some(PhysBacking::User { frame: stack_frame, layout: stack_layout }),
-                kind:    MappingKind::Stack { slot },
+                vaddr: stack_vaddr,
+                len: stack_size,
+                perms: (PagePermissions::U | PagePermissions::R | PagePermissions::W) as u64,
+                backing: Some(PhysBacking::User {
+                    frame: stack_frame,
+                    layout: stack_layout,
+                }),
+                kind: MappingKind::Stack { slot },
             });
             proc.insert_mapping(UserMapping {
-                vaddr:   trap_frame_vaddr,
-                len:     PAGE_SIZE as u64,
-                perms:   PagePermissions::R as u64,
-                backing: Some(PhysBacking::Shared { frame: tf_frame, layout: Self::THREAD_TRAP_FRAME_LAYOUT }),
-                kind:    MappingKind::TrapFrame { slot },
+                vaddr: trap_frame_vaddr,
+                len: PAGE_SIZE as u64,
+                perms: PagePermissions::R as u64,
+                backing: Some(PhysBacking::Shared {
+                    frame: tf_frame,
+                    layout: Self::THREAD_TRAP_FRAME_LAYOUT,
+                }),
+                kind: MappingKind::TrapFrame { slot },
             });
             if let Some((frame, layout)) = tls_backing {
                 proc.insert_mapping(UserMapping {
-                    vaddr:   tls_vaddr,
-                    len:     layout.size() as u64,
-                    perms:   (PagePermissions::U | PagePermissions::R | PagePermissions::W) as u64,
+                    vaddr: tls_vaddr,
+                    len: layout.size() as u64,
+                    perms: (PagePermissions::U | PagePermissions::R | PagePermissions::W) as u64,
                     backing: Some(PhysBacking::User { frame, layout }),
-                    kind:    MappingKind::Tls { slot },
+                    kind: MappingKind::Tls { slot },
                 });
             }
         }
@@ -3369,12 +3673,9 @@ impl Orbit {
             // through it here would fault. The &mut Stack reference below
             // is built for `Thread.stack` but never derefed kernel-side;
             // user code reaches the same backing via the user-VA mapping.
-            let s = stack_pa as *mut Stack;
+            let s = stack_pa.get_raw() as *mut Stack;
 
-            (
-                f.as_mut_unchecked(),
-                s.as_mut_unchecked()
-            )
+            (f.as_mut_unchecked(), s.as_mut_unchecked())
         };
 
         let mut satp = Satp::from_bits(0);
@@ -3399,7 +3700,10 @@ impl Orbit {
 
         info!(
             "ventry={:016X?},vsp=0x{:016X?},vtp=0x{:016X?},rpt_pa={:016X?}",
-            entrypoint, frame.regs[2], frame.regs[4], root_pa.get_raw(),
+            entrypoint,
+            frame.regs[2],
+            frame.regs[4],
+            root_pa.get_raw(),
         );
 
         // Snapshot the owning process's permissions for the new
@@ -3410,7 +3714,9 @@ impl Orbit {
         // already been removed (impossible on the live spawn path,
         // defensive against future refactors). Fail-closed default
         // matches `Process::new`'s ZERO baseline.
-        let perms_snapshot = self.processes.get(&pid)
+        let perms_snapshot = self
+            .processes
+            .get(&pid)
             .map(|p| p.permissions)
             .unwrap_or(orbit_abi::perms::Permissions::ZERO);
 
@@ -3418,10 +3724,16 @@ impl Orbit {
             pc: AtomicUsize::new(entrypoint),
             satp,
             mode: SPP::User,
-            tid, pid,
+            tid,
+            pid,
             ticks: 0,
             frame: frame,
             stack,
+            // User threads track stack/trap-frame ownership via
+            // `Process.maps` `PhysBacking` entries — these fields are
+            // kthread-only.
+            kernel_stack_pa: None,
+            kernel_trap_frame_pa: None,
             state: AtomicUsize::new(ThreadState::Ready as usize),
             wake_time: 0,
             wake_override: AtomicU64::new(0),
@@ -3498,10 +3810,15 @@ impl Orbit {
         // installed at a fixed VA via `install_argv_blob`, not via
         // this register.)
         let thread = match self.create_new_thread(
-            pid, &root_table, elf.entrypoint, slot,
-            proc_components.stack_size, proc_components.allowed_affinity,
-            proc_components.affinity, 0)
-        {
+            pid,
+            &root_table,
+            elf.entrypoint,
+            slot,
+            proc_components.stack_size,
+            proc_components.allowed_affinity,
+            proc_components.affinity,
+            0,
+        ) {
             Ok(t) => t,
             Err(e) => {
                 // Process was inserted before create_new_thread, with
@@ -3532,17 +3849,19 @@ impl Orbit {
                 proc.parent_pid = 0;
                 self.dealloc_process(proc);
             }
-            return Err(())
+            return Err(());
         }
 
         // TODO: figure out why pin<box<thread>> doesnt work
         // or move this to a pool
         let t = Box::new(thread);
         let tptr = Box::into_raw(t);
-        info!("created uprocess@{tptr:016X?},pid={pid},tid={tid},table_pa={:016X?}", root_pa.get_raw());
+        info!(
+            "created uprocess@{tptr:016X?},pid={pid},tid={tid},table_pa={:016X?}",
+            root_pa.get_raw()
+        );
 
-        let proc = self.processes.get_mut(&pid)
-            .expect("just inserted");
+        let proc = self.processes.get_mut(&pid).expect("just inserted");
 
         proc.threads.insert(tid);
         proc.thread_count = 1;
@@ -3587,7 +3906,9 @@ impl Orbit {
         debug!(
             "create pid{}: ktables consumed={}B (entry={}B now={}B)",
             pid,
-            self.table_pages.allocated_bytes().saturating_sub(ktables_at_create),
+            self.table_pages
+                .allocated_bytes()
+                .saturating_sub(ktables_at_create),
             ktables_at_create,
             self.table_pages.allocated_bytes(),
         );
@@ -3600,11 +3921,18 @@ impl Orbit {
             self.free_backing(b);
         }
     }
-    
-    pub fn load_elf(&mut self, root_table: &mmu::mmap::RootTable<'_>, elf_blob: &[u8]) -> Result<orbital_elf::ElfInfo, ()> {
+
+    pub fn load_elf(
+        &mut self,
+        root_table: &mmu::mmap::RootTable<'_>,
+        elf_blob: &[u8],
+    ) -> Result<orbital_elf::ElfInfo, ()> {
         let elf = match elf::ElfBytes::<LittleEndian>::minimal_parse(elf_blob) {
             Ok(e) => e,
-            Err(e) => { error!("failed to parse umode elf: {e:?}"); return Err(()) }
+            Err(e) => {
+                error!("failed to parse umode elf: {e:?}");
+                return Err(());
+            }
         };
 
         let mut segment_allocations = Vec::new();
@@ -3613,16 +3941,19 @@ impl Orbit {
         for segment in segments.iter() {
             let load_segment = segment.p_type == elf::abi::PT_LOAD;
             if !load_segment {
-                continue
+                continue;
             }
 
             if segment.p_vaddr < USER_TEXT_BASE {
-                error!("illegal elf p_vaddr 0x{:X} (below USER_TEXT_BASE 0x{:X})", segment.p_vaddr, USER_TEXT_BASE);
-                return Err(())
+                error!(
+                    "illegal elf p_vaddr 0x{:X} (below USER_TEXT_BASE 0x{:X})",
+                    segment.p_vaddr, USER_TEXT_BASE
+                );
+                return Err(());
             }
 
             if segment.p_memsz == 0 {
-                continue
+                continue;
             }
 
             info!("loading {segment:08x?}");
@@ -3631,7 +3962,7 @@ impl Orbit {
                 Ok(seg) => seg,
                 Err(e) => {
                     error!("error parsing loadable segment data: {e:?}");
-                    return Err(())
+                    return Err(());
                 }
             };
 
@@ -3647,8 +3978,8 @@ impl Orbit {
                     None => {
                         self.free_backings(segment_allocations);
                         error!("failed to alloc segment");
-                        return Err(())
-                    },
+                        return Err(());
+                    }
                 };
                 let paddr_start = seg_pa.get_raw();
 
@@ -3667,7 +3998,10 @@ impl Orbit {
                     }
                 }
 
-                segment_allocations.push(PhysBacking::User { frame: seg_pa, layout });
+                segment_allocations.push(PhysBacking::User {
+                    frame: seg_pa,
+                    layout,
+                });
 
                 let vaddr_start = round_u64_down(segment.p_vaddr, PAGE_SIZE as u64);
 
@@ -3696,7 +4030,7 @@ impl Orbit {
                     vaddr: VirtAddr::new(vaddr_start),
                     paddr: PhysAddr::new(paddr_start),
                     log: false,
-                    supervisor_tag: SupervisorTag::None
+                    supervisor_tag: SupervisorTag::None,
                 };
 
                 let map = map_address_range(
@@ -3704,12 +4038,13 @@ impl Orbit {
                     &mut pages,
                     &config,
                     VirtAddr::new(vaddr_end),
-                    PhysAddr::new(paddr_end));
+                    PhysAddr::new(paddr_end),
+                );
 
                 if map.is_err() {
                     self.free_backings(segment_allocations);
                     error!("failed to map segment into process");
-                    return Err(())
+                    return Err(());
                 }
             }
         }
@@ -3774,18 +4109,23 @@ impl Orbit {
 
     fn map_kernel_into(&mut self, root_table: &mmu::mmap::RootTable<'_>) -> Result<(), ()> {
         let mut pages = PageAlloc::FA(self.table_pages.frames_mut());
-        unsafe { memmap::map_kernel_shared(root_table, &mut pages, &self.layout, /*is_kernel_root=*/ false) }
+        unsafe {
+            memmap::map_kernel_shared(
+                root_table,
+                &mut pages,
+                &self.layout,
+                /*is_kernel_root=*/ false,
+            )
+        }
     }
 
     fn next_tid(&mut self) -> u32 {
         let mut next = self.current_thread_id.wrapping_add(1);
         loop {
-            let matches = self.threads.iter()
-                .filter(|(t, _)| next == **t)
-                .count();
+            let matches = self.threads.iter().filter(|(t, _)| next == **t).count();
 
             if matches == 0 {
-                break
+                break;
             }
             next = next.wrapping_add(1);
         }
@@ -3818,12 +4158,14 @@ impl Orbit {
     fn next_pid(&mut self) -> u16 {
         let mut next = self.current_process_id.wrapping_add(1);
         loop {
-            let matches = self.processes.iter()
+            let matches = self
+                .processes
+                .iter()
                 .filter(|(pid, _)| **pid == next)
                 .count();
 
             if matches == 0 {
-                break
+                break;
             }
             next = next.wrapping_add(1);
 
@@ -3866,10 +4208,9 @@ impl orbit_core::sched::Scheduler for Orbit {
 
 pub fn ksleep(duration: Duration) {
     let context = get_hart_context();
-    let current_thread = unsafe {
-        (context.current.load(Ordering::Acquire)
-            as *mut Thread).as_mut_unchecked() };
-    
+    let current_thread =
+        unsafe { (context.current.load(Ordering::Acquire) as *mut Thread).as_mut_unchecked() };
+
     const TICKS_PER_MS: usize = 10_000;
     current_thread.wake_time = riscv::register::time::read()
         .wrapping_add((duration.as_millis() as usize).wrapping_mul(TICKS_PER_MS));

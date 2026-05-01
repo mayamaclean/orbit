@@ -1,13 +1,13 @@
 #![no_std]
 
 use core::arch::asm;
-use core::sync::{atomic::{AtomicUsize, Ordering}};
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use device::{SysInfo, TrapFrame, wake_hart};
-use mmu::{MB};
+use mmu::MB;
 use serial::println;
 
-use elf::{endian::LittleEndian};
+use elf::endian::LittleEndian;
 use riscv::register::mstatus::SPP;
 
 unsafe extern "C" {
@@ -16,7 +16,8 @@ unsafe extern "C" {
     unsafe static RODATA_END: u64;
 }
 
-pub const KERNEL_ELF: &'static [u8] = include_bytes!("../../kmain/target/riscv64gc-unknown-none-elf/release/orbit");
+pub const KERNEL_ELF: &'static [u8] =
+    include_bytes!("../../kmain/target/riscv64gc-unknown-none-elf/release/orbit");
 pub const KERNEL_ELF_LEN: usize = KERNEL_ELF.len();
 
 pub const TRAP_FRAME_ADDR: usize = 0x80800000;
@@ -24,7 +25,7 @@ pub const TRAP_FRAMES: *mut TrapFrame = 0x80800000 as *mut _;
 
 pub static SYSINFO: SysInfo = SysInfo {
     dtb_addr: AtomicUsize::new(0),
-    serial: AtomicUsize::new(0)
+    serial: AtomicUsize::new(0),
 };
 
 // PA of kmain's `_start`, computed by hart 0 once it has copied the kernel
@@ -34,7 +35,7 @@ pub static SYSINFO: SysInfo = SysInfo {
 pub static KMAIN_ENTRY: AtomicUsize = AtomicUsize::new(0);
 
 pub fn setup_interrupts() {
-    use riscv::register::{mstatus, mie, mcounteren, mideleg, medeleg};
+    use riscv::register::{mcounteren, medeleg, mideleg, mie, mstatus};
 
     unsafe {
         //riscv::register::mstatus::set_mie();
@@ -76,7 +77,7 @@ pub fn setup_interrupts() {
         medeleg::set_breakpoint();
         medeleg::set_supervisor_env_call();
         medeleg::set_user_env_call();
-        
+
         medeleg::set_instruction_fault();
         medeleg::set_instruction_page_fault();
         medeleg::set_load_page_fault();
@@ -117,20 +118,16 @@ pub unsafe fn setup_pmp() {
     //   bits 5..6 = reserved
     //   bit  7    = L
     const TOR: u64 = 1 << 3;
-    const R:   u64 = 1 << 0;
-    const W:   u64 = 1 << 1;
-    const X:   u64 = 1 << 2;
-    const L:   u64 = 1 << 7;
-    let entry0 = TOR | R | W | X;       // 0x0F
-    let entry1 = TOR;                   // 0x08
-    let entry2 = TOR | R | L;           // 0x89
-    let entry3 = TOR;                   // 0x08
-    let entry4 = TOR | R | W | X;       // 0x0F
-    let pmpcfg0 = entry0
-        | (entry1 << 8)
-        | (entry2 << 16)
-        | (entry3 << 24)
-        | (entry4 << 32);
+    const R: u64 = 1 << 0;
+    const W: u64 = 1 << 1;
+    const X: u64 = 1 << 2;
+    const L: u64 = 1 << 7;
+    let entry0 = TOR | R | W | X; // 0x0F
+    let entry1 = TOR; // 0x08
+    let entry2 = TOR | R | L; // 0x89
+    let entry3 = TOR; // 0x08
+    let entry4 = TOR | R | W | X; // 0x0F
+    let pmpcfg0 = entry0 | (entry1 << 8) | (entry2 << 16) | (entry3 << 24) | (entry4 << 32);
 
     // Upper bound for "below kmain" — bl's text/data, stack, id_map_tables
     // and the M-mode trap frames at 0x80800000 all live below this.
@@ -185,7 +182,10 @@ pub extern "C" fn kmain_enter(serial_addr: usize, dtb_addr: usize) {
 
     let elf = match elf::ElfBytes::<LittleEndian>::minimal_parse(&KERNEL_ELF[..]) {
         Ok(e) => e,
-        Err(e) => { println!("failed to parse kernel elf: {e:?}"); return }
+        Err(e) => {
+            println!("failed to parse kernel elf: {e:?}");
+            return;
+        }
     };
 
     const VBASE: u64 = 0x8000_0000 + (64 * MB);
@@ -194,29 +194,37 @@ pub extern "C" fn kmain_enter(serial_addr: usize, dtb_addr: usize) {
     for segment in segments.iter() {
         let load_segment = segment.p_type == elf::abi::PT_LOAD;
         if !load_segment {
-            continue
+            continue;
         }
 
         let vaddr = VBASE + segment.p_vaddr;
-        println!("loading {}KB 0x{vaddr:08X}={segment:08x?}",
-            mem::round_u64_up(segment.p_memsz, 4096) / 1024);
+        println!(
+            "loading {}KB 0x{vaddr:08X}={segment:08x?}",
+            mem::round_u64_up(segment.p_memsz, 4096) / 1024
+        );
 
         let segment_data = match elf.segment_data(&segment) {
             Ok(seg) => seg,
             Err(e) => {
                 println!("error parsing loadable segment data: {e:?}");
-                return
+                return;
             }
         };
 
-        unsafe { core::ptr::copy_nonoverlapping(segment_data.as_ptr(), vaddr as *mut u8, segment_data.len()); }
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                segment_data.as_ptr(),
+                vaddr as *mut u8,
+                segment_data.len(),
+            );
+        }
 
         if segment.p_memsz > segment.p_filesz {
             unsafe {
                 core::ptr::write_bytes(
                     (vaddr + segment.p_filesz) as *mut u8,
                     0,
-                    (segment.p_memsz - segment.p_filesz) as usize
+                    (segment.p_memsz - segment.p_filesz) as usize,
                 );
             }
         }

@@ -19,7 +19,10 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::ptr::null_mut;
 use core::sync::atomic::{AtomicPtr, Ordering};
-use dtoolkit::{Node, Property, fdt::{Fdt, FdtNode}};
+use dtoolkit::{
+    Node, Property,
+    fdt::{Fdt, FdtNode},
+};
 use mmu::mmap::{PageAlloc, RootTable};
 use tracing::{error, info};
 
@@ -36,7 +39,8 @@ pub struct PlicInfo {
 }
 
 fn plic_node_matches(n: &FdtNode<'_>) -> bool {
-    let Some(compat) = n.property("compatible") else {
+    let Some(compat) = n.property("compatible")
+    else {
         return false;
     };
     compat
@@ -96,9 +100,7 @@ pub fn find_plic(fdt: &Fdt<'_>) -> Result<PlicInfo, ()> {
     let mut s_contexts: Vec<Option<u32>> = vec![None; max_hart + 1];
 
     let ie = node.property("interrupts-extended").ok_or(())?;
-    let pairs = ie
-        .as_prop_encoded_array([1usize, 1usize])
-        .map_err(|_| ())?;
+    let pairs = ie.as_prop_encoded_array([1usize, 1usize]).map_err(|_| ())?;
 
     for (i, [intc_cells, irq_cells]) in pairs.enumerate() {
         let intc_phandle: u32 = intc_cells.to_int().map_err(|_| ())?;
@@ -106,7 +108,8 @@ pub fn find_plic(fdt: &Fdt<'_>) -> Result<PlicInfo, ()> {
         if irq != 9 {
             continue;
         }
-        let Some((_, hart)) = intc_map.iter().find(|(p, _)| *p == intc_phandle) else {
+        let Some((_, hart)) = intc_map.iter().find(|(p, _)| *p == intc_phandle)
+        else {
             continue;
         };
         let hart = *hart as usize;
@@ -149,10 +152,15 @@ impl Plic {
     /// `base_kva` must be a KMMIO mapping covering the PLIC register
     /// region, and `ndev` must match the device's source count.
     pub const unsafe fn new(base_kva: u64, ndev: u32) -> Self {
-        Self { base: base_kva as *mut u32, ndev }
+        Self {
+            base: base_kva as *mut u32,
+            ndev,
+        }
     }
 
-    pub fn ndev(&self) -> u32 { self.ndev }
+    pub fn ndev(&self) -> u32 {
+        self.ndev
+    }
 
     #[inline]
     fn priority_ptr(&self, src: u32) -> *mut u32 {
@@ -182,13 +190,17 @@ impl Plic {
     /// harts. Writes are 32-bit atomic on the bus; concurrency is a
     /// semantic concern, not a memory-model one.
     pub unsafe fn set_priority(&self, src: u32, prio: u32) {
-        unsafe { self.priority_ptr(src).write_volatile(prio); }
+        unsafe {
+            self.priority_ptr(src).write_volatile(prio);
+        }
     }
 
     /// # Safety
     /// `ctx` must be a valid PLIC context for this device.
     pub unsafe fn set_threshold(&self, ctx: u32, thr: u32) {
-        unsafe { self.threshold_ptr(ctx).write_volatile(thr); }
+        unsafe {
+            self.threshold_ptr(ctx).write_volatile(thr);
+        }
     }
 
     /// Enable `src` on `ctx`.
@@ -229,7 +241,9 @@ impl Plic {
     /// Signal completion for `src` on `ctx`. Must pair with a claim that
     /// returned the same `src`.
     pub unsafe fn complete(&self, ctx: u32, src: u32) {
-        unsafe { self.claim_ptr(ctx).write_volatile(src); }
+        unsafe {
+            self.claim_ptr(ctx).write_volatile(src);
+        }
     }
 
     /// Read the pending-bit word containing `src`. Diagnostic only.
@@ -254,13 +268,23 @@ static PLIC_INFO_PTR: AtomicPtr<PlicInfo> = AtomicPtr::new(null_mut());
 /// handling yet" and ignore the claim.
 pub fn plic() -> Option<&'static Plic> {
     let p = PLIC_PTR.load(Ordering::Acquire);
-    if p.is_null() { None } else { Some(unsafe { &*p }) }
+    if p.is_null() {
+        None
+    }
+    else {
+        Some(unsafe { &*p })
+    }
 }
 
 /// Read-only view of the `PlicInfo` captured during install.
 pub fn info() -> Option<&'static PlicInfo> {
     let p = PLIC_INFO_PTR.load(Ordering::Acquire);
-    if p.is_null() { None } else { Some(unsafe { &*p }) }
+    if p.is_null() {
+        None
+    }
+    else {
+        Some(unsafe { &*p })
+    }
 }
 
 /// Discover the PLIC via DTB, install a KMMIO alias for its registers,
@@ -331,8 +355,7 @@ pub const MAX_SRC: usize = 128;
 
 // One slot per source. Stored as `*mut ()`; the loader transmutes it
 // back to `Handler` on dispatch. Null = unregistered.
-static HANDLERS: [AtomicPtr<()>; MAX_SRC] =
-    [const { AtomicPtr::new(null_mut()) }; MAX_SRC];
+static HANDLERS: [AtomicPtr<()>; MAX_SRC] = [const { AtomicPtr::new(null_mut()) }; MAX_SRC];
 
 fn s_context_for(hart: usize) -> Option<u32> {
     info().and_then(|i| i.s_contexts.get(hart).copied().flatten())
@@ -343,15 +366,21 @@ fn s_context_for(hart: usize) -> Option<u32> {
 /// hart in MVP — the `hart` parameter is plumbed through so future
 /// distribution is a call-site change.
 pub fn plic_register(src: u32, handler: Handler, hart: usize) -> Result<(), ()> {
-    let Some(plic) = plic() else {
+    let Some(plic) = plic()
+    else {
         error!("plic_register: plic not initialized");
         return Err(());
     };
     if src == 0 || (src as usize) >= MAX_SRC || src > plic.ndev() {
-        error!("plic_register: src {} out of range (ndev={})", src, plic.ndev());
+        error!(
+            "plic_register: src {} out of range (ndev={})",
+            src,
+            plic.ndev()
+        );
         return Err(());
     }
-    let Some(ctx) = s_context_for(hart) else {
+    let Some(ctx) = s_context_for(hart)
+    else {
         error!("plic_register: hart {} has no S-mode PLIC context", hart);
         return Err(());
     };
@@ -420,7 +449,10 @@ fn uart_rx_cycle_handler(_src: u32) {
 /// the `scause = 9` arm of `s_trap`. Loops until claim returns 0 so a
 /// burst of pending IRQs is handled in a single trap.
 pub fn dispatch(ctx: u32) {
-    let Some(plic) = plic() else { return };
+    let Some(plic) = plic()
+    else {
+        return;
+    };
     if ctx == u32::MAX {
         return;
     }
@@ -439,6 +471,8 @@ pub fn dispatch(ctx: u32) {
                 handler(src);
             }
         }
-        unsafe { plic.complete(ctx, src); }
+        unsafe {
+            plic.complete(ctx, src);
+        }
     }
 }
