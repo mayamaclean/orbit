@@ -459,6 +459,7 @@ impl Permissions {
             syscall::GET_AFFINITY => class::SCHED,
             syscall::GET_HART_ID => class::SCHED,
             syscall::GET_MICROS => class::STDIO,
+            syscall::PLEDGE => class::PLEDGE,
             syscall::MMAP => class::VMEM,
             syscall::CREATE_NETCH => class::NETCH,
             syscall::CLOSE_HANDLE => class::STDIO,
@@ -468,6 +469,8 @@ impl Permissions {
             syscall::QUERY_SYSCALL_STATS => class::STATS,
             syscall::CREATE_PROCESS_EX => class::PROC_SPAWN,
             syscall::ARGV_ENVP => class::PROC_LIFE,
+            syscall::CREATE_PROCESS_V2 => class::PROC_SPAWN,
+            syscall::QUERY_SHADOW_LOG => class::STATS,
             syscall::CREATE_THREAD => class::PROC_SPAWN,
             syscall::GETPID => class::PROC_LIFE,
             syscall::GETTID => class::PROC_LIFE,
@@ -486,12 +489,59 @@ impl Permissions {
     /// vacuous so we short-circuit on `is_empty`). A class with
     /// multiple bits would require all of them; today every class is
     /// a single bit so this collapses to a single `&`.
+    ///
+    /// **Use [`can_call`](Self::can_call) instead at production
+    /// dispatch sites.** This bare check doesn't push a
+    /// [`ShadowEvent`](crate::shadow::ShadowEvent) on denial, so a
+    /// shadow-mode failure won't show up in `query_shadow_log` or
+    /// the `shadow_perm_denials` counter. `allows` is for tests and
+    /// for the rare context where the caller already knows a denial
+    /// shouldn't be recorded (e.g. a speculative check).
     pub const fn allows(&self, sysno: usize) -> bool {
         let cls = Self::class_for(sysno);
         if cls.is_empty() {
             return false;
         }
         self.perms_mask().contains(cls)
+    }
+
+    /// Dispatch-gate entrypoint. Equivalent to
+    /// [`allows`](Self::allows) plus a [`ShadowEvent::PermDeny`]
+    /// push to `sink` on denial. The return value is what `allows`
+    /// would have returned — the caller decides what to do with it
+    /// (PR2 shadow: ignore the bool, fall through to the handler;
+    /// PR3 enforcement: return EPERM on `false`).
+    ///
+    /// "You can't shadow without recording" is type-enforced here:
+    /// the gate function takes the sink by mutable reference, so
+    /// any code path that wants to invoke the gate must have a
+    /// sink in scope. The kernel's production sink is the bounded
+    /// `ShadowRing` in `orbit-core::roles`; tests pass a Vec-backed
+    /// sink (or `()` for "no recording, I'm checking idempotently").
+    ///
+    /// `ctx` carries the caller-side metadata (pid/tid/time_ticks)
+    /// that lands in the event's matching fields. The dispatch site
+    /// reads it from the hart context once per syscall and threads
+    /// it through.
+    pub fn can_call(
+        &self,
+        sysno: usize,
+        ctx: crate::shadow::GateContext,
+        sink: &mut impl crate::shadow::ShadowSink,
+    ) -> bool {
+        if self.allows(sysno) {
+            return true;
+        }
+        sink.push(crate::shadow::ShadowEvent::PermDeny {
+            required_class: Self::class_for(sysno).raw(),
+            perms: self.perms,
+            time_ticks: ctx.time_ticks,
+            tid: ctx.tid,
+            sysno: sysno as u32,
+            source_role: self.role,
+            pid: ctx.pid,
+        });
+        false
     }
 
     /// Pledge-style narrowing. Each axis is intersected with its
@@ -671,6 +721,7 @@ mod tests {
             GET_AFFINITY,
             GET_HART_ID,
             GET_MICROS,
+            PLEDGE,
             MMAP,
             CREATE_NETCH,
             CLOSE_HANDLE,
@@ -680,6 +731,8 @@ mod tests {
             QUERY_SYSCALL_STATS,
             CREATE_PROCESS_EX,
             ARGV_ENVP,
+            CREATE_PROCESS_V2,
+            QUERY_SHADOW_LOG,
             CREATE_THREAD,
             GETPID,
             GETTID,
@@ -1072,6 +1125,118 @@ mod tests {
         assert_eq!(r.allowed_perms_mask(), class::ALL);
     }
 
+    /// Vec-backed ShadowSink for can_call() tests. Captures pushed
+    /// events for inspection — the production sink is in orbit-core
+    /// (the bounded ring) and isn't reachable from this crate's tests.
+    #[derive(Default)]
+    struct CapturingSink(alloc::vec::Vec<crate::shadow::ShadowEvent>);
+
+    impl crate::shadow::ShadowSink for CapturingSink {
+        fn push(&mut self, event: crate::shadow::ShadowEvent) {
+            self.0.push(event);
+        }
+    }
+
+    extern crate alloc;
+
+    fn ctx() -> crate::shadow::GateContext {
+        crate::shadow::GateContext {
+            pid: 7,
+            tid: 11,
+            time_ticks: 99_000,
+        }
+    }
+
+    #[test]
+    fn can_call_returns_true_and_does_not_push_when_allowed() {
+        // Happy path — perms permit the syscall, no event pushed.
+        // The sink is a witness that no spurious events landed.
+        let p = Permissions::ALL;
+        let mut sink = CapturingSink::default();
+        let ok = p.can_call(crate::syscall::CREATE_NETCH, ctx(), &mut sink);
+        assert!(ok);
+        assert!(sink.0.is_empty(), "no event should fire on the allow path");
+    }
+
+    #[test]
+    fn can_call_returns_false_and_pushes_perm_deny_when_denied() {
+        // Pledge away NETCH, then attempt CREATE_NETCH — gate returns
+        // false AND pushes one PermDeny carrying the right class /
+        // perms / sysno / pid / tid / time_ticks.
+        use crate::shadow::ShadowEvent;
+        let p = Permissions::ALL.pledge(PermsRequest {
+            perms: ClassMask::from_raw(class::raw::ALL & !class::raw::NETCH),
+            allowed_perms: class::ALL,
+        });
+        let mut sink = CapturingSink::default();
+        let ok = p.can_call(crate::syscall::CREATE_NETCH, ctx(), &mut sink);
+        assert!(!ok, "denied call must return false");
+        assert_eq!(sink.0.len(), 1, "exactly one event per denied call");
+        match sink.0[0] {
+            ShadowEvent::PermDeny {
+                required_class, perms, time_ticks, tid, sysno, source_role, pid,
+            } => {
+                assert_eq!(required_class, class::raw::NETCH);
+                assert_eq!(perms, class::raw::ALL & !class::raw::NETCH);
+                assert_eq!(time_ticks, 99_000);
+                assert_eq!(tid, 11);
+                assert_eq!(sysno as usize, crate::syscall::CREATE_NETCH);
+                // Permissions::ALL has role::BOOTSTRAP — the gate populates
+                // source_role from self.role for symmetric "which role
+                // hit the gate" diagnosis.
+                assert_eq!(source_role, role::BOOTSTRAP);
+                assert_eq!(pid, 7);
+            }
+            other => panic!("expected PermDeny, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn can_call_for_unknown_syscall_pushes_event_with_empty_class() {
+        // Unknown sysno → class_for returns EMPTY, allows returns false.
+        // The gate still pushes a PermDeny so reviewers can spot the
+        // "syscall N has no class — extend class_for" miss in the log.
+        use crate::shadow::ShadowEvent;
+        let p = Permissions::ALL;
+        let mut sink = CapturingSink::default();
+        let ok = p.can_call(99_999, ctx(), &mut sink);
+        assert!(!ok);
+        assert_eq!(sink.0.len(), 1);
+        match sink.0[0] {
+            ShadowEvent::PermDeny { required_class, sysno, source_role, .. } => {
+                assert_eq!(required_class, 0);
+                assert_eq!(sysno, 99_999);
+                // Even on unknown-sysno path the source role is captured.
+                assert_eq!(source_role, role::BOOTSTRAP);
+            }
+            other => panic!("expected PermDeny, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn can_call_with_unit_sink_compiles_and_returns_correct_bool() {
+        // `()` is a no-op ShadowSink — the gate still computes the
+        // bool correctly under enforcement-shaped contexts where
+        // logging is redundant.
+        let p = Permissions::ALL;
+        let mut sink = ();
+        assert!(p.can_call(crate::syscall::SERIAL_PRINT, ctx(), &mut sink));
+        let q = Permissions::ZERO;
+        assert!(!q.can_call(crate::syscall::SERIAL_PRINT, ctx(), &mut sink));
+    }
+
+    #[test]
+    fn can_call_does_not_double_push_on_repeated_denials() {
+        // Each invocation pushes exactly one event. Two back-to-back
+        // denials produce two events — caller-side dedup, if any,
+        // happens at the ring not at the gate.
+        let p = Permissions::ZERO;
+        let mut sink = CapturingSink::default();
+        let _ = p.can_call(crate::syscall::SERIAL_PRINT, ctx(), &mut sink);
+        let _ = p.can_call(crate::syscall::CREATE_NETCH, ctx(), &mut sink);
+        assert_eq!(sink.0.len(), 2);
+    }
+
     #[test]
     fn allows_is_true_for_all_perms_on_every_known_syscall() {
         // Symmetric to the above: a process with class::ALL should be
@@ -1089,6 +1254,7 @@ mod tests {
             GET_AFFINITY,
             GET_HART_ID,
             GET_MICROS,
+            PLEDGE,
             MMAP,
             CREATE_NETCH,
             CLOSE_HANDLE,
@@ -1098,6 +1264,8 @@ mod tests {
             QUERY_SYSCALL_STATS,
             CREATE_PROCESS_EX,
             ARGV_ENVP,
+            CREATE_PROCESS_V2,
+            QUERY_SHADOW_LOG,
             CREATE_THREAD,
             GETPID,
             GETTID,

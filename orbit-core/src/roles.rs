@@ -453,8 +453,8 @@ pub fn derive_child_perms(
 
 /// **PR2 shadow-only.** Compute the child's would-be [`Permissions`]
 /// *as if* the transition had been allowed. Used by the shadow-mode
-/// `create_process_v2` handler on the `Err(TransitionDenied)` branch
-/// of [`check_transition`], so the spawn proceeds with realistic
+/// `create_process_v2` handler on the `Err(_)` branches of
+/// [`check_transition`], so the spawn proceeds with realistic
 /// child perms while the kernel logs the would-be denial.
 ///
 /// Returns raw [`Permissions`] (no [`ChildPerms`] witness) — the
@@ -462,17 +462,78 @@ pub fn derive_child_perms(
 /// spawns require. Kernel-side, this means the manager has a
 /// separate `install_child_via_shadow` path that takes a plain
 /// `Permissions`. Both the function here and that kernel-side path
-/// are deleted in PR3 when `Err(TransitionDenied)` becomes EPERM.
+/// are deleted in PR3.
+///
+/// "You can't take the shadow path without recording" is type-enforced
+/// here: the function takes both the [`SpawnDeny`] that triggered the
+/// shadow (so the recorded event names the actual reason, not just
+/// "transition denied") and a [`ShadowSink`] (so the [`RoleDeny`]
+/// event lands somewhere). Even in PR2-shadow, an unrecorded shadow
+/// call is impossible.
+///
+/// **Caller discipline for `trigger`.** This argument is *not*
+/// recomputed inside the function — the caller is responsible for
+/// passing the [`SpawnDeny`] that actually fired. The intended call
+/// site is the kernel `create_process_v2` handler, which has just
+/// matched on the `Err` arm of [`check_transition`] and has the
+/// authoritative variant in hand:
+///
+/// ```ignore
+/// match check_transition(parent.role, target) {
+///     Ok(t)  => { /* enforcement path */ }
+///     Err(e) => {
+///         let p = install_child_shadow(parent, target, req, e, ctx, sink)?;
+///         // … install p, fall through, increment shadow_role_denials …
+///     }
+/// }
+/// ```
+///
+/// Passing a `trigger` that doesn't correspond to the real failure
+/// (e.g. claiming `TransitionDenied` when the actual cause was
+/// `UnknownParentRole`) yields a `RoleDeny` event with a misleading
+/// `deny_reason`. There's no way for the function to detect this —
+/// the cost of forwarding the variant unchecked is type-light glue
+/// at call sites. Audit `install_child_shadow` callers as a unit
+/// when adding a new spawn path.
 ///
 /// Errors:
 /// - `UnknownTargetRole` if `target_role` is out of registry range.
 ///   Even in shadow mode we don't pretend an out-of-range role is
-///   real — that's a caller bug, not a policy denial.
+///   real — that's a caller bug, not a policy denial. The `RoleDeny`
+///   event is *still* pushed (with `deny_reason` taken from
+///   `trigger`) before this returns, so the would-be denial shows up
+///   in the log even on the error path.
+///
+/// [`RoleDeny`]: orbit_abi::shadow::ShadowEvent::RoleDeny
+/// [`ShadowSink`]: orbit_abi::shadow::ShadowSink
 pub fn install_child_shadow(
     parent: &Permissions,
     target_role: RoleId,
     request: PermsRequest,
+    trigger: SpawnDeny,
+    ctx: orbit_abi::shadow::GateContext,
+    sink: &mut impl orbit_abi::shadow::ShadowSink,
 ) -> Result<Permissions, SpawnDeny> {
+    use orbit_abi::shadow::{deny_reason, ShadowEvent};
+
+    // Always push the event first — the function's contract is
+    // "every shadow call is recorded," which holds even on the
+    // unknown-role error path.
+    let deny_reason_code = match trigger {
+        SpawnDeny::UnknownParentRole => deny_reason::UNKNOWN_PARENT_ROLE,
+        SpawnDeny::UnknownTargetRole => deny_reason::UNKNOWN_TARGET_ROLE,
+        SpawnDeny::TransitionDenied => deny_reason::TRANSITION_DENIED,
+    };
+    sink.push(ShadowEvent::RoleDeny {
+        time_ticks: ctx.time_ticks,
+        _reserved: 0,
+        tid: ctx.tid,
+        source_role: parent.role,
+        target_role,
+        deny_reason: deny_reason_code,
+        pid: ctx.pid,
+    });
+
     let target_def = role_def(target_role).ok_or(SpawnDeny::UnknownTargetRole)?;
     let parent_cap = parent.allowed_perms_mask();
 
@@ -1231,6 +1292,21 @@ mod tests {
 
     // ── shadow-path equivalence ──────────────────────────────────────────
 
+    use orbit_abi::shadow::{deny_reason, GateContext, ShadowEvent, ShadowSink};
+
+    #[derive(Default)]
+    struct CapturingSink(alloc::vec::Vec<ShadowEvent>);
+
+    impl ShadowSink for CapturingSink {
+        fn push(&mut self, event: ShadowEvent) {
+            self.0.push(event);
+        }
+    }
+
+    fn shadow_ctx() -> GateContext {
+        GateContext { pid: 42, tid: 7, time_ticks: 12_345 }
+    }
+
     #[test]
     fn install_child_shadow_matches_enforcement_path_when_transition_would_be_allowed() {
         // Even though install_child_shadow exists for the *denied*
@@ -1241,8 +1317,16 @@ mod tests {
         let enforced = try_spawn(&shell, role::NET_CLIENT, full_request())
             .unwrap()
             .into_permissions();
-        let shadow =
-            install_child_shadow(&shell, role::NET_CLIENT, full_request()).unwrap();
+        let mut sink = CapturingSink::default();
+        let shadow = install_child_shadow(
+            &shell,
+            role::NET_CLIENT,
+            full_request(),
+            SpawnDeny::TransitionDenied,
+            shadow_ctx(),
+            &mut sink,
+        )
+        .unwrap();
         assert_eq!(enforced, shadow);
     }
 
@@ -1252,8 +1336,16 @@ mod tests {
         // path produces what the child WOULD have had — full WORKER
         // defaults clamped against parent's allowed_perms.
         let worker = parent_in_role(role::WORKER);
-        let shadowed =
-            install_child_shadow(&worker, role::WORKER, full_request()).unwrap();
+        let mut sink = CapturingSink::default();
+        let shadowed = install_child_shadow(
+            &worker,
+            role::WORKER,
+            full_request(),
+            SpawnDeny::TransitionDenied,
+            shadow_ctx(),
+            &mut sink,
+        )
+        .unwrap();
         assert_eq!(shadowed.role, role::WORKER);
         // worker's allowed_perms = WORKER_PERMS, target default = WORKER_PERMS,
         // request = ALL → child perms = WORKER_PERMS.
@@ -1261,12 +1353,83 @@ mod tests {
     }
 
     #[test]
-    fn install_child_shadow_rejects_unknown_target() {
+    fn install_child_shadow_rejects_unknown_target_but_still_records_event() {
+        // Out-of-range target_role returns Err — but the RoleDeny
+        // event is still pushed before the early return. The shadow
+        // log must capture the would-be denial regardless of which
+        // error path the function took.
         let shell = parent_in_role(role::SHELL);
-        // Even shadow mode rejects out-of-range role IDs — that's
-        // caller bug territory, not a policy denial.
-        let r = install_child_shadow(&shell, 9999, full_request());
+        let mut sink = CapturingSink::default();
+        let r = install_child_shadow(
+            &shell,
+            9999,
+            full_request(),
+            SpawnDeny::UnknownTargetRole,
+            shadow_ctx(),
+            &mut sink,
+        );
         assert_eq!(r, Err(SpawnDeny::UnknownTargetRole));
+        assert_eq!(sink.0.len(), 1, "RoleDeny must be pushed even on unknown-target error");
+        match sink.0[0] {
+            ShadowEvent::RoleDeny { deny_reason: dr, target_role: tr, .. } => {
+                assert_eq!(dr, deny_reason::UNKNOWN_TARGET_ROLE);
+                assert_eq!(tr, 9999);
+            }
+            other => panic!("expected RoleDeny, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn install_child_shadow_pushes_role_deny_with_correct_metadata() {
+        // Pin the wire shape: a shadow call from a SHELL trying to
+        // transition to SHELL (denied) yields a RoleDeny event whose
+        // fields exactly match the call site's pid/tid/time_ticks
+        // and the SHELL/SHELL/TRANSITION_DENIED triple.
+        let shell = parent_in_role(role::SHELL);
+        let mut sink = CapturingSink::default();
+        let _ = install_child_shadow(
+            &shell,
+            role::SHELL, // SHELL → SHELL is denied
+            full_request(),
+            SpawnDeny::TransitionDenied,
+            shadow_ctx(),
+            &mut sink,
+        )
+        .unwrap();
+        assert_eq!(sink.0.len(), 1);
+        match sink.0[0] {
+            ShadowEvent::RoleDeny {
+                time_ticks, _reserved, tid, source_role, target_role,
+                deny_reason: dr, pid,
+            } => {
+                assert_eq!(time_ticks, 12_345);
+                assert_eq!(_reserved, 0);
+                assert_eq!(tid, 7);
+                assert_eq!(source_role, role::SHELL);
+                assert_eq!(target_role, role::SHELL);
+                assert_eq!(dr, deny_reason::TRANSITION_DENIED);
+                assert_eq!(pid, 42);
+            }
+            other => panic!("expected RoleDeny, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn install_child_shadow_records_each_call_separately() {
+        // Two consecutive shadow calls produce two events — no dedup
+        // at the function level. (Dedup, if any, is the ring's
+        // concern.)
+        let worker = parent_in_role(role::WORKER);
+        let mut sink = CapturingSink::default();
+        let _ = install_child_shadow(
+            &worker, role::WORKER, full_request(),
+            SpawnDeny::TransitionDenied, shadow_ctx(), &mut sink,
+        ).unwrap();
+        let _ = install_child_shadow(
+            &worker, role::WORKER, full_request(),
+            SpawnDeny::TransitionDenied, shadow_ctx(), &mut sink,
+        ).unwrap();
+        assert_eq!(sink.0.len(), 2);
     }
 
     // ── registry sanity ──────────────────────────────────────────────────

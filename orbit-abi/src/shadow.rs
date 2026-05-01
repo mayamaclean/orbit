@@ -1,0 +1,293 @@
+//! Shadow-mode telemetry — the events the gates push when they would
+//! have EPERMed under enforcement.
+//!
+//! Two surfaces:
+//!
+//! - [`ShadowEvent`] — the wire shape for a single would-be denial.
+//!   `repr(C)` so the kernel-side ring can serialize bytes straight
+//!   into a user buffer via the `query_shadow_log` syscall.
+//!   Two variants: [`PermDeny`](ShadowEvent::PermDeny) for the
+//!   dispatch-site bitmask gate, [`RoleDeny`](ShadowEvent::RoleDeny)
+//!   for the role-transition gate inside `create_process_v2`.
+//! - [`ShadowSink`] — the trait the gates call into. Any
+//!   `&mut impl ShadowSink` will do; the production implementor is
+//!   the kernel-wide bounded ring in `orbit-core::shadow_ring::ShadowRing`,
+//!   tests use a `Vec`-backed sink.
+//!
+//! The trait/event split is what lets us type-encode "you can't take
+//! the shadow path without recording" — the gate functions
+//! ([`crate::perms::Permissions::can_call`],
+//! `orbit-core::roles::install_child_shadow`) take a sink by mutable
+//! reference and push their event before/after returning. A caller
+//! cannot reach the shadow code without supplying somewhere for the
+//! event to land.
+//!
+//! # Lifecycle
+//!
+//! This module is introduced in PR2 to back shadow-mode gating
+//! (logged, not enforced). PR3 enforces the gates (EPERM on denial)
+//! and deletes `install_child_shadow`. Whether `ShadowEvent` /
+//! `ShadowSink` / `ShadowRing` / `query_shadow_log` survive into PR3
+//! is deferred — they may be repurposed as enforcement-mode audit
+//! logging (relabelling "would-be denials" to "actual denials") or
+//! deleted alongside the shadow install path. Don't take a hard
+//! dependency on this surface from non-shadow code paths until that
+//! decision lands.
+//!
+//! See [docs/dev/permissions-roles.md](../../../docs/dev/permissions-roles.md)
+//! for the broader shadow-vs-enforcement design and how the ring fits
+//! into `query_shadow_log`.
+
+use crate::perms::role::RoleId;
+
+/// Maximum entries the kernel-wide shadow ring retains. Chosen for
+/// "enough to capture a regression's worth of context" while staying
+/// small enough that a full snapshot fits in a single ~2.4 KiB user
+/// buffer for `query_shadow_log` (50 × 48 B = 2400 B, no header —
+/// the reply is just a packed sequence of `ShadowEvent`s). Older
+/// events are evicted on push.
+///
+/// Also pinned as the wire-shape upper bound for `query_shadow_log`'s
+/// reply, so user code can size its buffer up-front.
+pub const SHADOW_RING_CAPACITY: usize = 50;
+
+/// A single would-be denial. Pushed onto the kernel-wide shadow ring
+/// (and the per-process counters incremented) whenever PR2's shadow
+/// gates fire.
+///
+/// `repr(C, u32)` so the layout is stable across user/kernel and the
+/// variant tag is grep-able in a hex dump. Fields within each variant
+/// are laid out **largest-alignment-first** — that lets `repr(C)`
+/// compute the natural padding without any explicit `_pad` fields,
+/// keeping the source readable while still pinning the wire shape.
+/// Each variant occupies 48 bytes (4 discriminant + 4 trailing pad +
+/// 40 payload).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C, u32)]
+pub enum ShadowEvent {
+    /// The dispatch-site bitmask gate would have EPERMed. Recorded
+    /// before the syscall handler is invoked under shadow mode; the
+    /// handler runs anyway and the syscall succeeds.
+    PermDeny {
+        /// Class bit the syscall required, from `Permissions::class_for`.
+        /// A reader can match this against `class::raw::*` to identify
+        /// which permission was missing.
+        required_class: u64,
+        /// Effective `perms` mask of the calling process at the moment
+        /// of the would-be denial. The complement of `required_class`
+        /// against this is "what role/pledge change would have made
+        /// the call succeed."
+        perms: u64,
+        /// Monotonic ticks at the time of the event. Same time domain
+        /// as `get_micros` / `query_stats` — readers should not
+        /// interpret as wallclock.
+        time_ticks: u64,
+        /// Thread ID of the caller.
+        tid: u32,
+        /// Syscall number that triggered the would-be denial.
+        sysno: u32,
+        /// Role of the calling process at the time of the gate. Symmetric
+        /// with [`RoleDeny`](Self::RoleDeny)'s `source_role` — lets a
+        /// log reader answer "which role's `default_perms` is too
+        /// tight?" without joining against external process metadata.
+        /// Lives in the u32 group between `sysno` and `pid` to fit the
+        /// existing variant size (40 B payload, 48 B total) without
+        /// bumping the layout pin.
+        source_role: RoleId,
+        /// Process ID of the caller.
+        pid: u16,
+        // 2 bytes of trailing padding to align the variant size to 8.
+    } = 0,
+
+    /// `create_process_v2`'s role-transition gate would have EPERMed.
+    /// Recorded before the shadow path falls through to
+    /// `install_child_shadow`; the spawn proceeds with realistic
+    /// child perms regardless.
+    RoleDeny {
+        /// Monotonic ticks at the time of the event.
+        time_ticks: u64,
+        /// Reserved for future axes (e.g. additional `SpawnDeny`
+        /// variants, label fingerprints). Must be zero today. Same
+        /// forward-compat *idea* as
+        /// [`crate::perms::Permissions::_reserved`] — old kernels
+        /// stamp zero, new readers can repurpose — but a single
+        /// `u64` slot here vs. that field's `[u64; 2]`. Bump the
+        /// variant size pin in `shadow_event_layout_is_pinned` if
+        /// you grow this slot.
+        _reserved: u64,
+        /// Parent thread's tid (the one that issued the spawn).
+        tid: u32,
+        /// Parent's role at the time of the call.
+        source_role: RoleId,
+        /// Role the spawn was targeting.
+        target_role: RoleId,
+        /// Discriminant of the [`crate::perms::SpawnDeny`]-shaped reason
+        /// for the would-be denial: `0` = `UnknownParentRole`, `1` =
+        /// `UnknownTargetRole`, `2` = `TransitionDenied`. Inlined as
+        /// `u32` so the wire layout doesn't depend on a Rust enum's
+        /// internal layout.
+        deny_reason: u32,
+        /// Parent process's pid.
+        pid: u16,
+        // 2 bytes of trailing padding to align the variant size to 8.
+    } = 1,
+}
+
+/// `deny_reason` values for [`ShadowEvent::RoleDeny`]. Mirror the
+/// discriminants of `orbit_core::roles::SpawnDeny`; pinned here as
+/// `u32` constants because the on-the-wire shape can't depend on a
+/// Rust enum's representation.
+pub mod deny_reason {
+    pub const UNKNOWN_PARENT_ROLE: u32 = 0;
+    pub const UNKNOWN_TARGET_ROLE: u32 = 1;
+    pub const TRANSITION_DENIED: u32 = 2;
+}
+
+/// Sink for shadow events. Production sites use the kernel-wide
+/// bounded ring (`orbit-core::roles::ShadowRing`); tests use a
+/// `Vec`-backed sink to inspect the event stream.
+///
+/// Threading model: implementors are free to require external
+/// synchronization. The kernel-side ring lives behind the manager
+/// lock, which serializes both gates by construction.
+pub trait ShadowSink {
+    /// Push an event. Implementors that have a fixed capacity (e.g.
+    /// the production ring) evict the oldest event on push. Drops
+    /// from the sink-side don't need to be observable to the
+    /// pusher — the ring is best-effort.
+    fn push(&mut self, event: ShadowEvent);
+}
+
+/// `()` is the no-op sink. Useful for tests / contexts where the
+/// gate is being exercised outside shadow mode (e.g. enforcement
+/// path under PR3, where the EPERM return is what matters and the
+/// event push is redundant).
+impl ShadowSink for () {
+    fn push(&mut self, _event: ShadowEvent) {}
+}
+
+/// Caller-side metadata needed to populate a [`ShadowEvent`]. The
+/// gate functions themselves don't have access to the kernel's
+/// `(pid, tid, time)` triple; the dispatch site reads it from the
+/// hart context and bundles it here.
+///
+/// Internal-only — doesn't cross the syscall boundary, so no
+/// `repr(C)` / wire-shape concerns. Implementors of the gate
+/// functions can ignore the fields they don't need (pure-logic
+/// tests typically pass `GateContext::ZERO`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GateContext {
+    /// PID of the calling process. Lands in the event's `pid` field.
+    pub pid: u16,
+    /// TID of the calling thread. Lands in the event's `tid` field.
+    pub tid: u32,
+    /// Monotonic ticks at the time of the gate call. Lands in the
+    /// event's `time_ticks` field.
+    pub time_ticks: u64,
+}
+
+impl GateContext {
+    /// All-zero context. Useful for tests; production callers
+    /// populate from the hart context.
+    pub const ZERO: Self = Self {
+        pid: 0,
+        tid: 0,
+        time_ticks: 0,
+    };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pin the variant sizes — both PermDeny and RoleDeny target
+    /// 32 bytes including the discriminant, so 50 events fit in
+    /// 1.6 KiB. If a future field grows the variant, this fails
+    /// loudly so the wire-shape impact is visible.
+    #[test]
+    fn shadow_event_layout_is_pinned() {
+        // `repr(C, u32)` enum layout: 4-byte discriminant + variant
+        // payload, padded to the variant's alignment. The largest
+        // variant determines size_of::<ShadowEvent>().
+        assert_eq!(core::mem::size_of::<ShadowEvent>(), 48);
+        assert_eq!(core::mem::align_of::<ShadowEvent>(), 8);
+    }
+
+    #[test]
+    fn shadow_ring_capacity_pinned() {
+        // SHADOW_RING_CAPACITY is part of the ABI: user code sizing a
+        // query_shadow_log buffer relies on this number.
+        assert_eq!(SHADOW_RING_CAPACITY, 50);
+    }
+
+    #[test]
+    fn deny_reason_constants_match_documented_values() {
+        // Pinned: kernel-side log readers and on-host analysis tools
+        // assume these specific u32 values for SpawnDeny variants.
+        assert_eq!(deny_reason::UNKNOWN_PARENT_ROLE, 0);
+        assert_eq!(deny_reason::UNKNOWN_TARGET_ROLE, 1);
+        assert_eq!(deny_reason::TRANSITION_DENIED, 2);
+    }
+
+    /// Vec-backed sink for tests — the production sink (`ShadowRing`
+    /// in orbit-core) requires alloc + manager-lock context, so unit
+    /// tests at the orbit-abi level use this.
+    #[derive(Default)]
+    struct VecSink(alloc::vec::Vec<ShadowEvent>);
+
+    impl ShadowSink for VecSink {
+        fn push(&mut self, event: ShadowEvent) {
+            self.0.push(event);
+        }
+    }
+
+    #[test]
+    fn vec_sink_records_events_in_order() {
+        // ShadowSink trait sanity — a sink that just collects should
+        // see events in the order push was called. Plain Vec semantics,
+        // pinned because the production ring promises chronological
+        // order in the snapshot reply.
+        let mut sink = VecSink::default();
+        let e0 = ShadowEvent::PermDeny {
+            required_class: 0x40,
+            perms: 0x1,
+            time_ticks: 100,
+            tid: 1,
+            sysno: 4097,
+            source_role: 6,
+            pid: 1,
+        };
+        let e1 = ShadowEvent::RoleDeny {
+            time_ticks: 200,
+            _reserved: 0,
+            tid: 1,
+            source_role: 6,
+            target_role: 3,
+            deny_reason: deny_reason::TRANSITION_DENIED,
+            pid: 1,
+        };
+        sink.push(e0);
+        sink.push(e1);
+        assert_eq!(sink.0.len(), 2);
+        assert_eq!(sink.0[0], e0);
+        assert_eq!(sink.0[1], e1);
+    }
+
+    #[test]
+    fn unit_sink_is_a_noop() {
+        // `impl ShadowSink for ()` — push compiles and is a no-op.
+        // Used in enforcement-mode contexts where logging is redundant.
+        let mut sink = ();
+        sink.push(ShadowEvent::PermDeny {
+            required_class: 0,
+            perms: 0,
+            time_ticks: 0,
+            tid: 0,
+            sysno: 0,
+            source_role: 0,
+            pid: 0,
+        });
+    }
+
+    extern crate alloc;
+}

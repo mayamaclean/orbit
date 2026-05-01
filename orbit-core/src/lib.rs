@@ -18,6 +18,7 @@ pub mod pending_work;
 pub mod ready_queue;
 pub mod roles;
 pub mod sched;
+pub mod shadow_ring;
 pub mod sleep_heap;
 pub mod syscall;
 pub mod tlb_shootdown;

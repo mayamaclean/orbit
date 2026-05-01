@@ -86,6 +86,32 @@ pub struct ProcessStats {
     pub hart_kernel_ticks: u64,
     pub hart_scheduler_ticks: u64,
     pub hart_idle_ticks: u64,
+
+    // ─── per-process shadow-mode counters (PR2+) ─────────────────────
+    /// Number of times the dispatch-site bitmask gate would have
+    /// EPERMed a syscall from this process under enforcement.
+    /// Monotonic; the smoke-test fast path ("did the gate fire at
+    /// all since `before_delta`?") reads this delta.
+    ///
+    /// Bookkeeping is kernel-side: after `Permissions::can_call`
+    /// returns `false`, the dispatch handler increments this field.
+    /// `can_call` itself only knows about the
+    /// [`ShadowSink`](crate::shadow::ShadowSink) — it has no handle
+    /// on the per-process counter, so counter/ring agreement is a
+    /// dispatch-handler discipline, not a type-level invariant.
+    /// Pairs with the kernel-wide
+    /// [`ShadowEvent`](crate::shadow::ShadowEvent) ring — this
+    /// counter answers "how many?", the ring answers "which?".
+    pub shadow_perm_denials: u64,
+    /// Number of times `create_process_v2`'s role-transition gate
+    /// would have EPERMed a spawn from this process under
+    /// enforcement. Same kernel-side bookkeeping shape as
+    /// `shadow_perm_denials`: the `create_process_v2` handler
+    /// increments after `install_child_shadow` returns; the function
+    /// itself only pushes the
+    /// [`RoleDeny`](crate::shadow::ShadowEvent::RoleDeny) event into
+    /// the sink.
+    pub shadow_role_denials: u64,
 }
 
 #[cfg(test)]
@@ -93,11 +119,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn layout_is_128_bytes() {
+    fn layout_is_144_bytes() {
         // Pinning the size keeps reviewers honest about ABI growth.
         // Bump only when appending fields (and update the kernel's
-        // matching write path in lockstep).
-        assert_eq!(core::mem::size_of::<ProcessStats>(), 128);
+        // matching write path in lockstep). PR2 added two u64 shadow
+        // counters: 128 + 16 = 144.
+        assert_eq!(core::mem::size_of::<ProcessStats>(), 144);
     }
 
     #[test]
@@ -148,7 +175,7 @@ mod tests {
         // knows. The trailing fields it doesn't have yet aren't in
         // user_buf at all — that's fine.
         let read_size = u32::from_le_bytes(user_buf[0..4].try_into().unwrap());
-        assert_eq!(read_size, 128);
+        assert_eq!(read_size, core::mem::size_of::<ProcessStats>() as u32);
 
         // pid is at offset 8, length 2.
         let read_pid = u16::from_le_bytes(user_buf[8..10].try_into().unwrap());
@@ -205,5 +232,7 @@ mod tests {
         assert_eq!(&s.hart_kernel_ticks      as *const _ as usize - base, 104);
         assert_eq!(&s.hart_scheduler_ticks   as *const _ as usize - base, 112);
         assert_eq!(&s.hart_idle_ticks        as *const _ as usize - base, 120);
+        assert_eq!(&s.shadow_perm_denials    as *const _ as usize - base, 128);
+        assert_eq!(&s.shadow_role_denials    as *const _ as usize - base, 136);
     }
 }
