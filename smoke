@@ -27,6 +27,138 @@ NC_LOG=/tmp/orbit-smoke-nc.log
 die()  { echo "FAIL: $*" >&2; exit 1; }
 note() { printf ">> %s\n" "$*"; }
 
+# --- mode selection ---
+# Default: the umode TCP/tarfs/syscall smoke (what the rest of this
+# script implements). `--perms-roles`: build + ship `smoke-perms-roles`
+# to a running orbit-loader, assert its PASS marker. The two modes
+# share build-layer code via `build_kernel_and_disk` but otherwise
+# branch in `main`.
+MODE=default
+while (( $# )); do
+  case "$1" in
+    --perms-roles)
+      MODE=perms-roles
+      shift
+      ;;
+    -h|--help)
+      cat <<USAGE
+Usage: $0 [MODE]
+
+Modes:
+  (no args)        umode TCP/tarfs/syscall smoke (default)
+  --perms-roles    ship smoke-perms-roles to orbit-loader and assert PASS
+USAGE
+      exit 0
+      ;;
+    *)
+      die "unknown option: $1 (try --help)"
+      ;;
+  esac
+done
+
+# Forward declarations so `main`-style branching reads top-down.
+run_perms_roles_smoke() {
+  # Build the kernel with the *default* feature set so init = /bin/console
+  # (the loader still listens on :7777 alongside its init spawn, so
+  # we can ship perms-roles to it via send-payload.py).
+  note "building orbit-loader (release)"
+  ( cd "$ROOT/orbit-loader" && cargo build --release --bin orbit-loader >/dev/null )
+  note "building kmain (release, default features → init=/bin/console)"
+  ( cd "$ROOT/kmain" && ./build.sh >/tmp/orbit-pr-kmain-build.log 2>&1 ) \
+    || die "kmain build failed (see /tmp/orbit-pr-kmain-build.log)"
+  note "building bl (release)"
+  ( cd "$ROOT/bl" && cargo build --release --bin launch >/dev/null )
+  BL_BIN="$ROOT/bl/target/riscv64gc-unknown-none-elf/release/launch"
+  [ -x "$BL_BIN" ] || die "bl binary missing at $BL_BIN"
+
+  # smoke-stub-child must build before smoke-perms-roles (it's
+  # include_bytes!'d as the v2-spawn ELF blob).
+  note "building smoke-stub-child (release) — embedded as v2 spawn payload"
+  ( cd "$ROOT/smoke-stub-child" && cargo build --release >/dev/null )
+  note "building smoke-perms-roles (release)"
+  ( cd "$ROOT/smoke-perms-roles" && cargo build --release >/dev/null )
+  PR_ELF="$ROOT/smoke-perms-roles/target/riscv64gc-unknown-none-elf/release/smoke-perms-roles"
+  [ -s "$PR_ELF" ] || die "smoke-perms-roles binary missing at $PR_ELF"
+
+  note "building disk.img (loader needs tarfs to read /bin/console)"
+  "$ROOT/tools/build-disk.sh" >/dev/null
+  [ -s "$ROOT/disk.img" ] || die "disk.img missing at $ROOT/disk.img"
+
+  # Pre-flight: the loader's TCP listener uses guest port 7777 and
+  # we map it to host 7777 via -hostfwd. If something else owns the
+  # host port, send-payload would fail silently.
+  if ss -ltn 2>/dev/null | grep -q ':7777 '; then
+    die "host port 7777 already in use — kill the existing listener (ss -ltnp | grep :7777)"
+  fi
+
+  note "booting qemu in background (timeout ${QEMU_TIMEOUT}s)"
+  : >"$QEMU_LOG"
+  timeout "$QEMU_TIMEOUT" qemu-system-riscv64 \
+    -d guest_errors -smp 4 -m 2G \
+    -machine virt,aclint=on -cpu max,sstc=true \
+    -nographic -bios none -serial mon:stdio \
+    -netdev user,id=orbit0,net=192.168.76.0/24,dhcpstart=192.168.76.9,hostfwd=tcp::7777-:7777 \
+    -device e1000,netdev=orbit0 \
+    -global virtio-mmio.force-legacy=off \
+    -drive file="$ROOT/disk.img",format=raw,if=none,id=hd0,readonly=on,file.locking=off \
+    -device virtio-blk-device,drive=hd0 \
+    -kernel "$BL_BIN" \
+    </dev/null >>"$QEMU_LOG" 2>&1 &
+  QEMU_PID=$!
+  trap 'kill "$QEMU_PID" 2>/dev/null || true' EXIT
+
+  # Wait for the loader to advertise its TCP listener. Cap at half the
+  # overall timeout so a stuck boot fails fast rather than after the
+  # full QEMU window.
+  note "waiting for orbit-loader to start listening on :7777"
+  WAIT_DEADLINE=$(( $(date +%s) + QEMU_TIMEOUT / 2 ))
+  while ! grep -q 'orbit-loader: listening on :7777' "$QEMU_LOG" 2>/dev/null; do
+    if (( $(date +%s) >= WAIT_DEADLINE )); then
+      kill "$QEMU_PID" 2>/dev/null || true
+      tail -n 50 "$QEMU_LOG" >&2 || true
+      die "orbit-loader never came up (no 'listening on :7777' in $QEMU_LOG)"
+    fi
+    if ! kill -0 "$QEMU_PID" 2>/dev/null; then
+      tail -n 50 "$QEMU_LOG" >&2 || true
+      die "QEMU exited before orbit-loader was ready"
+    fi
+    sleep 0.5
+  done
+
+  note "shipping smoke-perms-roles via send-payload.py"
+  python3 "$ROOT/orbit-loader/tools/send-payload.py" "$PR_ELF" \
+    --name smoke-perms-roles >/tmp/orbit-pr-send.log 2>&1 \
+    || die "send-payload failed (see /tmp/orbit-pr-send.log)"
+
+  note "waiting for PASS / FAIL marker"
+  while ! grep -qE '(PASS|FAIL) smoke-perms-roles' "$QEMU_LOG" 2>/dev/null; do
+    if ! kill -0 "$QEMU_PID" 2>/dev/null; then
+      break  # QEMU exited, fall through to the marker check
+    fi
+    sleep 0.3
+  done
+
+  # Stop QEMU cleanly so the log is final.
+  kill "$QEMU_PID" 2>/dev/null || true
+  wait "$QEMU_PID" 2>/dev/null || true
+
+  if grep -q '^.*PASS smoke-perms-roles' "$QEMU_LOG"; then
+    note "smoke-perms-roles PASS"
+    grep 'smoke-perms-roles' "$QEMU_LOG" | tail -10
+    exit 0
+  fi
+  if grep -q '^.*FAIL smoke-perms-roles' "$QEMU_LOG"; then
+    grep 'smoke-perms-roles' "$QEMU_LOG" | tail -20 >&2
+    die "smoke-perms-roles FAILed (see $QEMU_LOG)"
+  fi
+  tail -n 100 "$QEMU_LOG" >&2 || true
+  die "smoke-perms-roles never reported PASS or FAIL (see $QEMU_LOG)"
+}
+
+if [[ $MODE == perms-roles ]]; then
+  run_perms_roles_smoke
+fi
+
 # --- build layers ---
 # kmain always embeds orbit-loader; the `smoke` cargo feature on kmain
 # now selects the init *path* (/bin/smoke instead of /bin/console)

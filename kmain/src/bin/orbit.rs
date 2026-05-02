@@ -336,6 +336,12 @@ extern "C" fn s_trap(
                         4106 => {
                             kmain::handle_query_denial_log(epc, hart_context, frame);
                         }
+                        4107 => {
+                            kmain::handle_chdir(epc, hart_context, frame);
+                        }
+                        4108 => {
+                            kmain::handle_getcwd(epc, hart_context, frame);
+                        }
                         5000 => {
                             debug!("orbit handling u mode ecall({syscall})");
                             kmain::handle_create_thread(epc, hart_context, frame);
@@ -371,6 +377,12 @@ extern "C" fn s_trap(
                         6003 => {
                             debug!("orbit handling u mode ecall({syscall})");
                             kmain::handle_fs_readdir(epc, hart_context, frame);
+                        }
+                        6004 => {
+                            kmain::handle_fs_seek(epc, hart_context, frame);
+                        }
+                        6005 => {
+                            kmain::handle_fs_fstat(epc, hart_context, frame);
                         }
                         _ => {
                             debug!("orbit handling u mode ecall({syscall})");
@@ -535,6 +547,7 @@ pub extern "C" fn k_smpstart() {
         argv_bytes: Some(argv_blob),
         envp_bytes: Some(envp_blob),
         perms: Some(Permissions::LOADER),
+        cwd: None,
     };
 
     orbit

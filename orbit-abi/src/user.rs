@@ -827,6 +827,65 @@ pub fn fs_readdir(fd: u32, buf: &mut [u8]) -> Result<usize, Errno> {
     })
 }
 
+/// `fs_fstat(fd, &mut Stat)` — fill `*stat` with metadata for the file
+/// backing `fd`. Mirror of [`fs_stat`] keyed on an open fd, so callers
+/// don't have to retain the path used at open. Backs
+/// `std::fs::File::metadata` in the orbit std PAL.
+///
+/// Errnos: `EBADF` (fd not open), `EFAULT` (bad pointer), `EINVAL`
+/// (stat straddles a page), `EIO` (backing fs lookup failed).
+#[inline]
+pub fn fs_fstat(fd: u32, stat: &mut crate::fs::Stat) -> Result<(), Errno> {
+    Errno::from_ret(unsafe { ecall2(syscall::FS_FSTAT, fd as usize, stat as *mut _ as usize) })
+        .map(|_| ())
+}
+
+/// `fs_seek(fd, offset, whence)` — reposition the byte cursor on a
+/// regular-file fd. `whence` is one of [`crate::fs::SEEK_SET`],
+/// [`crate::fs::SEEK_CUR`], [`crate::fs::SEEK_END`]. Returns the new
+/// absolute offset; never negative on success.
+///
+/// Errnos: `EBADF` (fd not a regular-file fd), `EINVAL` (bad whence
+/// or resolved offset would be negative).
+#[inline]
+pub fn fs_seek(fd: u32, offset: i64, whence: u32) -> Result<u64, Errno> {
+    Errno::from_ret(unsafe {
+        ecall3(
+            syscall::FS_SEEK,
+            fd as usize,
+            offset as usize,
+            whence as usize,
+        )
+    })
+    .map(|n| n as u64)
+}
+
+/// `chdir(path)` — replace the calling process's cwd with the
+/// (absolute, UTF-8) `path`. The kernel validates the target
+/// resolves to an existing directory in the active filesystem
+/// before mutating cwd, so a successful return guarantees that
+/// subsequent relative-path fs syscalls have a defined base.
+///
+/// Errnos: `EFAULT`, `EINVAL` (non-absolute / empty),
+/// `ENAMETOOLONG`, `ENOENT` (target dir missing), `ENOTDIR`
+/// (target exists but isn't a directory).
+#[inline]
+pub fn chdir(path: &str) -> Result<(), Errno> {
+    Errno::from_ret(unsafe { ecall2(syscall::CHDIR, path.as_ptr() as usize, path.len()) })
+        .map(|_| ())
+}
+
+/// `getcwd(buf)` — copy the calling process's cwd into `buf` and
+/// return the number of bytes written (no NUL terminator).
+///
+/// Errnos: `EFAULT`, `ERANGE` (buffer too small for current cwd —
+/// caller can re-attempt with a larger buffer or fall back to a
+/// page-sized scratch).
+#[inline]
+pub fn getcwd(buf: &mut [u8]) -> Result<usize, Errno> {
+    Errno::from_ret(unsafe { ecall2(syscall::GETCWD, buf.as_mut_ptr() as usize, buf.len()) })
+}
+
 /// Snapshot per-process and kernel-wide accounting. The wrapper owns
 /// the buffer so callers don't have to think about ABI sizing — pass
 /// `()`, get a struct back. On a kernel newer than this build,

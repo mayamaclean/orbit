@@ -221,6 +221,10 @@ fn syscall_name(ordinal: usize) -> &'static str {
         28 => "pledge",
         29 => "create_process_v2",
         30 => "query_denial_log",
+        31 => "chdir",
+        32 => "getcwd",
+        33 => "fs_seek",
+        34 => "fs_fstat",
         _ => "?",
     }
 }

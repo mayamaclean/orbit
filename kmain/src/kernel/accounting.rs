@@ -76,10 +76,14 @@ pub static SYSCALL_STATS: [SyscallSlot; Sysno::COUNT] = [
     SyscallSlot::new(),
     SyscallSlot::new(),
     SyscallSlot::new(),
+    SyscallSlot::new(),
+    SyscallSlot::new(),
+    SyscallSlot::new(),
+    SyscallSlot::new(),
 ];
 
 const _: () = assert!(
-    Sysno::COUNT == 31,
+    Sysno::COUNT == 35,
     "SYSCALL_STATS literal must be resized when Sysno::COUNT changes"
 );
 

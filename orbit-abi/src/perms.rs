@@ -270,6 +270,29 @@ pub mod role {
     /// Total number of defined roles. Sized to fit the static `ROLES`
     /// table in `orbit-core::roles`; bump when adding a role.
     pub const COUNT: usize = 8;
+
+    /// Sentinel passed as `target_role` to `create_process_v2` meaning
+    /// "spawn a child with my own role and perms exactly — no role
+    /// transition, no perm narrowing." Outside the registry range, so
+    /// `role_def(INHERIT)` returns `None`; `check_transition`
+    /// short-circuits and `derive_child_perms` returns the parent's
+    /// `Permissions` verbatim.
+    ///
+    /// This is the escape hatch for callers that want fork-shaped
+    /// semantics rather than the role-aware downgrade lattice — the
+    /// shape `std::process::Command` and any other libc-style spawn
+    /// surface needs. Real role-aware spawn paths (the loader chain,
+    /// service supervisors) pass a concrete `RoleId`.
+    ///
+    /// **TODO (role-metadata milestone):** every kernel/userland call
+    /// site that currently passes `INHERIT` is a placeholder. Once
+    /// per-binary role metadata exists (signed manifest, ELF note,
+    /// or tarfs sidecar — TBD), each `INHERIT` should be replaced
+    /// with the concrete `target_role` derived from that metadata so
+    /// the role-transition gate runs for real. Search this codebase
+    /// for `role::INHERIT` to find the full list of sites that need
+    /// promotion.
+    pub const INHERIT: RoleId = u32::MAX;
 }
 
 /// Process-wide permission state. Lives on `Process` in the kernel; user
@@ -395,6 +418,29 @@ pub struct CreateProcessV2Args {
     /// Caller-requested narrowing of the child's allowed_perms cap.
     /// Independent axis — see [`Permissions`] struct docs.
     pub request_allowed_perms: u64,
+    /// Optional cwd override for the child. `cwd_vaddr == 0` (or
+    /// `cwd_len == 0`) means "inherit the parent's cwd verbatim",
+    /// matching POSIX fork+exec semantics; non-zero gives the child
+    /// a starting cwd of the bytes at `[cwd_vaddr, cwd_vaddr+cwd_len)`,
+    /// which the kernel validates as absolute UTF-8 + existing dir
+    /// before installing.
+    pub cwd_vaddr: usize,
+    /// Length of the cwd override in bytes; ignored when `cwd_vaddr
+    /// == 0`. Capped at 4 KiB; longer requests yield `ENAMETOOLONG`.
+    pub cwd_len: usize,
+    /// User VA of an argv blob in [`crate::argv`] wire format, or `0`
+    /// for a child with no argv. Capped at one page. Mirrors the
+    /// `argv_vaddr` arg of the legacy `CREATE_PROCESS_EX` syscall —
+    /// V2 carries the field directly so it's a strict superset.
+    pub argv_vaddr: usize,
+    /// Length of the argv blob in bytes; ignored when `argv_vaddr ==
+    /// 0`. Must fit in one page.
+    pub argv_len: usize,
+    /// User VA of a page-aligned envp blob in [`crate::envp`] wire
+    /// format, or `0` for "no envp." The kernel always reads exactly
+    /// one page from this VA; callers must pass a page-resident,
+    /// page-sized buffer (zero-padded past the packed bytes).
+    pub envp_vaddr: usize,
 }
 
 impl CreateProcessV2Args {
@@ -544,6 +590,13 @@ impl Permissions {
             syscall::FS_READ => class::FS_RO,
             syscall::FS_STAT => class::FS_RO,
             syscall::FS_READDIR => class::FS_RO,
+            syscall::FS_SEEK => class::FS_RO,
+            syscall::FS_FSTAT => class::FS_RO,
+            // chdir validates the target dir exists in the active fs
+            // before mutating cwd, so it needs FS_RO. getcwd is pure
+            // process-state read, like getpid.
+            syscall::CHDIR => class::FS_RO,
+            syscall::GETCWD => class::PROC_LIFE,
             _ => ClassMask::EMPTY,
         }
     }
@@ -811,6 +864,10 @@ mod tests {
             FS_READ,
             FS_STAT,
             FS_READDIR,
+            FS_SEEK,
+            FS_FSTAT,
+            CHDIR,
+            GETCWD,
         ];
         for s in all {
             let cls = Permissions::class_for(s);
@@ -1341,6 +1398,10 @@ mod tests {
             FS_OPEN,
             FS_READ,
             FS_STAT,
+            FS_SEEK,
+            FS_FSTAT,
+            CHDIR,
+            GETCWD,
         ] {
             assert!(p.allows(s), "ALL.allows({s}) should be true");
         }

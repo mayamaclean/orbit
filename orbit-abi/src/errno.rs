@@ -25,6 +25,8 @@ pub const ENOTDIR: i32 = 20;
 pub const EISDIR: i32 = 21;
 pub const EINVAL: i32 = 22;
 pub const ENFILE: i32 = 23;
+pub const ERANGE: i32 = 34;
+pub const ENAMETOOLONG: i32 = 36;
 pub const ENOSYS: i32 = 38;
 pub const ETIMEDOUT: i32 = 110;
 

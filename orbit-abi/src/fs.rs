@@ -14,6 +14,13 @@
 /// without a syscall renumber. Pass 0.
 pub const OPEN_RDONLY: usize = 0;
 
+/// `whence` argument to [`crate::user::fs_seek`]. POSIX numbering
+/// (`SEEK_SET = 0`, `SEEK_CUR = 1`, `SEEK_END = 2`) so a future libc
+/// shim can pass the value through unchanged.
+pub const SEEK_SET: u32 = 0;
+pub const SEEK_CUR: u32 = 1;
+pub const SEEK_END: u32 = 2;
+
 // File-type bits for `Stat::st_mode`. POSIX-shape (octal). High bits
 // encode the type; low 12 bits are permission + setuid/setgid/sticky.
 pub const S_IFMT: u32 = 0o170000;

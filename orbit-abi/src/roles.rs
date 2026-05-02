@@ -388,6 +388,24 @@ pub fn check_transition(
     parent_role: RoleId,
     target_role: RoleId,
 ) -> Result<TransitionAllowed, SpawnDeny> {
+    // Passthrough sentinel — child inherits parent's role + perms
+    // verbatim. Always succeeds for any parent (including NOROLE),
+    // because the v2 path is the only spawn surface and `std::Command`
+    // shouldn't have to thread role-aware downgrade logic for the
+    // common "fork a child like me" case. The witness carries
+    // `target = INHERIT`; `derive_child_perms` recognizes this and
+    // short-circuits the clamp, returning parent's `Permissions`.
+    if target_role == role::INHERIT {
+        // `target_def` is never read on the inherit path; reuse
+        // NOROLE's def as a non-null placeholder so the witness's
+        // wire shape stays uniform.
+        let placeholder = role_def(role::NOROLE).expect("NOROLE always present in registry");
+        return Ok(TransitionAllowed {
+            source: parent_role,
+            target: role::INHERIT,
+            target_def: placeholder,
+        });
+    }
     let parent_def = role_def(parent_role).ok_or(SpawnDeny::UnknownParentRole)?;
     let target_def = role_def(target_role).ok_or(SpawnDeny::UnknownTargetRole)?;
     if !parent_def.allows_transition(target_role) {
@@ -429,6 +447,15 @@ pub fn derive_child_perms(
     transition: TransitionAllowed,
     request: PermsRequest,
 ) -> ChildPerms {
+    // INHERIT short-circuit — return parent's `Permissions` verbatim.
+    // No clamp, no role-default intersection. `request` is ignored
+    // (callers wanting to *narrow* on top of inherit should use
+    // `pledge` after spawn). The role on the child is the parent's,
+    // not the INHERIT sentinel — INHERIT only labels the *transition*,
+    // never the resulting role.
+    if transition.target() == role::INHERIT {
+        return ChildPerms(*parent);
+    }
     // No expect / no panic path: the witness carries the resolved
     // RoleDef directly (populated by check_transition). Even a forged
     // witness via `mem::transmute` would only produce undefined

@@ -8,6 +8,7 @@ use core::marker::PhantomData;
 use core::sync::atomic::{AtomicU64, AtomicUsize};
 
 use alloc::collections::{btree_map::BTreeMap, btree_set::BTreeSet};
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use device::{Stack, TrapFrame};
 use mmu::sv48::PhysAddr;
@@ -511,6 +512,14 @@ pub struct Process {
     /// manager-side `create_process_v2` handler before it returns
     /// `-EPERM`.
     pub role_denials: AtomicU64,
+    /// Per-process current working directory. Always an absolute
+    /// UTF-8 path (rooted at `/`) — relative path syscalls
+    /// (`fs_open`/`fs_stat`/`fs_readdir`) prefix this before
+    /// resolution. Mutated by `chdir`; copied from the parent at
+    /// spawn time, or overridden by `CreateProcessV2Args.cwd_*` if
+    /// the spawn caller passed a non-empty buffer. Init process
+    /// boots with `/`.
+    pub cwd: String,
 }
 
 impl Process {
@@ -545,6 +554,7 @@ impl Process {
             gid: 0,
             perm_denials: AtomicU64::new(0),
             role_denials: AtomicU64::new(0),
+            cwd: "/".to_string(),
         }
     }
 

@@ -181,6 +181,13 @@ pub extern "C" fn main() -> i32 {
         _pad: 0,
         request_perms: class::raw::ALL,
         request_allowed_perms: class::raw::ALL,
+        // No cwd / argv / envp override — child inherits parent's
+        // cwd and runs with empty argv / envp.
+        cwd_vaddr: 0,
+        cwd_len: 0,
+        argv_vaddr: 0,
+        argv_len: 0,
+        envp_vaddr: 0,
     };
     let rc_role = match create_process_v2(&v2_args) {
         Ok(child_pid) => {

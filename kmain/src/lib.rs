@@ -96,6 +96,12 @@ pub struct ProcessComponents<'c> {
     pub argv_bytes: Option<&'c [u8]>,
     pub envp_bytes: Option<&'c [u8]>,
     pub perms: Option<Permissions>,
+    /// Initial cwd for the child. `None` = inherit verbatim from
+    /// `parent_pid`'s cwd (or `"/"` for boot, where parent_pid is 0).
+    /// `Some(p)` overrides — caller is `Command::current_dir(...)` or
+    /// equivalent. Must be absolute UTF-8; the manager validates the
+    /// dir exists in the active fs before installing.
+    pub cwd: Option<&'c str>,
 }
 
 pub fn write_sswi(hart: usize, val: u32) {
@@ -1174,6 +1180,60 @@ pub fn handle_futex_wait(epc: usize, hart_context: &'static HartContext, frame: 
 pub fn handle_futex_wake(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
     dispatch_syscall(epc, hart_context, frame, |t, f| {
         orbit_core::syscall::futex_wake_req(t, f, &mut crate::hw::RiscvHardware)
+    });
+}
+
+/// `fs_fstat(fd, &mut Stat) → 0 | -errno`. Sync — looks up the
+/// process's `OpenFile`, runs `Filesystem::stat`, copies into the
+/// user buffer.
+#[unsafe(no_mangle)]
+pub fn handle_fs_fstat(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
+    let orbit = unsafe { (hart_context.cscratch as *mut kernel::Orbit).as_mut_unchecked() };
+    dispatch_syscall(epc, hart_context, frame, |t, f| {
+        let fd = f.regs[11] as u32;
+        let stat_va = f.regs[12] as u64;
+        let ret = orbit.run_fs_fstat(t.pid, t.root_table_addr(), fd, stat_va);
+        orbit_core::SyscallOutcome::Return { ret }
+    });
+}
+
+/// `fs_seek(fd, offset, whence) → new_offset | -errno`. Sync — only
+/// touches the per-fd `OpenFile.offset`, no DMA / manager work.
+#[unsafe(no_mangle)]
+pub fn handle_fs_seek(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
+    let orbit = unsafe { (hart_context.cscratch as *mut kernel::Orbit).as_mut_unchecked() };
+    dispatch_syscall(epc, hart_context, frame, |t, f| {
+        let fd = f.regs[11] as u32;
+        let offset = f.regs[12] as i64;
+        let whence = f.regs[13] as u32;
+        let ret = orbit.run_fs_seek(t.pid, fd, offset, whence);
+        orbit_core::SyscallOutcome::Return { ret }
+    });
+}
+
+/// `chdir(path_ptr, path_len) → 0 | -errno`. Sync handler — mutates
+/// the calling process's cwd in place after the kernel-side fs lookup
+/// confirms the target dir exists. Body lives on `Orbit` so it can
+/// reach into `self.processes`.
+#[unsafe(no_mangle)]
+pub fn handle_chdir(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
+    let orbit = unsafe { (hart_context.cscratch as *mut kernel::Orbit).as_mut_unchecked() };
+    dispatch_syscall(epc, hart_context, frame, |t, f| {
+        let ret = orbit.run_chdir(t.pid, t.root_table_addr(), f.regs[11] as u64, f.regs[12]);
+        orbit_core::SyscallOutcome::Return { ret }
+    });
+}
+
+/// `getcwd(buf_ptr, buf_len) → bytes | -errno`. Sync handler — copies
+/// the calling process's cwd into the user buffer. Caller passes a
+/// page-resident buffer at least `cwd.len()` bytes long; ERANGE if the
+/// buffer is too short.
+#[unsafe(no_mangle)]
+pub fn handle_getcwd(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
+    let orbit = unsafe { (hart_context.cscratch as *mut kernel::Orbit).as_mut_unchecked() };
+    dispatch_syscall(epc, hart_context, frame, |t, f| {
+        let ret = orbit.run_getcwd(t.pid, t.root_table_addr(), f.regs[11] as u64, f.regs[12]);
+        orbit_core::SyscallOutcome::Return { ret }
     });
 }
 

@@ -1045,6 +1045,31 @@ impl Orbit {
         0
     }
 
+    /// Resolve a user-supplied fs path against `pid`'s cwd. Absolute
+    /// inputs are returned as-is; relative inputs become `<cwd>/<path>`
+    /// (with a single `/` between them). Allocates because the prefix
+    /// is dynamic. Falls back to `/<path>` if the process record has
+    /// vanished — a defensive shape; the caller's pid is always alive
+    /// in practice since the syscall is on its own thread.
+    fn resolve_fs_path(&self, pid: u16, path: &str) -> alloc::string::String {
+        use alloc::string::String;
+        if path.starts_with('/') {
+            return alloc::borrow::ToOwned::to_owned(path);
+        }
+        let mut out = String::new();
+        if let Some(p) = self.processes.get(&pid) {
+            out.push_str(&p.cwd);
+            if !out.ends_with('/') {
+                out.push('/');
+            }
+        }
+        else {
+            out.push('/');
+        }
+        out.push_str(path);
+        out
+    }
+
     /// Copy `len` bytes of a user path string into a kernel-side
     /// buffer. Caller has already enforced `len <= MAX_FS_PATH_LEN`
     /// at the syscall boundary so this stays bounded. Returns the
@@ -1082,11 +1107,13 @@ impl Orbit {
             return Errno::new(EIO).to_ret();
         };
         let mut path_buf = [0u8; MAX_FS_PATH_LEN];
-        let path =
+        let raw =
             match self.copy_user_path(root_pa, req.path_vaddr.raw(), req.path_len, &mut path_buf) {
                 Ok(p) => p,
                 Err(e) => return e,
             };
+        let resolved = self.resolve_fs_path(pid, raw);
+        let path = resolved.as_str();
         let inode = match fs.open(path) {
             Ok(i) => i,
             Err(FsErr::NotFound) => return Errno::new(orbit_abi::errno::ENOENT).to_ret(),
@@ -1452,11 +1479,13 @@ impl Orbit {
             return Errno::new(EIO).to_ret();
         };
         let mut path_buf = [0u8; MAX_FS_PATH_LEN];
-        let path =
+        let raw =
             match self.copy_user_path(root_pa, req.path_vaddr.raw(), req.path_len, &mut path_buf) {
                 Ok(p) => p,
                 Err(e) => return e,
             };
+        let resolved = self.resolve_fs_path(pid, raw);
+        let path = resolved.as_str();
         let inode = match fs.open(path) {
             Ok(i) => i,
             Err(FsErr::NotFound) => return Errno::new(orbit_abi::errno::ENOENT).to_ret(),
@@ -1717,6 +1746,7 @@ impl Orbit {
             argv_bytes: argv_bytes.as_deref(),
             envp_bytes: envp_bytes.as_deref(),
             perms: None,
+            cwd: None,
         };
 
         let pid = match self.create_new_process(proc_components) {
@@ -1942,15 +1972,127 @@ impl Orbit {
             return Errno::new(EINVAL).to_ret();
         }
 
+        // Optional cwd override: `cwd_vaddr == 0 || cwd_len == 0` means
+        // "inherit parent's cwd verbatim". Otherwise copy the bytes in,
+        // validate UTF-8 + absolute + dir-exists, and pass to
+        // create_new_process. Validation here mirrors run_chdir so a
+        // child can't be spawned into a cwd a chdir(...) would reject.
+        let mut cwd_buf = [0u8; MAX_FS_PATH_LEN];
+        let cwd_override: Option<&str> = if args.cwd_vaddr != 0 && args.cwd_len != 0 {
+            if args.cwd_len > MAX_FS_PATH_LEN {
+                return Errno::new(orbit_abi::errno::ENAMETOOLONG).to_ret();
+            }
+            if !user_range_ok(args.cwd_vaddr as u64, args.cwd_len as u64) {
+                return Errno::new(EFAULT).to_ret();
+            }
+            let s = match self.copy_user_path(
+                root_pa,
+                args.cwd_vaddr as u64,
+                args.cwd_len,
+                &mut cwd_buf,
+            ) {
+                Ok(s) => s,
+                Err(e) => return e,
+            };
+            if !s.starts_with('/') {
+                return Errno::new(EINVAL).to_ret();
+            }
+            let Some(fs) = crate::kernel::fs::mounted()
+            else {
+                return Errno::new(EIO).to_ret();
+            };
+            let inode = match fs.open(s) {
+                Ok(i) => i,
+                Err(FsErr::NotFound) => {
+                    return Errno::new(orbit_abi::errno::ENOENT).to_ret();
+                }
+                Err(_) => return Errno::new(EIO).to_ret(),
+            };
+            let st = match fs.stat(inode) {
+                Ok(s) => s,
+                Err(_) => return Errno::new(EIO).to_ret(),
+            };
+            if (st.st_mode & orbit_abi::fs::S_IFMT) != orbit_abi::fs::S_IFDIR {
+                return Errno::new(ENOTDIR).to_ret();
+            }
+            Some(s)
+        }
+        else {
+            None
+        };
+
+        // Optional argv blob: same shape as the legacy EX path —
+        // single-page wire-format blob from `orbit_abi::argv::pack`.
+        // `argv_vaddr == 0 || argv_len == 0` means "no argv."
+        let argv_bytes: Option<Vec<u8>> = if args.argv_vaddr != 0 && args.argv_len != 0 {
+            if args.argv_len > PAGE_SIZE {
+                return Errno::new(EINVAL).to_ret();
+            }
+            if !user_range_ok(args.argv_vaddr as u64, args.argv_len as u64) {
+                return Errno::new(EFAULT).to_ret();
+            }
+            let mut buf = Vec::with_capacity(args.argv_len);
+            let mut argv_copied = 0usize;
+            while argv_copied < args.argv_len {
+                let cursor = args.argv_vaddr + argv_copied;
+                let page_base = cursor & !(PAGE_SIZE - 1);
+                let page_off = cursor - page_base;
+                let take = core::cmp::min(PAGE_SIZE - page_off, args.argv_len - argv_copied);
+                let pa = match unsafe {
+                    mmu::mmap::virt_to_phys(&root_table, VirtAddr::new(page_base as u64))
+                } {
+                    Some(p) => p as u64,
+                    None => return Errno::new(EFAULT).to_ret(),
+                };
+                unsafe {
+                    let mut w = user_page::UserPageWindow::map(pa, PAGE_SIZE);
+                    let page = w.as_mut_slice();
+                    buf.extend_from_slice(&page[page_off..page_off + take]);
+                }
+                argv_copied += take;
+            }
+            Some(buf)
+        }
+        else {
+            None
+        };
+
+        // Optional envp blob: always one page, must be page-aligned.
+        // `envp_vaddr == 0` means "no envp."
+        let envp_bytes: Option<Vec<u8>> = if args.envp_vaddr != 0 {
+            if (args.envp_vaddr as u64) & (PAGE_SIZE as u64 - 1) != 0 {
+                return Errno::new(EINVAL).to_ret();
+            }
+            if !user_range_ok(args.envp_vaddr as u64, PAGE_SIZE as u64) {
+                return Errno::new(EFAULT).to_ret();
+            }
+            let pa = match unsafe {
+                mmu::mmap::virt_to_phys(&root_table, VirtAddr::new(args.envp_vaddr as u64))
+            } {
+                Some(p) => p as u64,
+                None => return Errno::new(EFAULT).to_ret(),
+            };
+            let mut buf = Vec::with_capacity(PAGE_SIZE);
+            unsafe {
+                let mut w = user_page::UserPageWindow::map(pa, PAGE_SIZE);
+                buf.extend_from_slice(w.as_mut_slice());
+            }
+            Some(buf)
+        }
+        else {
+            None
+        };
+
         let proc_components = ProcessComponents {
             elf_blob: &blob,
             stack_size: UPROC_STACK_DEFAULT,
             allowed_affinity: allowed,
             affinity,
             parent_pid,
-            argv_bytes: None,
-            envp_bytes: None,
+            argv_bytes: argv_bytes.as_deref(),
+            envp_bytes: envp_bytes.as_deref(),
             perms: None,
+            cwd: cwd_override,
         };
 
         let child_pid = match self.create_new_process(proc_components) {
@@ -2438,6 +2580,7 @@ impl Orbit {
             argv_bytes: None,
             envp_bytes: None,
             perms: None,
+            cwd: None,
         };
 
         match self.create_new_process(proc_components) {
@@ -4033,6 +4176,20 @@ impl Orbit {
         // and calls `install_permissions` itself with the
         // witness-derived value, overwriting this default.
         proc.install_permissions(orbit_abi::perms::Permissions::ALL);
+        // cwd inheritance: explicit override > parent's cwd > "/" default
+        // (`Process::new` already seeded cwd = "/" for the boot case where
+        // there's no parent). The override is the caller-side
+        // `Command::current_dir(...)` shape.
+        if let Some(p) = proc_components.cwd {
+            proc.cwd.clear();
+            proc.cwd.push_str(p);
+        }
+        else if proc_components.parent_pid != 0 {
+            if let Some(parent) = self.processes.get(&proc_components.parent_pid) {
+                proc.cwd.clear();
+                proc.cwd.push_str(&parent.cwd);
+            }
+        }
         let slot = proc.thread_slots.alloc().ok_or(())?;
 
         // ELF segment backings are tracked on the process so dealloc_process
@@ -4408,6 +4565,225 @@ impl Orbit {
             .get(&pid)
             .map(|p| p.envp_blob.is_some())
             .unwrap_or(false)
+    }
+
+    /// `chdir(path)` body. Synchronous — orbital's tarfs lookups are
+    /// in-memory so the manager-round-trip pattern other fs syscalls
+    /// use isn't needed here. Validates absolute UTF-8, confirms the
+    /// target resolves to an existing directory in the active fs, then
+    /// mutates `Process.cwd` in place. Returns 0 or `-errno`.
+    pub fn run_chdir(
+        &mut self,
+        pid: u16,
+        root_pa: PhysAddr,
+        path_vaddr: u64,
+        path_len: usize,
+    ) -> isize {
+        if path_len == 0 {
+            return Errno::new(EINVAL).to_ret();
+        }
+        if path_len > MAX_FS_PATH_LEN {
+            return Errno::new(orbit_abi::errno::ENAMETOOLONG).to_ret();
+        }
+        if !orbit_abi::layout::user_range_ok(path_vaddr, path_len as u64) {
+            return Errno::new(EFAULT).to_ret();
+        }
+        let mut path_buf = [0u8; MAX_FS_PATH_LEN];
+        let path = match self.copy_user_path(root_pa, path_vaddr, path_len, &mut path_buf) {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+        // v1 only handles absolute targets — `chdir("..")` would need
+        // a normalized path-walk that resolves dot/dot-dot against the
+        // current cwd, which we don't have yet. Userland that wants
+        // relative chdir does the join itself and chdirs absolute.
+        if !path.starts_with('/') {
+            return Errno::new(EINVAL).to_ret();
+        }
+        let Some(fs) = crate::kernel::fs::mounted()
+        else {
+            return Errno::new(EIO).to_ret();
+        };
+        let inode = match fs.open(path) {
+            Ok(i) => i,
+            Err(FsErr::NotFound) => return Errno::new(orbit_abi::errno::ENOENT).to_ret(),
+            Err(_) => return Errno::new(EIO).to_ret(),
+        };
+        let stat = match fs.stat(inode) {
+            Ok(s) => s,
+            Err(_) => return Errno::new(EIO).to_ret(),
+        };
+        if (stat.st_mode & orbit_abi::fs::S_IFMT) != orbit_abi::fs::S_IFDIR {
+            return Errno::new(ENOTDIR).to_ret();
+        }
+        match self.processes.get_mut(&pid) {
+            Some(p) => {
+                p.cwd.clear();
+                p.cwd.push_str(path);
+                info!("chdir: pid={pid} cwd={path}");
+                0
+            }
+            None => Errno::new(ESRCH).to_ret(),
+        }
+    }
+
+    /// `fs_fstat(fd, &mut Stat)` body. Sync — looks up the calling
+    /// process's `OpenFile` for `fd`, runs `Filesystem::stat` on its
+    /// inode, copies the result into the user buffer. Single-page
+    /// constraint mirrors `fs_stat`. Returns 0 or `-errno`.
+    pub fn run_fs_fstat(&mut self, pid: u16, root_pa: PhysAddr, fd: u32, stat_vaddr: u64) -> isize {
+        let stat_size = core::mem::size_of::<orbit_abi::fs::Stat>() as u64;
+        if !orbit_abi::layout::user_range_ok(stat_vaddr, stat_size) {
+            return Errno::new(EFAULT).to_ret();
+        }
+        if (stat_vaddr & (PAGE_SIZE as u64 - 1)) + stat_size > PAGE_SIZE as u64 {
+            return Errno::new(EINVAL).to_ret();
+        }
+        // Snapshot the inode + fs ref under the handle borrow, then
+        // drop the borrow before doing the fs lookup + user-copy.
+        let (fs, inode) = {
+            let Some(ph) = self.process_handles.get(&pid)
+            else {
+                return Errno::new(EBADF).to_ret();
+            };
+            let Some(handle_ref) = ph.get(fd)
+            else {
+                return Errno::new(EBADF).to_ret();
+            };
+            let Handle::File(of) = handle_ref
+            else {
+                return Errno::new(EBADF).to_ret();
+            };
+            (of.fs, of.inode)
+        };
+        let stat = match fs.stat(inode) {
+            Ok(s) => s,
+            Err(_) => return Errno::new(EIO).to_ret(),
+        };
+        let stat_bytes = unsafe {
+            core::slice::from_raw_parts(&stat as *const _ as *const u8, stat_size as usize)
+        };
+        let root_table = unsafe { memmap::kernel_root_from_pa(root_pa) };
+        let page_base = stat_vaddr & !(PAGE_SIZE as u64 - 1);
+        let page_off = (stat_vaddr - page_base) as usize;
+        let page_pa =
+            match unsafe { mmu::mmap::virt_to_phys(&root_table, VirtAddr::new(page_base)) } {
+                Some(p) => p as u64,
+                None => return Errno::new(EFAULT).to_ret(),
+            };
+        unsafe {
+            let mut w = user_page::UserPageWindow::map(page_pa, PAGE_SIZE);
+            let page = w.as_mut_slice();
+            page[page_off..page_off + stat_bytes.len()].copy_from_slice(stat_bytes);
+        }
+        0
+    }
+
+    /// `fs_seek(fd, offset, whence)` body. Sync — touches only the
+    /// per-fd `OpenFile.offset`, no fs / DMA. Returns the new
+    /// absolute offset on success or `-errno` on failure.
+    pub fn run_fs_seek(&mut self, pid: u16, fd: u32, offset: i64, whence: u32) -> isize {
+        let Some(ph) = self.process_handles.get_mut(&pid)
+        else {
+            return Errno::new(EBADF).to_ret();
+        };
+        let Some(handle_ref) = ph.get_mut(fd)
+        else {
+            return Errno::new(EBADF).to_ret();
+        };
+        let Handle::File(of) = handle_ref
+        else {
+            return Errno::new(EBADF).to_ret();
+        };
+        // Directories use the opaque `dir_cursor` tracked by
+        // `fs_readdir`; seeking on a dir fd is a separate POSIX
+        // operation (`seekdir`) we don't model. Reject so callers
+        // get a clear error instead of silent breakage.
+        if of.scratch.is_none() {
+            return Errno::new(EBADF).to_ret();
+        }
+        let new_offset: i64 = match whence {
+            x if x == orbit_abi::fs::SEEK_SET => offset,
+            x if x == orbit_abi::fs::SEEK_CUR => match (of.offset as i64).checked_add(offset) {
+                Some(n) => n,
+                None => return Errno::new(EINVAL).to_ret(),
+            },
+            x if x == orbit_abi::fs::SEEK_END => {
+                let size = match of.fs.size(of.inode) {
+                    Ok(s) => s,
+                    Err(_) => return Errno::new(EIO).to_ret(),
+                };
+                match (size as i64).checked_add(offset) {
+                    Some(n) => n,
+                    None => return Errno::new(EINVAL).to_ret(),
+                }
+            }
+            _ => return Errno::new(EINVAL).to_ret(),
+        };
+        if new_offset < 0 {
+            return Errno::new(EINVAL).to_ret();
+        }
+        of.offset = new_offset as u64;
+        new_offset as isize
+    }
+
+    /// `getcwd(buf)` body. Snapshots `Process.cwd`, copies the bytes
+    /// (no NUL terminator) into the user buffer via a `UserPageWindow`,
+    /// returns the byte count written. The buffer must lie within a
+    /// single 4 KiB page — same constraint as the other fs copy-out
+    /// syscalls.
+    pub fn run_getcwd(
+        &mut self,
+        pid: u16,
+        root_pa: PhysAddr,
+        buf_vaddr: u64,
+        buf_len: usize,
+    ) -> isize {
+        if buf_len == 0 || buf_len > PAGE_SIZE {
+            return Errno::new(EINVAL).to_ret();
+        }
+        if !orbit_abi::layout::user_range_ok(buf_vaddr, buf_len as u64) {
+            return Errno::new(EFAULT).to_ret();
+        }
+        if (buf_vaddr & (PAGE_SIZE as u64 - 1)) + buf_len as u64 > PAGE_SIZE as u64 {
+            return Errno::new(EINVAL).to_ret();
+        }
+        // Snapshot into a stack buffer so we can drop the borrow on
+        // `self.processes` before calling into UserPageWindow (which
+        // is independent kernel-managed mapping but keeping the
+        // process borrow narrow is the conservative shape).
+        let mut snap = [0u8; MAX_FS_PATH_LEN];
+        let cwd_len = match self.processes.get(&pid) {
+            Some(p) => {
+                let bytes = p.cwd.as_bytes();
+                if bytes.len() > snap.len() {
+                    // Defensive: chdir caps at MAX_FS_PATH_LEN, so a
+                    // longer cwd shouldn't be reachable, but if a future
+                    // path lifts that cap we want EIO not a panic.
+                    return Errno::new(EIO).to_ret();
+                }
+                snap[..bytes.len()].copy_from_slice(bytes);
+                bytes.len()
+            }
+            None => return Errno::new(ESRCH).to_ret(),
+        };
+        if cwd_len > buf_len {
+            return Errno::new(orbit_abi::errno::ERANGE).to_ret();
+        }
+        let root_table = unsafe { memmap::kernel_root_from_pa(root_pa) };
+        let page_base = buf_vaddr & !(PAGE_SIZE as u64 - 1);
+        let page_off = (buf_vaddr - page_base) as usize;
+        let page_pa =
+            match unsafe { mmu::mmap::virt_to_phys(&root_table, VirtAddr::new(page_base)) } {
+                Some(p) => p as u64,
+                None => return Errno::new(EFAULT).to_ret(),
+            };
+        unsafe {
+            let mut w = user_page::UserPageWindow::map(page_pa, PAGE_SIZE);
+            let page = w.as_mut_slice();
+            page[page_off..page_off + cwd_len].copy_from_slice(&snap[..cwd_len]);
+        }
+        cwd_len as isize
     }
 
     fn next_pid(&mut self) -> u16 {

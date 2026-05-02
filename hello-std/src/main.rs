@@ -253,7 +253,7 @@ fn main() {
 
         match fs::read_dir("/bin") {
             Ok(rd) => {
-                let mut entries: Vec<(String, bool)> = rd
+                let entries: Vec<(String, bool)> = rd
                     .filter_map(|r| r.ok())
                     .map(|e| {
                         let nm = e.file_name().to_string_lossy().into_owned();
@@ -261,12 +261,17 @@ fn main() {
                         (nm, is_file)
                     })
                     .collect();
-                entries.sort_by(|a, b| a.0.cmp(&b.0));
-                if entries == [("hello".into(), true), ("hello.txt".into(), true)] {
-                    println!("PASS: std::fs::read_dir /bin yields [hello(file), hello.txt(file)]");
+                // Disk image grows over time as new in-tree binaries
+                // pick up the [package.metadata.disk] marker. Assert
+                // the canonical entries are present + are regular
+                // files rather than pinning the full list.
+                let has_hello = entries.iter().any(|(n, f)| n == "hello" && *f);
+                let has_hello_txt = entries.iter().any(|(n, f)| n == "hello.txt" && *f);
+                if has_hello && has_hello_txt {
+                    println!("PASS: std::fs::read_dir /bin contains hello(file) + hello.txt(file)");
                 }
                 else {
-                    println!("FAIL: std::fs::read_dir /bin yields {entries:?}");
+                    println!("FAIL: std::fs::read_dir /bin missing canonical entries: {entries:?}");
                 }
             }
             Err(e) => println!("FAIL: std::fs::read_dir /bin: {e}"),
@@ -278,6 +283,151 @@ fn main() {
             }
             Ok(_) => println!("FAIL: std::fs::metadata /does-not-exist returned Ok"),
             Err(e) => println!("FAIL: std::fs::metadata /does-not-exist unexpected err: {e}"),
+        }
+
+        // §13e File::seek round trip. /bin/hello.txt is 26 bytes
+        // ("hello from /bin/hello.txt\n"). SeekFrom::Start past the
+        // first word, SeekFrom::End(-5), and SeekFrom::Current after
+        // a partial read each verify the kernel-side cursor and the
+        // post-seek read returns the right slice.
+        use std::io::{Seek, SeekFrom};
+        match fs::File::open("/bin/hello.txt") {
+            Ok(mut f) => {
+                // Start: seek 6 bytes in, read 4 → "from"
+                match f.seek(SeekFrom::Start(6)) {
+                    Ok(p) if p == 6 => {}
+                    Ok(p) => println!("FAIL: seek(Start(6)) returned {p}"),
+                    Err(e) => println!("FAIL: seek(Start(6)): {e}"),
+                }
+                let mut buf = [0u8; 4];
+                match f.read(&mut buf) {
+                    Ok(4) if &buf == b"from" => {
+                        println!("PASS: File::seek(Start(6)) + read 4 yields \"from\"");
+                    }
+                    Ok(n) => println!("FAIL: post-seek read got n={n} buf={buf:?}"),
+                    Err(e) => println!("FAIL: post-seek read: {e}"),
+                }
+                // Current: from offset 10 (after read), seek -4 to land
+                // back at 6, then re-read "from".
+                match f.seek(SeekFrom::Current(-4)) {
+                    Ok(p) if p == 6 => println!("PASS: File::seek(Current(-4)) returns 6"),
+                    Ok(p) => println!("FAIL: seek(Current(-4)) returned {p}"),
+                    Err(e) => println!("FAIL: seek(Current(-4)): {e}"),
+                }
+                // End: -4 from the end of a 26-byte file = offset 22,
+                // read 4 → "txt\n".
+                match f.seek(SeekFrom::End(-4)) {
+                    Ok(p) if p == 22 => {}
+                    Ok(p) => println!("FAIL: seek(End(-4)) returned {p}"),
+                    Err(e) => println!("FAIL: seek(End(-4)): {e}"),
+                }
+                let mut tail = [0u8; 4];
+                match f.read(&mut tail) {
+                    Ok(4) if &tail == b"txt\n" => {
+                        println!("PASS: File::seek(End(-4)) + read 4 yields \"txt\\n\"");
+                    }
+                    Ok(n) => println!("FAIL: tail read got n={n} buf={tail:?}"),
+                    Err(e) => println!("FAIL: tail read: {e}"),
+                }
+                // Negative resolved offset is rejected.
+                match f
+                    .seek(SeekFrom::Start(0))
+                    .and_then(|_| f.seek(SeekFrom::Current(-1)))
+                {
+                    Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
+                        println!("PASS: File::seek negative resolved offset -> InvalidInput");
+                    }
+                    Ok(p) => println!("FAIL: seek into negative returned {p}"),
+                    Err(e) => println!("FAIL: seek negative unexpected: {e}"),
+                }
+            }
+            Err(e) => println!("FAIL: open /bin/hello.txt for seek tests: {e}"),
+        }
+
+        // §13e File::metadata round trip via fstat-by-fd. The same
+        // stat data is reachable via fs::metadata(path) but file
+        // handles that have outlived their open path (e.g. piped
+        // through a function that lost the path) need fstat.
+        match fs::File::open("/bin/hello.txt").and_then(|f| f.metadata()) {
+            Ok(md) if md.is_file() && md.len() == 26 => {
+                println!("PASS: File::metadata fstat /bin/hello.txt is_file size=26");
+            }
+            Ok(md) => println!(
+                "FAIL: File::metadata is_file={} size={}",
+                md.is_file(),
+                md.len()
+            ),
+            Err(e) => println!("FAIL: File::metadata: {e}"),
+        }
+        // fstat on a directory fd should also work and report is_dir.
+        match fs::File::open("/bin").and_then(|f| f.metadata()) {
+            Ok(md) if md.is_dir() => {
+                println!("PASS: File::metadata fstat /bin reports is_dir");
+            }
+            Ok(md) => println!(
+                "FAIL: File::metadata /bin: is_dir={} is_file={}",
+                md.is_dir(),
+                md.is_file()
+            ),
+            Err(e) => println!("FAIL: File::metadata /bin: {e}"),
+        }
+    }
+
+    // §13e — cwd round trip. Boot cwd is `/` (init process default).
+    // chdir to /bin → relative "hello.txt" should now resolve to
+    // /bin/hello.txt. chdir back to / so the rest of the smoke isn't
+    // perturbed.
+    {
+        use std::env;
+        use std::fs;
+        match env::current_dir() {
+            Ok(p) if p == std::path::PathBuf::from("/") => {
+                println!("PASS: std::env::current_dir boot cwd is /");
+            }
+            Ok(p) => println!("FAIL: std::env::current_dir got {p:?}"),
+            Err(e) => println!("FAIL: std::env::current_dir: {e}"),
+        }
+        if let Err(e) = env::set_current_dir("/bin") {
+            println!("FAIL: std::env::set_current_dir(/bin): {e}");
+        }
+        else {
+            match env::current_dir() {
+                Ok(p) if p == std::path::PathBuf::from("/bin") => {
+                    println!("PASS: std::env::set_current_dir(/bin) round trip");
+                }
+                Ok(p) => println!("FAIL: post-chdir current_dir got {p:?}"),
+                Err(e) => println!("FAIL: post-chdir current_dir: {e}"),
+            }
+            // Relative-path read should resolve against /bin.
+            match fs::metadata("hello.txt") {
+                Ok(md) if md.is_file() && md.len() == 26 => {
+                    println!("PASS: std::fs::metadata relative `hello.txt` resolves under cwd");
+                }
+                Ok(md) => println!(
+                    "FAIL: relative metadata is_file={} len={}",
+                    md.is_file(),
+                    md.len()
+                ),
+                Err(e) => println!("FAIL: relative metadata: {e}"),
+            }
+            // Restore cwd for the rest of the smoke.
+            let _ = env::set_current_dir("/");
+        }
+        // Negative path: chdir to a non-existent dir should fail.
+        match env::set_current_dir("/does-not-exist") {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                println!("PASS: std::env::set_current_dir missing -> NotFound");
+            }
+            Ok(()) => println!("FAIL: set_current_dir /does-not-exist returned Ok"),
+            Err(e) => println!("FAIL: set_current_dir missing unexpected: {e}"),
+        }
+        // Negative path: chdir to a regular file (not a directory).
+        match env::set_current_dir("/README") {
+            Err(e) if e.kind() == std::io::ErrorKind::NotADirectory => {
+                println!("PASS: std::env::set_current_dir on file -> NotADirectory");
+            }
+            Ok(()) => println!("FAIL: set_current_dir /README returned Ok"),
+            Err(e) => println!("FAIL: set_current_dir /README unexpected: {e}"),
         }
     }
 
@@ -322,6 +472,34 @@ fn main() {
             }
             Ok(_) => println!("FAIL: std::process::Command spawn missing returned Ok"),
             Err(e) => println!("FAIL: std::process::Command spawn missing unexpected: {e}"),
+        }
+
+        // Command::current_dir override. v1 implementation does
+        // parent chdir + spawn + restore (the EX path doesn't carry
+        // cwd). The child should observe the override; the parent's
+        // cwd should be restored afterward.
+        let parent_cwd_before = std::env::current_dir().ok();
+        let mut cmd = Command::new("/bin/hello");
+        cmd.current_dir("/bin");
+        match cmd.spawn() {
+            Ok(mut child) => match child.wait() {
+                Ok(status) if status.code() == Some(42) => {
+                    println!("PASS: Command::current_dir(/bin) spawn ok status=42");
+                }
+                Ok(status) => println!("FAIL: cwd-spawn wait got {status}"),
+                Err(e) => println!("FAIL: cwd-spawn wait: {e}"),
+            },
+            Err(e) => println!("FAIL: Command::current_dir(/bin) spawn: {e}"),
+        }
+        if std::env::current_dir().ok() == parent_cwd_before {
+            println!("PASS: parent cwd restored after Command::current_dir spawn");
+        }
+        else {
+            println!(
+                "FAIL: parent cwd not restored — was {:?}, now {:?}",
+                parent_cwd_before,
+                std::env::current_dir().ok(),
+            );
         }
     }
 

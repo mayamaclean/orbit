@@ -75,6 +75,10 @@ The syscall layer (`orbit-core::syscall`) enforces the priv/shared split at the 
 - `4097` — create_netch(vaddr_hint, region_size, sock_type) → (user_va, fd) — vaddr_hint must be in `UPROC_SHARED_BASE..UPROC_SHARED_END`
 - `4098` — close_handle(fd)
 - `4099` — create_process(elf_ptr, elf_len) → pid
+- `4107` — chdir(path_ptr, path_len) → 0 — replace caller's cwd with the absolute UTF-8 path; kernel validates the dir exists in the active fs before mutating
+- `4108` — getcwd(buf_ptr, buf_len) → bytes_written — copy the caller's cwd (no NUL) into the user buffer; ERANGE if too small. Children inherit the parent's cwd at spawn (`CreateProcessV2Args` carries an optional `cwd_vaddr`/`cwd_len` override; legacy `CREATE_PROCESS` / `CREATE_PROCESS_EX` always inherit). Relative-path fs syscalls (`fs_open`, `fs_stat`) are prefixed by `Process.cwd` kernel-side.
+- `6004` — fs_seek(fd, offset, whence) → new_offset — POSIX-shaped: `SEEK_SET = 0`, `SEEK_CUR = 1`, `SEEK_END = 2`. Mutates the per-fd `OpenFile.offset` only; rejects directory fds (`EBADF`) and resolved-negative offsets (`EINVAL`).
+- `6005` — fs_fstat(fd, &mut Stat) → 0 — fill `*stat` with metadata for the file backing `fd`. Mirror of `fs_stat` keyed on an open fd.
 
 ### Supporting crates (all under the same workspace)
 

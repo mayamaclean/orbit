@@ -76,6 +76,30 @@ pub const CREATE_PROCESS_V2: usize = 4105;
 /// `class::DENIAL_LOG` so a low-trust observer role can hold STATS
 /// without seeing other processes' denials.
 pub const QUERY_DENIAL_LOG: usize = 4106;
+/// `chdir(path_ptr: *const u8, path_len: usize) -> 0 | -errno` —
+/// replace the calling process's `cwd` with the (absolute, UTF-8)
+/// path at `[path_ptr, path_ptr+path_len)`. v1 rejects relative
+/// paths with `EINVAL` (no cwd-relative chdir until path-walk
+/// resolution lands). The new value is the literal bytes passed —
+/// the kernel does not canonicalize, so callers should pre-strip
+/// trailing slashes if they want `getcwd` to echo the same shape.
+///
+/// Errnos:
+/// - `EFAULT` — buffer doesn't translate under the caller's satp.
+/// - `EINVAL` — non-absolute path, non-UTF-8, or empty length.
+/// - `ENAMETOOLONG` — path exceeds the kernel-side cwd cap (4 KiB).
+/// - `ENOENT` — path doesn't resolve to an existing directory in
+///   the active filesystem (validated at chdir time so subsequent
+///   relative-path syscalls don't dangle).
+pub const CHDIR: usize = 4107;
+/// `getcwd(buf_ptr: *mut u8, buf_len: usize) -> bytes_written | -errno`
+/// — copy the calling process's `cwd` into the user buffer. The
+/// returned byte count is the cwd's length (no NUL terminator).
+///
+/// Errnos:
+/// - `EFAULT` — buffer doesn't translate under the caller's satp.
+/// - `ERANGE` — buffer too small for the current cwd.
+pub const GETCWD: usize = 4108;
 
 // 5000+ — multi-thread / SMP control plane. Numbered out of the 4096
 // block so the categorical split is obvious in dispatch tables and so
@@ -95,6 +119,32 @@ pub const FS_OPEN: usize = 6000;
 pub const FS_READ: usize = 6001;
 pub const FS_STAT: usize = 6002;
 pub const FS_READDIR: usize = 6003;
+/// `fs_fstat(fd, &mut Stat) -> 0 | -errno` — fill `*stat` with metadata
+/// for the file backing `fd`. Mirror of `FS_STAT` but keyed on an
+/// already-open fd, so callers don't have to retain the path used at
+/// open. Backs `std::fs::File::metadata`.
+///
+/// Errnos:
+/// - `EBADF` — `fd` not open in the calling process.
+/// - `EFAULT` — `stat` doesn't translate.
+/// - `EINVAL` — `stat` straddles a page (same constraint as `FS_STAT`).
+/// - `EIO`   — backing fs lookup failed.
+pub const FS_FSTAT: usize = 6005;
+
+/// `fs_seek(fd, offset, whence) -> new_offset | -errno` — reposition
+/// the byte cursor on a regular-file fd. `whence` follows POSIX:
+/// `SEEK_SET = 0` (absolute), `SEEK_CUR = 1` (relative to current
+/// offset), `SEEK_END = 2` (relative to file size). `offset` is
+/// `i64`; it sign-extends the syscall arg. The return value is the
+/// resulting absolute offset.
+///
+/// Errnos:
+/// - `EBADF`  — `fd` not open, or not a regular-file fd (directories
+///   use `fs_readdir`'s opaque cursor instead).
+/// - `EINVAL` — invalid `whence`, or the resolved offset would be
+///   negative. Past-EOF is allowed (POSIX hole semantics — orbit's
+///   read-only fs returns 0 on those reads).
+pub const FS_SEEK: usize = 6004;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(usize)]
@@ -120,6 +170,8 @@ pub enum Sysno {
     ArgvEnvp = ARGV_ENVP,
     CreateProcessV2 = CREATE_PROCESS_V2,
     QueryDenialLog = QUERY_DENIAL_LOG,
+    Chdir = CHDIR,
+    Getcwd = GETCWD,
     CreateThread = CREATE_THREAD,
     GetPid = GETPID,
     GetTid = GETTID,
@@ -130,6 +182,8 @@ pub enum Sysno {
     FsRead = FS_READ,
     FsStat = FS_STAT,
     FsReaddir = FS_READDIR,
+    FsSeek = FS_SEEK,
+    FsFstat = FS_FSTAT,
 }
 
 impl Sysno {
@@ -156,6 +210,8 @@ impl Sysno {
             ARGV_ENVP => Self::ArgvEnvp,
             CREATE_PROCESS_V2 => Self::CreateProcessV2,
             QUERY_DENIAL_LOG => Self::QueryDenialLog,
+            CHDIR => Self::Chdir,
+            GETCWD => Self::Getcwd,
             CREATE_THREAD => Self::CreateThread,
             GETPID => Self::GetPid,
             GETTID => Self::GetTid,
@@ -166,6 +222,8 @@ impl Sysno {
             FS_READ => Self::FsRead,
             FS_STAT => Self::FsStat,
             FS_READDIR => Self::FsReaddir,
+            FS_SEEK => Self::FsSeek,
+            FS_FSTAT => Self::FsFstat,
             _ => return None,
         })
     }
@@ -207,6 +265,10 @@ impl Sysno {
             Self::Pledge => 28,
             Self::CreateProcessV2 => 29,
             Self::QueryDenialLog => 30,
+            Self::Chdir => 31,
+            Self::Getcwd => 32,
+            Self::FsSeek => 33,
+            Self::FsFstat => 34,
         }
     }
 
@@ -215,7 +277,7 @@ impl Sysno {
     /// when adding a `Sysno` variant. Older userland with a smaller
     /// COUNT reads a prefix of the kernel's table; newer userland with
     /// a larger COUNT treats the kernel's missing slots as zero.
-    pub const COUNT: usize = 31;
+    pub const COUNT: usize = 35;
 }
 
 #[cfg(test)]
@@ -270,6 +332,10 @@ mod tests {
             Sysno::from_usize(QUERY_DENIAL_LOG),
             Some(Sysno::QueryDenialLog)
         );
+        assert_eq!(Sysno::from_usize(CHDIR), Some(Sysno::Chdir));
+        assert_eq!(Sysno::from_usize(GETCWD), Some(Sysno::Getcwd));
+        assert_eq!(Sysno::from_usize(FS_SEEK), Some(Sysno::FsSeek));
+        assert_eq!(Sysno::from_usize(FS_FSTAT), Some(Sysno::FsFstat));
     }
 
     #[test]
@@ -277,12 +343,13 @@ mod tests {
         // 9 is PLEDGE — used to be a hole below 4096, now decodes.
         assert_eq!(Sysno::from_usize(10), None);
         assert_eq!(Sysno::from_usize(4095), None);
-        // 4105/4106 are now CREATE_PROCESS_V2 / QUERY_DENIAL_LOG.
-        assert_eq!(Sysno::from_usize(4107), None);
+        // 4105..=4108 are now CREATE_PROCESS_V2 / QUERY_DENIAL_LOG / CHDIR / GETCWD.
+        assert_eq!(Sysno::from_usize(4109), None);
         assert_eq!(Sysno::from_usize(4999), None);
         assert_eq!(Sysno::from_usize(5006), None);
         assert_eq!(Sysno::from_usize(5999), None);
-        assert_eq!(Sysno::from_usize(6004), None);
+        // 6004 / 6005 are now FS_SEEK / FS_FSTAT.
+        assert_eq!(Sysno::from_usize(6006), None);
         assert_eq!(Sysno::from_usize(usize::MAX), None);
     }
 
@@ -319,6 +386,10 @@ mod tests {
         assert_eq!(Sysno::Pledge as usize, PLEDGE);
         assert_eq!(Sysno::CreateProcessV2 as usize, CREATE_PROCESS_V2);
         assert_eq!(Sysno::QueryDenialLog as usize, QUERY_DENIAL_LOG);
+        assert_eq!(Sysno::Chdir as usize, CHDIR);
+        assert_eq!(Sysno::Getcwd as usize, GETCWD);
+        assert_eq!(Sysno::FsSeek as usize, FS_SEEK);
+        assert_eq!(Sysno::FsFstat as usize, FS_FSTAT);
     }
 
     #[test]
@@ -356,6 +427,10 @@ mod tests {
         assert_eq!(PLEDGE, 9);
         assert_eq!(CREATE_PROCESS_V2, 4105);
         assert_eq!(QUERY_DENIAL_LOG, 4106);
+        assert_eq!(CHDIR, 4107);
+        assert_eq!(GETCWD, 4108);
+        assert_eq!(FS_SEEK, 6004);
+        assert_eq!(FS_FSTAT, 6005);
     }
 
     #[test]
@@ -394,6 +469,10 @@ mod tests {
             Sysno::Pledge,
             Sysno::CreateProcessV2,
             Sysno::QueryDenialLog,
+            Sysno::Chdir,
+            Sysno::Getcwd,
+            Sysno::FsSeek,
+            Sysno::FsFstat,
         ];
         assert_eq!(all.len(), Sysno::COUNT);
         let mut seen = [false; Sysno::COUNT];
