@@ -385,6 +385,14 @@ pub struct Thread {
     /// `perm_denials` counter, then short-circuits the syscall with
     /// `-EPERM`.
     pub permissions: Permissions,
+    /// Snapshot of [`Process::stdout_redirect`] taken at thread
+    /// construction. The `console_write` syscall reads this without
+    /// locking the process table; immutable for the thread's
+    /// lifetime because the owning `Process`'s redirect is set at
+    /// spawn and never mutated. `None` ⇒ writes go to the thread's
+    /// own pid pane (today's behavior); `Some(target)` ⇒ writes
+    /// route to `Source::Process(target)` instead.
+    pub stdout_redirect: Option<u16>,
 }
 
 impl Thread {
@@ -520,6 +528,19 @@ pub struct Process {
     /// the spawn caller passed a non-empty buffer. Init process
     /// boots with `/`.
     pub cwd: String,
+    /// `Some(parent_pid)` ⇒ this process's `console_write` syscalls
+    /// route their bytes to `Source::Process(parent_pid)` in the
+    /// display compositor instead of this process's own pane. Set at
+    /// spawn time when `CreateProcessV2Args.stdout_capture == 1`;
+    /// never mutated. Each [`Thread`] of this process holds a
+    /// snapshot in [`Thread::stdout_redirect`] so the syscall hot
+    /// path is lock-free.
+    ///
+    /// If the redirect target has exited by the time the child
+    /// writes, `k_gpu::push_chunk` quietly drops the bytes — same
+    /// failure shape as a full ring. The kernel does not validate
+    /// the target is alive at write time.
+    pub stdout_redirect: Option<u16>,
 }
 
 impl Process {
@@ -555,6 +576,7 @@ impl Process {
             perm_denials: AtomicU64::new(0),
             role_denials: AtomicU64::new(0),
             cwd: "/".to_string(),
+            stdout_redirect: None,
         }
     }
 

@@ -188,6 +188,8 @@ pub extern "C" fn main() -> i32 {
         argv_vaddr: 0,
         argv_len: 0,
         envp_vaddr: 0,
+        stdout_capture: 0,
+        _pad2: 0,
     };
     let rc_role = match create_process_v2(&v2_args) {
         Ok(child_pid) => {

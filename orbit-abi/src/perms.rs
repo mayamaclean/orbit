@@ -441,6 +441,26 @@ pub struct CreateProcessV2Args {
     /// one page from this VA; callers must pass a page-resident,
     /// page-sized buffer (zero-padded past the packed bytes).
     pub envp_vaddr: usize,
+    /// Stdout-routing override for the child. Determines where
+    /// `console_write` from the new process lands.
+    ///
+    /// - `0` — child writes go to its own scrollback pane (today's
+    ///   behavior; legacy `CREATE_PROCESS` / `CREATE_PROCESS_EX` both
+    ///   resolve to this).
+    /// - `1` — child writes route to the *parent's* pane. Lets a
+    ///   shell-style caller (`console`) run a foreground child and
+    ///   have its output land inline in the caller's scrollback,
+    ///   without an fd table or pipes. Defined as parent-routed
+    ///   rather than fd-1 redirected so the field has a meaning even
+    ///   while fds (option 2) don't exist.
+    /// - other values — reserved. The kernel rejects with `-EINVAL`.
+    ///
+    /// When fds land this slot can carry an fd index instead, with
+    /// `0`/`1` retaining the current meaning as compat shims.
+    pub stdout_capture: u32,
+    /// Reserved — must be zero. Pads `stdout_capture` up to the next
+    /// 8-byte boundary so the struct's natural alignment is explicit.
+    pub _pad2: u32,
 }
 
 impl CreateProcessV2Args {

@@ -844,7 +844,11 @@ pub fn console_write<H: Hardware>(
     let mut buf = [0u8; PAGE_SIZE];
     hw.copy_from_user(user_va, &mut buf[..len]);
 
-    match hw.console_write_user(thread.pid, &buf[..len]) {
+    // Honor `stdout_capture=1` at spawn time — the calling thread's
+    // snapshot redirects the bytes to the parent's pane. `None` is
+    // the legacy/default path (writes go to the producer's own pane).
+    let dest_pid = thread.stdout_redirect.unwrap_or(thread.pid);
+    match hw.console_write_user(dest_pid, &buf[..len]) {
         Ok(()) => ready(len as isize),
         Err(()) => ready(Errno::new(EAGAIN).to_ret()),
     }

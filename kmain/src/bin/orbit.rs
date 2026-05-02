@@ -225,14 +225,13 @@ extern "C" fn s_trap(
             }
             8 => {
                 let syscall = frame.regs[10];
-                // Bracket the dispatch for per-syscall + per-thread
-                // service-time accounting. Only handlers that *return*
-                // (non-blocking, non-exit) reach `record_syscall`
-                // below; blocking/exit paths long-jump out via
-                // `exit_thread_with_state` and are excluded — that's
-                // the right semantic since "service time" stops when
-                // the handler hands control back to the trap path.
-                let syscall_start_ticks = riscv::register::time::read64();
+                // Per-syscall + per-thread service-time accounting
+                // is bracketed inside `dispatch_syscall` itself so
+                // that blocking handlers — which long-jump out via
+                // `exit_thread_with_state` — get recorded too. The
+                // `exit` arm below is the only path that bypasses
+                // dispatch_syscall, and it's deliberately excluded
+                // (terminal calls don't return service time).
 
                 // Dispatch-site permission gate: lock-free check
                 // against the calling thread's permission snapshot.
@@ -395,16 +394,6 @@ extern "C" fn s_trap(
                         }
                     }
                 } // close the `if allowed` arm
-                // Close the bracket: handlers that returned hit this;
-                // long-jumping ones (exit, blocking SyscallOutcome)
-                // skipped past it. `current` may be null if the
-                // syscall path nulled it (shouldn't happen on
-                // non-yielding paths, but check defensively).
-                let cur = hart_context.current.load(Ordering::Acquire);
-                if !cur.is_null() {
-                    let t = unsafe { (cur as *const Thread).as_ref_unchecked() };
-                    kmain::kernel::accounting::record_syscall(syscall, t, syscall_start_ticks);
-                }
                 check_context_and_switch();
             }
             _ => {
@@ -548,6 +537,7 @@ pub extern "C" fn k_smpstart() {
         envp_bytes: Some(envp_blob),
         perms: Some(Permissions::LOADER),
         cwd: None,
+        stdout_redirect: None,
     };
 
     orbit
@@ -1158,7 +1148,7 @@ extern "C" fn rust_main(_hartid: usize, dtb: usize, serial: usize, load_addr: u6
 
         log::set_logger(&LOGGER).unwrap();
         log::set_max_level(log::LevelFilter::Info);
-        tracing::subscriber::set_global_default(OrbitSubscriber::new(Level::TRACE))
+        tracing::subscriber::set_global_default(OrbitSubscriber::new(Level::INFO))
             .expect("no tracing");
 
         let mut kernel_tables = kmain::kernel::memmap::TablePages::new();

@@ -102,6 +102,12 @@ pub struct ProcessComponents<'c> {
     /// equivalent. Must be absolute UTF-8; the manager validates the
     /// dir exists in the active fs before installing.
     pub cwd: Option<&'c str>,
+    /// `Some(parent_pid)` ⇒ install [`process::Process::stdout_redirect`]
+    /// on the new process so its `console_write` bytes route to the
+    /// parent's pane. Reachable only via `CREATE_PROCESS_V2` with
+    /// `stdout_capture == 1`; legacy `CREATE_PROCESS` /
+    /// `CREATE_PROCESS_EX` always pass `None`.
+    pub stdout_redirect: Option<u16>,
 }
 
 pub fn write_sswi(hart: usize, val: u32) {
@@ -781,6 +787,17 @@ fn dispatch_syscall<F>(
 ) where
     F: FnOnce(&mut Thread, &mut TrapFrame) -> orbit_core::SyscallOutcome,
 {
+    // Snapshot the syscall number + start tick *before* `body` runs,
+    // since the handler clobbers `regs[10]` with its return value.
+    // These are consumed by `record_syscall` below and feed the
+    // global per-syscall histogram. The bracket lives here rather
+    // than at the trap-loop call site so that blocking syscalls
+    // (which long-jump out of `apply_syscall_outcome` via
+    // `exit_thread_with_state`) get recorded too — see the
+    // `ShimAction::Yield` arm below.
+    let syscall_no = frame.regs[10];
+    let syscall_start_ticks = riscv::register::time::read64();
+
     unsafe {
         let current = hart_context.current.load(Ordering::Acquire);
         if current == null_mut() {
@@ -859,7 +876,15 @@ fn dispatch_syscall<F>(
         }
 
         let outcome = body(thread, frame);
-        match orbit_core::apply_syscall_outcome(outcome, thread, frame, epc) {
+        let action = orbit_core::apply_syscall_outcome(outcome, thread, frame, epc);
+        // Bracket close: record on *both* arms before `Yield` long-
+        // jumps. Service-time semantics still hold — `apply_syscall_
+        // outcome` has finished its work (frame committed, state
+        // transition decided) by this point, so `now() - start_ticks`
+        // is the time the kernel spent before either resuming the
+        // caller or parking it.
+        crate::kernel::accounting::record_syscall(syscall_no, thread, syscall_start_ticks);
+        match action {
             orbit_core::ShimAction::Resume => {}
             orbit_core::ShimAction::Yield(state) => exit_thread_with_state(state),
         }

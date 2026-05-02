@@ -28,9 +28,10 @@ use core::panic::PanicInfo;
 use core::fmt::Write;
 use orbit_abi::{
     fs::Stat,
+    perms::{CreateProcessV2Args, role},
     syscall_stats::payload_size,
     user::{
-        ConsoleWriter, close_handle, console_write, create_process, exit, fs_open, fs_read,
+        ConsoleWriter, close_handle, console_write, create_process_v2, exit, fs_open, fs_read,
         fs_stat, query_stats, query_syscall_stats, read_stdin, sleep_ms, wait_pid,
     },
 };
@@ -368,11 +369,29 @@ fn slurp_file(path: &str) -> Result<alloc::vec::Vec<u8>, &'static str> {
     Ok(buf)
 }
 
-/// Resolve `path` against the mounted FS, read it, hand the bytes to
-/// `create_process`, and block on `wait_pid` for the child's exit
-/// status. Foreground execution — interactive shell shape; the
-/// `&` background-spawn case is a future addition.
-fn exec_path(path: &str) {
+/// Tokenize `line` on whitespace, slurp the first token as the ELF
+/// path, and spawn it via `create_process_v2` with `stdout_capture=1`
+/// so the child's `console_write` bytes route into *this* console's
+/// pane (option-1 stdout capture — no fds, no pipes), then block on
+/// `wait_pid` for the child's exit status. argv[0] is the program
+/// path (POSIX convention); subsequent tokens are passed verbatim.
+/// No quoting, no escapes — typing `eza "a b"` lands as three argv
+/// entries. Foreground execution; the `&` background-spawn case is
+/// a future addition.
+fn exec_path(line: &str) {
+    let tokens: Vec<&[u8]> = line.split_whitespace().map(str::as_bytes).collect();
+    let path_bytes = match tokens.first() {
+        Some(b) => *b,
+        None => return,
+    };
+    let path = match core::str::from_utf8(path_bytes) {
+        Ok(s) => s,
+        Err(_) => {
+            write_chunked(b"exec: path must be utf-8\n");
+            return;
+        }
+    };
+
     let elf = match slurp_file(path) {
         Ok(b) => b,
         Err(why) => {
@@ -384,11 +403,46 @@ fn exec_path(path: &str) {
             return;
         }
     };
-    let pid = match create_process(elf.as_ptr(), elf.len(), 0, 0) {
+
+    // Pack argv into the wire format the kernel + orbit-rt expect.
+    // 4 KiB scratch matches `ARGV_BLOB_MAX`; the kernel reads exactly
+    // `argv_len` bytes, so no page alignment needed.
+    let mut argv_buf = [0u8; orbit_abi::argv::ARGV_BLOB_MAX];
+    let argv_len = match orbit_abi::argv::pack(&tokens, &mut argv_buf) {
+        Some(n) => n,
+        None => {
+            write_chunked(b"exec: argv exceeds 4 KiB\n");
+            return;
+        }
+    };
+
+    let args = CreateProcessV2Args {
+        elf_vaddr: elf.as_ptr() as usize,
+        elf_len: elf.len(),
+        allowed_affinity: 0,
+        affinity: 0,
+        // INHERIT keeps the parent's role + perms verbatim, matching
+        // the fork-shaped semantic shells expect. Role-aware spawn
+        // surfaces would name a concrete RoleId here.
+        target_role: role::INHERIT,
+        _pad: 0,
+        request_perms: 0,
+        request_allowed_perms: 0,
+        cwd_vaddr: 0,
+        cwd_len: 0,
+        argv_vaddr: argv_buf.as_ptr() as usize,
+        argv_len,
+        envp_vaddr: 0,
+        // Route the child's `console_write` bytes into the console's
+        // own pane so output lands inline like a normal shell.
+        stdout_capture: 1,
+        _pad2: 0,
+    };
+    let pid = match create_process_v2(&args) {
         Ok(p) => p,
         Err(e) => {
             let mut w = LineWriter::new();
-            let _ = writeln!(w, "exec: create_process {}: errno {}", path, e.0);
+            let _ = writeln!(w, "exec: create_process_v2 {}: errno {}", path, e.0);
             w.flush();
             return;
         }
@@ -420,9 +474,9 @@ fn dispatch(line: &[u8]) {
     if s.is_empty() {
         return;
     }
-    // Anything starting with `/` is treated as a path to exec — no
-    // PATH search yet. Matches what users type when they explicitly
-    // run a file.
+    // Anything starting with `/` is an explicit path to exec — no
+    // PATH search yet. Matches what users type when they want to
+    // pin a specific file.
     if s.starts_with('/') {
         exec_path(s);
         return;
@@ -437,7 +491,7 @@ fn dispatch(line: &[u8]) {
         }
         "help" => {
             write_chunked(b"builtins: echo <text>, help, clear, stats, syscall-stats\n");
-            write_chunked(b"exec: type a path starting with /, e.g. /bin/hello\n");
+            write_chunked(b"exec: type a path (e.g. /bin/eza), or a bare name to look up in /bin (e.g. eza /tmp)\n");
         }
         "clear" => {
             // Form-feed: compositor clears this source's scrollback.
@@ -445,10 +499,15 @@ fn dispatch(line: &[u8]) {
         }
         "stats" => stats_cmd(),
         "syscall-stats" => syscall_stats_cmd(),
+        // Fallback for bare names: rewrite `cmd args...` as
+        // `/bin/cmd args...` and try to exec. No real PATH search —
+        // /bin is the only directory consulted today. exec_path will
+        // surface ENOENT etc. cleanly if the binary isn't there.
         _ => {
-            write_chunked(b"unknown command: ");
-            write_chunked(cmd.as_bytes());
-            write_chunked(b"\n");
+            let mut line = alloc::string::String::with_capacity(5 + s.len());
+            line.push_str("/bin/");
+            line.push_str(s);
+            exec_path(&line);
         }
     }
 }

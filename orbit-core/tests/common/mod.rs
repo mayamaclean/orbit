@@ -76,6 +76,7 @@ pub fn make_thread(state: ThreadState, mode: SPP) -> Thread {
             syscall_count: AtomicU64::new(0),
             syscall_ticks: AtomicU64::new(0),
             permissions: orbit_abi::perms::Permissions::ZERO,
+            stdout_redirect: None,
         }
     }
 }

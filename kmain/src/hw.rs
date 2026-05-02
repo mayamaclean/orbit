@@ -59,17 +59,22 @@ impl Hardware for RiscvHardware {
         crate::supervisor_wake_hart(hart_id);
     }
 
-    fn console_write_user(&mut self, pid: u16, bytes: &[u8]) -> Result<(), ()> {
+    fn console_write_user(&mut self, dest_pid: u16, bytes: &[u8]) -> Result<(), ()> {
         use crate::drivers::{display::Source, k_gpu};
         if !k_gpu::is_ready() {
             // Framebuffer path not live — fall back to the serial
             // back-channel so the bytes aren't silently dropped.
             if let Ok(s) = core::str::from_utf8(bytes) {
-                serial::print!("{}t USER[{}]: {}", riscv::register::time::read64(), pid, s);
+                serial::print!(
+                    "{}t USER[{}]: {}",
+                    riscv::register::time::read64(),
+                    dest_pid,
+                    s
+                );
             }
             return Ok(());
         }
-        if k_gpu::push_chunk(Source::Process(pid), bytes) {
+        if k_gpu::push_chunk(Source::Process(dest_pid), bytes) {
             Ok(())
         }
         else {

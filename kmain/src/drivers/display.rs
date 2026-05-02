@@ -130,7 +130,9 @@ enum AnsiState {
     /// Inside a CSI sequence. `params` accumulates digits + `;` from
     /// the parameter bytes; the final byte (anything in the range
     /// 0x40..0x7E) terminates the sequence.
-    Csi { params: String },
+    Csi {
+        params: String,
+    },
 }
 
 /// Per-source line history + an in-progress partial line + style
@@ -182,7 +184,9 @@ impl Scrollback {
                 }
                 AnsiState::Esc => {
                     self.ansi = if b == b'[' {
-                        AnsiState::Csi { params: String::new() }
+                        AnsiState::Csi {
+                            params: String::new(),
+                        }
                     }
                     else {
                         // Two-byte escape (e.g. `ESC c`) or junk —
@@ -482,7 +486,8 @@ impl Display {
                     chunk.text.as_str()
                 };
                 let x = col as u32 * GLYPH_W;
-                self.fb.blit_text(x, y, slice, chunk.style.fg, chunk.style.bg);
+                self.fb
+                    .blit_text(x, y, slice, chunk.style.fg, chunk.style.bg);
                 col += slice.len();
             }
         }

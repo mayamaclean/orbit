@@ -76,13 +76,20 @@ pub trait Hardware {
     /// code. Returns Err on UART failure.
     fn serial_write_user(&mut self, pid: u16, tid: u32, text: &str) -> Result<(), ()>;
 
-    /// Append `bytes` to `pid`'s framebuffer scrollback. Real impl
-    /// pushes a `Cmd` onto `k_gpu`'s thingbuf ring; the compositor
-    /// thread eventually appends to `scrollbacks[Process(pid)]` and
-    /// repaints if that source is active. Returns `Err(())` if the
-    /// ring is full or the gpu package isn't initialized — in which
-    /// case the syscall returns `-7` (EAGAIN-analog).
-    fn console_write_user(&mut self, pid: u16, bytes: &[u8]) -> Result<(), ()>;
+    /// Append `bytes` to the framebuffer scrollback for the pane
+    /// `dest_pid`. Real impl pushes a `Cmd` onto `k_gpu`'s thingbuf
+    /// ring; the compositor thread eventually appends to
+    /// `scrollbacks[Process(dest_pid)]` and repaints if that source
+    /// is active. Returns `Err(())` if the ring is full or the gpu
+    /// package isn't initialized — in which case the syscall returns
+    /// `-7` (EAGAIN-analog).
+    ///
+    /// `dest_pid` is the *destination* pane, which the syscall
+    /// resolves from the calling thread's `stdout_redirect` snapshot
+    /// — for unredirected processes it equals the producer's pid; for
+    /// children spawned with `CREATE_PROCESS_V2 stdout_capture=1` it
+    /// equals the parent's pid.
+    fn console_write_user(&mut self, dest_pid: u16, bytes: &[u8]) -> Result<(), ()>;
 
     /// Send an inter-processor interrupt to `hart_id`. Real impl writes
     /// the hart's ACLINT SSWI MSIP; tests record the call.

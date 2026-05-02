@@ -734,6 +734,11 @@ impl Orbit {
             // route a kthread through the gate fails closed rather
             // than silently running with full caps.
             permissions: orbit_abi::perms::Permissions::ZERO,
+            // Kernel threads don't `console_write` via the U-mode
+            // syscall path; trace output goes through `Source::Kernel`
+            // directly. `None` keeps the field consistent with the
+            // U-mode contract (no redirect ⇒ writes go to own pane).
+            stdout_redirect: None,
         };
 
         // TODO: figure out why pin<box<thread>> doesnt work
@@ -1183,7 +1188,7 @@ impl Orbit {
                 dir_cursor: 0,
                 scratch,
             }));
-        info!("fs_open: pid={pid} path={path} → fd={fd} ino={inode}");
+        debug!("fs_open: pid={pid} path={path} → fd={fd} ino={inode}");
         fd as isize
     }
 
@@ -1537,7 +1542,7 @@ impl Orbit {
             let page = w.as_mut_slice();
             page[page_off..page_off + stat_bytes.len()].copy_from_slice(stat_bytes);
         }
-        info!(
+        debug!(
             "fs_stat: pid={pid} path={path} ino={inode} size={}",
             stat.st_size
         );
@@ -1762,6 +1767,7 @@ impl Orbit {
             envp_bytes: envp_bytes.as_deref(),
             perms: None,
             cwd: None,
+            stdout_redirect: None,
         };
 
         let pid = match self.create_new_process(proc_components) {
@@ -1897,6 +1903,13 @@ impl Orbit {
 
         if !user_range_ok(args.elf_vaddr as u64, args.elf_len as u64) {
             return Errno::new(EFAULT).to_ret();
+        }
+
+        // Reject unknown stdout_capture values up front. `_pad2` is
+        // also expected zero so a future expansion of the slot doesn't
+        // silently accept legacy callers' uninitialized stack bytes.
+        if args.stdout_capture > 1 || args._pad2 != 0 {
+            return Errno::new(EINVAL).to_ret();
         }
 
         // Snapshot the parent's permissions for the gate. `Permissions`
@@ -2098,6 +2111,17 @@ impl Orbit {
             None
         };
 
+        // `stdout_capture == 1` ⇒ child writes route to the parent's
+        // pane. Validated above; only 0/1 reach this point. The
+        // parent_pid is unconditional here because the V2 syscall is
+        // only callable from a U-mode process (parent_pid != 0).
+        let stdout_redirect = if args.stdout_capture == 1 {
+            Some(parent_pid)
+        }
+        else {
+            None
+        };
+
         let proc_components = ProcessComponents {
             elf_blob: &blob,
             stack_size: UPROC_STACK_DEFAULT,
@@ -2108,6 +2132,7 @@ impl Orbit {
             envp_bytes: envp_bytes.as_deref(),
             perms: None,
             cwd: cwd_override,
+            stdout_redirect,
         };
 
         let child_pid = match self.create_new_process(proc_components) {
@@ -2596,6 +2621,7 @@ impl Orbit {
             envp_bytes: None,
             perms: None,
             cwd: None,
+            stdout_redirect: None,
         };
 
         match self.create_new_process(proc_components) {
@@ -4120,11 +4146,15 @@ impl Orbit {
         // already been removed (impossible on the live spawn path,
         // defensive against future refactors). Fail-closed default
         // matches `Process::new`'s ZERO baseline.
-        let perms_snapshot = self
+        //
+        // Same single-snapshot contract for `stdout_redirect` — read
+        // once here, fall back to `None` if the record is gone (no
+        // redirect ⇒ writes to own pane, identical to legacy spawns).
+        let (perms_snapshot, stdout_redirect_snapshot) = self
             .processes
             .get(&pid)
-            .map(|p| p.permissions)
-            .unwrap_or(orbit_abi::perms::Permissions::ZERO);
+            .map(|p| (p.permissions, p.stdout_redirect))
+            .unwrap_or((orbit_abi::perms::Permissions::ZERO, None));
 
         Ok(Thread {
             pc: AtomicUsize::new(entrypoint),
@@ -4155,6 +4185,7 @@ impl Orbit {
             syscall_count: AtomicU64::new(0),
             syscall_ticks: AtomicU64::new(0),
             permissions: perms_snapshot,
+            stdout_redirect: stdout_redirect_snapshot,
         })
     }
 
@@ -4205,6 +4236,11 @@ impl Orbit {
                 proc.cwd.push_str(&parent.cwd);
             }
         }
+        // Install the stdout redirect target before the first thread
+        // is constructed — `create_new_thread` snapshots this onto the
+        // thread's lock-free read slot. Setting it later would leave
+        // the initial thread with a stale `None`.
+        proc.stdout_redirect = proc_components.stdout_redirect;
         let slot = proc.thread_slots.alloc().ok_or(())?;
 
         // ELF segment backings are tracked on the process so dealloc_process
@@ -4295,9 +4331,21 @@ impl Orbit {
         // the cmd is dropped — the user_prints path via UART still
         // works as a fallback. k_gpu picks up the InsertSource cmd
         // in its drain loop.
-        let _ = crate::drivers::k_gpu::push_insert_source(
-            crate::drivers::display::Source::Process(pid),
-        );
+        //
+        // Skip the registration entirely for `stdout_redirect`-ed
+        // children: their `console_write` bytes route to the parent's
+        // pane, so this pane would only ever be empty. Without this
+        // skip every captured spawn would leave a `pid N (exited)`
+        // tombstone behind — `display::remove_source` keeps the
+        // scrollback around in case the user wants to flip back to
+        // the (in our case nonexistent) listing. The matching
+        // `push_remove_source` in `dealloc_process` is a no-op when
+        // the source was never inserted.
+        if proc_components.stdout_redirect.is_none() {
+            let _ = crate::drivers::k_gpu::push_insert_source(
+                crate::drivers::display::Source::Process(pid),
+            );
+        }
 
         // Register a per-process stdin slot so input::dispatch has a
         // place to deliver keystrokes once the process becomes the
