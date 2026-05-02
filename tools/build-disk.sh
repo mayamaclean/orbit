@@ -71,5 +71,23 @@ else
     printf 'warn: orbit-stage1 toolchain not linked; skipping /bin/hello-std\n' >&2
 fi
 
+# eza — modern `ls` replacement, out-of-tree at ../eza. Built against
+# orbit-stage1 with --no-default-features (drops git2). The crate's
+# Cargo.toml carries [patch.crates-io] entries pointing at the
+# vendored libc / backtrace / terminal_size / uzers under
+# rust/library/; see docs/dev/unix-surface.md. Skip-with-warning if
+# either the toolchain or the eza checkout is missing so contributors
+# without that sibling repo can still run ./smoke.
+EZA_SRC="$ROOT/../eza"
+if rustup toolchain list 2>/dev/null | grep -q '^orbit-stage1\b' \
+   && [ -d "$EZA_SRC" ]; then
+    note "building eza (+orbit-stage1, release, --no-default-features) → /bin/eza"
+    ( cd "$EZA_SRC" && cargo +orbit-stage1 build --release --no-default-features >/dev/null )
+    cp "$EZA_SRC/target/riscv64gc-unknown-orbit/release/eza" rootfs/bin/eza
+else
+    rm -f rootfs/bin/eza
+    printf 'warn: orbit-stage1 toolchain or %s missing; skipping /bin/eza\n' "$EZA_SRC" >&2
+fi
+
 tar --format=ustar -cf disk.img -C rootfs .
 printf 'built %s/disk.img (%s bytes) from rootfs/\n' "$ROOT" "$(stat -c %s disk.img)"

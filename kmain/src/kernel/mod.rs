@@ -1056,17 +1056,32 @@ impl Orbit {
         if path.starts_with('/') {
             return alloc::borrow::ToOwned::to_owned(path);
         }
+        // Normalize a relative `path` against the caller's cwd:
+        // strip any leading `./` so "./foo" resolves to "<cwd>/foo",
+        // and treat a bare "." as the cwd itself. Without this,
+        // `eza` (which defaults to listing ".") gets handed "/."
+        // which the tarfs walker doesn't recognize.
+        let mut tail = path;
+        loop {
+            tail = match tail {
+                "." => "",
+                t if t.starts_with("./") => &t[2..],
+                _ => break,
+            };
+        }
         let mut out = String::new();
         if let Some(p) = self.processes.get(&pid) {
             out.push_str(&p.cwd);
-            if !out.ends_with('/') {
-                out.push('/');
-            }
         }
         else {
             out.push('/');
         }
-        out.push_str(path);
+        if !tail.is_empty() {
+            if !out.ends_with('/') {
+                out.push('/');
+            }
+            out.push_str(tail);
+        }
         out
     }
 

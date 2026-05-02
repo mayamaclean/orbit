@@ -26,6 +26,75 @@ pub const WHITE: u32 = rgb(0xFF, 0xFF, 0xFF);
 pub const DARK_GRAY: u32 = rgb(0x20, 0x20, 0x20);
 pub const CYAN: u32 = rgb(0, 0xCC, 0xCC);
 
+// ANSI 16-color palette. Indices match SGR 30..37 (standard) and
+// 90..97 (bright). Values cribbed from the VS Code default dark
+// theme — close enough to xterm that eza/ripgrep output reads
+// correctly while staying legible against `DARK_GRAY` background.
+pub const ANSI_BLACK: u32 = rgb(0, 0, 0);
+pub const ANSI_RED: u32 = rgb(0xCD, 0x31, 0x31);
+pub const ANSI_GREEN: u32 = rgb(0x0D, 0xBC, 0x79);
+pub const ANSI_YELLOW: u32 = rgb(0xE5, 0xE5, 0x10);
+pub const ANSI_BLUE: u32 = rgb(0x24, 0x72, 0xC8);
+pub const ANSI_MAGENTA: u32 = rgb(0xBC, 0x3F, 0xBC);
+pub const ANSI_CYAN: u32 = rgb(0x11, 0xA8, 0xCD);
+pub const ANSI_WHITE: u32 = rgb(0xE5, 0xE5, 0xE5);
+pub const ANSI_BRIGHT_BLACK: u32 = rgb(0x66, 0x66, 0x66);
+pub const ANSI_BRIGHT_RED: u32 = rgb(0xF1, 0x4C, 0x4C);
+pub const ANSI_BRIGHT_GREEN: u32 = rgb(0x23, 0xD1, 0x8B);
+pub const ANSI_BRIGHT_YELLOW: u32 = rgb(0xF5, 0xF5, 0x43);
+pub const ANSI_BRIGHT_BLUE: u32 = rgb(0x3B, 0x8E, 0xEA);
+pub const ANSI_BRIGHT_MAGENTA: u32 = rgb(0xD6, 0x70, 0xD6);
+pub const ANSI_BRIGHT_CYAN: u32 = rgb(0x29, 0xB8, 0xDB);
+pub const ANSI_BRIGHT_WHITE: u32 = rgb(0xFF, 0xFF, 0xFF);
+
+/// Map an SGR fg parameter (`30..37` standard, `90..97` bright) to a
+/// concrete BGRA pixel. Returns `None` for any other code so the
+/// parser can swallow it without changing color state.
+pub const fn ansi_fg(code: u8) -> Option<u32> {
+    match code {
+        30 => Some(ANSI_BLACK),
+        31 => Some(ANSI_RED),
+        32 => Some(ANSI_GREEN),
+        33 => Some(ANSI_YELLOW),
+        34 => Some(ANSI_BLUE),
+        35 => Some(ANSI_MAGENTA),
+        36 => Some(ANSI_CYAN),
+        37 => Some(ANSI_WHITE),
+        90 => Some(ANSI_BRIGHT_BLACK),
+        91 => Some(ANSI_BRIGHT_RED),
+        92 => Some(ANSI_BRIGHT_GREEN),
+        93 => Some(ANSI_BRIGHT_YELLOW),
+        94 => Some(ANSI_BRIGHT_BLUE),
+        95 => Some(ANSI_BRIGHT_MAGENTA),
+        96 => Some(ANSI_BRIGHT_CYAN),
+        97 => Some(ANSI_BRIGHT_WHITE),
+        _ => None,
+    }
+}
+
+/// Same shape for SGR background codes (`40..47`, `100..107`).
+pub const fn ansi_bg(code: u8) -> Option<u32> {
+    match code {
+        40 => Some(ANSI_BLACK),
+        41 => Some(ANSI_RED),
+        42 => Some(ANSI_GREEN),
+        43 => Some(ANSI_YELLOW),
+        44 => Some(ANSI_BLUE),
+        45 => Some(ANSI_MAGENTA),
+        46 => Some(ANSI_CYAN),
+        47 => Some(ANSI_WHITE),
+        100 => Some(ANSI_BRIGHT_BLACK),
+        101 => Some(ANSI_BRIGHT_RED),
+        102 => Some(ANSI_BRIGHT_GREEN),
+        103 => Some(ANSI_BRIGHT_YELLOW),
+        104 => Some(ANSI_BRIGHT_BLUE),
+        105 => Some(ANSI_BRIGHT_MAGENTA),
+        106 => Some(ANSI_BRIGHT_CYAN),
+        107 => Some(ANSI_BRIGHT_WHITE),
+        _ => None,
+    }
+}
+
 /// Wrapper around a linear BGRA8888 framebuffer.
 #[derive(Clone, Copy)]
 pub struct FrameBuffer {
