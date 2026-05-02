@@ -13,7 +13,9 @@ use kmain::kernel::Orbit;
 use kmain::kernel::context::{enter_hart_context, fault_thread};
 use kmain::kernel::memmap::{map_kernel_self, unmap_boot_only_regions};
 use kmain::ktrace::OrbitSubscriber;
+use kmain::tracked_heap::KHEAP;
 use kmain::{ProcessComponents, check_context_and_switch, supervisor_clear_ipi};
+use mem::round_u64_up;
 use mmu::mmap::PageAlloc;
 use mmu::{PAGE_SIZE, sv48::PageTable};
 use orbit_abi::perms::Permissions;
@@ -23,10 +25,6 @@ use riscv::register::{
     satp::Mode,
     stvec::{Stvec, TrapMode},
 };
-
-use linked_list_allocator::LockedHeap;
-
-use mem::round_u64_up;
 use serial::println;
 
 use tracing::{Level, debug, error, info};
@@ -37,9 +35,6 @@ global_asm!(
     ".attribute arch, \"rv64gc\"",
     include_str!("../../asm/trap.S"),
 );
-
-#[global_allocator]
-static KHEAP: LockedHeap = LockedHeap::empty();
 
 unsafe extern "C" {
     unsafe fn s_trap_vector();
@@ -1140,7 +1135,7 @@ extern "C" fn rust_main(_hartid: usize, dtb: usize, serial: usize, load_addr: u6
         // Initialize KHEAP through its KDMAP VA. Allocator-returned pointers
         // are KDMAP VAs from here on — they stay valid after identity pools
         // are eventually dropped.
-        KHEAP.make_guard_unchecked().init(
+        KHEAP.init(
             kmain::kernel::memmap::phys_to_kdmap(mmu::sv48::PhysAddr::new(layout.kheap.start))
                 .as_mut_ptr::<u8>(),
             kmain::kernel::memmap::KHEAP_SIZE as usize,

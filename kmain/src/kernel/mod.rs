@@ -517,9 +517,7 @@ impl Orbit {
             kernel_kpages_bytes: self.kernel_pages.allocated_bytes() as u64,
             kernel_user_pages_bytes: self.user_pages.allocated_bytes() as u64,
             kernel_ktables_bytes: self.table_pages.allocated_bytes() as u64,
-            // KHEAP usage requires intercepting `#[global_allocator]`
-            // — orthogonal to time accounting, deferred.
-            kernel_heap_bytes: 0,
+            kernel_heap_bytes: crate::tracked_heap::KHEAP.allocated_bytes() as u64,
             syscall_ticks,
             hart_user_ticks,
             hart_kernel_ticks,
@@ -1125,7 +1123,8 @@ impl Orbit {
                 valid_bytes: 0,
                 loading: false,
             })
-        } else {
+        }
+        else {
             None
         };
         // Lazy-create the handle table — same pattern create_netch
@@ -1140,7 +1139,7 @@ impl Orbit {
                 inode,
                 offset: 0,
                 dir_cursor: 0,
-                scratch
+                scratch,
             }));
         info!("fs_open: pid={pid} path={path} → fd={fd} ino={inode}");
         fd as isize
@@ -1297,7 +1296,13 @@ impl Orbit {
         of.offset = prev_off + visible_len as u64;
 
         match unsafe {
-            fs.read_async(inode, sector_off, SECTOR as u32, scratch_pa.get_raw(), notif)
+            fs.read_async(
+                inode,
+                sector_off,
+                SECTOR as u32,
+                scratch_pa.get_raw(),
+                notif,
+            )
         } {
             Ok(()) => {
                 // The notification (and its handle clone) is in the
@@ -1361,9 +1366,8 @@ impl Orbit {
         // submit_blk_read for exactly this work item; the IRQ
         // forwarded it through PendingWork unchanged. This is the
         // unique consumer.
-        let notif = unsafe {
-            *Box::from_raw(notif_ptr as *mut crate::kernel::fs::WorkNotification)
-        };
+        let notif =
+            unsafe { *Box::from_raw(notif_ptr as *mut crate::kernel::fs::WorkNotification) };
         let desc = match notif {
             crate::kernel::fs::WorkNotification::Bounce(d) => d,
             crate::kernel::fs::WorkNotification::Direct { .. } => {
@@ -4185,7 +4189,7 @@ impl Orbit {
             Some(seg) => seg,
             None => {
                 error!("load_elf fed bad bytes");
-                return Err(())
+                return Err(());
             }
         };
 

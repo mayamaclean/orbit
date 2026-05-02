@@ -385,9 +385,7 @@ fn virtio_blk_handler(_src: u32) {
                             *slot = work;
                         }
                         Err(_) => {
-                            warn!(
-                                "virtio-blk: MANAGER_WORK full — signaling -EIO for head={head}"
-                            );
+                            warn!("virtio-blk: MANAGER_WORK full — signaling -EIO for head={head}");
                             let recovered = Box::from_raw(raw);
                             if let WorkNotification::Bounce(desc) = *recovered {
                                 desc.handle.signal(-(orbit_abi::errno::EIO as isize));

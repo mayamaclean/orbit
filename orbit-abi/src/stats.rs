@@ -70,6 +70,17 @@ pub struct ProcessStats {
     /// Bytes outstanding from the ktables pool (page-table frames).
     pub kernel_ktables_bytes: u64,
     /// Bytes outstanding from KHEAP (linked-list kernel allocator).
+    ///
+    /// Includes the per-source framebuffer scrollback (one
+    /// `VecDeque<String>` capped at `SCROLLBACK_LINES` lines per
+    /// source). Each `console_write`d line that completes with `\n`
+    /// donates the `pending` String's grown capacity (≤ `MAX_LINE_LEN`
+    /// bytes) into the deque. Until the deque hits its line cap the
+    /// per-source contribution grows monotonically — looks like a
+    /// leak in stats output, but it plateaus at ~140 KB per source
+    /// and releases on `dealloc_process`'s `RemoveSource`. See
+    /// `hello/src/main.rs::scrollback_bounding_test` for a
+    /// reproduction.
     pub kernel_heap_bytes: u64,
 
     // ─── per-process syscall service time ────────────────────────────

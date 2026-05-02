@@ -31,6 +31,7 @@ pub mod drivers;
 pub mod hw;
 pub mod kernel;
 pub mod ktrace;
+pub mod tracked_heap;
 
 /// Scope guard that enables `sstatus.SUM` for the duration of its lifetime
 /// so the supervisor can touch `U=1` pages. Syscall handlers build one,

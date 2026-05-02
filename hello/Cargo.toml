@@ -6,3 +6,15 @@ edition = "2024"
 [dependencies]
 orbit-abi = { path = "../orbit-abi" }
 orbit-rt  = { path = "../orbit-rt" }
+
+[features]
+# Run the kheap-bounding stress loop instead of returning immediately
+# from main. Needs >500 iters to demonstrate the plateau, so it's not
+# in the default path. See `scrollback_bounding_test` in src/main.rs.
+scrollback-stress = []
+
+# Marker for tools/build-disk.sh — presence of this section flags the
+# crate as a simple disk binary (default toolchain, default target,
+# install name == crate name). Bespoke cases stay as explicit blocks
+# in the script.
+[package.metadata.disk]

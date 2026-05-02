@@ -303,7 +303,8 @@ fn main() {
                     Ok(status) => {
                         if status.code() == Some(42) {
                             println!("PASS: std::process::Command wait /bin/hello status=42");
-                        } else {
+                        }
+                        else {
                             println!("FAIL: std::process::Command wait got {status}");
                         }
                     }

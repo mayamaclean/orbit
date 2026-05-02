@@ -71,7 +71,7 @@ pub struct OpenFile {
     /// `None` for directories (use `fs_readdir` instead, no scratch
     /// needed) and on close-handle teardown after the backing has
     /// been freed.
-    pub scratch: Option<ScratchSector>
+    pub scratch: Option<ScratchSector>,
 }
 
 /// Per-`OpenFile` 512-byte sector cache. Owns a [`SharedFrame`]

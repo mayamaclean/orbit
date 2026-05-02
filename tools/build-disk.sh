@@ -4,34 +4,57 @@
 # over virtio-blk; consumed by §12c's tarfs mount. Rebuilt fresh every
 # call — disk.img is gitignored.
 #
-# Builds the in-tree user binaries that ship on the disk and stages
-# them under rootfs/bin/ before tarring:
-#   /bin/hello      — §12e exec smoke target
-#   /bin/console    — interactive shell, default init
-#   /bin/smoke      — umode test harness (renamed from `umode`); fed to
-#                     orbit-loader as init when kmain is built with the
-#                     `smoke` cargo feature
-#   /bin/hello-std  — std-on-orbit smoke. Optional; built only if the
-#                     orbit-stage1 rustup toolchain is linked (the rust
-#                     fork at ./rust ships its own libstd).
+# Two-tier discovery for the in-tree user binaries staged under
+# rootfs/bin/:
+#
+# 1. Simple crates (default toolchain, default target, install name ==
+#    crate name) are auto-discovered by the presence of a
+#    `[package.metadata.disk]` section in their Cargo.toml. Add a new
+#    simple disk binary by adding that marker to the new crate; no
+#    edit here required. Currently:
+#      /bin/hello      — §12e exec smoke target
+#      /bin/console    — interactive shell, default init
+#
+# 2. Bespoke crates (rename, special toolchain, optional skip) stay as
+#    explicit blocks below since each needs custom handling:
+#      /bin/smoke      — umode test harness (renamed from `umode`);
+#                        fed to orbit-loader as init when kmain is
+#                        built with the `smoke` cargo feature
+#      /bin/hello-std  — std-on-orbit smoke. Optional; built only if
+#                        the orbit-stage1 rustup toolchain is linked
+#                        (the rust fork at ./rust ships its own libstd).
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT"
 [ -d rootfs ] || { echo "FAIL: $ROOT/rootfs does not exist" >&2; exit 1; }
 mkdir -p rootfs/bin
 
-# §12e: simple no_std exec target.
-( cd hello && cargo build --release >/dev/null )
-cp hello/target/riscv64gc-unknown-none-elf/release/hello rootfs/bin/hello
+note() { printf '>> %s\n' "$*"; }
 
-# Default init.
-( cd console && cargo build --release >/dev/null )
-cp console/target/riscv64gc-unknown-none-elf/release/console rootfs/bin/console
+# Tier 1 — auto-discover simple disk binaries via the
+# `[package.metadata.disk]` marker. grep is enough; no TOML parser
+# needed for the empty-section presence check.
+mapfile -t SIMPLE_DISK_BINS < <(
+  git ls-files '*Cargo.toml' | while read -r m; do
+    if grep -q '^\[package\.metadata\.disk\]' "$m"; then
+      printf '%s\n' "${m%/Cargo.toml}"
+    fi
+  done
+)
+
+for crate in "${SIMPLE_DISK_BINS[@]}"; do
+  note "building $crate (release) → /bin/$crate"
+  ( cd "$crate" && cargo build --release >/dev/null )
+  cp "$crate/target/riscv64gc-unknown-none-elf/release/$crate" "rootfs/bin/$crate"
+done
+
+# Tier 2 — bespoke binaries.
 
 # Smoke harness — renamed at install time so kmain's `feature = "smoke"`
 # argv (`/bin/smoke`) matches what the disk holds. Keeping the crate
 # name as `umode` avoids touching its Cargo.toml; the rename happens
 # only at the disk-staging step.
+note "building umode (release) → /bin/smoke"
 ( cd umode && cargo build --release >/dev/null )
 cp umode/target/riscv64gc-unknown-none-elf/release/umode rootfs/bin/smoke
 
@@ -40,6 +63,7 @@ cp umode/target/riscv64gc-unknown-none-elf/release/umode rootfs/bin/smoke
 # under "Building Orbit's std"). Skip-with-warning if absent so a
 # fresh checkout without the rust fork built can still run ./smoke.
 if rustup toolchain list 2>/dev/null | grep -q '^orbit-stage1\b'; then
+    note "building hello-std (+orbit-stage1, release) → /bin/hello-std"
     ( cd hello-std && cargo +orbit-stage1 build --release >/dev/null )
     cp hello-std/target/riscv64gc-unknown-orbit/release/hello-std rootfs/bin/hello-std
 else

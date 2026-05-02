@@ -70,7 +70,11 @@ note "building disk.img from rootfs/ (console, smoke=umode, hello-std, hello)"
 # orbit-loader/tools/send-payload.py at runtime. Built last so a
 # failure here (these crates predate orbit-rt's `_start` and may have
 # unmigrated entrypoints) doesn't strand the kernel/disk artifacts.
-BENCH_APPS=(umode-sleep-bench umode-tcp-bench)
+# Discovered via the `*-bench/` directory convention so a new bench
+# crate doesn't need a script edit.
+mapfile -t BENCH_APPS < <(
+  cd "$ROOT" && git ls-files '*-bench/Cargo.toml' | sed 's|/Cargo.toml$||'
+)
 for app in "${BENCH_APPS[@]}"; do
   if [ -d "$ROOT/$app" ]; then
     note "building $app (release)"

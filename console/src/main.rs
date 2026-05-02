@@ -212,6 +212,15 @@ fn syscall_name(ordinal: usize) -> &'static str {
         19 => "fs_stat",
         20 => "getpid",
         21 => "gettid",
+        22 => "wait_pid",
+        23 => "create_process_ex",
+        24 => "argv_envp",
+        25 => "futex_wait",
+        26 => "futex_wake",
+        27 => "fs_readdir",
+        28 => "pledge",
+        29 => "create_process_v2",
+        30 => "query_denial_log",
         _ => "?",
     }
 }
