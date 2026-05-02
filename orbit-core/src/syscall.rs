@@ -370,15 +370,19 @@ pub fn fs_open_req<H: Hardware>(
     }
 }
 
-/// `fs_read(fd, buf_ptr, len) → bytes | -errno`. v1 contract: `len`
-/// must equal `SECTOR_SIZE` (512). The kernel reads one sector at the
-/// fd's current offset into the user buffer (DMA direct, no bounce),
-/// auto-advances the offset by `SECTOR_SIZE`, and returns
-/// `min(SECTOR_SIZE, file_size - prev_offset)` — `0` at EOF.
+/// `fs_read(fd, buf_ptr, len) → bytes | -errno`. The kernel reads at
+/// the fd's current byte offset, returns up to `len` bytes (clipped
+/// at the next sector boundary and EOF), and advances the offset by
+/// exactly the number of bytes returned. `0` indicates EOF.
 ///
-/// Parks on a handle that the virtio-blk IRQ signals directly. If the
-/// manager-side submit fails (bad fd, queue full, …) the manager
-/// signals the retained handle clone with the errno.
+/// Buffer constraints: `len` is 1..=PAGE_SIZE; the buffer must lie
+/// within a single 4 KiB page (the kernel's user-page window can't
+/// straddle), and the user VA range must pass `user_range_ok`.
+///
+/// Parks on a handle the kernel signals after the underlying disk
+/// read + scratch→user copy completes. If the manager-side submit
+/// fails (bad fd, queue full, …) the retained handle clone is
+/// signaled synchronously with the errno.
 pub fn fs_read_req<H: Hardware>(
     thread: &mut Thread,
     frame: &TrapFrame,
@@ -395,10 +399,7 @@ pub fn fs_read_req<H: Hardware>(
         buf_vaddr,
         len: frame.regs[13],
     };
-    // v1: exactly one sector per syscall. Larger reads chunk in user
-    // space. See §12d roadmap notes for why we chose the strict cap.
-    const SECTOR_SIZE: usize = 512;
-    if req.len != SECTOR_SIZE {
+    if req.len == 0 || req.len > PAGE_SIZE {
         return SyscallOutcome::Return {
             ret: Errno::new(EINVAL).to_ret(),
         };
@@ -406,6 +407,15 @@ pub fn fs_read_req<H: Hardware>(
     if !user_range_ok(req.buf_vaddr.raw(), req.len as u64) {
         return SyscallOutcome::Return {
             ret: Errno::new(EFAULT).to_ret(),
+        };
+    }
+    // Buffer must fit within one page so the kernel's bounce-copy
+    // path can use a single `UserPageWindow`. Multi-page reads are
+    // not supported in v1; user code chunks at the page boundary.
+    let page_off = req.buf_vaddr.raw() & (PAGE_SIZE as u64 - 1);
+    if page_off + req.len as u64 > PAGE_SIZE as u64 {
+        return SyscallOutcome::Return {
+            ret: Errno::new(EINVAL).to_ret(),
         };
     }
     let handle = CompletionHandle::new();

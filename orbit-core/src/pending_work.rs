@@ -354,4 +354,23 @@ pub enum PendingWork {
         root_pa: PhysAddr,
         handle: CompletionHandle,
     },
+    /// Post-DMA completion step for `fs_read`. The virtio-blk IRQ
+    /// enqueues this for every successfully-completed (or failed)
+    /// bounce-path chain; the manager unboxes `notif_ptr`,
+    /// performs the scratch→user copy + cache publish + signal
+    /// under MANAGER_LOCK, and drops the box (which drops the
+    /// SharedFrame clone inside the `Bounce` variant, possibly
+    /// returning the scratch page to `pending_frees`).
+    ///
+    /// `notif_ptr` is the same `Box::into_raw` of a kmain-side
+    /// `WorkNotification` that submit_blk_read stashed in the
+    /// virtio-blk slot table — the IRQ forwards it through
+    /// unchanged so we don't double-box. orbit-core sees it as an
+    /// opaque transport pointer; valid for exactly one
+    /// `Box::from_raw` on the manager side. The variant is always
+    /// `Bounce` (Direct is signaled inline by the IRQ); the
+    /// manager matches accordingly. `status` carries the
+    /// underlying virtio status: 0 = success, non-zero = device
+    /// error.
+    FsReadCopy { notif_ptr: usize, status: u8 },
 }

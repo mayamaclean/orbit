@@ -281,6 +281,49 @@ fn main() {
         }
     }
 
+    // §13e — std::process::Command smoke. Spawn /bin/hello (a tiny
+    // arg-printing binary on the disk image), wait for it, and check
+    // the exit code matches the value its main() returns. Exercises
+    // the full Phase-7 path: fs read of program → argv pack → envp
+    // pack from current std::env table → create_process_with_argv_envp
+    // → wait_pid round trip.
+    {
+        use std::process::Command;
+        // /bin/hello returns 42 from main() and prints its argv via
+        // serialln. We pass two extra args so the exec path is
+        // exercised end-to-end, then read the exit code back.
+        let mut cmd = Command::new("/bin/hello");
+        cmd.arg("world");
+        cmd.arg("peace");
+        match cmd.spawn() {
+            Ok(mut child) => {
+                let pid = child.id();
+                println!("PASS: std::process::Command spawn /bin/hello pid={pid}");
+                match child.wait() {
+                    Ok(status) => {
+                        if status.code() == Some(42) {
+                            println!("PASS: std::process::Command wait /bin/hello status=42");
+                        } else {
+                            println!("FAIL: std::process::Command wait got {status}");
+                        }
+                    }
+                    Err(e) => println!("FAIL: std::process::Command wait: {e}"),
+                }
+            }
+            Err(e) => println!("FAIL: std::process::Command spawn /bin/hello: {e}"),
+        }
+
+        // Negative path — missing program surfaces as NotFound from
+        // the std::fs::File::open inside spawn().
+        match Command::new("/bin/does-not-exist").spawn() {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                println!("PASS: std::process::Command spawn missing -> NotFound");
+            }
+            Ok(_) => println!("FAIL: std::process::Command spawn missing returned Ok"),
+            Err(e) => println!("FAIL: std::process::Command spawn missing unexpected: {e}"),
+        }
+    }
+
     // §13e — std::net::TcpStream::connect over the kernel's NetChannel
     // primitive. Connect to QEMU's user-net gateway (which maps to host
     // loopback) on a port the smoke harness has nc(1) listening on.

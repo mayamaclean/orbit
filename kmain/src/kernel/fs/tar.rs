@@ -15,12 +15,11 @@ use alloc::vec::Vec;
 use orbit_abi::fs::{
     DIRENT_ALIGN, DIRENT_HDR_LEN, DT_DIR, DT_REG, DirEntry, S_IFDIR, S_IFREG, STAT_BLOCK_UNIT, Stat,
 };
-use process::CompletionHandle;
 use tracing::{info, warn};
 use virtio_blk::{Block, BlockError, SECTOR_SIZE};
 
 use crate::drivers::virtio_blk_dev;
-use crate::kernel::fs::{Filesystem, FsErr, Inode};
+use crate::kernel::fs::{Filesystem, FsErr, Inode, WorkNotification};
 
 const HEADER_NAME_LEN: usize = 100;
 const HEADER_MODE_OFFSET: usize = 100;
@@ -237,7 +236,7 @@ impl Filesystem for Tarfs {
         off: u64,
         len: u32,
         dst_pa: u64,
-        handle: CompletionHandle,
+        notif: WorkNotification,
     ) -> Result<(), FsErr> {
         let entry = self.entry(ino)?;
         if !matches!(entry.kind, Kind::Reg) {
@@ -253,15 +252,8 @@ impl Filesystem for Tarfs {
             return Err(FsErr::BadRange);
         }
         let lba = entry.data_sector + off / SECTOR_SIZE as u64;
-        // Bytes considered valid in this read: the lesser of the
-        // sector size and what's left in the file. Pinned at submit
-        // time and stashed in the virtio-blk slot table so the IRQ
-        // signals exactly this many bytes on success without needing
-        // to know about FS state.
-        let remaining = entry.size.saturating_sub(off);
-        let valid = core::cmp::min(SECTOR_SIZE as u64, remaining) as isize;
         unsafe {
-            virtio_blk_dev::submit_blk_read(lba, dst_pa, handle, valid).map_err(|e| {
+            virtio_blk_dev::submit_blk_read(lba, dst_pa, notif).map_err(|e| {
                 warn!("tarfs: submit_blk_read failed: {:?}", e);
                 FsErr::IoError
             })?;

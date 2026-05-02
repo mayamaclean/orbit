@@ -34,7 +34,7 @@ use orbit_core::{
 };
 use thingbuf::StaticThingBuf;
 
-use crate::kernel::fs::FsErr;
+use crate::kernel::fs::{FsErr, WorkNotification};
 use crate::kernel::handle::{Handle, OpenFile, ProcessHandles};
 use crate::kernel::memmap::FrameToKdmap;
 use crate::kernel::shared_user_ptr::SharedUserPtr;
@@ -62,6 +62,7 @@ pub mod memmap;
 pub mod orbital_elf;
 pub mod pci;
 pub mod pending_frees;
+pub mod shared_frame;
 pub mod shared_user_ptr;
 pub mod shootdown;
 pub mod stdin;
@@ -1020,7 +1021,7 @@ impl Orbit {
 
         let root_table = unsafe { memmap::kernel_root_from_pa(root_pa) };
 
-        match &handle {
+        match handle {
             Handle::NetChannel(sup) => {
                 if let Err(e) = sup.revoke(&root_table) {
                     warn!(
@@ -1029,17 +1030,20 @@ impl Orbit {
                     );
                     return Errno::new(EIO).to_ret();
                 }
+                // sup drops here — Arc release. Same shape as before
+                // the by-value match.
             }
-            Handle::File(_) => {
-                // No revoke step — file handles carry no SharedUserPtr,
-                // and the inode table outlives any single fd. Just drop.
+            Handle::File(of) => {
+                // The scratch SharedFrame drops with `of` here.
+                // If a DMA is in flight (loading=true), the
+                // CopyDescriptor in the virtio-blk slot table holds
+                // another clone; the page survives until the
+                // manager finishes the post-DMA copy. Otherwise the
+                // last clone drops here and the page goes to
+                // pending_frees.
+                drop(of);
             }
         }
-
-        // `handle` drops here, releasing the manager's Arc. If k_net
-        // still holds a clone the backing survives until its next
-        // drop.
-        drop(handle);
         0
     }
 
@@ -1090,6 +1094,40 @@ impl Orbit {
             Err(FsErr::NotFound) => return Errno::new(orbit_abi::errno::ENOENT).to_ret(),
             Err(_) => return Errno::new(EIO).to_ret(),
         };
+        // Allocate the per-fd sector cache for regular files. Stat
+        // tells us the kind. For directories the scratch is `None` —
+        // dir reads go through `fs_readdir`, which has its own
+        // page-aligned out-buffer in user space and doesn't need the
+        // bounce.
+        let stat = match fs.stat(inode) {
+            Ok(s) => s,
+            Err(_) => return Errno::new(EIO).to_ret(),
+        };
+        let is_reg = (stat.st_mode & orbit_abi::fs::S_IFMT) == orbit_abi::fs::S_IFREG;
+        let scratch = if is_reg {
+            let layout = match Layout::from_size_align(PAGE_SIZE, PAGE_SIZE) {
+                Ok(l) => l,
+                Err(_) => return Errno::new(EIO).to_ret(),
+            };
+            let frame = match crate::kernel::shared_frame::SharedFrame::alloc(
+                &mut self.kernel_pages,
+                layout,
+            ) {
+                Some(f) => f,
+                None => {
+                    error!("fs_open: kernel_pages exhausted; cannot allocate scratch");
+                    return Errno::new(orbit_abi::errno::ENOMEM).to_ret();
+                }
+            };
+            Some(crate::kernel::handle::ScratchSector {
+                frame,
+                cached_sector: u64::MAX,
+                valid_bytes: 0,
+                loading: false,
+            })
+        } else {
+            None
+        };
         // Lazy-create the handle table — same pattern create_netch
         // uses, since a process that opens a file before ever creating
         // a NetChannel won't have an entry yet.
@@ -1102,82 +1140,186 @@ impl Orbit {
                 inode,
                 offset: 0,
                 dir_cursor: 0,
+                scratch
             }));
         info!("fs_open: pid={pid} path={path} → fd={fd} ino={inode}");
         fd as isize
     }
 
-    /// Returns `Some(v)` for synchronous signal (manager signals the
-    /// retained handle clone with `v`); `None` means async — the
-    /// manager passed its handle clone to the virtio-blk slot table
-    /// and the IRQ owns it now.
+    /// Owns the `handle` it's passed: either consumes it into a
+    /// `WorkNotification::Bounce` (async — IRQ + manager FsReadCopy
+    /// signal it) or signals it inline with the appropriate value.
+    /// Caller must not signal again.
     fn run_fs_read_req(
         &mut self,
         req: FsReadReq,
         pid: u16,
         root_pa: PhysAddr,
         handle: process::CompletionHandle,
-    ) -> Option<isize> {
+    ) {
         const SECTOR: u64 = 512;
 
         // Look up the file handle and snapshot what we need.
         let Some(ph) = self.process_handles.get_mut(&pid)
         else {
-            return Some(Errno::new(EBADF).to_ret());
+            handle.signal(Errno::new(EBADF).to_ret());
+            return;
         };
         let Some(handle_ref) = ph.get_mut(req.fd)
         else {
-            return Some(Errno::new(EBADF).to_ret());
+            handle.signal(Errno::new(EBADF).to_ret());
+            return;
         };
         let Handle::File(of) = handle_ref
         else {
-            return Some(Errno::new(EBADF).to_ret());
+            handle.signal(Errno::new(EBADF).to_ret());
+            return;
         };
+
         let fs = of.fs;
         let inode = of.inode;
         let prev_off = of.offset;
 
         let file_size = match fs.size(inode) {
             Ok(s) => s,
-            Err(_) => return Some(Errno::new(EIO).to_ret()),
+            Err(_) => {
+                handle.signal(Errno::new(EIO).to_ret());
+                return;
+            }
         };
         if prev_off >= file_size {
             // EOF — sync signal 0; don't touch the device.
-            return Some(0);
+            handle.signal(0);
+            return;
         }
 
-        // Single-page constraint: a sector-sized buffer can straddle
-        // at most one 4 KiB page boundary, and we don't bounce. User
-        // aligns to 512.
+        // Buffer constraints already enforced at the syscall layer
+        // (one-page span, len > 0, user_range_ok). Resolve the user
+        // PA once.
         let buf_va = req.buf_vaddr.raw();
-        if (buf_va & (PAGE_SIZE as u64 - 1)) + req.len as u64 > PAGE_SIZE as u64 {
-            return Some(Errno::new(EINVAL).to_ret());
-        }
-
         let root_table = unsafe { memmap::kernel_root_from_pa(root_pa) };
         let page_base = buf_va & !(PAGE_SIZE as u64 - 1);
-        let page_off = buf_va - page_base;
-        let page_pa =
+        let user_page_off = (buf_va - page_base) as u32;
+        let user_page_pa =
             match unsafe { mmu::mmap::virt_to_phys(&root_table, VirtAddr::new(page_base)) } {
                 Some(p) => p as u64,
-                None => return Some(Errno::new(EFAULT).to_ret()),
+                None => {
+                    handle.signal(Errno::new(EFAULT).to_ret());
+                    return;
+                }
             };
-        let buf_pa = page_pa + page_off;
 
-        // Commit-then-submit: advance the offset before submission so
-        // a re-entrant fs_read against the same fd can't double-read
-        // this sector. On submit failure we revert below.
-        of.offset = prev_off + SECTOR;
+        // Compute the relevant slice of the current sector. `intra`
+        // is the byte offset within the sector that we want to start
+        // reading from; `visible_len` is the most we can return in
+        // this call (clipped at the sector boundary and at EOF).
+        let target_sector = prev_off / SECTOR;
+        let intra = (prev_off & (SECTOR - 1)) as u32;
+        let sector_remaining = SECTOR - intra as u64;
+        let file_remaining = file_size - prev_off;
+        let visible_len = core::cmp::min(
+            req.len as u64,
+            core::cmp::min(sector_remaining, file_remaining),
+        ) as u32;
 
-        match unsafe { fs.read_async(inode, prev_off, req.len as u32, buf_pa, handle) } {
-            Ok(()) => None, // IRQ owns the handle now.
+        // Take the scratch by &mut so we can flip `loading` in
+        // place. Regular files always have a scratch (allocated at
+        // fs_open); directories don't, but hitting fs_read on a
+        // directory should surface as EISDIR through the FS, not
+        // panic here.
+        let scratch = match &mut of.scratch {
+            Some(s) => s,
+            None => {
+                handle.signal(Errno::new(orbit_abi::errno::EISDIR).to_ret());
+                return;
+            }
+        };
+
+        // EAGAIN any concurrent reader while a DMA is in flight on
+        // this fd — we don't have a per-fd waiter queue in v1, and
+        // we must not submit a second DMA into the same scratch
+        // page. The `loading` check has to come *before* the
+        // cache-hit check: while loading is true `cached_sector` may
+        // still hold the previous valid sector, but the scratch
+        // page is being overwritten, so cache hits would return torn
+        // data.
+        if scratch.loading {
+            handle.signal(Errno::new(orbit_abi::errno::EAGAIN).to_ret());
+            return;
+        }
+
+        // Cache hit: the scratch already holds `target_sector`.
+        // Copy the slice into the user buffer through a
+        // UserPageWindow (we hold MANAGER_LOCK here, so single-slot
+        // serialisation is fine), advance offset, signal
+        // synchronously.
+        if scratch.cached_sector == target_sector {
+            let src_kva = scratch.frame.kva().raw() + intra as u64;
+            unsafe {
+                let mut w = user_page::UserPageWindow::map(user_page_pa, PAGE_SIZE);
+                let dst = w.as_mut_slice();
+                let src = core::slice::from_raw_parts(src_kva as *const u8, visible_len as usize);
+                dst[user_page_off as usize..user_page_off as usize + visible_len as usize]
+                    .copy_from_slice(src);
+            }
+            of.offset = prev_off + visible_len as u64;
+            handle.signal(visible_len as isize);
+            return;
+        }
+
+        // Cache miss: arm the loading state, build the bounce
+        // descriptor (cloning the SharedFrame so the in-flight
+        // descriptor keeps the scratch page alive across
+        // close_handle / process teardown), submit, park.
+        // cached_sector / valid_bytes stay at whatever they were
+        // (empty or the previous valid sector) — they get
+        // published from run_fs_read_copy on success. Only
+        // `loading` and `of.offset` move here, so the
+        // submit-failure rollback below has minimal state to undo.
+        let scratch_clone = scratch.frame.clone();
+        let scratch_pa = scratch_clone.pa();
+        let sector_off = target_sector * SECTOR;
+        let valid_bytes = core::cmp::min(SECTOR, file_size - sector_off) as u32;
+        let notif = WorkNotification::Bounce(crate::kernel::fs::CopyDescriptor {
+            handle: handle.clone(),
+            pid,
+            fd: req.fd,
+            target_sector,
+            valid_bytes,
+            scratch: scratch_clone,
+            user_page_pa: PhysAddr::new(user_page_pa),
+            user_page_off,
+            intra,
+            len: visible_len,
+        });
+
+        scratch.loading = true;
+        of.offset = prev_off + visible_len as u64;
+
+        match unsafe {
+            fs.read_async(inode, sector_off, SECTOR as u32, scratch_pa.get_raw(), notif)
+        } {
+            Ok(()) => {
+                // The notification (and its handle clone) is in the
+                // virtio-blk slot table; the IRQ + FsReadCopy will
+                // signal once the chain completes. Our retained
+                // `handle` here drops with this scope, releasing
+                // the manager-side Arc ref.
+            }
             Err(e) => {
-                // Revert the offset since the read didn't actually go
-                // out — keep fd state consistent.
+                // Submit failed — no FsReadCopy will ever fire to
+                // clear `loading`, so undo the speculative state
+                // here and signal the retained handle directly.
                 if let Some(ph) = self.process_handles.get_mut(&pid)
                     && let Some(Handle::File(of)) = ph.get_mut(req.fd)
                 {
                     of.offset = prev_off;
+                    if let Some(s) = of.scratch.as_mut() {
+                        s.loading = false;
+                        // cached_sector / valid_bytes stay
+                        // unchanged — the DMA never went out, so
+                        // whatever was valid before still is.
+                    }
                 }
                 let errno = match e {
                     FsErr::NotRegular => orbit_abi::errno::EISDIR,
@@ -1187,9 +1329,117 @@ impl Orbit {
                     FsErr::IoError => EIO,
                     FsErr::NotFound => orbit_abi::errno::ENOENT,
                 };
-                Some(Errno::new(errno).to_ret())
+                handle.signal(Errno::new(errno).to_ret());
             }
         }
+    }
+
+    /// Manager-side post-DMA completion for `fs_read`.
+    ///
+    /// `notif_ptr` is the same `Box<WorkNotification>` that
+    /// `submit_blk_read` stashed in the virtio-blk slot table; the
+    /// IRQ swapped it out of `IN_FLIGHT` and forwarded the pointer
+    /// through `PendingWork::FsReadCopy` for us to unbox here.
+    /// Always the `Bounce` variant — Direct is handled inline by
+    /// the IRQ.
+    ///
+    /// Three cases:
+    /// - `status != 0` (device error): clear `loading` on the fd
+    ///   (if still alive), invalidate the cache to avoid serving
+    ///   the partially-written sector, signal `-EIO`.
+    /// - Process exited mid-flight: skip the user-page copy
+    ///   (`user_page_pa` may have been reallocated to another
+    ///   tenant). Signal anyway — the parked thread is gone, so
+    ///   it's a no-op, but it releases the manager's clone.
+    /// - Otherwise: copy scratch→user, publish cache state on the
+    ///   fd if still alive (close_handle while DMA was in flight
+    ///   leaves us with no fd to update, but the user buffer is
+    ///   still mapped because the process is alive — the read
+    ///   completes as a courtesy).
+    fn run_fs_read_copy(&mut self, notif_ptr: usize, status: u8) {
+        // SAFETY: `notif_ptr` was produced by `Box::into_raw` in
+        // submit_blk_read for exactly this work item; the IRQ
+        // forwarded it through PendingWork unchanged. This is the
+        // unique consumer.
+        let notif = unsafe {
+            *Box::from_raw(notif_ptr as *mut crate::kernel::fs::WorkNotification)
+        };
+        let desc = match notif {
+            crate::kernel::fs::WorkNotification::Bounce(d) => d,
+            crate::kernel::fs::WorkNotification::Direct { .. } => {
+                // Direct never reaches the manager — the IRQ
+                // signals it inline. If we get here something
+                // smuggled the wrong variant through PendingWork.
+                error!("run_fs_read_copy: received WorkNotification::Direct — invariant violated");
+                return;
+            }
+        };
+
+        let process_alive = self.processes.contains_key(&desc.pid);
+        let scratch_state = self
+            .process_handles
+            .get_mut(&desc.pid)
+            .and_then(|ph| ph.get_mut(desc.fd))
+            .and_then(|h| match h {
+                Handle::File(of) => of.scratch.as_mut(),
+                _ => None,
+            });
+
+        if status != 0 {
+            // Block device reported failure. Clear `loading` so the
+            // fd isn't permanently stuck at EAGAIN; conservatively
+            // invalidate the cache (a partial-sector DMA may have
+            // landed before the failure, so anything previously
+            // valid is now suspect).
+            if let Some(s) = scratch_state {
+                s.loading = false;
+                s.cached_sector = u64::MAX;
+                s.valid_bytes = 0;
+            }
+            desc.handle.signal(-(orbit_abi::errno::EIO as isize));
+            return;
+        }
+
+        if !process_alive {
+            // Process exited mid-flight. The DMA landed in scratch
+            // (still alive via the SharedFrame clone in `desc`), but
+            // `user_page_pa` belonged to a tenant that is no longer
+            // there — writing to it would clobber whoever owns those
+            // physical pages now. Signal and return; desc drops →
+            // SharedFrame clone drops → scratch returns to
+            // pending_frees if this was the last clone.
+            desc.handle.signal(-(orbit_abi::errno::EIO as isize));
+            return;
+        }
+
+        // Success path. Copy scratch→user first, then publish cache
+        // state. UserPageWindow is single-slot but we're under
+        // MANAGER_LOCK, so no contention with other manager-side
+        // copies.
+        let scratch_kva = desc.scratch.kva().raw();
+        unsafe {
+            let mut w = user_page::UserPageWindow::map(desc.user_page_pa.get_raw(), PAGE_SIZE);
+            let dst = w.as_mut_slice();
+            let src = core::slice::from_raw_parts(
+                (scratch_kva + desc.intra as u64) as *const u8,
+                desc.len as usize,
+            );
+            dst[desc.user_page_off as usize..desc.user_page_off as usize + desc.len as usize]
+                .copy_from_slice(src);
+        }
+
+        if let Some(s) = scratch_state {
+            s.cached_sector = desc.target_sector;
+            s.valid_bytes = desc.valid_bytes;
+            s.loading = false;
+        }
+        // If scratch_state was None, the fd was closed while the
+        // DMA was in flight. The read still completed (we wrote
+        // into the user buffer); the cache update is moot because
+        // there's no fd to consult it. desc drops here → final
+        // SharedFrame clone drops → pending_frees.
+
+        desc.handle.signal(desc.len as isize);
     }
 
     fn run_fs_stat_req(&mut self, req: FsStatReq, pid: u16, root_pa: PhysAddr) -> isize {
@@ -2414,16 +2664,12 @@ impl Orbit {
                     root_pa,
                     handle,
                 } => {
-                    // The submit path takes a clone of `handle`. If
-                    // submit succeeds, `run_fs_read_req` returns
-                    // `None` and the IRQ will signal that clone (and
-                    // ours, sharing the Arc state). If it returns
-                    // `Some(v)` (EOF / errno), the manager-retained
-                    // clone signals the value sync.
-                    match self.run_fs_read_req(req, pid, root_pa, handle.clone()) {
-                        Some(v) => handle.signal(v),
-                        None => {}
-                    }
+                    // run_fs_read_req owns the handle: it either
+                    // consumes it into a WorkNotification::Bounce
+                    // (async — the IRQ + FsReadCopy signal it) or
+                    // signals it inline (sync — cache hit, EOF, or
+                    // error). No return value to dispatch on.
+                    self.run_fs_read_req(req, pid, root_pa, handle);
                 }
                 PendingWork::FsStat {
                     req,
@@ -2497,6 +2743,9 @@ impl Orbit {
                 } => {
                     let result = self.run_create_process_v2_req(req, pid, root_pa);
                     handle.signal(result);
+                }
+                PendingWork::FsReadCopy { notif_ptr, status } => {
+                    self.run_fs_read_copy(notif_ptr, status);
                 }
             }
         }
@@ -2689,8 +2938,13 @@ impl Orbit {
         //   2. Must happen before `unmap` below, which frees the
         //      intermediate PT pages the revoker walks.
         let root_table = unsafe { memmap::kernel_root_from_pa(process_root_table_pa) };
-        if let Some(ph) = self.process_handles.get(&process.pid) {
-            for (_fd, handle) in ph.iter() {
+        // NetChannels need an explicit revoke walk before drop;
+        // File handles' scratch SharedFrames drop on their own (in-
+        // flight DMA descriptors, if any, retain a clone so the page
+        // survives until the post-DMA copy completes — see the
+        // close-mid-flight fix in run_fs_read_copy).
+        if let Some(ph) = self.process_handles.remove(&process.pid) {
+            for (_fd, handle) in ph.into_iter() {
                 match handle {
                     Handle::NetChannel(sup) => {
                         if let Err(e) = sup.revoke(&root_table) {
@@ -2699,21 +2953,14 @@ impl Orbit {
                                 process.pid,
                             );
                         }
+                        drop(sup);
                     }
-                    Handle::File(_) => {
-                        // No revoke step — file handles carry no
-                        // SharedUserPtr; just drop with the rest of
-                        // the table below.
+                    Handle::File(of) => {
+                        drop(of);
                     }
                 }
             }
         }
-        // Drop the manager's Arcs. k_net still holds its own clones via
-        // `user_conns`; those drop later when `socket_deletions`
-        // removes them. When *both* sides have released, the
-        // SharedInner Drop fires and pushes the backing onto
-        // `pending_frees`.
-        let _ = self.process_handles.remove(&process.pid);
 
         while let Some(b) = process.heap_pages.pop() {
             info!(
@@ -3934,7 +4181,14 @@ impl Orbit {
 
         let mut segment_allocations = Vec::new();
 
-        let segments = elf.segments().unwrap();
+        let segments = match elf.segments() {
+            Some(seg) => seg,
+            None => {
+                error!("load_elf fed bad bytes");
+                return Err(())
+            }
+        };
+
         for segment in segments.iter() {
             let load_segment = segment.p_type == elf::abi::PT_LOAD;
             if !load_segment {

@@ -15,7 +15,8 @@
 //!    through [`mounted`].
 
 use orbit_abi::fs::Stat;
-use process::CompletionHandle;
+
+pub use crate::drivers::virtio_blk_dev::{CopyDescriptor, WorkNotification};
 
 pub mod tar;
 
@@ -46,9 +47,10 @@ pub trait Filesystem: Send + Sync {
     /// Returns `NotFound` for paths the FS doesn't have.
     fn open(&self, path: &str) -> Result<Inode, FsErr>;
 
-    /// Submit one sector-sized read. The implementation parks `handle`
-    /// on the underlying block-device completion; signaling carries
-    /// `0` on success or a negative error code.
+    /// Submit one sector-sized read. `notif` carries both the
+    /// completion handle and the post-DMA action (direct signal vs.
+    /// manager-side scratch→user copy); the FS layer just forwards
+    /// it to the block driver.
     ///
     /// v1 contract:
     /// - `len` must equal 512.
@@ -57,18 +59,20 @@ pub trait Filesystem: Send + Sync {
     ///   the next sector — the last sector of a file is read fully and
     ///   the caller trims).
     ///
-    /// Multi-sector reads chunk at the syscall layer (12d's `fs_read`).
+    /// On submit failure the boxed `notif` is dropped (taking the
+    /// handle inside it with it); the caller is expected to retain
+    /// its own handle clone if it needs to signal an errno.
     ///
     /// # Safety
     /// `dst_pa` must reference 512 bytes of memory the kernel keeps
-    /// mapped until `handle` signals.
+    /// mapped until the notification is dispatched.
     unsafe fn read_async(
         &self,
         ino: Inode,
         off: u64,
         len: u32,
         dst_pa: u64,
-        handle: CompletionHandle,
+        notif: WorkNotification,
     ) -> Result<(), FsErr>;
 
     /// Fill `*out` with stat info for `ino`. Synchronous — tar's

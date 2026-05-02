@@ -1,31 +1,35 @@
 //! kmain-side glue for virtio-blk: pick the device-id 2 slot off
 //! [`virtio_probe`], allocate request queue + arena from `kernel_pages`,
 //! drive `Block::new` to bring the device live, register a PLIC handler
-//! that drains used chains and signals each waiting [`CompletionHandle`].
+//! that drains used chains and dispatches each completion through the
+//! caller-supplied [`WorkNotification`].
 //!
 //! Lookup table for in-flight async reads is keyed by descriptor head:
-//! [`submit_blk_read`] stores the caller's `CompletionHandle` (as a raw
-//! `Arc::into_raw` pointer) at `IN_FLIGHT[head]`; the IRQ handler swaps
-//! it back to null and signals exactly once. Single-mutator on each
-//! slot via the atomic swap, so there's no locking.
+//! [`submit_blk_read`] boxes the caller's `WorkNotification` and stashes
+//! the raw pointer at `IN_FLIGHT[head]`; the IRQ handler swaps it back
+//! to null and runs the appropriate completion shape exactly once.
+//! Single-mutator on each slot via the atomic swap, so there's no
+//! locking.
 
 use alloc::boxed::Box;
 use core::alloc::Layout;
 use core::ptr::null_mut;
-use core::sync::atomic::{AtomicI64, AtomicPtr, Ordering};
+use core::sync::atomic::{AtomicPtr, Ordering};
 
-use tracing::{error, info};
+use mmu::sv48::PhysAddr;
+use tracing::{error, info, warn};
 use virtio::queue::VirtqBacking;
 use virtio_blk::{
     ARENA_BYTES, Block, BlockBacking, BlockError, QUEUE_SIZE, SECTOR_SIZE, VIRTIO_BLK_DEVICE_ID,
     proto::VIRTIO_BLK_S_OK,
 };
 
+use orbit_core::PendingWork;
 use process::CompletionHandle;
-use process::completion::CompletionInner;
 
 use crate::drivers::{plic, virtio_probe};
 use crate::kernel::memmap::KernelPages;
+use crate::kernel::shared_frame::SharedFrame;
 
 // Queue page layout matches virtio_input_dev / virtio_gpu_dev — one
 // page holds desc / avail / used with comfortable slack at the chosen
@@ -35,25 +39,71 @@ const DESC_OFFSET: u64 = 0;
 const AVAIL_OFFSET: u64 = 1024;
 const USED_OFFSET: u64 = 2048;
 
-/// Per-descriptor-head completion-handle slot table. Index range
-/// `0..QUEUE_SIZE`; entries hold an `Arc::into_raw`'d handle while the
-/// chain is in flight, null otherwise.
-static IN_FLIGHT: [AtomicPtr<CompletionInner>; QUEUE_SIZE as usize] = {
-    const NULL: AtomicPtr<CompletionInner> = AtomicPtr::new(null_mut());
-    [NULL; QUEUE_SIZE as usize]
-};
-
-/// Per-slot value to signal on a successful (status=OK) completion.
-/// Submitter sets this before the Release-store into [`IN_FLIGHT`];
-/// the IRQ reads it after the AcqRel-swap takes the handle out, so
-/// the publication of [`IN_FLIGHT`] orders this read.
+/// What to do when a chain completes. `submit_blk_read` boxes one of
+/// these and stashes the pointer at `IN_FLIGHT[head]`; the IRQ takes
+/// ownership and dispatches.
 ///
-/// Keeps the IRQ handler ignorant of FS-layer concepts like
-/// "bytes-read for this request" — the syscall handler stashes the
-/// target value here at submit time.
-static IN_FLIGHT_OK_VAL: [AtomicI64; QUEUE_SIZE as usize] = {
-    const ZERO: AtomicI64 = AtomicI64::new(0);
-    [ZERO; QUEUE_SIZE as usize]
+/// Two shapes today, extensible:
+/// - [`WorkNotification::Direct`] — IRQ signals `handle` directly with
+///   `success_value` on `VIRTIO_BLK_S_OK` or `-1` otherwise. For
+///   future raw kernel-side reads where the IRQ has everything it
+///   needs to complete the request.
+/// - [`WorkNotification::Bounce`] — IRQ enqueues a
+///   [`PendingWork::FsReadCopy`] from the carried [`CopyDescriptor`];
+///   the manager performs the scratch→user copy + cache publish +
+///   signal under MANAGER_LOCK (UserPageWindow can't run in IRQ
+///   context). The current `fs_read` path uses this exclusively.
+pub enum WorkNotification {
+    Direct {
+        handle: CompletionHandle,
+        success_value: isize,
+    },
+    Bounce(CopyDescriptor),
+}
+
+/// Bounce-path completion metadata. Carries everything the manager
+/// needs to (1) copy `scratch[intra..intra + len]` into the user's
+/// buffer at `user_page_pa[user_page_off..]`, and (2) publish the
+/// new cache state on the originating `OpenFile` (clear `loading`,
+/// set `cached_sector` / `valid_bytes`).
+///
+/// The `handle` and `scratch` ride inside the descriptor so the
+/// side-table holds a single allocation per in-flight request, and
+/// the [`SharedFrame`] clone keeps the scratch page alive across
+/// `close_handle` / process teardown — last clone drops via
+/// `pending_frees::push` after the manager finishes the post-DMA
+/// copy.
+pub struct CopyDescriptor {
+    pub handle: CompletionHandle,
+    /// pid that owns the originating fd. Used by the manager to find
+    /// the `OpenFile` in `process_handles` (and to skip the
+    /// user-page copy if the process has exited).
+    pub pid: u16,
+    /// fd within `pid`'s handle table.
+    pub fd: u32,
+    /// File-relative sector index DMA was filling. Becomes
+    /// `cached_sector` on success.
+    pub target_sector: u64,
+    /// Bytes considered valid in the just-DMA'd sector. Becomes
+    /// `valid_bytes` on success.
+    pub valid_bytes: u32,
+    /// Refcount clone keeping the scratch page alive across the
+    /// IRQ → manager hand-off. The OpenFile holds the fd-side
+    /// clone; close_handle / process teardown can drop theirs at
+    /// any time without UAF.
+    pub scratch: SharedFrame,
+    pub user_page_pa: PhysAddr,
+    pub user_page_off: u32,
+    pub intra: u32,
+    pub len: u32,
+}
+
+/// Per-descriptor-head completion slot table. Each entry holds a
+/// `Box::into_raw`'d [`WorkNotification`] while the chain is in
+/// flight, null otherwise. Single-mutator per slot via atomic swap.
+static IN_FLIGHT: [AtomicPtr<WorkNotification>; QUEUE_SIZE as usize] = {
+    const NULL: AtomicPtr<WorkNotification> = AtomicPtr::new(null_mut());
+    [NULL; QUEUE_SIZE as usize]
 };
 
 static BLOCK_PTR: AtomicPtr<Block> = AtomicPtr::new(null_mut());
@@ -193,15 +243,14 @@ pub fn setup_virtio_blk(kernel_pages: &mut KernelPages) -> bool {
     true
 }
 
-/// Submit an asynchronous single-sector read at `lba` into `dst_pa`,
-/// signalling `handle` from the IRQ handler when the chain completes.
-/// On `VIRTIO_BLK_S_OK` the IRQ signals `success_value` into the
-/// handle's first ret slot; on any other status it signals `-1`.
-/// Returns the descriptor head used.
+/// Submit an asynchronous single-sector read at `lba` into `dst_pa`.
+/// The IRQ handler dispatches `notif` once the chain completes:
+/// [`WorkNotification::Direct`] signals the carried handle inline;
+/// [`WorkNotification::Bounce`] enqueues a [`PendingWork::FsReadCopy`]
+/// for the manager to copy scratch→user and signal.
 ///
-/// `success_value` is the value the syscall layer wants the parked
-/// thread to see in `a0`. For `fs_read` that's "bytes considered
-/// valid" (≤ 512); for a future raw-block read it'd be `512`.
+/// Returns the descriptor head used. On `Err`, the boxed `notif`
+/// is dropped — including any `CompletionHandle` it owned.
 ///
 /// # Safety
 /// - `dst_pa` must reference `SECTOR_SIZE` bytes the kernel keeps
@@ -210,8 +259,7 @@ pub fn setup_virtio_blk(kernel_pages: &mut KernelPages) -> bool {
 pub unsafe fn submit_blk_read(
     lba: u64,
     dst_pa: u64,
-    handle: CompletionHandle,
-    success_value: isize,
+    notif: WorkNotification,
 ) -> Result<u16, BlockError> {
     let dev = block_dev().ok_or(BlockError::QueueFull)?;
 
@@ -226,29 +274,28 @@ pub unsafe fn submit_blk_read(
     // peek_free_head + push_chain land on the same head we predicted.
     let head = dev.peek_next_head().ok_or(BlockError::QueueFull)?;
 
-    IN_FLIGHT_OK_VAL[head as usize].store(success_value as i64, Ordering::Relaxed);
-
-    // Stash the handle's Arc for the IRQ handler to reclaim. swap, not
-    // store: a previous in-flight chain at this descriptor index must
-    // have completed (drain_used cleared the slot to null) before its
-    // index re-entered the free list, so this swap should always see
-    // null. If it doesn't, something violated the queue invariant —
-    // log and drop the prior handle to avoid leaking the Arc.
-    let raw = handle.into_raw() as *mut CompletionInner;
+    // Stash the notification for the IRQ handler to reclaim. swap,
+    // not store: a previous in-flight chain at this descriptor index
+    // must have completed (drain_used cleared the slot to null) before
+    // its index re-entered the free list, so this swap should always
+    // see null. If it doesn't, something violated the queue invariant
+    // — log and drop the prior notification to avoid leaking the Arc.
+    let raw = Box::into_raw(Box::new(notif));
     let prev = IN_FLIGHT[head as usize].swap(raw, Ordering::AcqRel);
     if !prev.is_null() {
         error!(
-            "virtio-blk: IN_FLIGHT[{head}] was non-null at submit — pre-existing handle leaked then dropped"
+            "virtio-blk: IN_FLIGHT[{head}] was non-null at submit — pre-existing notification leaked then dropped"
         );
         unsafe {
-            drop(CompletionHandle::from_raw(prev));
+            drop(Box::from_raw(prev));
         }
     }
 
     // Now actually submit. push_chain must produce the same head we
-    // pre-published; if not, our handle is stranded at the wrong slot.
-    // submit_read debug_asserts head == predicted internally, so a
-    // mismatch panics in dev builds; in release it's silently wrong.
+    // pre-published; if not, our notification is stranded at the
+    // wrong slot. submit_read debug_asserts head == predicted
+    // internally, so a mismatch panics in dev builds; in release
+    // it's silently wrong.
     match unsafe { dev.submit_read(lba, dst_pa, SECTOR_SIZE as u32) } {
         Ok(actual) => {
             debug_assert!(
@@ -258,11 +305,12 @@ pub unsafe fn submit_blk_read(
             Ok(head)
         }
         Err(e) => {
-            // Reclaim the handle since the chain never went out.
+            // Reclaim the notification (and the handle inside it)
+            // since the chain never went out.
             let raw = IN_FLIGHT[head as usize].swap(core::ptr::null_mut(), Ordering::AcqRel);
             if !raw.is_null() {
                 unsafe {
-                    drop(CompletionHandle::from_raw(raw));
+                    drop(Box::from_raw(raw));
                 }
             }
             Err(e)
@@ -271,7 +319,13 @@ pub unsafe fn submit_blk_read(
 }
 
 /// PLIC handler. Acks the device interrupt, drains every completed
-/// chain, and signals each chain's [`CompletionHandle`].
+/// chain, and dispatches the corresponding [`WorkNotification`].
+///
+/// For [`WorkNotification::Bounce`] the IRQ forwards the same
+/// `Box<WorkNotification>` pointer that `submit_blk_read` stashed
+/// in IN_FLIGHT — `PendingWork::FsReadCopy { notif_ptr, status }`
+/// — so the box (with its [`SharedFrame`] clone inside) survives
+/// the IRQ → manager hand-off without re-allocation.
 fn virtio_blk_handler(_src: u32) {
     let Some(dev) = block_dev()
     else {
@@ -282,22 +336,66 @@ fn virtio_blk_handler(_src: u32) {
         dev.drain_used(|head, status| {
             let raw = IN_FLIGHT[head as usize].swap(null_mut(), Ordering::AcqRel);
             if raw.is_null() {
-                // No handle registered. Either the submitter raced
-                // and hasn't published yet (impossible: we publish
-                // before notify_queue) or the chain was a stray. Log
-                // once and drop.
-                error!("virtio-blk: completion for head={head} with no registered handle");
+                // No notification registered. Either the submitter
+                // raced and hasn't published yet (impossible: we
+                // publish before notify_queue) or the chain was a
+                // stray. Log once and drop.
+                error!("virtio-blk: completion for head={head} with no registered notification");
                 return;
             }
-            let h = CompletionHandle::from_raw(raw);
-            let ok_val = IN_FLIGHT_OK_VAL[head as usize].load(Ordering::Relaxed);
-            let result: isize = if status == VIRTIO_BLK_S_OK {
-                ok_val as isize
+            // Peek the variant without consuming the box: bounce
+            // path forwards the same pointer through PendingWork
+            // (manager unboxes), direct path unboxes here and
+            // signals inline.
+            //
+            // SAFETY: `raw` was just swapped out of IN_FLIGHT; no
+            // other thread observes it. The `&*raw` read is valid
+            // for this match arm; we either consume the box
+            // (Direct) or transfer ownership through PendingWork
+            // (Bounce).
+            match &*raw {
+                WorkNotification::Direct { .. } => {
+                    let notif = *Box::from_raw(raw);
+                    let WorkNotification::Direct {
+                        handle,
+                        success_value,
+                    } = notif
+                    else {
+                        unreachable!()
+                    };
+                    let result: isize = if status == VIRTIO_BLK_S_OK {
+                        success_value
+                    }
+                    else {
+                        -1
+                    };
+                    handle.signal(result);
+                }
+                WorkNotification::Bounce(_) => {
+                    let notif_ptr = raw as usize;
+                    let work = PendingWork::FsReadCopy { notif_ptr, status };
+                    // If MANAGER_WORK is full the parked thread
+                    // would otherwise hang forever — recover the
+                    // box, signal -EIO inline, drop. The
+                    // SharedFrame clone drops with the box and the
+                    // scratch page heads to pending_frees if this
+                    // was the last clone.
+                    match crate::kernel::MANAGER_WORK.push_ref() {
+                        Ok(mut slot) => {
+                            *slot = work;
+                        }
+                        Err(_) => {
+                            warn!(
+                                "virtio-blk: MANAGER_WORK full — signaling -EIO for head={head}"
+                            );
+                            let recovered = Box::from_raw(raw);
+                            if let WorkNotification::Bounce(desc) = *recovered {
+                                desc.handle.signal(-(orbit_abi::errno::EIO as isize));
+                            }
+                        }
+                    }
+                }
             }
-            else {
-                -1
-            };
-            h.signal(result);
         });
     }
 }
