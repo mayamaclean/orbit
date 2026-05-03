@@ -79,6 +79,16 @@ struct Payload<'a> {
     #[n(3)]
     #[cbor(default)]
     affinity: u64,
+    /// Optional argv. Each element is a borrowed UTF-8 string from
+    /// the CBOR body; the loader converts to `&[u8]` and hands the
+    /// packed blob to `create_process_with_argv_envp`. Empty /
+    /// missing → child sees argc=0, which is what the legacy
+    /// `create_process` path produces. Strings (rather than byte
+    /// strings) keep the CBOR shape simple and work for every CLI
+    /// argv we've shipped so far.
+    #[n(4)]
+    #[cbor(default)]
+    argv: alloc::vec::Vec<&'a str>,
 }
 
 #[derive(Debug)]
@@ -380,18 +390,45 @@ fn spawn(body_only: &[u8]) -> Result<u16, LoaderErr> {
     ];
     logln!(
         "orbit-loader: spawn ptr={:p} len={} head={:02x?} \
-           allowed_affinity={:#x} affinity={:#x}",
+           allowed_affinity={:#x} affinity={:#x} argc={}",
         elf.as_ptr(),
         elf.len(),
         head,
         payload.allowed_affinity,
-        payload.affinity
+        payload.affinity,
+        payload.argv.len()
     );
-    create_process(
+    if payload.argv.is_empty() {
+        return create_process(
+            elf.as_ptr(),
+            elf.len(),
+            payload.allowed_affinity,
+            payload.affinity,
+        )
+        .map_err(LoaderErr::Syscall);
+    }
+    // Pack argv into the same wire format orbit-rt's `_start` expects;
+    // 4 KiB scratch matches the kernel's argv-page mapping. Larger
+    // argv blobs would need a paged rewrite of this path — defer
+    // until something actually hits the cap.
+    let argv_bytes: alloc::vec::Vec<&[u8]> =
+        payload.argv.iter().map(|s| s.as_bytes()).collect();
+    let mut argv_buf = [0u8; 4096];
+    let Some(argv_len) = orbit_abi::argv::pack(&argv_bytes, &mut argv_buf)
+    else {
+        return Err(LoaderErr::Cbor);
+    };
+    let argv_blob = &argv_buf[..argv_len];
+    // No envp transfer over the wire — the child inherits the
+    // loader's envp via the kernel's standard create_process_v2 path
+    // when envp_va = 0.
+    create_process_with_argv_envp(
         elf.as_ptr(),
         elf.len(),
         payload.allowed_affinity,
         payload.affinity,
+        argv_blob,
+        0,
     )
     .map_err(LoaderErr::Syscall)
 }

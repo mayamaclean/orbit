@@ -89,5 +89,22 @@ else
     printf 'warn: orbit-stage1 toolchain or %s missing; skipping /bin/eza\n' "$EZA_SRC" >&2
 fi
 
+# ripgrep — `rg` recursive grep, out-of-tree at ../ripgrep. Same
+# build pattern as eza but uses the `release-lto` profile (defined
+# in ripgrep's Cargo.toml) to get a stripped + LTO'd binary instead
+# of the 29 MB debug-info-laden default release. Patches in
+# [patch.crates-io] cover same-file + memmap2 (in addition to the
+# eza set); see docs/dev/unix-surface.md §6.
+RG_SRC="$ROOT/../ripgrep"
+if rustup toolchain list 2>/dev/null | grep -q '^orbit-stage1\b' \
+   && [ -d "$RG_SRC" ]; then
+    note "building ripgrep (+orbit-stage1, release-lto, --no-default-features) → /bin/rg"
+    ( cd "$RG_SRC" && cargo +orbit-stage1 build --profile release-lto --no-default-features >/dev/null )
+    cp "$RG_SRC/target/riscv64gc-unknown-orbit/release-lto/rg" rootfs/bin/rg
+else
+    rm -f rootfs/bin/rg
+    printf 'warn: orbit-stage1 toolchain or %s missing; skipping /bin/rg\n' "$RG_SRC" >&2
+fi
+
 tar --format=ustar -cf disk.img -C rootfs .
 printf 'built %s/disk.img (%s bytes) from rootfs/\n' "$ROOT" "$(stat -c %s disk.img)"
