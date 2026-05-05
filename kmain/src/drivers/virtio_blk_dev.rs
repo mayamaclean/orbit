@@ -30,6 +30,7 @@ use process::CompletionHandle;
 use crate::drivers::{plic, virtio_probe};
 use crate::kernel::memmap::KernelPages;
 use crate::kernel::shared_frame::SharedFrame;
+use crate::kernel::shootdown::CPU_COUNT;
 
 // Queue page layout matches virtio_input_dev / virtio_gpu_dev — one
 // page holds desc / avail / used with comfortable slack at the chosen
@@ -234,7 +235,7 @@ pub fn setup_virtio_blk(kernel_pages: &mut KernelPages) -> bool {
     let leaked: &'static mut Block = Box::leak(Box::new(dev));
     BLOCK_PTR.store(leaked as *mut _, Ordering::Release);
 
-    if plic::plic_register(slot.irq, virtio_blk_handler, 0).is_err() {
+    if plic::plic_register(slot.irq, virtio_blk_handler, core::cmp::min(1, CPU_COUNT.load(Ordering::Relaxed) - 1)).is_err() {
         error!("virtio-blk: plic_register failed for irq {}", slot.irq);
         return false;
     }
@@ -370,6 +371,16 @@ fn virtio_blk_handler(_src: u32) {
                         -1
                     };
                     handle.signal(result);
+                    // Wake k_io. Today Direct is only consumed by
+                    // k_io's per-sector reads in the path-mode spawn
+                    // flow; pushing WakeEvent::Io here is the
+                    // counterpart to the e1000 PLIC handler pushing
+                    // WakeEvent::Net to wake k_net. Without this k_io
+                    // would only re-check `is_signaled` on its idle-
+                    // heartbeat tick (~100 ms), making per-sector
+                    // wait latency dominate spawn time.
+                    let _ = crate::kernel::WAKE_QUEUE
+                        .push(crate::kernel::WakeEvent::Io);
                 }
                 WorkNotification::Bounce(_) => {
                     let notif_ptr = raw as usize;

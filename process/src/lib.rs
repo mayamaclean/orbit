@@ -385,6 +385,23 @@ pub struct Thread {
     /// `perm_denials` counter, then short-circuits the syscall with
     /// `-EPERM`.
     pub permissions: Permissions,
+    /// Snapshot of the owning process's POSIX credential triplet. Read
+    /// without locking by the `getuid`/`geteuid`/`getgid`/`getegid`
+    /// fast paths; refreshed alongside [`Self::permissions`] when the
+    /// process mutates its credentials (today: only at construction;
+    /// future: by `setuid`/`setgid` propagating across all threads of
+    /// the process under MANAGER_LOCK, same shape as pledge).
+    ///
+    /// Supplementary groups and login name are *not* snapshotted onto
+    /// the thread — they're variable-size and rarely-read; the
+    /// `getgroups`/`getlogin` syscalls go through the manager-side
+    /// [`Process`] lookup instead.
+    pub uid: u32,
+    pub euid: u32,
+    pub suid: u32,
+    pub gid: u32,
+    pub egid: u32,
+    pub sgid: u32,
     /// Snapshot of [`Process::stdout_redirect`] taken at thread
     /// construction. The `console_write` syscall reads this without
     /// locking the process table; immutable for the thread's
@@ -411,6 +428,13 @@ pub enum ProcessState {
     Waiting,
     Broken,
 }
+
+/// Maximum supplementary groups per process — POSIX `NGROUPS_MAX`. Set
+/// to 16 to match OpenBSD's default; `setgroups` will reject longer
+/// lists with `EINVAL`. Bump cautiously — the value is part of the
+/// observable ABI (`getgroups` callers size their buffers off this) and
+/// changing it forces every consumer to re-check.
+pub const NGROUPS_MAX: usize = 16;
 
 #[derive(Debug)]
 pub struct Process {
@@ -499,13 +523,50 @@ pub struct Process {
     /// process rather than a fully-trusted one — the safer failure
     /// mode.
     pub permissions: Permissions,
-    /// Advisory uid. Not used for authentication or authorization —
-    /// roles + permissions own that surface. Carried for Unix-compat
-    /// observability (`getuid`, `ps`-style diagnostics) and for
-    /// fs ownership metadata once writes land.
+    /// Real uid — POSIX `getuid()`. Identity-only, not used for
+    /// authentication or authorization (roles + permissions own that
+    /// surface). Carried for Unix-compat observability (`getuid`,
+    /// `ps`-style diagnostics) and for fs ownership metadata once
+    /// writes land. The real/effective/saved triplet matches POSIX
+    /// `_POSIX_SAVED_IDS` so a future `setuid(2)` can implement the
+    /// standard saved-set rules without growing this struct.
     pub uid: u32,
-    /// Advisory gid. Same caveats as [`uid`](Self::uid).
+    /// Effective uid — POSIX `geteuid()`. The id used for FS access
+    /// checks (`vaccess` against inode `st_uid`) once enforcement
+    /// lands. v1: equals `uid` for every process; only diverges when
+    /// `setuid`/`seteuid` ship.
+    pub euid: u32,
+    /// Saved-set uid — POSIX `getresuid()`'s third slot. Stamped at
+    /// spawn from the parent's `euid` (POSIX exec semantics carried
+    /// over to orbit's spawn-only model); future `seteuid` may swap
+    /// the effective uid back to this value to reclaim privilege a
+    /// process voluntarily dropped.
+    pub suid: u32,
+    /// Real gid — POSIX `getgid()`. Same identity-only caveats as
+    /// [`uid`](Self::uid); paired with `egid`/`sgid` for the standard
+    /// triplet.
     pub gid: u32,
+    /// Effective gid — POSIX `getegid()`. FS-access counterpart to
+    /// `euid`; checked against inode `st_gid` after the uid arm of
+    /// `vaccess`.
+    pub egid: u32,
+    /// Saved-set gid — POSIX `getresgid()`'s third slot. Mirror of
+    /// `suid` for gids.
+    pub sgid: u32,
+    /// Supplementary group memberships — POSIX `getgroups()`. Capped
+    /// at [`NGROUPS_MAX`] entries (matches OpenBSD); `setgroups`
+    /// rejects longer lists with `EINVAL`. Empty by default; populated
+    /// at spawn time by a `LOGIN`-role caller (future) reading
+    /// `/etc/group` and stamping the child via the spawn syscall.
+    pub groups: Vec<u32>,
+    /// Session login name — POSIX `getlogin()` / `setlogin()`. Pure
+    /// accounting / observability surface; auth never consults it
+    /// (mirrors OpenBSD's documented "advisory" classification).
+    /// `None` means "no login name installed" — the read syscall
+    /// reports `ENOENT`. Set once at spawn by the future `login`
+    /// binary; mutable in-process via the future `setlogin(2)` (gated
+    /// on `euid == 0`).
+    pub login_name: Option<String>,
     /// Count of times the dispatch-site bitmask gate has EPERMed a
     /// syscall from this process. Surfaced via `query_stats`'s
     /// `perm_denials` field. Incremented by the manager-side
@@ -572,7 +633,13 @@ impl Process {
             // than a fully-trusted one.
             permissions: Permissions::ZERO,
             uid: 0,
+            euid: 0,
+            suid: 0,
             gid: 0,
+            egid: 0,
+            sgid: 0,
+            groups: Vec::new(),
+            login_name: None,
             perm_denials: AtomicU64::new(0),
             role_denials: AtomicU64::new(0),
             cwd: "/".to_string(),

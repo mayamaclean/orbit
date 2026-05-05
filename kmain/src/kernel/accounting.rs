@@ -80,10 +80,25 @@ pub static SYSCALL_STATS: [SyscallSlot; Sysno::COUNT] = [
     SyscallSlot::new(),
     SyscallSlot::new(),
     SyscallSlot::new(),
+    // GetUid, GetEuid, GetGid, GetEgid, GetGroups, GetLogin —
+    // ordinals 35..=40, appended when POSIX credential read syscalls
+    // landed.
+    SyscallSlot::new(),
+    SyscallSlot::new(),
+    SyscallSlot::new(),
+    SyscallSlot::new(),
+    SyscallSlot::new(),
+    SyscallSlot::new(),
+    // SetUid, SetGid, SetGroups, SetLogin — ordinals 41..=44,
+    // appended for POSIX credential write syscalls.
+    SyscallSlot::new(),
+    SyscallSlot::new(),
+    SyscallSlot::new(),
+    SyscallSlot::new(),
 ];
 
 const _: () = assert!(
-    Sysno::COUNT == 35,
+    Sysno::COUNT == 45,
     "SYSCALL_STATS literal must be resized when Sysno::COUNT changes"
 );
 

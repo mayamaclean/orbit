@@ -106,5 +106,20 @@ else
     printf 'warn: orbit-stage1 toolchain or %s missing; skipping /bin/rg\n' "$RG_SRC" >&2
 fi
 
-tar --format=ustar -cf disk.img -C rootfs .
+# Two-pass archive build so /etc/ entries land with owner=root:0 in
+# the tar headers despite the rootfs/ files being owned by the build
+# user (tar would otherwise stamp the owner from stat()). The kernel-
+# side `vaccess()` check needs at least one file unreadable to a
+# non-root caller for the deny-path smoke; system files (passwd,
+# shadow, etc.) are the natural home and POSIX-shape callers expect
+# uid=0 ownership there. Add new system-owned subtrees by extending
+# this block — the default tar pass handles everything else with
+# the build user's uid.
+if [ -d rootfs/etc ]; then
+  tar --format=ustar -cf disk.img -C rootfs --exclude='./etc' .
+  tar --format=ustar --append -f disk.img -C rootfs \
+      --owner=0 --group=0 etc
+else
+  tar --format=ustar -cf disk.img -C rootfs .
+fi
 printf 'built %s/disk.img (%s bytes) from rootfs/\n' "$ROOT" "$(stat -c %s disk.img)"

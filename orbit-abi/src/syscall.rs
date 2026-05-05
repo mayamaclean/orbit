@@ -101,6 +101,107 @@ pub const CHDIR: usize = 4107;
 /// - `ERANGE` — buffer too small for the current cwd.
 pub const GETCWD: usize = 4108;
 
+/// `getuid() -> uid` — POSIX `getuid(2)`. Returns the calling
+/// process's real uid. Reads the per-thread credential snapshot
+/// without locking. Never fails — uid is a `u32` so the return
+/// always fits in the positive range of `isize`.
+pub const GETUID: usize = 4109;
+
+/// `geteuid() -> euid` — POSIX `geteuid(2)`. Returns the calling
+/// process's effective uid. Same shape as [`GETUID`] but reads
+/// `Thread.euid`. Splitting effective from real avoids the negative-
+/// `isize` hazard a bundled `(real << 32) | effective` return would
+/// have for uids ≥ 0x8000_0000.
+pub const GETEUID: usize = 4110;
+
+/// `getgid() -> gid` — POSIX `getgid(2)`. Real gid counterpart to
+/// [`GETUID`].
+pub const GETGID: usize = 4111;
+
+/// `getegid() -> egid` — POSIX `getegid(2)`. Effective gid counterpart
+/// to [`GETEUID`].
+pub const GETEGID: usize = 4112;
+
+/// `getgroups(buf_ptr: *mut u32, count: usize) -> count | -errno` —
+/// POSIX `getgroups(2)`. Copy the caller's supplementary group list
+/// into the user buffer (one `u32` per slot) and return the number of
+/// entries copied. POSIX special case: `count == 0` (regardless of
+/// `buf_ptr`) returns the current group count *without* writing —
+/// callers use this to size the real call.
+///
+/// `count` is in `u32` slots, not bytes. Buffer length in bytes is
+/// implicitly `count * 4`. Maximum entries the kernel will write is
+/// [`process::NGROUPS_MAX`].
+///
+/// Errnos:
+/// - `EFAULT` — `buf_ptr` doesn't translate when `count > 0`.
+/// - `EINVAL` — buffer straddles a page boundary.
+/// - `ERANGE` — `count > 0` but smaller than the current group count.
+pub const GETGROUPS: usize = 4113;
+
+/// `getlogin(buf_ptr: *mut u8, buf_len: usize) -> bytes_written | -errno`
+/// — POSIX `getlogin_r(3)` shape (Rust prefers the bounded form over
+/// `getlogin(3)`'s static-buffer return). Copy the calling process's
+/// session login name (no NUL terminator) into the user buffer.
+///
+/// Errnos:
+/// - `EFAULT` — `buf_ptr` doesn't translate.
+/// - `EINVAL` — buffer straddles a page boundary.
+/// - `ERANGE` — buffer too small for the current login name.
+/// - `ENOENT` — no login name installed (initial process state, before
+///   any `setlogin` has run).
+pub const GETLOGIN: usize = 4114;
+
+/// `setuid(uid) -> 0 | -errno` — POSIX `setuid(2)`. Mutates the
+/// calling process's uid triplet under the standard rules:
+///   - euid == 0: set all three (real, effective, saved) to `uid` —
+///     the privilege-drop path.
+///   - euid != 0: set only euid, IFF `uid ∈ {ruid, suid}` (the
+///     privilege-toggle path used by setuid-bit binaries; real and
+///     saved are unchanged).
+///
+/// Per-thread credential snapshots refreshed in the same call by
+/// walking the calling process's thread set, so subsequent syscalls
+/// from sibling threads observe the new identity. Gated on
+/// [`orbit_abi::perms::class::PROC_CRED`]; pledging it away locks the
+/// caller's identity for the rest of its lifetime.
+///
+/// Errnos:
+/// - `EPERM` — non-root caller passed a uid that isn't in
+///   `{ruid, suid}`.
+pub const SETUID: usize = 4115;
+
+/// `setgid(gid) -> 0 | -errno` — POSIX `setgid(2)`. Same shape as
+/// [`SETUID`] for the gid triplet. EPERM rules apply against
+/// `{rgid, sgid}` rather than the uid pair, but the privilege-drop
+/// vs privilege-toggle distinction is identical.
+pub const SETGID: usize = 4116;
+
+/// `setgroups(buf_ptr: *const u32, count: usize) -> 0 | -errno` —
+/// POSIX `setgroups(2)`. Replace the caller's supplementary group
+/// list with the `count` `u32`s at `buf_ptr`. Requires `euid == 0`
+/// (matches POSIX); a caller that has dropped privilege via
+/// `setuid(N)` for non-zero N gets `EPERM`.
+///
+/// Errnos:
+/// - `EPERM` — caller's `euid != 0`.
+/// - `EINVAL` — `count > process::NGROUPS_MAX` (16).
+/// - `EFAULT` — `buf_ptr` doesn't translate.
+pub const SETGROUPS: usize = 4117;
+
+/// `setlogin(name_ptr: *const u8, name_len: usize) -> 0 | -errno` —
+/// POSIX `setlogin(2)`. Stamp the calling process's session login
+/// name. Caller must have `euid == 0` (matches OpenBSD; the syscall
+/// is meant for `login(1)` to install the authenticated user's name
+/// on the session). Capped at `MAXLOGNAME = 32` bytes.
+///
+/// Errnos:
+/// - `EPERM` — caller's `euid != 0`.
+/// - `EINVAL` — non-UTF-8 input.
+/// - `ENAMETOOLONG` — `name_len > 32`.
+/// - `EFAULT` — `name_ptr` doesn't translate.
+pub const SETLOGIN: usize = 4118;
+
 // 5000+ — multi-thread / SMP control plane. Numbered out of the 4096
 // block so the categorical split is obvious in dispatch tables and so
 // future single-process-spanning syscalls (futex wake/wait, etc.)
@@ -172,6 +273,16 @@ pub enum Sysno {
     QueryDenialLog = QUERY_DENIAL_LOG,
     Chdir = CHDIR,
     Getcwd = GETCWD,
+    GetUid = GETUID,
+    GetEuid = GETEUID,
+    GetGid = GETGID,
+    GetEgid = GETEGID,
+    GetGroups = GETGROUPS,
+    GetLogin = GETLOGIN,
+    SetUid = SETUID,
+    SetGid = SETGID,
+    SetGroups = SETGROUPS,
+    SetLogin = SETLOGIN,
     CreateThread = CREATE_THREAD,
     GetPid = GETPID,
     GetTid = GETTID,
@@ -212,6 +323,16 @@ impl Sysno {
             QUERY_DENIAL_LOG => Self::QueryDenialLog,
             CHDIR => Self::Chdir,
             GETCWD => Self::Getcwd,
+            GETUID => Self::GetUid,
+            GETEUID => Self::GetEuid,
+            GETGID => Self::GetGid,
+            GETEGID => Self::GetEgid,
+            GETGROUPS => Self::GetGroups,
+            GETLOGIN => Self::GetLogin,
+            SETUID => Self::SetUid,
+            SETGID => Self::SetGid,
+            SETGROUPS => Self::SetGroups,
+            SETLOGIN => Self::SetLogin,
             CREATE_THREAD => Self::CreateThread,
             GETPID => Self::GetPid,
             GETTID => Self::GetTid,
@@ -269,6 +390,16 @@ impl Sysno {
             Self::Getcwd => 32,
             Self::FsSeek => 33,
             Self::FsFstat => 34,
+            Self::GetUid => 35,
+            Self::GetEuid => 36,
+            Self::GetGid => 37,
+            Self::GetEgid => 38,
+            Self::GetGroups => 39,
+            Self::GetLogin => 40,
+            Self::SetUid => 41,
+            Self::SetGid => 42,
+            Self::SetGroups => 43,
+            Self::SetLogin => 44,
         }
     }
 
@@ -277,7 +408,7 @@ impl Sysno {
     /// when adding a `Sysno` variant. Older userland with a smaller
     /// COUNT reads a prefix of the kernel's table; newer userland with
     /// a larger COUNT treats the kernel's missing slots as zero.
-    pub const COUNT: usize = 35;
+    pub const COUNT: usize = 45;
 }
 
 #[cfg(test)]
@@ -336,6 +467,16 @@ mod tests {
         assert_eq!(Sysno::from_usize(GETCWD), Some(Sysno::Getcwd));
         assert_eq!(Sysno::from_usize(FS_SEEK), Some(Sysno::FsSeek));
         assert_eq!(Sysno::from_usize(FS_FSTAT), Some(Sysno::FsFstat));
+        assert_eq!(Sysno::from_usize(GETUID), Some(Sysno::GetUid));
+        assert_eq!(Sysno::from_usize(GETEUID), Some(Sysno::GetEuid));
+        assert_eq!(Sysno::from_usize(GETGID), Some(Sysno::GetGid));
+        assert_eq!(Sysno::from_usize(GETEGID), Some(Sysno::GetEgid));
+        assert_eq!(Sysno::from_usize(GETGROUPS), Some(Sysno::GetGroups));
+        assert_eq!(Sysno::from_usize(GETLOGIN), Some(Sysno::GetLogin));
+        assert_eq!(Sysno::from_usize(SETUID), Some(Sysno::SetUid));
+        assert_eq!(Sysno::from_usize(SETGID), Some(Sysno::SetGid));
+        assert_eq!(Sysno::from_usize(SETGROUPS), Some(Sysno::SetGroups));
+        assert_eq!(Sysno::from_usize(SETLOGIN), Some(Sysno::SetLogin));
     }
 
     #[test]
@@ -343,8 +484,10 @@ mod tests {
         // 9 is PLEDGE — used to be a hole below 4096, now decodes.
         assert_eq!(Sysno::from_usize(10), None);
         assert_eq!(Sysno::from_usize(4095), None);
-        // 4105..=4108 are now CREATE_PROCESS_V2 / QUERY_DENIAL_LOG / CHDIR / GETCWD.
-        assert_eq!(Sysno::from_usize(4109), None);
+        // 4105..=4118 are now CREATE_PROCESS_V2 / QUERY_DENIAL_LOG /
+        // CHDIR / GETCWD / GETUID / GETEUID / GETGID / GETEGID /
+        // GETGROUPS / GETLOGIN / SETUID / SETGID / SETGROUPS / SETLOGIN.
+        assert_eq!(Sysno::from_usize(4119), None);
         assert_eq!(Sysno::from_usize(4999), None);
         assert_eq!(Sysno::from_usize(5006), None);
         assert_eq!(Sysno::from_usize(5999), None);
@@ -390,6 +533,16 @@ mod tests {
         assert_eq!(Sysno::Getcwd as usize, GETCWD);
         assert_eq!(Sysno::FsSeek as usize, FS_SEEK);
         assert_eq!(Sysno::FsFstat as usize, FS_FSTAT);
+        assert_eq!(Sysno::GetUid as usize, GETUID);
+        assert_eq!(Sysno::GetEuid as usize, GETEUID);
+        assert_eq!(Sysno::GetGid as usize, GETGID);
+        assert_eq!(Sysno::GetEgid as usize, GETEGID);
+        assert_eq!(Sysno::GetGroups as usize, GETGROUPS);
+        assert_eq!(Sysno::GetLogin as usize, GETLOGIN);
+        assert_eq!(Sysno::SetUid as usize, SETUID);
+        assert_eq!(Sysno::SetGid as usize, SETGID);
+        assert_eq!(Sysno::SetGroups as usize, SETGROUPS);
+        assert_eq!(Sysno::SetLogin as usize, SETLOGIN);
     }
 
     #[test]
@@ -431,6 +584,16 @@ mod tests {
         assert_eq!(GETCWD, 4108);
         assert_eq!(FS_SEEK, 6004);
         assert_eq!(FS_FSTAT, 6005);
+        assert_eq!(GETUID, 4109);
+        assert_eq!(GETEUID, 4110);
+        assert_eq!(GETGID, 4111);
+        assert_eq!(GETEGID, 4112);
+        assert_eq!(GETGROUPS, 4113);
+        assert_eq!(GETLOGIN, 4114);
+        assert_eq!(SETUID, 4115);
+        assert_eq!(SETGID, 4116);
+        assert_eq!(SETGROUPS, 4117);
+        assert_eq!(SETLOGIN, 4118);
     }
 
     #[test]
@@ -473,6 +636,16 @@ mod tests {
             Sysno::Getcwd,
             Sysno::FsSeek,
             Sysno::FsFstat,
+            Sysno::GetUid,
+            Sysno::GetEuid,
+            Sysno::GetGid,
+            Sysno::GetEgid,
+            Sysno::GetGroups,
+            Sysno::GetLogin,
+            Sysno::SetUid,
+            Sysno::SetGid,
+            Sysno::SetGroups,
+            Sysno::SetLogin,
         ];
         assert_eq!(all.len(), Sysno::COUNT);
         let mut seen = [false; Sysno::COUNT];

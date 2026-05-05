@@ -138,6 +138,7 @@ pub mod class {
         pub const FUTEX: u64 = 1 << 8;
         pub const STATS: u64 = 1 << 9;
         pub const PLEDGE: u64 = 1 << 10;
+        pub const PROC_CRED: u64 = 1 << 11;
 
         /// Union of every defined class's raw bit. Update when adding
         /// a class — the `all_is_union_of_classes` test pins this.
@@ -151,7 +152,8 @@ pub mod class {
             | FS_RO
             | FUTEX
             | STATS
-            | PLEDGE;
+            | PLEDGE
+            | PROC_CRED;
     }
 
     /// `serial_print`, `console_write`, `read_stdin`, `get_micros`,
@@ -208,6 +210,17 @@ pub mod class {
     /// pledges this away can never re-narrow itself afterwards (which
     /// is fine — the typical caller does it once at startup).
     pub const PLEDGE: ClassMask = ClassMask::from_raw(raw::PLEDGE);
+
+    /// In-process credential mutation: `setuid`, `setgid`, `setgroups`,
+    /// `setlogin`. Distinct from PROC_LIFE (the read side, which is
+    /// nearly free to grant) because privilege drop and login-name
+    /// stamping are stateful changes that benefit from explicit
+    /// pledging — a daemon that has finished privsep startup can
+    /// `pledge` PROC_CRED away, locking its current identity for the
+    /// rest of its life. Default-on for `BOOTSTRAP` and `LOADER` (via
+    /// `class::ALL`); narrow roles like `SHELL`/`WORKER`/`NET_CLIENT`
+    /// don't need it and don't get it.
+    pub const PROC_CRED: ClassMask = ClassMask::from_raw(raw::PROC_CRED);
 
     /// Union of every defined class. Equal to a process's `perms` in
     /// the `BOOTSTRAP` role. The composition lives in [`raw::ALL`]
@@ -461,9 +474,76 @@ pub struct CreateProcessV2Args {
     /// Reserved — must be zero. Pads `stdout_capture` up to the next
     /// 8-byte boundary so the struct's natural alignment is explicit.
     pub _pad2: u32,
+    /// Identity stamping — sentinel `-1` means "inherit the parent's
+    /// real/effective/saved uid triplet verbatim" (the POSIX
+    /// fork-on-spawn semantic). Any non-negative value is installed on
+    /// all three slots of the child's uid triplet at spawn time —
+    /// equivalent to a hypothetical `setuid(uid)` running with euid==0
+    /// before exec. Kernel gates this on the parent's role: only
+    /// [`role::LOADER`] may stamp a non-inherit value, others get
+    /// `-EPERM`. Identity is observability-only — roles + permissions
+    /// own authorization; uid feeds future `vaccess()`-shape FS checks.
+    pub setuid_uid: i64,
+    /// Identity stamping — sentinel `-1` means "inherit." Same gate
+    /// and shape as [`Self::setuid_uid`] but for the gid triplet.
+    pub setuid_gid: i64,
+    /// Optional session login-name override. `setlogin_vaddr == 0` (or
+    /// `setlogin_len == 0`) means "inherit the parent's login name
+    /// verbatim." Otherwise the kernel reads `setlogin_len` bytes at
+    /// `setlogin_vaddr`, validates them as UTF-8, and stamps the
+    /// child's `Process.login_name`. Capped at MAXLOGNAME (32 bytes,
+    /// matching OpenBSD); longer requests yield `ENAMETOOLONG`. Same
+    /// LOADER-only gate as the uid/gid stamps.
+    pub setlogin_vaddr: usize,
+    pub setlogin_len: usize,
+    /// Optional supplementary-groups override. `groups_vaddr == 0`
+    /// means "inherit parent's full groups list verbatim" (matches the
+    /// POSIX fork inherit semantics that argv/envp/cwd already follow
+    /// elsewhere in this struct). Otherwise the kernel reads
+    /// `groups_count` `u32`s at `groups_vaddr` and installs them as
+    /// the child's supplementary groups. Capped at
+    /// [`process::NGROUPS_MAX`]-shaped 16; longer counts yield
+    /// `EINVAL`. The buffer must be page-resident and not straddle a
+    /// page (single `UserPageWindow` read on the kernel side). Same
+    /// LOADER-only gate.
+    pub groups_vaddr: usize,
+    pub groups_count: usize,
+    /// Spawn-source discriminator. Two modes:
+    ///
+    /// **Path mode** (`spawn_path_vaddr != 0`): the kernel opens
+    /// `spawn_path_vaddr[..spawn_path_len]` against the active
+    /// filesystem, runs `vaccess(X)` against the inode using the
+    /// caller's effective credentials, and reads the bytes itself.
+    /// This is the POSIX `execve(path, …)` shape and the only path
+    /// available to non-LOADER callers — the X-bit check makes it
+    /// impossible to spawn a non-executable file even if the caller
+    /// could fs_read its bytes. `elf_vaddr` / `elf_len` are ignored.
+    ///
+    /// **Bytes mode** (`spawn_path_vaddr == 0`): the kernel reads
+    /// `elf_vaddr[..elf_len]` directly from the caller's address
+    /// space, with no fs lookup. Restricted to callers running with
+    /// `role::LOADER` because there's no file to check the X bit
+    /// against — the caller is asserting "I trust these bytes." Used
+    /// by orbit-loader for the network-payload flow where there is
+    /// no path; should NOT be used for any "spawn `/bin/foo`" pattern,
+    /// which loses X enforcement.
+    ///
+    /// Path string must be UTF-8, ≤ `MAX_FS_PATH_LEN` bytes; longer
+    /// requests yield `ENAMETOOLONG`. Buffer is bound-checked but does
+    /// NOT need to be page-resident (the kernel's
+    /// `copy_user_path` walks pages as needed).
+    pub spawn_path_vaddr: usize,
+    pub spawn_path_len: usize,
 }
 
 impl CreateProcessV2Args {
+    /// Sentinel for [`Self::setuid_uid`] / [`Self::setuid_gid`]
+    /// meaning "inherit the parent's value verbatim." Picked as `-1`
+    /// to match POSIX `setresuid(2)`'s "no change" sentinel; non-LOADER
+    /// callers MUST use this (the kernel rejects any non-inherit value
+    /// from a non-LOADER caller with `-EPERM`).
+    pub const INHERIT_ID: i64 = -1;
+
     /// Typed view of the request masks, for the kernel-side
     /// `derive_child_perms` clamp.
     pub const fn request(&self) -> PermsRequest {
@@ -617,6 +697,25 @@ impl Permissions {
             // process-state read, like getpid.
             syscall::CHDIR => class::FS_RO,
             syscall::GETCWD => class::PROC_LIFE,
+            // POSIX credential reads — pure per-thread/per-process
+            // state lookups, no FS or device reach. Same class as
+            // getpid / gettid / getcwd.
+            syscall::GETUID => class::PROC_LIFE,
+            syscall::GETEUID => class::PROC_LIFE,
+            syscall::GETGID => class::PROC_LIFE,
+            syscall::GETEGID => class::PROC_LIFE,
+            syscall::GETGROUPS => class::PROC_LIFE,
+            syscall::GETLOGIN => class::PROC_LIFE,
+            // POSIX credential writes — separate class from PROC_LIFE
+            // so a process can pledge identity-mutation away
+            // independently of its ability to read its own identity.
+            // Pattern: a daemon does its privsep startup (setuid drop,
+            // setgroups, setlogin), then `pledge(... ~PROC_CRED)` to
+            // lock the new identity for the rest of its lifetime.
+            syscall::SETUID => class::PROC_CRED,
+            syscall::SETGID => class::PROC_CRED,
+            syscall::SETGROUPS => class::PROC_CRED,
+            syscall::SETLOGIN => class::PROC_CRED,
             _ => ClassMask::EMPTY,
         }
     }
@@ -739,7 +838,8 @@ mod tests {
                 | class::raw::FS_RO
                 | class::raw::FUTEX
                 | class::raw::STATS
-                | class::raw::PLEDGE,
+                | class::raw::PLEDGE
+                | class::raw::PROC_CRED,
         );
         assert_eq!(class::ALL, computed);
     }
@@ -758,6 +858,7 @@ mod tests {
             class::FUTEX,
             class::STATS,
             class::PLEDGE,
+            class::PROC_CRED,
         ];
         for c in all {
             assert!(
@@ -888,6 +989,16 @@ mod tests {
             FS_FSTAT,
             CHDIR,
             GETCWD,
+            GETUID,
+            GETEUID,
+            GETGID,
+            GETEGID,
+            GETGROUPS,
+            GETLOGIN,
+            SETUID,
+            SETGID,
+            SETGROUPS,
+            SETLOGIN,
         ];
         for s in all {
             let cls = Permissions::class_for(s);
@@ -1422,6 +1533,16 @@ mod tests {
             FS_FSTAT,
             CHDIR,
             GETCWD,
+            GETUID,
+            GETEUID,
+            GETGID,
+            GETEGID,
+            GETGROUPS,
+            GETLOGIN,
+            SETUID,
+            SETGID,
+            SETGROUPS,
+            SETLOGIN,
         ] {
             assert!(p.allows(s), "ALL.allows({s}) should be true");
         }

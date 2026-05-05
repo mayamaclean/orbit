@@ -27,12 +27,11 @@ use core::panic::PanicInfo;
 
 use core::fmt::Write;
 use orbit_abi::{
-    fs::Stat,
     perms::{CreateProcessV2Args, role},
     syscall_stats::payload_size,
     user::{
-        ConsoleWriter, close_handle, console_write, create_process_v2, exit, fs_open, fs_read,
-        fs_stat, query_stats, query_syscall_stats, read_stdin, sleep_ms, wait_pid,
+        ConsoleWriter, console_write, create_process_v2, exit, query_stats, query_syscall_stats,
+        read_stdin, sleep_ms, wait_pid,
     },
 };
 
@@ -226,6 +225,16 @@ fn syscall_name(ordinal: usize) -> &'static str {
         32 => "getcwd",
         33 => "fs_seek",
         34 => "fs_fstat",
+        35 => "getuid",
+        36 => "geteuid",
+        37 => "getgid",
+        38 => "getegid",
+        39 => "getgroups",
+        40 => "getlogin",
+        41 => "setuid",
+        42 => "setgid",
+        43 => "setgroups",
+        44 => "setlogin",
         _ => "?",
     }
 }
@@ -334,41 +343,6 @@ impl core::fmt::Write for LineWriter {
     }
 }
 
-/// Read a regular file off the mounted FS into a fresh `Vec<u8>`.
-/// Sector-aligned 512-byte scratch buffer per chunk; loops until the
-/// stat-reported size is consumed or we hit EOF.
-fn slurp_file(path: &str) -> Result<alloc::vec::Vec<u8>, &'static str> {
-    let mut st = Stat::default();
-    fs_stat(path, &mut st).map_err(|_| "stat failed")?;
-    if st.st_size <= 0 {
-        return Err("empty or non-regular");
-    }
-    let total = st.st_size as usize;
-
-    let fd = fs_open(path, 0).map_err(|_| "open failed")?;
-
-    #[repr(align(512))]
-    struct AlignedBuf([u8; 512]);
-    let mut scratch = AlignedBuf([0; 512]);
-    let mut buf = alloc::vec::Vec::with_capacity(total);
-
-    while buf.len() < total {
-        match fs_read(fd, &mut scratch.0) {
-            Ok(0) => break,
-            Ok(n) => buf.extend_from_slice(&scratch.0[..n]),
-            Err(_) => {
-                let _ = close_handle(fd);
-                return Err("read failed");
-            }
-        }
-    }
-    let _ = close_handle(fd);
-    if buf.len() != total {
-        return Err("short read");
-    }
-    Ok(buf)
-}
-
 /// Tokenize `line` on whitespace, slurp the first token as the ELF
 /// path, and spawn it via `create_process_v2` with `stdout_capture=1`
 /// so the child's `console_write` bytes route into *this* console's
@@ -392,18 +366,6 @@ fn exec_path(line: &str) {
         }
     };
 
-    let elf = match slurp_file(path) {
-        Ok(b) => b,
-        Err(why) => {
-            write_chunked(b"exec: ");
-            write_chunked(path.as_bytes());
-            write_chunked(b": ");
-            write_chunked(why.as_bytes());
-            write_chunked(b"\n");
-            return;
-        }
-    };
-
     // Pack argv into the wire format the kernel + orbit-rt expect.
     // 4 KiB scratch matches `ARGV_BLOB_MAX`; the kernel reads exactly
     // `argv_len` bytes, so no page alignment needed.
@@ -417,8 +379,11 @@ fn exec_path(line: &str) {
     };
 
     let args = CreateProcessV2Args {
-        elf_vaddr: elf.as_ptr() as usize,
-        elf_len: elf.len(),
+        // Path mode — the kernel does fs.open + X-bit check + fs.read
+        // for us via the spawn_path_* fields below. Bytes mode would
+        // EPERM here anyway since console is SHELL role, not LOADER.
+        elf_vaddr: 0,
+        elf_len: 0,
         allowed_affinity: 0,
         affinity: 0,
         // INHERIT keeps the parent's role + perms verbatim, matching
@@ -437,6 +402,20 @@ fn exec_path(line: &str) {
         // own pane so output lands inline like a normal shell.
         stdout_capture: 1,
         _pad2: 0,
+        // Identity inherits — the console isn't LOADER and the kernel
+        // would EPERM any non-inherit attempt.
+        setuid_uid: CreateProcessV2Args::INHERIT_ID,
+        setuid_gid: CreateProcessV2Args::INHERIT_ID,
+        setlogin_vaddr: 0,
+        setlogin_len: 0,
+        groups_vaddr: 0,
+        groups_count: 0,
+        // Path mode — the console runs as SHELL role, not LOADER, so
+        // bytes-mode would EPERM. The kernel does the fs.open + X-bit
+        // check + fs.read for us, which also means we can drop the
+        // userspace fs_open + fs_read of the binary above.
+        spawn_path_vaddr: path.as_ptr() as usize,
+        spawn_path_len: path.len(),
     };
     let pid = match create_process_v2(&args) {
         Ok(p) => p,

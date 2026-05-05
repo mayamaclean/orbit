@@ -109,6 +109,49 @@ pub static MANAGER_WORK: StaticThingBuf<PendingWork, 32> = StaticThingBuf::new()
 /// Default slot is `WakeEvent::None` (the Default impl returns it).
 pub static WAKE_QUEUE: StaticThingBuf<WakeEvent, 64> = StaticThingBuf::new();
 
+/// Lock-free MPSC queue of work items handed to `k_io` — the generic
+/// "kernel reads / waits on something and reports back to manager"
+/// kthread. See [`orbit_core::IoWork`] for the variant set.
+///
+/// Producers: any manager arm or trap handler that needs to do
+/// blocking I/O without holding the manager up. Push a boxed
+/// [`orbit_core::IoWork`] (boxed so per-slot footprint is one
+/// pointer + an `Option` tag), then `WAKE_QUEUE.push(WakeEvent::Io)`
+/// so k_io's wake_override fires on the next manager pass.
+///
+/// Consumer: `k_io` exclusively. The kthread loops drain → dispatch
+/// per variant → either signals the embedded `CompletionHandle`
+/// directly (cheap path) or pushes a `PendingWork::*Ready` entry
+/// back through `MANAGER_WORK` for the manager to finish (when
+/// Orbit-state mutation is needed — `MANAGER_LOCK` only flips on the
+/// manager hart).
+///
+/// Cap is 16 — spawn rate is bounded by user-space "exec" calls,
+/// nowhere close to a hot path. If a future variant raises the
+/// throughput we'll bump this; full-on-push drops are best-effort
+/// shaped (caller can retry or surface `EAGAIN`).
+///
+/// Default slot is `None` so empty slots are zero-cost.
+pub static IO_QUEUE: StaticThingBuf<Option<alloc::boxed::Box<orbit_core::IoWork>>, 16> =
+    StaticThingBuf::new();
+
+/// PA of `k_io`'s sector-sized DMA scratch page. Latched by
+/// `setup_io_kthread` at boot from a freshly-allocated KDMAP frame.
+/// `0` until that fires; `k_io` checks for `0` and signals `EIO` on
+/// the (impossible-in-practice) "tried to do a read before scratch
+/// was allocated" path.
+///
+/// Single-page is sufficient because k_io is single-threaded — at
+/// most one DMA in flight at a time, sector-sized. A future
+/// throughput optimization (multi-sector batching) would replace
+/// this with a per-in-flight pool.
+pub static IO_SCRATCH_PA: AtomicU64 = AtomicU64::new(0);
+
+/// KVA of the same page as [`IO_SCRATCH_PA`]. KDMAP-mapped so `k_io`
+/// can read the bytes after the IRQ signals completion (DMA writes
+/// to the PA, kernel reads from the matching KVA).
+pub static IO_SCRATCH_KVA: AtomicUsize = AtomicUsize::new(0);
+
 /// Lock-free MPSC ring of denial events produced by the dispatch-
 /// site gate. Producers: any hart's `s_trap` cause=8 arm on syscall
 /// denial. Consumer: the manager drains this alongside
@@ -143,6 +186,13 @@ pub enum WakeEvent {
     /// Wake every kernel thread (pid=0). Today that's k_net (and
     /// possibly k_gpu); a finer-grained variant can come later.
     Net,
+    /// Wake `k_io` — the generic "kernel reads / waits on something
+    /// and reports back to the manager" kthread. Pushed by manager
+    /// arms that hand work to [`IO_QUEUE`]; targets `k_io`'s tid via
+    /// the [`Orbit::io_thread_tid`] latch (falls back to coarse
+    /// pid=0 wake during the boot window before the latch fires,
+    /// same shape as [`WakeEvent::Net`]).
+    Io,
     /// Wake every thread of the given user pid. Coarse but cheap —
     /// each thread re-checks its own wait predicate on wake and
     /// re-parks if not actually ready, so over-waking is harmless.
@@ -367,6 +417,13 @@ pub struct Orbit {
     /// tid so unrelated kernel threads (k_gpu) aren't woken
     /// spuriously by every netch tickle.
     net_thread_tid: Option<u32>,
+    /// Latched tid of `k_io` once `setup_io_kthread` succeeds. Same
+    /// shape and use as [`Self::net_thread_tid`] but for the generic
+    /// "kernel reads/waits and reports back to manager" kthread that
+    /// owns [`IO_QUEUE`]. `None` during the boot window before
+    /// `k_io` is up; consumers fall back to a coarse pid=0 wake
+    /// during that window — same safety net as `net_thread_tid`.
+    io_thread_tid: Option<u32>,
     orphaned_sockets: Vec<SocketHandle>,
 
     /// Min-heap of `(wake_time, sleep_seq, *mut Thread)` for Suspended
@@ -562,6 +619,7 @@ impl Orbit {
             processes: BTreeMap::new(),
             threads: BTreeMap::new(),
             net_thread_tid: None,
+            io_thread_tid: None,
             net_pkg: NetPackage {
                 phy: None,
                 iface: None,
@@ -734,6 +792,17 @@ impl Orbit {
             // route a kthread through the gate fails closed rather
             // than silently running with full caps.
             permissions: orbit_abi::perms::Permissions::ZERO,
+            // Kthread credentials: uid 0 across the triplet. Kthreads
+            // never invoke the U-mode getuid/getgid syscalls, so this
+            // is observability-only — but the all-zeroes default
+            // matches `Process::new` and stays consistent with the
+            // "kthreads run as root-equivalent" mental model.
+            uid: 0,
+            euid: 0,
+            suid: 0,
+            gid: 0,
+            egid: 0,
+            sgid: 0,
             // Kernel threads don't `console_write` via the U-mode
             // syscall path; trace output goes through `Source::Kernel`
             // directly. `None` keeps the field consistent with the
@@ -1090,6 +1159,29 @@ impl Orbit {
         out
     }
 
+    /// POSIX `vaccess`-style check against the calling process's
+    /// effective credentials. Returns the raw negative isize errno on
+    /// the deny path so handlers can `return e;` directly. The pure
+    /// rule logic + unit tests live in
+    /// [`orbit_abi::fs::vaccess`]; this method is a thin adapter that
+    /// reads the credential triple off `Process` and forwards.
+    ///
+    /// `ESRCH` if `pid` isn't in the process table — same shape as
+    /// the other `run_*_req` helpers.
+    fn vaccess_pid(
+        &self,
+        pid: u16,
+        st: &orbit_abi::fs::Stat,
+        want: u32,
+    ) -> Result<(), isize> {
+        let proc = match self.processes.get(&pid) {
+            Some(p) => p,
+            None => return Err(Errno::new(ESRCH).to_ret()),
+        };
+        orbit_abi::fs::vaccess(proc.euid, proc.egid, &proc.groups, st, want)
+            .map_err(|e| e.to_ret())
+    }
+
     /// Copy `len` bytes of a user path string into a kernel-side
     /// buffer. Caller has already enforced `len <= MAX_FS_PATH_LEN`
     /// at the syscall boundary so this stays bounded. Returns the
@@ -1148,6 +1240,18 @@ impl Orbit {
             Ok(s) => s,
             Err(_) => return Errno::new(EIO).to_ret(),
         };
+        // POSIX mode-bit access check. Today fs_open is read-only
+        // (`OPEN_RDONLY = 0`), so we always need R. When O_WRONLY /
+        // O_RDWR land, derive `want` from `req.flags` instead.
+        // Path-walk traversal checks (X on each parent dir) are TBD
+        // — tarfs's `open(path)` is a single-pass internal walk that
+        // doesn't surface intermediate inodes. v1 just checks the
+        // final inode; that's already a meaningful improvement over
+        // "any process can read anything that role-FS_RO permits."
+        if let Err(e) = self.vaccess_pid(pid, &stat, orbit_abi::fs::ACCESS_R_OK) {
+            debug!("fs_open: vaccess EACCES pid={pid} path={path} mode={:#o}", stat.st_mode);
+            return e;
+        }
         let is_reg = (stat.st_mode & orbit_abi::fs::S_IFMT) == orbit_abi::fs::S_IFREG;
         let scratch = if is_reg {
             let layout = match Layout::from_size_align(PAGE_SIZE, PAGE_SIZE) {
@@ -1866,10 +1970,21 @@ impl Orbit {
         req: orbit_core::CreateProcessV2Req,
         parent_pid: u16,
         root_pa: PhysAddr,
-    ) -> isize {
+        handle: process::CompletionHandle,
+    ) {
         use orbit_abi::denial::{DenialEvent, DenialSink};
         use orbit_abi::perms::CreateProcessV2Args;
         use orbit_core::roles::{check_transition, deny_reason_code, derive_child_perms};
+
+        // Macro to bail with an errno: signal the handle and return.
+        // Replaces the previous `return Errno::new(...).to_ret()`
+        // pattern now that the function owns the signal call.
+        macro_rules! bail {
+            ($errno:expr) => {{
+                handle.signal(Errno::new($errno).to_ret());
+                return;
+            }};
+        }
 
         const MAX_ELF_BYTES: usize = 4 * 1024 * 1024;
 
@@ -1887,7 +2002,7 @@ impl Orbit {
                         "create_process_v2: args va 0x{:X} does not translate",
                         req.args_vaddr
                     );
-                    return Errno::new(EFAULT).to_ret();
+                    bail!(EFAULT);
                 }
             };
         let args: CreateProcessV2Args = unsafe {
@@ -1897,31 +2012,168 @@ impl Orbit {
             core::ptr::read_unaligned(p)
         };
 
-        if args.elf_len == 0 || args.elf_len > MAX_ELF_BYTES {
-            return Errno::new(EINVAL).to_ret();
-        }
-
-        if !user_range_ok(args.elf_vaddr as u64, args.elf_len as u64) {
-            return Errno::new(EFAULT).to_ret();
-        }
+        // ELF range validation only applies to bytes mode — path mode
+        // gets its bytes from k_io reading off disk, so elf_vaddr /
+        // elf_len are ignored there. Bytes mode is also LOADER-only;
+        // both checks happen below at the spawn-source branch after
+        // the role-transition gate has fired.
 
         // Reject unknown stdout_capture values up front. `_pad2` is
         // also expected zero so a future expansion of the slot doesn't
         // silently accept legacy callers' uninitialized stack bytes.
         if args.stdout_capture > 1 || args._pad2 != 0 {
-            return Errno::new(EINVAL).to_ret();
+            bail!(EINVAL);
         }
 
-        // Snapshot the parent's permissions for the gate. `Permissions`
-        // is `Copy`, so this releases the borrow on `processes`
-        // before we touch `denial_ring` (which also lives on `self`).
-        let parent_perms = match self.processes.get(&parent_pid) {
-            Some(p) => p.permissions,
+        // Snapshot the parent's permissions for the gate, plus the
+        // credential triplet + login_name + groups for the inherit
+        // path. Cloning `groups`/`login_name` upfront releases the
+        // borrow on `processes` before we touch `denial_ring` (which
+        // also lives on `self`).
+        let (
+            parent_perms,
+            parent_uid,
+            parent_euid,
+            parent_suid,
+            parent_gid,
+            parent_egid,
+            parent_sgid,
+            parent_login,
+            parent_groups,
+        ) = match self.processes.get(&parent_pid) {
+            Some(p) => (
+                p.permissions,
+                p.uid,
+                p.euid,
+                p.suid,
+                p.gid,
+                p.egid,
+                p.sgid,
+                p.login_name.clone(),
+                p.groups.clone(),
+            ),
             None => {
                 error!("create_process_v2: parent pid={parent_pid} vanished");
-                return Errno::new(ESRCH).to_ret();
+                bail!(ESRCH);
             }
         };
+
+        // Identity-stamping gate. Sentinel `-1` on either uid/gid
+        // means "inherit"; any non-inherit value (uid/gid, login
+        // override, or groups override) requires the parent to be
+        // running with `role::LOADER`. Other roles get -EPERM here
+        // before any further work. The check is deliberately strict
+        // (LOADER-only, not "any role with full caps") because uid is
+        // identity, not authorization — we don't want a BOOTSTRAP-
+        // shaped rescue process to be able to forge identity on a
+        // child it spawns.
+        let stamps_identity = args.setuid_uid != orbit_abi::perms::CreateProcessV2Args::INHERIT_ID
+            || args.setuid_gid != orbit_abi::perms::CreateProcessV2Args::INHERIT_ID
+            || args.setlogin_vaddr != 0
+            || args.groups_vaddr != 0;
+        if stamps_identity && parent_perms.role != orbit_abi::perms::role::LOADER {
+            error!(
+                "create_process_v2: identity stamping requires LOADER role (parent role={})",
+                parent_perms.role
+            );
+            bail!(EPERM);
+        }
+
+        // Validate the uid/gid sentinels: either INHERIT_ID (-1) or a
+        // non-negative value that fits in u32. Anything else is
+        // EINVAL — catches accidental sign-extension bugs in callers.
+        let setuid_override: Option<u32> = match args.setuid_uid {
+            orbit_abi::perms::CreateProcessV2Args::INHERIT_ID => None,
+            v if (0..=u32::MAX as i64).contains(&v) => Some(v as u32),
+            _ => bail!(EINVAL),
+        };
+        let setgid_override: Option<u32> = match args.setuid_gid {
+            orbit_abi::perms::CreateProcessV2Args::INHERIT_ID => None,
+            v if (0..=u32::MAX as i64).contains(&v) => Some(v as u32),
+            _ => bail!(EINVAL),
+        };
+
+        // Optional login-name override. MAXLOGNAME = 32 matches
+        // OpenBSD's `_POSIX_LOGIN_NAME_MAX`. Validation mirrors the
+        // cwd path: bound-check, single-page, copy, UTF-8 check. The
+        // copy reuses `copy_user_path`, which insists on a
+        // `MAX_FS_PATH_LEN`-sized scratch — we cap the meaningful
+        // payload at MAX_LOGIN_NAME but use the larger fixed buffer.
+        const MAX_LOGIN_NAME: usize = 32;
+        let mut login_buf = [0u8; MAX_FS_PATH_LEN];
+        let login_override: Option<&str> = if args.setlogin_vaddr != 0 && args.setlogin_len != 0 {
+            if args.setlogin_len > MAX_LOGIN_NAME {
+                bail!(orbit_abi::errno::ENAMETOOLONG);
+            }
+            if !user_range_ok(args.setlogin_vaddr as u64, args.setlogin_len as u64) {
+                bail!(EFAULT);
+            }
+            let s = match self.copy_user_path(
+                root_pa,
+                args.setlogin_vaddr as u64,
+                args.setlogin_len,
+                &mut login_buf,
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    handle.signal(e);
+                    return;
+                }
+            };
+            Some(s)
+        }
+        else {
+            None
+        };
+
+        // Optional supplementary-groups override. Single page, packed
+        // u32 array. groups_count == 0 means "install an empty list"
+        // (distinct from groups_vaddr == 0 which means "inherit").
+        let mut groups_override: Option<alloc::vec::Vec<u32>> = None;
+        if args.groups_vaddr != 0 {
+            if args.groups_count > process::NGROUPS_MAX {
+                bail!(EINVAL);
+            }
+            let bytes = args
+                .groups_count
+                .checked_mul(core::mem::size_of::<u32>())
+                .and_then(|n| u64::try_from(n).ok())
+                .ok_or(())
+                .map(|n| n)
+                .unwrap_or(0);
+            if bytes != 0 {
+                if !user_range_ok(args.groups_vaddr as u64, bytes) {
+                    bail!(EFAULT);
+                }
+                if (args.groups_vaddr as u64 & (PAGE_SIZE as u64 - 1)) + bytes > PAGE_SIZE as u64 {
+                    bail!(EINVAL);
+                }
+                let page_base = (args.groups_vaddr as u64) & !(PAGE_SIZE as u64 - 1);
+                let page_off = (args.groups_vaddr as u64 - page_base) as usize;
+                let pa =
+                    match unsafe { mmu::mmap::virt_to_phys(&root_table, VirtAddr::new(page_base)) }
+                    {
+                        Some(p) => p as u64,
+                        None => bail!(EFAULT),
+                    };
+                let mut buf: alloc::vec::Vec<u32> =
+                    alloc::vec::Vec::with_capacity(args.groups_count);
+                unsafe {
+                    let mut w = user_page::UserPageWindow::map(pa, PAGE_SIZE);
+                    let page = w.as_mut_slice();
+                    let src = &page[page_off..page_off + bytes as usize];
+                    for chunk in src.chunks_exact(4) {
+                        let mut le = [0u8; 4];
+                        le.copy_from_slice(chunk);
+                        buf.push(u32::from_le_bytes(le));
+                    }
+                }
+                groups_override = Some(buf);
+            }
+            else {
+                groups_override = Some(alloc::vec::Vec::new());
+            }
+        }
 
         // Role-transition gate. Ok: derive the child's perms via the
         // witness path; the resulting `ChildPerms` flows directly
@@ -1949,11 +2201,103 @@ impl Orbit {
                 if let Some(proc) = self.processes.get(&parent_pid) {
                     proc.role_denials.fetch_add(1, Ordering::Relaxed);
                 }
-                return Errno::new(EPERM).to_ret();
+                bail!(EPERM);
             }
         };
 
-        // Copy the ELF (same loop as run_create_process_req).
+        // Spawn-source branch. Path mode (`spawn_path_vaddr != 0`)
+        // packages the validated context + path into an
+        // `IoWork::Spawn` and forwards to k_io; that kthread does the
+        // X-bit check + sector-by-sector fs.read_async, then bounces
+        // back to the manager via `PendingWork::SpawnReady` for the
+        // canonical install. Bytes mode requires LOADER role (no FS
+        // file means no X bit to check, so we trust only the
+        // privileged spawner) and runs the install inline.
+        if args.spawn_path_vaddr != 0 {
+            // Path mode. Validate the path string, then ship it to k_io.
+            if args.spawn_path_len == 0 || args.spawn_path_len > MAX_FS_PATH_LEN {
+                bail!(orbit_abi::errno::ENAMETOOLONG);
+            }
+            if !user_range_ok(args.spawn_path_vaddr as u64, args.spawn_path_len as u64) {
+                bail!(EFAULT);
+            }
+            let mut path_buf = [0u8; MAX_FS_PATH_LEN];
+            let raw_path = match self.copy_user_path(
+                root_pa,
+                args.spawn_path_vaddr as u64,
+                args.spawn_path_len,
+                &mut path_buf,
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    handle.signal(e);
+                    return;
+                }
+            };
+            let resolved = self.resolve_fs_path(parent_pid, raw_path);
+            let owned_path = alloc::string::String::from(resolved.as_str());
+            let owned_login = login_override.map(alloc::string::String::from);
+            let ctx = orbit_core::SpawnContext {
+                args,
+                parent_pid,
+                root_pa,
+                child_perms,
+                setuid_override,
+                setgid_override,
+                login_override: owned_login,
+                groups_override,
+                parent_uid,
+                parent_euid,
+                parent_suid,
+                parent_gid,
+                parent_egid,
+                parent_sgid,
+                parent_login,
+                parent_groups,
+            };
+            let work = orbit_core::IoWork::Spawn {
+                ctx: alloc::boxed::Box::new(ctx),
+                handle: handle.clone(),
+                path: owned_path,
+            };
+            match IO_QUEUE.push_ref() {
+                Ok(mut slot) => {
+                    *slot = Some(alloc::boxed::Box::new(work));
+                }
+                Err(_) => {
+                    error!("create_process_v2: IO_QUEUE full; signaling EAGAIN");
+                    bail!(EAGAIN);
+                }
+            }
+            // Tickle k_io. Drop the manager's signal — k_io will
+            // signal `handle` once the load + bounce-back + install
+            // chain finishes.
+            let _ = WAKE_QUEUE.push(WakeEvent::Io);
+            return;
+        }
+
+        // Bytes mode — caller asserts they trust these bytes; only
+        // LOADER-roled callers are allowed (the X-bit story degrades
+        // for paths the kernel never sees, so we restrict the
+        // delivery surface to the single privileged spawner).
+        if parent_perms.role != orbit_abi::perms::role::LOADER {
+            error!(
+                "create_process_v2: bytes-mode spawn requires LOADER role (parent role={}); use spawn_path instead",
+                parent_perms.role
+            );
+            bail!(EPERM);
+        }
+        if args.elf_len == 0 || args.elf_len > MAX_ELF_BYTES {
+            bail!(EINVAL);
+        }
+        if !user_range_ok(args.elf_vaddr as u64, args.elf_len as u64) {
+            bail!(EFAULT);
+        }
+
+        // Copy the ELF (same loop as run_create_process_req). Bytes-
+        // mode path: source bytes from caller's user memory and
+        // converge on the canonical `install_spawn` helper below
+        // (same one path-mode hits via the SpawnReady bounce).
         let mut blob: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(args.elf_len);
         let mut copied = 0usize;
         while copied < args.elf_len {
@@ -1970,7 +2314,7 @@ impl Orbit {
                         "create_process_v2: elf va 0x{:X} does not translate",
                         page_base
                     );
-                    return Errno::new(EFAULT).to_ret();
+                    bail!(EFAULT);
                 }
             };
             unsafe {
@@ -1980,6 +2324,75 @@ impl Orbit {
             }
             copied += take;
         }
+
+        let result = self.install_spawn(
+            &blob,
+            &args,
+            parent_pid,
+            root_pa,
+            child_perms,
+            setuid_override,
+            setgid_override,
+            login_override,
+            groups_override,
+            parent_uid,
+            parent_euid,
+            parent_suid,
+            parent_gid,
+            parent_egid,
+            parent_sgid,
+            parent_login,
+            parent_groups,
+        );
+        handle.signal(result);
+    }
+
+    /// Post-blob spawn-install: validate affinity, resolve cwd/argv/envp
+    /// against the parent's user memory, allocate the child Process via
+    /// `create_new_process`, install the witness-derived perms via
+    /// `install_child`, then walk the child's threads to refresh
+    /// per-thread perms + credential snapshots.
+    ///
+    /// Both spawn front-doors (bytes-mode in the manager and path-mode
+    /// via `k_spawn` bouncing back as `PendingWork::SpawnReady`) call
+    /// this helper with their resolved blob. The split lets the path
+    /// front-door do its FS reads without holding the manager up while
+    /// keeping a single canonical install codepath — one place to fix
+    /// any spawn-related regression.
+    ///
+    /// Caller responsibilities:
+    /// - `args` validated (struct copy + `stdout_capture <= 1` + `_pad2 == 0`)
+    /// - parent credential snapshot supplied (parent's `Process` may
+    ///   exit between the snapshot and this call; the snapshot is
+    ///   self-contained for the credential-resolve step)
+    /// - `child_perms` already derived via the role-transition gate
+    /// - identity-stamping gate already enforced (any non-inherit
+    ///   `setuid_override` / `setgid_override` / `login_override` /
+    ///   `groups_override` was vetted as LOADER-only at the gate)
+    ///
+    /// Returns the new pid on success or a negative errno on failure.
+    /// Caller signals the original CompletionHandle with this value.
+    fn install_spawn(
+        &mut self,
+        blob: &[u8],
+        args: &orbit_abi::perms::CreateProcessV2Args,
+        parent_pid: u16,
+        root_pa: PhysAddr,
+        child_perms: orbit_abi::roles::ChildPerms,
+        setuid_override: Option<u32>,
+        setgid_override: Option<u32>,
+        login_override: Option<&str>,
+        groups_override: Option<alloc::vec::Vec<u32>>,
+        parent_uid: u32,
+        parent_euid: u32,
+        parent_suid: u32,
+        parent_gid: u32,
+        parent_egid: u32,
+        parent_sgid: u32,
+        parent_login: Option<alloc::string::String>,
+        parent_groups: alloc::vec::Vec<u32>,
+    ) -> isize {
+        let root_table = unsafe { memmap::kernel_root_from_pa(root_pa) };
 
         // Affinity validation, identical to run_create_process_req.
         let all_harts = self.all_harts_mask();
@@ -2123,7 +2536,7 @@ impl Orbit {
         };
 
         let proc_components = ProcessComponents {
-            elf_blob: &blob,
+            elf_blob: blob,
             stack_size: UPROC_STACK_DEFAULT,
             allowed_affinity: allowed,
             affinity,
@@ -2143,6 +2556,27 @@ impl Orbit {
             }
         };
 
+        // Resolve final credentials. Inherit copies parent's matching
+        // slots verbatim (POSIX fork semantic); stamp installs the
+        // overridden value on all three slots of the triplet (POSIX
+        // fresh-login semantic — what `login(1)` does after auth).
+        let (child_uid, child_euid, child_suid) = match setuid_override {
+            Some(uid) => (uid, uid, uid),
+            None => (parent_uid, parent_euid, parent_suid),
+        };
+        let (child_gid, child_egid, child_sgid) = match setgid_override {
+            Some(gid) => (gid, gid, gid),
+            None => (parent_gid, parent_egid, parent_sgid),
+        };
+        let child_login: Option<alloc::string::String> = match login_override {
+            Some(s) => Some(alloc::string::String::from(s)),
+            None => parent_login,
+        };
+        let child_groups: alloc::vec::Vec<u32> = match groups_override {
+            Some(g) => g,
+            None => parent_groups,
+        };
+
         // Install the witness-derived perms on the child via the
         // type-enforced path. `create_new_process` stamps BOOTSTRAP-
         // shaped ALL by default for legacy callers; v2 overrides
@@ -2153,6 +2587,18 @@ impl Orbit {
         // `permissions()`, which doesn't consume the `ChildPerms`.
         if let Some(proc) = self.processes.get_mut(&child_pid) {
             proc.install_child(child_perms);
+            // Same-locked-section credential stamp. Ordering doesn't
+            // matter relative to install_child — both are pure field
+            // writes — but bundling them under one `get_mut` keeps
+            // the borrow life narrow.
+            proc.uid = child_uid;
+            proc.euid = child_euid;
+            proc.suid = child_suid;
+            proc.gid = child_gid;
+            proc.egid = child_egid;
+            proc.sgid = child_sgid;
+            proc.login_name = child_login;
+            proc.groups = child_groups;
         }
         let perms_snapshot = child_perms.permissions();
         let tids: alloc::vec::Vec<u32> = self
@@ -2164,12 +2610,29 @@ impl Orbit {
             if let Some(pt) = self.threads.get(&tid) {
                 let t = unsafe { (pt.0 as *mut Thread).as_mut_unchecked() };
                 t.permissions = perms_snapshot;
+                // Refresh the per-thread credential snapshot so the
+                // getuid/geteuid/getgid/getegid fast paths read the
+                // freshly stamped values. login_name + groups stay
+                // on Process — getlogin/getgroups go through the
+                // manager-side lookup, no thread snapshot to refresh.
+                t.uid = child_uid;
+                t.euid = child_euid;
+                t.suid = child_suid;
+                t.gid = child_gid;
+                t.egid = child_egid;
+                t.sgid = child_sgid;
             }
         }
 
         info!(
-            "create_process_v2: spawned pid={child_pid} parent={parent_pid} role={} perms={:#x}/{:#x}",
-            args.target_role, perms_snapshot.perms, perms_snapshot.allowed_perms,
+            "create_process_v2: spawned pid={child_pid} parent={parent_pid} role={} perms={:#x}/{:#x} uid={}:{} gid={}:{}",
+            args.target_role,
+            perms_snapshot.perms,
+            perms_snapshot.allowed_perms,
+            child_uid,
+            child_euid,
+            child_gid,
+            child_egid,
         );
         child_pid as isize
     }
@@ -2680,6 +3143,19 @@ impl Orbit {
                         }
                     }
                 }
+                WakeEvent::Io => {
+                    // Same shape as Net: target the latched k_io tid
+                    // when set, fall back to pid=0 scan during boot.
+                    // Pushed by manager arms that hand IO_QUEUE work
+                    // and by k_io itself when re-arming.
+                    match self.io_thread_tid {
+                        Some(tid) => self
+                            .set_wake_reason_where(process::wake_reason::TICKLE, |t| t.tid == tid),
+                        None => {
+                            self.set_wake_reason_where(process::wake_reason::TICKLE, |t| t.pid == 0)
+                        }
+                    }
+                }
                 WakeEvent::Pid(pid) => {
                     self.set_wake_reason_where(process::wake_reason::NET_IO, |t| t.pid == pid);
                 }
@@ -2735,6 +3211,9 @@ impl Orbit {
                 // The sleep-heap entry becomes stale (state mismatch)
                 // and is reaped on the next drain_woken.
                 self.ready.push(p.0);
+            }
+            else {
+                debug!("[set_wake_reason] non suspended thread #{}", thread.tid);
             }
         }
     }
@@ -2929,14 +3408,65 @@ impl Orbit {
                     root_pa,
                     handle,
                 } => {
-                    let result = self.run_create_process_v2_req(req, pid, root_pa);
-                    handle.signal(result);
+                    // Handler owns the signal — bytes mode signals
+                    // inline with the install result, path mode
+                    // forwards to k_io which signals later (or via
+                    // PendingWork::SpawnReady → install_spawn →
+                    // signal). Either way, no manager-side signal here.
+                    self.run_create_process_v2_req(req, pid, root_pa, handle);
                 }
                 PendingWork::FsReadCopy { notif_ptr, status } => {
                     self.run_fs_read_copy(notif_ptr, status);
                 }
+                PendingWork::SpawnReady { ctx, blob, handle } => {
+                    let result = self.run_spawn_ready(*ctx, &blob);
+                    handle.signal(result);
+                }
             }
         }
+    }
+
+    /// Manager arm for [`PendingWork::SpawnReady`]. k_spawn has already
+    /// loaded the bytes; the manager now runs the canonical install
+    /// pipeline (same one bytes-mode calls inline).
+    fn run_spawn_ready(&mut self, ctx: orbit_core::SpawnContext, blob: &[u8]) -> isize {
+        let orbit_core::SpawnContext {
+            args,
+            parent_pid,
+            root_pa,
+            child_perms,
+            setuid_override,
+            setgid_override,
+            login_override,
+            groups_override,
+            parent_uid,
+            parent_euid,
+            parent_suid,
+            parent_gid,
+            parent_egid,
+            parent_sgid,
+            parent_login,
+            parent_groups,
+        } = ctx;
+        self.install_spawn(
+            blob,
+            &args,
+            parent_pid,
+            root_pa,
+            child_perms,
+            setuid_override,
+            setgid_override,
+            login_override.as_deref(),
+            groups_override,
+            parent_uid,
+            parent_euid,
+            parent_suid,
+            parent_gid,
+            parent_egid,
+            parent_sgid,
+            parent_login,
+            parent_groups,
+        )
     }
 
     fn get_runnable_thread(&mut self, hart_mask: u64) -> Option<PThread> {
@@ -3624,6 +4154,53 @@ impl Orbit {
         }
     }
 
+    /// Allocate `k_io`'s sector-sized DMA scratch page (latches
+    /// `IO_SCRATCH_PA` / `IO_SCRATCH_KVA`) and spawn the kthread.
+    /// Called once at boot after the FS mount is up.
+    ///
+    /// On scratch-allocation failure or kthread-creation failure we
+    /// log + return without latching `io_thread_tid` — `k_io` simply
+    /// won't run, and any path-mode `create_process_v2` will time out
+    /// on its caller's `CompletionHandle`. (Today no path-mode call
+    /// happens until a non-LOADER process invokes v2 with
+    /// `spawn_path_vaddr != 0`, which only the bootstrap shell does
+    /// post-mount.)
+    pub fn setup_io_kthread(&mut self) {
+        const SECTOR_SIZE: usize = 512;
+        let layout = match Layout::from_size_align(PAGE_SIZE, PAGE_SIZE) {
+            Ok(l) => l,
+            Err(_) => {
+                error!("k_io: scratch layout invalid");
+                return;
+            }
+        };
+        let (frame, kva) = match self.kernel_pages.alloc_kdmap(layout) {
+            Some(pair) => pair,
+            None => {
+                error!("k_io: kernel_pages exhausted; scratch alloc failed");
+                return;
+            }
+        };
+        IO_SCRATCH_PA.store(frame.get_raw() as u64, Ordering::Release);
+        IO_SCRATCH_KVA.store(kva.raw() as usize, Ordering::Release);
+        // Lifetime: scratch lives for the kernel's lifetime — k_io
+        // never frees. Forget the Frame so its Drop doesn't return
+        // the page to the allocator on scope exit.
+        core::mem::forget(frame);
+        let _ = SECTOR_SIZE; // silence unused-const lint if future opt removes the cap
+
+        let entrypoint = crate::k_io as *const () as usize;
+        match self.create_kernel_thread(entrypoint, None) {
+            Ok(tid) => {
+                info!("created k_io thread tid={tid}");
+                self.io_thread_tid = Some(tid);
+            }
+            Err(_) => {
+                error!("k_io: create_kernel_thread failed");
+            }
+        }
+    }
+
     pub fn get_pci_info<'n>(&mut self, node: FdtNode<'n>) {
         let reg = match node.reg() {
             Ok(Some(mut r)) => match r.nth(0) {
@@ -3715,6 +4292,11 @@ impl Orbit {
         self.setup_virtio_gpu();
         self.setup_virtio_input();
         self.setup_virtio_blk();
+        // k_io must come up after the FS is mounted (it reads bytes
+        // off tarfs for path-mode spawns) and after kernel_pages is
+        // ready (allocates the DMA scratch). setup_virtio_blk
+        // satisfies both — the FS mount happens inside it.
+        self.setup_io_kthread();
     }
 
     fn setup_plic(&mut self, fdt: &Fdt<'_>) {
@@ -4150,11 +4732,26 @@ impl Orbit {
         // Same single-snapshot contract for `stdout_redirect` — read
         // once here, fall back to `None` if the record is gone (no
         // redirect ⇒ writes to own pane, identical to legacy spawns).
-        let (perms_snapshot, stdout_redirect_snapshot) = self
+        // Snapshot uids/gids alongside permissions so the
+        // getuid/getgid fast paths can read thread-local fields
+        // without re-acquiring MANAGER_LOCK. groups + login_name stay
+        // on Process (variable-size, rarely read).
+        let (perms_snapshot, stdout_redirect_snapshot, cred_snapshot) = self
             .processes
             .get(&pid)
-            .map(|p| (p.permissions, p.stdout_redirect))
-            .unwrap_or((orbit_abi::perms::Permissions::ZERO, None));
+            .map(|p| {
+                (
+                    p.permissions,
+                    p.stdout_redirect,
+                    (p.uid, p.euid, p.suid, p.gid, p.egid, p.sgid),
+                )
+            })
+            .unwrap_or((
+                orbit_abi::perms::Permissions::ZERO,
+                None,
+                (0, 0, 0, 0, 0, 0),
+            ));
+        let (cred_uid, cred_euid, cred_suid, cred_gid, cred_egid, cred_sgid) = cred_snapshot;
 
         Ok(Thread {
             pc: AtomicUsize::new(entrypoint),
@@ -4185,6 +4782,12 @@ impl Orbit {
             syscall_count: AtomicU64::new(0),
             syscall_ticks: AtomicU64::new(0),
             permissions: perms_snapshot,
+            uid: cred_uid,
+            euid: cred_euid,
+            suid: cred_suid,
+            gid: cred_gid,
+            egid: cred_egid,
+            sgid: cred_sgid,
             stdout_redirect: stdout_redirect_snapshot,
         })
     }
@@ -4215,13 +4818,20 @@ impl Orbit {
 
         let mut proc = Process::new(pid, proc_components.parent_pid, proc_satp);
         // Migration default: `Process::new()` defaults to ZERO perms
-        // (fail closed). Legacy CREATE_PROCESS / CREATE_PROCESS_EX
-        // callers stamp BOOTSTRAP-shaped Permissions::ALL here so
-        // they keep working without role-aware spawn arguments.
-        // CREATE_PROCESS_V2 resolves perms through the role registry
-        // and calls `install_permissions` itself with the
-        // witness-derived value, overwriting this default.
-        proc.install_permissions(orbit_abi::perms::Permissions::ALL);
+        // (fail closed). Honor an explicit `proc_components.perms`
+        // override (used by the boot path to install LOADER directly
+        // on orbit-loader); otherwise fall back to BOOTSTRAP-shaped
+        // `Permissions::ALL` so legacy CREATE_PROCESS /
+        // CREATE_PROCESS_EX callers keep working without role-aware
+        // spawn arguments. CREATE_PROCESS_V2 still calls
+        // `install_permissions` (via `install_child`) itself with
+        // the witness-derived value, overwriting whichever default
+        // landed here.
+        proc.install_permissions(
+            proc_components
+                .perms
+                .unwrap_or(orbit_abi::perms::Permissions::ALL),
+        );
         // cwd inheritance: explicit override > parent's cwd > "/" default
         // (`Process::new` already seeded cwd = "/" for the boot case where
         // there's no parent). The override is the caller-side
@@ -4847,6 +5457,337 @@ impl Orbit {
             page[page_off..page_off + cwd_len].copy_from_slice(&snap[..cwd_len]);
         }
         cwd_len as isize
+    }
+
+    /// `getgroups(buf, count)` body. Snapshots the calling process's
+    /// supplementary group list, copies up to `count` entries (one
+    /// `u32` per slot) into the user buffer via a `UserPageWindow`.
+    /// Returns the number of entries written. POSIX special case:
+    /// `count == 0` returns the current group count without writing.
+    /// Buffer must lie within a single 4 KiB page — same constraint as
+    /// the other fs copy-out syscalls.
+    pub fn run_getgroups(
+        &mut self,
+        pid: u16,
+        root_pa: PhysAddr,
+        buf_vaddr: u64,
+        count: usize,
+    ) -> isize {
+        // Snapshot the group list under the process borrow, then drop
+        // it before touching UserPageWindow.
+        let mut snap = [0u32; process::NGROUPS_MAX];
+        let group_count = match self.processes.get(&pid) {
+            Some(p) => {
+                if p.groups.len() > snap.len() {
+                    // Defensive: setgroups (when it lands) will cap
+                    // input at NGROUPS_MAX; a longer list shouldn't
+                    // be reachable, but EIO not panic if it is.
+                    return Errno::new(EIO).to_ret();
+                }
+                for (i, &g) in p.groups.iter().enumerate() {
+                    snap[i] = g;
+                }
+                p.groups.len()
+            }
+            None => return Errno::new(ESRCH).to_ret(),
+        };
+
+        // POSIX: count == 0 returns the count without writing. The
+        // user buffer is not consulted in this case (callers pass
+        // null when sizing).
+        if count == 0 {
+            return group_count as isize;
+        }
+
+        if count > process::NGROUPS_MAX {
+            return Errno::new(EINVAL).to_ret();
+        }
+        if count < group_count {
+            return Errno::new(orbit_abi::errno::ERANGE).to_ret();
+        }
+
+        let bytes = group_count
+            .checked_mul(core::mem::size_of::<u32>())
+            .and_then(|n| u64::try_from(n).ok())
+            .unwrap_or(0);
+        // Zero-byte writes are a no-op (group_count == 0 with
+        // count > 0); skip the page checks because there's nothing
+        // to map.
+        if bytes != 0 {
+            if !orbit_abi::layout::user_range_ok(buf_vaddr, bytes) {
+                return Errno::new(EFAULT).to_ret();
+            }
+            if (buf_vaddr & (PAGE_SIZE as u64 - 1)) + bytes > PAGE_SIZE as u64 {
+                return Errno::new(EINVAL).to_ret();
+            }
+            let root_table = unsafe { memmap::kernel_root_from_pa(root_pa) };
+            let page_base = buf_vaddr & !(PAGE_SIZE as u64 - 1);
+            let page_off = (buf_vaddr - page_base) as usize;
+            let page_pa =
+                match unsafe { mmu::mmap::virt_to_phys(&root_table, VirtAddr::new(page_base)) } {
+                    Some(p) => p as u64,
+                    None => return Errno::new(EFAULT).to_ret(),
+                };
+            unsafe {
+                let mut w = user_page::UserPageWindow::map(page_pa, PAGE_SIZE);
+                let page = w.as_mut_slice();
+                let dst = &mut page[page_off..page_off + bytes as usize];
+                for (i, slot) in dst.chunks_exact_mut(4).enumerate() {
+                    slot.copy_from_slice(&snap[i].to_le_bytes());
+                }
+            }
+        }
+        group_count as isize
+    }
+
+    /// `setuid(uid)` body. POSIX rules:
+    ///   - euid == 0: stamp `uid` on all three triplet slots — the
+    ///     privilege-drop path. Once dropped, `setuid` from non-root
+    ///     can only toggle euid back to ruid or suid, never widen.
+    ///   - euid != 0: set only euid, IFF `uid ∈ {ruid, suid}` (POSIX
+    ///     privilege-toggle rule used by setuid-bit binaries today).
+    ///     Anything else returns `EPERM`.
+    ///
+    /// On success walks the calling process's thread set and refreshes
+    /// each `Thread.uid/euid/suid` snapshot so subsequent
+    /// `getuid`/`geteuid` reads from sibling threads observe the new
+    /// identity.
+    pub fn run_setuid(&mut self, pid: u16, uid: u32) -> isize {
+        let new_triplet: (u32, u32, u32) = {
+            let proc = match self.processes.get_mut(&pid) {
+                Some(p) => p,
+                None => return Errno::new(ESRCH).to_ret(),
+            };
+            if proc.euid == 0 {
+                proc.uid = uid;
+                proc.euid = uid;
+                proc.suid = uid;
+            }
+            else if uid == proc.uid || uid == proc.suid {
+                proc.euid = uid;
+            }
+            else {
+                return Errno::new(EPERM).to_ret();
+            }
+            (proc.uid, proc.euid, proc.suid)
+        };
+        // Walk threads to refresh per-thread snapshot. Same pattern as
+        // run_pledge_req: snapshot tids first, then walk to drop the
+        // borrow on `processes`.
+        for tid in self.processes.get(&pid).unwrap().threads.iter().copied() {
+            if let Some(pt) = self.threads.get(&tid) {
+                let t = unsafe { (pt.0 as *mut Thread).as_mut_unchecked() };
+                t.uid = new_triplet.0;
+                t.euid = new_triplet.1;
+                t.suid = new_triplet.2;
+            }
+        }
+        0
+    }
+
+    /// `setgid(gid)` body. POSIX gid mirror of [`run_setuid`]: the
+    /// privilege-test slot is `euid == 0` (matches POSIX — gid
+    /// privilege still keys off uid==0, not gid==0).
+    pub fn run_setgid(&mut self, pid: u16, gid: u32) -> isize {
+        let new_triplet: (u32, u32, u32) = {
+            let proc = match self.processes.get_mut(&pid) {
+                Some(p) => p,
+                None => return Errno::new(ESRCH).to_ret(),
+            };
+            if proc.euid == 0 {
+                proc.gid = gid;
+                proc.egid = gid;
+                proc.sgid = gid;
+            }
+            else if gid == proc.gid || gid == proc.sgid {
+                proc.egid = gid;
+            }
+            else {
+                return Errno::new(EPERM).to_ret();
+            }
+            (proc.gid, proc.egid, proc.sgid)
+        };
+        let tids: alloc::vec::Vec<u32> = self
+            .processes
+            .get(&pid)
+            .map(|p| p.threads.iter().copied().collect())
+            .unwrap_or_default();
+        for tid in tids {
+            if let Some(pt) = self.threads.get(&tid) {
+                let t = unsafe { (pt.0 as *mut Thread).as_mut_unchecked() };
+                t.gid = new_triplet.0;
+                t.egid = new_triplet.1;
+                t.sgid = new_triplet.2;
+            }
+        }
+        0
+    }
+
+    /// `setgroups(buf, count)` body. Replace the caller's supplementary
+    /// group list with `count` u32s read from `buf_vaddr`. Requires
+    /// `euid == 0`. `count == 0` is legal (empties the list — same
+    /// shape as `setgroups(0, NULL)` on POSIX). Buffer must lie
+    /// within a single page.
+    ///
+    /// Groups are stored on Process only — no per-thread snapshot to
+    /// refresh, since `getgroups` already goes through the manager-side
+    /// lookup.
+    pub fn run_setgroups(
+        &mut self,
+        pid: u16,
+        root_pa: PhysAddr,
+        buf_vaddr: u64,
+        count: usize,
+    ) -> isize {
+        if count > process::NGROUPS_MAX {
+            return Errno::new(EINVAL).to_ret();
+        }
+        // Snapshot euid first (read-only), short-circuit before any
+        // user-buffer work if the caller isn't root.
+        let euid = match self.processes.get(&pid) {
+            Some(p) => p.euid,
+            None => return Errno::new(ESRCH).to_ret(),
+        };
+        if euid != 0 {
+            return Errno::new(EPERM).to_ret();
+        }
+
+        // Read the group list out of the user buffer. count == 0 is a
+        // valid "empty list" request — no buffer access needed.
+        let mut new_groups: alloc::vec::Vec<u32> = alloc::vec::Vec::with_capacity(count);
+        if count > 0 {
+            let bytes = (count * core::mem::size_of::<u32>()) as u64;
+            if !orbit_abi::layout::user_range_ok(buf_vaddr, bytes) {
+                return Errno::new(EFAULT).to_ret();
+            }
+            if (buf_vaddr & (PAGE_SIZE as u64 - 1)) + bytes > PAGE_SIZE as u64 {
+                return Errno::new(EINVAL).to_ret();
+            }
+            let root_table = unsafe { memmap::kernel_root_from_pa(root_pa) };
+            let page_base = buf_vaddr & !(PAGE_SIZE as u64 - 1);
+            let page_off = (buf_vaddr - page_base) as usize;
+            let pa = match unsafe { mmu::mmap::virt_to_phys(&root_table, VirtAddr::new(page_base)) }
+            {
+                Some(p) => p as u64,
+                None => return Errno::new(EFAULT).to_ret(),
+            };
+            unsafe {
+                let mut w = user_page::UserPageWindow::map(pa, PAGE_SIZE);
+                let page = w.as_mut_slice();
+                let src = &page[page_off..page_off + bytes as usize];
+                for chunk in src.chunks_exact(4) {
+                    let mut le = [0u8; 4];
+                    le.copy_from_slice(chunk);
+                    new_groups.push(u32::from_le_bytes(le));
+                }
+            }
+        }
+
+        // Install. Process-only mutation; no thread snapshot to refresh.
+        if let Some(proc) = self.processes.get_mut(&pid) {
+            proc.groups = new_groups;
+        }
+        0
+    }
+
+    /// `setlogin(name_ptr, name_len)` body. Stamp the calling
+    /// process's session login name. Requires `euid == 0`. Capped at
+    /// 32 bytes (POSIX `_POSIX_LOGIN_NAME_MAX`, matches OpenBSD).
+    /// Validates UTF-8 to keep the field compatible with the
+    /// `getlogin` copy-out path.
+    pub fn run_setlogin(
+        &mut self,
+        pid: u16,
+        root_pa: PhysAddr,
+        name_vaddr: u64,
+        name_len: usize,
+    ) -> isize {
+        const MAX_LOGIN_NAME: usize = 32;
+        if name_len == 0 || name_len > MAX_LOGIN_NAME {
+            return Errno::new(orbit_abi::errno::ENAMETOOLONG).to_ret();
+        }
+        let euid = match self.processes.get(&pid) {
+            Some(p) => p.euid,
+            None => return Errno::new(ESRCH).to_ret(),
+        };
+        if euid != 0 {
+            return Errno::new(EPERM).to_ret();
+        }
+        if !orbit_abi::layout::user_range_ok(name_vaddr, name_len as u64) {
+            return Errno::new(EFAULT).to_ret();
+        }
+
+        // Reuse copy_user_path's MAX_FS_PATH_LEN-sized scratch shape;
+        // the helper does the page-walk + UTF-8 validation for us.
+        let mut name_buf = [0u8; MAX_FS_PATH_LEN];
+        let name = match self.copy_user_path(root_pa, name_vaddr, name_len, &mut name_buf) {
+            Ok(s) => s,
+            Err(e) => return e,
+        };
+        let name_owned = alloc::string::String::from(name);
+        if let Some(proc) = self.processes.get_mut(&pid) {
+            proc.login_name = Some(name_owned);
+        }
+        0
+    }
+
+    /// `getlogin(buf)` body. Snapshots `Process.login_name`, copies
+    /// the bytes (no NUL terminator) into the user buffer via a
+    /// `UserPageWindow`. Returns the byte count written, or `ENOENT`
+    /// if no login name has been installed (initial state). Buffer
+    /// must lie within a single 4 KiB page.
+    pub fn run_getlogin(
+        &mut self,
+        pid: u16,
+        root_pa: PhysAddr,
+        buf_vaddr: u64,
+        buf_len: usize,
+    ) -> isize {
+        if buf_len == 0 || buf_len > PAGE_SIZE {
+            return Errno::new(EINVAL).to_ret();
+        }
+        if !orbit_abi::layout::user_range_ok(buf_vaddr, buf_len as u64) {
+            return Errno::new(EFAULT).to_ret();
+        }
+        if (buf_vaddr & (PAGE_SIZE as u64 - 1)) + buf_len as u64 > PAGE_SIZE as u64 {
+            return Errno::new(EINVAL).to_ret();
+        }
+        // setlogin (when it lands) will cap names at MAXLOGNAME; until
+        // then no path produces a long name, but use the same cwd-shape
+        // stack snapshot to keep the borrow narrow.
+        const MAX_LOGIN_NAME: usize = 256;
+        let mut snap = [0u8; MAX_LOGIN_NAME];
+        let name_len = match self.processes.get(&pid) {
+            Some(p) => match &p.login_name {
+                Some(name) => {
+                    let bytes = name.as_bytes();
+                    if bytes.len() > snap.len() {
+                        return Errno::new(EIO).to_ret();
+                    }
+                    snap[..bytes.len()].copy_from_slice(bytes);
+                    bytes.len()
+                }
+                None => return Errno::new(orbit_abi::errno::ENOENT).to_ret(),
+            },
+            None => return Errno::new(ESRCH).to_ret(),
+        };
+        if name_len > buf_len {
+            return Errno::new(orbit_abi::errno::ERANGE).to_ret();
+        }
+        let root_table = unsafe { memmap::kernel_root_from_pa(root_pa) };
+        let page_base = buf_vaddr & !(PAGE_SIZE as u64 - 1);
+        let page_off = (buf_vaddr - page_base) as usize;
+        let page_pa =
+            match unsafe { mmu::mmap::virt_to_phys(&root_table, VirtAddr::new(page_base)) } {
+                Some(p) => p as u64,
+                None => return Errno::new(EFAULT).to_ret(),
+            };
+        unsafe {
+            let mut w = user_page::UserPageWindow::map(page_pa, PAGE_SIZE);
+            let page = w.as_mut_slice();
+            page[page_off..page_off + name_len].copy_from_slice(&snap[..name_len]);
+        }
+        name_len as isize
     }
 
     fn next_pid(&mut self) -> u16 {

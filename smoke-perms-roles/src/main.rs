@@ -190,6 +190,21 @@ pub extern "C" fn main() -> i32 {
         envp_vaddr: 0,
         stdout_capture: 0,
         _pad2: 0,
+        // Smoke is checking the role-deny path; identity inherits.
+        setuid_uid: CreateProcessV2Args::INHERIT_ID,
+        setuid_gid: CreateProcessV2Args::INHERIT_ID,
+        setlogin_vaddr: 0,
+        setlogin_len: 0,
+        groups_vaddr: 0,
+        groups_count: 0,
+        // Bytes mode (the embedded STUB_ELF). The kernel orders
+        // role-deny before bytes-mode-gate, so this still hits the
+        // RoleDeny path even when the caller isn't LOADER. The
+        // role_denials counter check downstream depends on that
+        // ordering — flipping it would silently skip the role-deny
+        // accounting we're trying to verify here.
+        spawn_path_vaddr: 0,
+        spawn_path_len: 0,
     };
     let rc_role = match create_process_v2(&v2_args) {
         Ok(child_pid) => {

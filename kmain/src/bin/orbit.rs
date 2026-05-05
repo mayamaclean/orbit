@@ -74,8 +74,8 @@ extern "C" fn s_trap(
     cause: usize,
     status: usize,
     frame: &mut TrapFrame,
-    _code: usize,
-    _sarg: usize,
+    code: usize,
+    sarg: usize,
 ) -> usize {
     let hart_context =
         unsafe { (riscv::register::sscratch::read() as *mut HartContext).as_mut_unchecked() };
@@ -194,34 +194,53 @@ extern "C" fn s_trap(
                     });
                 }
             }
-            // supervisor ebreak
+            // Supervisor ebreak. The kthread self-yield path that
+            // used to ride this cause via a `cscratch2 = 1` sentinel
+            // moved to a dedicated S-mode ecall (cause=9) — debugger
+            // ebreaks regain their unambiguous meaning here, so just
+            // step past them.
             3 => {
-                match hart_context.cscratch2 {
-                    1 => {
-                        // kthread self-yield (knet, k_gpu). Save the
-                        // trap frame so the next dispatch resumes past
-                        // the ebreak, then park via
-                        // `exit_thread_with_state(Suspended)`. The new
-                        // ordering inside `exit_thread_with_state` is
-                        // load-bearing: it nulls `hart_context.current`
-                        // *before* writing `state=Suspended`, so any
-                        // hart's manager that observes the new state
-                        // (Acquire) is guaranteed to see this hart's
-                        // current=null too. Without that ordering, a
-                        // remote manager's `assign_threads` self_view
-                        // path picked up a still-running kthread and
-                        // caused double-dispatch (knet running on two
-                        // harts simultaneously, smoltcp ring corruption).
-                        hart_context.cscratch2 = 0;
-                        kmain::update_thread_and_trap_frame(epc, hart_context, frame, from_user);
-                        unsafe {
-                            kmain::kernel::context::exit_thread_with_state(ThreadState::Suspended);
-                        }
-                    }
-                    _ => (),
-                }
-
                 return_pc += 4;
+            }
+            // S-mode ecall (cause=9). Delegated to S-mode by bl's
+            // `medeleg.set_supervisor_env_call`, so we land here
+            // directly. The only legitimate producer is
+            // `kthread_park`, identified by the `KPARK_ECALL_NR`
+            // sentinel in `a7`. We snapshot the frame at `epc + 4`
+            // so the subsequent redispatch resumes one instruction
+            // past the ecall (single trap per park, vs the old
+            // ebreak path that needed two), then call
+            // `exit_thread_with_state(state)` — that publishes
+            // `current = null` (Release) and `state` (Release) and
+            // pushes the SLEEP_INBOX entry for `Suspended`.
+            9 => {
+                let sentinel = frame.regs[17]; // a7
+                let state_val = frame.regs[10]; // a0
+                if sentinel != kmain::kernel::context::KPARK_ECALL_NR {
+                    panic!(
+                        "unexpected S-mode ecall on cpu{}: a7={:#x} epc={:#x} \
+                         (no consumer registered for this sentinel)",
+                        hart_context.hart_id, sentinel, epc,
+                    );
+                }
+                let target_state = match state_val {
+                    v if v == ThreadState::Suspended as usize => ThreadState::Suspended,
+                    v if v == ThreadState::Exited as usize => ThreadState::Exited,
+                    v if v == ThreadState::Ready as usize => ThreadState::Ready,
+                    _ => panic!(
+                        "kthread_park: invalid state={} via S-ecall on cpu{}",
+                        state_val, hart_context.hart_id,
+                    ),
+                };
+                kmain::update_thread_and_trap_frame(
+                    epc.wrapping_add(4),
+                    hart_context,
+                    frame,
+                    from_user,
+                );
+                unsafe {
+                    kmain::kernel::context::exit_thread_with_state(target_state);
+                }
             }
             8 => {
                 let syscall = frame.regs[10];
@@ -340,6 +359,36 @@ extern "C" fn s_trap(
                         }
                         4108 => {
                             kmain::handle_getcwd(epc, hart_context, frame);
+                        }
+                        4109 => {
+                            kmain::handle_getuid(epc, hart_context, frame);
+                        }
+                        4110 => {
+                            kmain::handle_geteuid(epc, hart_context, frame);
+                        }
+                        4111 => {
+                            kmain::handle_getgid(epc, hart_context, frame);
+                        }
+                        4112 => {
+                            kmain::handle_getegid(epc, hart_context, frame);
+                        }
+                        4113 => {
+                            kmain::handle_getgroups(epc, hart_context, frame);
+                        }
+                        4114 => {
+                            kmain::handle_getlogin(epc, hart_context, frame);
+                        }
+                        4115 => {
+                            kmain::handle_setuid(epc, hart_context, frame);
+                        }
+                        4116 => {
+                            kmain::handle_setgid(epc, hart_context, frame);
+                        }
+                        4117 => {
+                            kmain::handle_setgroups(epc, hart_context, frame);
+                        }
+                        4118 => {
+                            kmain::handle_setlogin(epc, hart_context, frame);
                         }
                         5000 => {
                             debug!("orbit handling u mode ecall({syscall})");
@@ -1147,8 +1196,8 @@ extern "C" fn rust_main(_hartid: usize, dtb: usize, serial: usize, load_addr: u6
         static LOGGER: kmain::ktrace::OrbitLogger = kmain::ktrace::OrbitLogger;
 
         log::set_logger(&LOGGER).unwrap();
-        log::set_max_level(log::LevelFilter::Info);
-        tracing::subscriber::set_global_default(OrbitSubscriber::new(Level::INFO))
+        log::set_max_level(log::LevelFilter::Debug);
+        tracing::subscriber::set_global_default(OrbitSubscriber::new(Level::DEBUG))
             .expect("no tracing");
 
         let mut kernel_tables = kmain::kernel::memmap::TablePages::new();

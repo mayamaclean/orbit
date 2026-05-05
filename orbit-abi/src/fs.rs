@@ -28,6 +28,14 @@ pub const S_IFREG: u32 = 0o100000;
 pub const S_IFDIR: u32 = 0o040000;
 pub const S_IFLNK: u32 = 0o120000;
 
+/// Access-mode bits for `vaccess()`-style checks and the future POSIX
+/// `access(2)` syscall. Numeric values match Linux/POSIX `R_OK` /
+/// `W_OK` / `X_OK` so a future libc shim threads them through
+/// unchanged. Composable: `ACCESS_R_OK | ACCESS_W_OK` checks both.
+pub const ACCESS_R_OK: u32 = 4;
+pub const ACCESS_W_OK: u32 = 2;
+pub const ACCESS_X_OK: u32 = 1;
+
 /// Sector size used for `st_blocks` accounting. POSIX defines
 /// `st_blocks` as "number of 512-byte units" regardless of the
 /// filesystem's actual sector geometry.
@@ -134,6 +142,56 @@ pub struct Stat {
     pub __unused5: u32,
 }
 
+/// POSIX-style mode-bit access check. Returns `Ok(())` if the
+/// `(euid, egid, supplementary groups)` credential triple has the
+/// access bits in `want` (composition of [`ACCESS_R_OK`] /
+/// [`ACCESS_W_OK`] / [`ACCESS_X_OK`]) against the file metadata in
+/// `st`. Otherwise returns `EACCES`.
+///
+/// Rules (POSIX, matches OpenBSD `vaccess`):
+///   - `euid == 0` (root): bypass, always `Ok`.
+///   - `euid == st.st_uid`: check owner bits (`st_mode >> 6 & 7`).
+///   - `egid == st.st_gid` OR `st.st_gid` ∈ `groups`: check group
+///     bits (`st_mode >> 3 & 7`).
+///   - Else: check other bits (`st_mode & 7`).
+///
+/// First matching branch wins — a process whose euid matches `st_uid`
+/// uses owner bits even if its supplementary groups also include
+/// `st_gid`. This matches POSIX (compare glibc `__access_internal`,
+/// OpenBSD `vaccess`).
+///
+/// **Path-walk traversal isn't modeled here.** POSIX requires search
+/// (X) on every parent directory of a path; this helper only checks
+/// the final inode. tarfs's `open(path)` is a single-pass internal
+/// walk that doesn't surface intermediate inodes — wiring per-segment
+/// `vaccess(X)` waits on a vfs-layer rewrite.
+pub fn vaccess(
+    euid: u32,
+    egid: u32,
+    groups: &[u32],
+    st: &Stat,
+    want: u32,
+) -> Result<(), crate::errno::Errno> {
+    if euid == 0 {
+        return Ok(());
+    }
+    let bits = if euid == st.st_uid {
+        (st.st_mode >> 6) & 7
+    }
+    else if egid == st.st_gid || groups.contains(&st.st_gid) {
+        (st.st_mode >> 3) & 7
+    }
+    else {
+        st.st_mode & 7
+    };
+    if (bits & want) == want {
+        Ok(())
+    }
+    else {
+        Err(crate::errno::Errno::new(crate::errno::EACCES))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,6 +202,127 @@ mod tests {
     #[test]
     fn size_matches_linux_generic() {
         assert_eq!(core::mem::size_of::<Stat>(), 128);
+    }
+
+    fn st(mode: u32, uid: u32, gid: u32) -> Stat {
+        let mut s = Stat::default();
+        s.st_mode = mode;
+        s.st_uid = uid;
+        s.st_gid = gid;
+        s
+    }
+
+    #[test]
+    fn vaccess_root_bypass_regardless_of_mode() {
+        // Root reads a 0o000 file owned by someone else. Bypass should
+        // fire before mode bits are consulted.
+        let s = st(0o000, 1000, 1000);
+        assert!(vaccess(0, 0, &[], &s, ACCESS_R_OK).is_ok());
+        assert!(vaccess(0, 0, &[], &s, ACCESS_W_OK).is_ok());
+        assert!(vaccess(0, 0, &[], &s, ACCESS_R_OK | ACCESS_W_OK | ACCESS_X_OK).is_ok());
+    }
+
+    #[test]
+    fn vaccess_owner_branch_uses_owner_bits() {
+        // Owner of a 0o600 file: rw permitted, x denied.
+        let s = st(0o600, 1000, 1000);
+        assert!(vaccess(1000, 1000, &[], &s, ACCESS_R_OK).is_ok());
+        assert!(vaccess(1000, 1000, &[], &s, ACCESS_W_OK).is_ok());
+        assert_eq!(
+            vaccess(1000, 1000, &[], &s, ACCESS_X_OK).unwrap_err().0,
+            crate::errno::EACCES
+        );
+    }
+
+    #[test]
+    fn vaccess_owner_branch_ignores_group_and_other() {
+        // 0o007 = ---rwxrwx → owner bits are 0. Owner is denied even
+        // though group/other would allow. POSIX first-match-wins.
+        let s = st(0o007, 1000, 1000);
+        assert_eq!(
+            vaccess(1000, 1000, &[1000], &s, ACCESS_R_OK).unwrap_err().0,
+            crate::errno::EACCES
+        );
+    }
+
+    #[test]
+    fn vaccess_group_branch_via_egid() {
+        // Non-owner whose egid matches: 0o040 = ---r----- (group r only).
+        let s = st(0o040, 1000, 100);
+        assert!(vaccess(2000, 100, &[], &s, ACCESS_R_OK).is_ok());
+        assert_eq!(
+            vaccess(2000, 100, &[], &s, ACCESS_W_OK).unwrap_err().0,
+            crate::errno::EACCES
+        );
+    }
+
+    #[test]
+    fn vaccess_group_branch_via_supplementary() {
+        // Non-owner, egid != st_gid, but st_gid is in supplementary
+        // groups. Group bits apply.
+        let s = st(0o040, 1000, 100);
+        assert!(vaccess(2000, 999, &[100], &s, ACCESS_R_OK).is_ok());
+    }
+
+    #[test]
+    fn vaccess_other_branch_when_no_match() {
+        // 0o644 file owned by uid=0 — non-owner, non-group caller
+        // hits other branch (read OK, write denied).
+        let s = st(0o644, 0, 0);
+        assert!(vaccess(1000, 1000, &[], &s, ACCESS_R_OK).is_ok());
+        assert_eq!(
+            vaccess(1000, 1000, &[], &s, ACCESS_W_OK).unwrap_err().0,
+            crate::errno::EACCES
+        );
+    }
+
+    #[test]
+    fn vaccess_owner_takes_precedence_over_group() {
+        // 0o407 = r------rwx. Owner has r, group has nothing, other
+        // has rwx. Owner caller is denied W (because owner bits don't
+        // include W) even though other-bits would allow it.
+        let s = st(0o407, 1000, 1000);
+        assert_eq!(
+            vaccess(1000, 1000, &[], &s, ACCESS_W_OK).unwrap_err().0,
+            crate::errno::EACCES
+        );
+    }
+
+    #[test]
+    fn vaccess_zero_mode_denies_all_non_root() {
+        // chmod 000 on a file: nobody but root can do anything.
+        let s = st(0, 1000, 1000);
+        for caller_uid in [1000u32, 1234, 9999] {
+            for want in [ACCESS_R_OK, ACCESS_W_OK, ACCESS_X_OK] {
+                assert!(
+                    vaccess(caller_uid, 1000, &[1000], &s, want).is_err(),
+                    "uid={caller_uid} want={want:#x} should EACCES on chmod 000",
+                );
+            }
+        }
+        // root still bypasses.
+        assert!(vaccess(0, 0, &[], &s, ACCESS_R_OK | ACCESS_W_OK | ACCESS_X_OK).is_ok());
+    }
+
+    #[test]
+    fn vaccess_combined_want_requires_all_bits() {
+        // 0o500 = r-x------ (owner R+X). Asking for R+W requires both;
+        // R alone OK, R+W denied (W not present in owner bits).
+        let s = st(0o500, 1000, 1000);
+        assert!(vaccess(1000, 1000, &[], &s, ACCESS_R_OK).is_ok());
+        assert!(vaccess(1000, 1000, &[], &s, ACCESS_X_OK).is_ok());
+        assert_eq!(
+            vaccess(
+                1000,
+                1000,
+                &[],
+                &s,
+                ACCESS_R_OK | ACCESS_W_OK,
+            )
+            .unwrap_err()
+            .0,
+            crate::errno::EACCES
+        );
     }
 
     /// Pin DirEntry layout — the kernel writes packed records keyed

@@ -31,13 +31,19 @@ use net_channel::{BindSpec, NC_MAX_REGION_SIZE, NetChannel};
 use orbit_abi::errno::Errno;
 use orbit_abi::fs::Stat;
 use orbit_abi::net::SockType;
+use orbit_abi::perms::{CreateProcessV2Args, role};
 use orbit_abi::{
     logln,
-    user::{
-        ConsoleWriter, close_handle, create_process, create_process_with_argv_envp, exit, fs_open,
-        fs_read, fs_stat,
-    },
+    user::{ConsoleWriter, close_handle, create_process_v2, exit, fs_open, fs_read, fs_stat},
 };
+
+/// Default identity stamped on every payload the loader spawns, until
+/// real `/etc/passwd` lookup + login flow lands in a later milestone.
+/// Picked as 1000/1000 to match the conventional "first non-root user"
+/// allocation on Linux/BSD — gives `whoami`/`id` an interesting answer
+/// without a passwd file.
+const DEFAULT_PAYLOAD_UID: i64 = 1000;
+const DEFAULT_PAYLOAD_GID: i64 = 1000;
 use orbit_rt::netch::{NetCh, Session};
 
 const LISTEN_PORT: u16 = 7777;
@@ -261,14 +267,39 @@ fn spawn_init_from_argv() {
     // v1 inits (they don't need command-line args from the loader).
     // Envp is propagated from our own kernel-installed env so the
     // child sees the same baseline (PATH/HOME/TERM, plus anything we
-    // add later).
-    let argv_blob: &[u8] = &[];
-    match create_process_with_argv_envp(elf.as_ptr(), elf.len(), 0, 0, argv_blob, envp_va) {
+    // add later). Identity stamps via the same loader-default path
+    // as network payloads — init runs as 1000:1000 too.
+    let args = CreateProcessV2Args {
+        elf_vaddr: elf.as_ptr() as usize,
+        elf_len: elf.len(),
+        allowed_affinity: 0,
+        affinity: 0,
+        target_role: role::INHERIT,
+        _pad: 0,
+        request_perms: 0,
+        request_allowed_perms: 0,
+        cwd_vaddr: 0,
+        cwd_len: 0,
+        argv_vaddr: 0,
+        argv_len: 0,
+        envp_vaddr: envp_va,
+        stdout_capture: 0,
+        _pad2: 0,
+        setuid_uid: DEFAULT_PAYLOAD_UID,
+        setuid_gid: DEFAULT_PAYLOAD_GID,
+        setlogin_vaddr: 0,
+        setlogin_len: 0,
+        groups_vaddr: 0,
+        groups_count: 0,
+        spawn_path_len: 0,
+        spawn_path_vaddr: 0
+    };
+    match create_process_v2(&args) {
         Ok(pid) => logln!(
             "orbit-loader: spawned init {path} pid={pid} bytes={total} envp={}",
             if envp_va == 0 { "skipped" } else { "inherited" },
         ),
-        Err(e) => logln!("orbit-loader: init {path} create_process failed: {e:?}"),
+        Err(e) => logln!("orbit-loader: init {path} create_process_v2 failed: {e:?}"),
     }
 }
 
@@ -398,39 +429,56 @@ fn spawn(body_only: &[u8]) -> Result<u16, LoaderErr> {
         payload.affinity,
         payload.argv.len()
     );
-    if payload.argv.is_empty() {
-        return create_process(
-            elf.as_ptr(),
-            elf.len(),
-            payload.allowed_affinity,
-            payload.affinity,
-        )
-        .map_err(LoaderErr::Syscall);
-    }
-    // Pack argv into the same wire format orbit-rt's `_start` expects;
-    // 4 KiB scratch matches the kernel's argv-page mapping. Larger
-    // argv blobs would need a paged rewrite of this path — defer
-    // until something actually hits the cap.
-    let argv_bytes: alloc::vec::Vec<&[u8]> =
-        payload.argv.iter().map(|s| s.as_bytes()).collect();
+    // Pack argv into the same wire format orbit-rt's `_start` expects.
+    // 4 KiB scratch matches the kernel's argv-page mapping. Empty
+    // argv is fine — pack returns a zero-string header and we pass
+    // argv_vaddr=0/argv_len=0 below.
+    let argv_bytes: alloc::vec::Vec<&[u8]> = payload.argv.iter().map(|s| s.as_bytes()).collect();
     let mut argv_buf = [0u8; 4096];
-    let Some(argv_len) = orbit_abi::argv::pack(&argv_bytes, &mut argv_buf)
+    let argv_blob: &[u8] = if payload.argv.is_empty() {
+        &[]
+    }
     else {
-        return Err(LoaderErr::Cbor);
+        let Some(argv_len) = orbit_abi::argv::pack(&argv_bytes, &mut argv_buf)
+        else {
+            return Err(LoaderErr::Cbor);
+        };
+        &argv_buf[..argv_len]
     };
-    let argv_blob = &argv_buf[..argv_len];
-    // No envp transfer over the wire — the child inherits the
-    // loader's envp via the kernel's standard create_process_v2 path
-    // when envp_va = 0.
-    create_process_with_argv_envp(
-        elf.as_ptr(),
-        elf.len(),
-        payload.allowed_affinity,
-        payload.affinity,
-        argv_blob,
-        0,
-    )
-    .map_err(LoaderErr::Syscall)
+
+    // Stamp default uid/gid on every payload — orbit-loader is the
+    // single privileged spawner today, so this is the only path that
+    // produces non-root user processes. Once a real login pipeline
+    // lands the loader will defer identity to that path; until then
+    // every payload runs as 1000:1000.
+    let args = CreateProcessV2Args {
+        elf_vaddr: elf.as_ptr() as usize,
+        elf_len: elf.len(),
+        allowed_affinity: payload.allowed_affinity,
+        affinity: payload.affinity,
+        // INHERIT keeps loader's role + perms verbatim. A future
+        // signed-manifest path would name a concrete RoleId here.
+        target_role: role::INHERIT,
+        _pad: 0,
+        request_perms: 0,
+        request_allowed_perms: 0,
+        cwd_vaddr: 0,
+        cwd_len: 0,
+        argv_vaddr: argv_blob.as_ptr() as usize,
+        argv_len: argv_blob.len(),
+        envp_vaddr: 0,
+        stdout_capture: 0,
+        _pad2: 0,
+        setuid_uid: DEFAULT_PAYLOAD_UID,
+        setuid_gid: DEFAULT_PAYLOAD_GID,
+        setlogin_vaddr: 0,
+        setlogin_len: 0,
+        groups_vaddr: 0,
+        groups_count: 0,
+        spawn_path_len: 0,
+        spawn_path_vaddr: 0
+    };
+    create_process_v2(&args).map_err(LoaderErr::Syscall)
 }
 
 #[panic_handler]

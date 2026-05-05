@@ -521,6 +521,106 @@ pub fn gettid() -> u32 {
     r as u32
 }
 
+/// Return the calling process's real uid. POSIX `getuid(2)` —
+/// "shall always be successful and no return value is reserved to
+/// indicate an error." A negative isize from the kernel (e.g. if the
+/// caller pledged `PROC_LIFE` away) is silently re-cast and the
+/// caller sees a uid with the high bit set; treat that the same as
+/// any libc would. Backs `std::os::unix::fs::MetadataExt::uid` and
+/// `nix::unistd::getuid`.
+#[inline]
+pub fn getuid() -> u32 {
+    let r = unsafe { ecall1(syscall::GETUID, 0) };
+    r as u32
+}
+
+/// Return the calling process's effective uid. POSIX `geteuid(2)`.
+/// Same caveats as [`getuid`].
+#[inline]
+pub fn geteuid() -> u32 {
+    let r = unsafe { ecall1(syscall::GETEUID, 0) };
+    r as u32
+}
+
+/// Return the calling process's real gid. POSIX `getgid(2)`.
+#[inline]
+pub fn getgid() -> u32 {
+    let r = unsafe { ecall1(syscall::GETGID, 0) };
+    r as u32
+}
+
+/// Return the calling process's effective gid. POSIX `getegid(2)`.
+#[inline]
+pub fn getegid() -> u32 {
+    let r = unsafe { ecall1(syscall::GETEGID, 0) };
+    r as u32
+}
+
+/// Copy the calling process's supplementary group list into `buf`,
+/// returning the number of entries written. POSIX `getgroups(2)`:
+/// passing an empty slice (`buf.len() == 0`) returns the current
+/// group count without writing — callers use this to size the real
+/// call.
+///
+/// Errnos: `EFAULT`, `EINVAL` (buffer straddles a page), `ERANGE`
+/// (non-empty buffer too small for the current list).
+#[inline]
+pub fn getgroups(buf: &mut [u32]) -> Result<usize, Errno> {
+    Errno::from_ret(unsafe { ecall2(syscall::GETGROUPS, buf.as_mut_ptr() as usize, buf.len()) })
+}
+
+/// Copy the calling process's session login name into `buf` (no NUL
+/// terminator). POSIX `getlogin_r(3)`-shaped — the bounded form,
+/// since orbit doesn't carry the static-buffer flavor.
+///
+/// Errnos: `EFAULT`, `EINVAL` (buffer straddles a page), `ERANGE`
+/// (buffer too small), `ENOENT` (no login name installed yet).
+#[inline]
+pub fn getlogin(buf: &mut [u8]) -> Result<usize, Errno> {
+    Errno::from_ret(unsafe { ecall2(syscall::GETLOGIN, buf.as_mut_ptr() as usize, buf.len()) })
+}
+
+/// POSIX `setuid(uid)`. Mutate the calling process's uid triplet:
+///   - euid == 0: stamp `uid` on all three slots (real/effective/saved)
+///     — the privilege-drop path used by daemons after privsep startup.
+///   - euid != 0: set only euid, IFF `uid` is one of the existing
+///     ruid/suid (POSIX privilege-toggle rule).
+///
+/// Errnos: `EPERM` (non-root caller passed an unrelated uid).
+#[inline]
+pub fn setuid(uid: u32) -> Result<(), Errno> {
+    Errno::from_ret(unsafe { ecall1(syscall::SETUID, uid as usize) }).map(|_| ())
+}
+
+/// POSIX `setgid(gid)`. Same shape as [`setuid`] for the gid triplet.
+#[inline]
+pub fn setgid(gid: u32) -> Result<(), Errno> {
+    Errno::from_ret(unsafe { ecall1(syscall::SETGID, gid as usize) }).map(|_| ())
+}
+
+/// POSIX `setgroups(list)`. Replace the caller's supplementary group
+/// list. Requires `euid == 0`. Capped at `process::NGROUPS_MAX = 16`
+/// entries; longer lists yield `EINVAL`.
+///
+/// Errnos: `EPERM` (caller's `euid != 0`), `EINVAL` (list too long),
+/// `EFAULT` (buffer doesn't translate).
+#[inline]
+pub fn setgroups(groups: &[u32]) -> Result<(), Errno> {
+    Errno::from_ret(unsafe { ecall2(syscall::SETGROUPS, groups.as_ptr() as usize, groups.len()) })
+        .map(|_| ())
+}
+
+/// POSIX `setlogin(name)`. Stamp the calling process's session login
+/// name. Requires `euid == 0`. Capped at `MAXLOGNAME = 32` bytes.
+///
+/// Errnos: `EPERM` (caller's `euid != 0`), `EINVAL` (non-UTF-8),
+/// `ENAMETOOLONG`, `EFAULT`.
+#[inline]
+pub fn setlogin(name: &str) -> Result<(), Errno> {
+    Errno::from_ret(unsafe { ecall2(syscall::SETLOGIN, name.as_ptr() as usize, name.len()) })
+        .map(|_| ())
+}
+
 /// Spawn a child process with command-line arguments. Same shape as
 /// [`create_process`] otherwise; `argv_blob` is the packed bytes
 /// described in [`crate::argv`] (header + offsets + string table).

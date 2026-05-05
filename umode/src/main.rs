@@ -18,7 +18,8 @@ use orbit_abi::{
     user::{
         ConsoleWriter, close_handle, console_write, create_process_with_argv, create_thread, exit,
         fs_open, fs_read, fs_readdir, fs_stat, futex_wait, futex_wake, get_affinity, get_hart_id,
-        getpid, gettid, serial_print, set_affinity, sleep_ms, wait_pid,
+        getegid, geteuid, getgid, getgroups, getlogin, getpid, gettid, getuid, serial_print,
+        set_affinity, setgid, setgroups, setlogin, setuid, sleep_ms, wait_pid,
     },
 };
 use orbit_rt::netch::NetCh;
@@ -968,6 +969,113 @@ fn run_identity_probe() {
     }
     else {
         logln!("FAIL: getpid main got {pid} (want >0)");
+    }
+
+    // §multi-user Phase 2 — credential probe. orbit-loader stamps
+    // every payload it spawns with uid=1000/gid=1000 today. If those
+    // exact values change at the loader, update them here.
+    //
+    // Uses serialln! (not logln!) so the result lands in the host
+    // serial log — logln! routes through console_write to the
+    // framebuffer pane, which a headless smoke can't observe.
+    use orbit_abi::serialln;
+    let uid = getuid();
+    let euid = geteuid();
+    let gid = getgid();
+    let egid = getegid();
+    if uid == 1000 && euid == 1000 {
+        serialln!("PASS: getuid/geteuid main got {uid}/{euid} (loader-stamped)");
+    }
+    else {
+        serialln!("FAIL: getuid/geteuid main got {uid}/{euid} (want 1000/1000)");
+    }
+    if gid == 1000 && egid == 1000 {
+        serialln!("PASS: getgid/getegid main got {gid}/{egid} (loader-stamped)");
+    }
+    else {
+        serialln!("FAIL: getgid/getegid main got {gid}/{egid} (want 1000/1000)");
+    }
+    let mut g_buf = [0u32; 16];
+    match getgroups(&mut g_buf) {
+        Ok(n) => serialln!("PASS: getgroups returned {n} entries (loader inherits empty)"),
+        Err(e) => serialln!("FAIL: getgroups errno {}", e.0),
+    }
+    let mut login_buf = [0u8; 32];
+    match getlogin(&mut login_buf) {
+        Ok(n) => serialln!("FAIL: getlogin unexpectedly returned {n} bytes"),
+        Err(e) if e.0 == orbit_abi::errno::ENOENT => {
+            serialln!("PASS: getlogin returned ENOENT (no login_name installed yet)")
+        }
+        Err(e) => serialln!(
+            "FAIL: getlogin errno {} (want ENOENT={})",
+            e.0,
+            orbit_abi::errno::ENOENT
+        ),
+    }
+
+    // §multi-user Phase 3 — set* gate probe. We're running as
+    // uid=1000:1000 (loader-stamped), so the EPERM paths cover the
+    // standard "non-root tried to mutate identity" cases. The
+    // setuid(1000) success path exercises the POSIX privilege-toggle
+    // rule (uid ∈ {ruid, suid}) without needing a real privilege
+    // drop.
+    use orbit_abi::errno::EPERM;
+    match setuid(1000) {
+        Ok(()) => serialln!("PASS: setuid(1000) ok (matches ruid)"),
+        Err(e) => serialln!("FAIL: setuid(1000) errno {} (want ok)", e.0),
+    }
+    match setuid(0) {
+        Err(e) if e.0 == EPERM => {
+            serialln!("PASS: setuid(0) returned EPERM (non-root, uid not in {{ruid, suid}})")
+        }
+        Ok(()) => serialln!("FAIL: setuid(0) unexpectedly succeeded"),
+        Err(e) => serialln!("FAIL: setuid(0) errno {} (want EPERM={})", e.0, EPERM),
+    }
+    match setgid(1000) {
+        Ok(()) => serialln!("PASS: setgid(1000) ok (matches rgid)"),
+        Err(e) => serialln!("FAIL: setgid(1000) errno {} (want ok)", e.0),
+    }
+    match setgid(0) {
+        Err(e) if e.0 == EPERM => {
+            serialln!("PASS: setgid(0) returned EPERM")
+        }
+        Ok(()) => serialln!("FAIL: setgid(0) unexpectedly succeeded"),
+        Err(e) => serialln!("FAIL: setgid(0) errno {} (want EPERM={})", e.0, EPERM),
+    }
+    match setlogin("alice") {
+        Err(e) if e.0 == EPERM => {
+            serialln!("PASS: setlogin returned EPERM (non-root)")
+        }
+        Ok(()) => serialln!("FAIL: setlogin unexpectedly succeeded"),
+        Err(e) => serialln!("FAIL: setlogin errno {} (want EPERM={})", e.0, EPERM),
+    }
+    match setgroups(&[100, 200]) {
+        Err(e) if e.0 == EPERM => {
+            serialln!("PASS: setgroups returned EPERM (non-root)")
+        }
+        Ok(()) => serialln!("FAIL: setgroups unexpectedly succeeded"),
+        Err(e) => serialln!("FAIL: setgroups errno {} (want EPERM={})", e.0, EPERM),
+    }
+
+    // §multi-user Phase 4 — VFS access enforcement. /etc/secret is
+    // mode 0o600 owned by uid=0 in tarfs; uid=1000 hits the "other"
+    // branch with bits=0 → EACCES. Confirms the vaccess gate fires.
+    // /bin/hello.txt is mode 0o644 owned by uid=1000 (build user) →
+    // owner branch with R bit → opens fine; confirms no regression.
+    use orbit_abi::errno::EACCES;
+    match fs_open("/bin/hello.txt", 0) {
+        Ok(fd) => {
+            serialln!("PASS: fs_open /bin/hello.txt (0o644 own) → fd={fd} (vaccess permits)");
+            let _ = close_handle(fd as u32);
+        }
+        Err(e) => serialln!("FAIL: fs_open /bin/hello.txt errno {} (want ok)", e.0),
+    }
+    match fs_open("/etc/secret", 0) {
+        Err(e) if e.0 == EACCES => {
+            serialln!("PASS: fs_open /etc/secret (0o600 root) returned EACCES")
+        }
+        Ok(fd) => serialln!("FAIL: fs_open /etc/secret unexpectedly opened fd={fd}"),
+        Err(e) => serialln!("FAIL: fs_open /etc/secret errno {} (want EACCES={})", e.0, EACCES),
     }
 
     let tid_a = gettid();

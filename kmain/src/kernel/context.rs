@@ -2,10 +2,10 @@ use core::arch::asm;
 use core::ptr::null_mut;
 use core::sync::atomic::Ordering;
 
-use device::{HartContext, TRAP_STACK_SIZE, TrapFrame};
+use device::{HartContext, TRAP_STACK_SIZE};
 use process::{FaultInfo, Thread, ThreadState};
 use riscv::register::sstatus::SPP;
-use tracing::error;
+use tracing::{error};
 
 use crate::kernel::user_trap_frame_vaddr;
 
@@ -42,33 +42,15 @@ unsafe fn jump(context: &'static HartContext, target: usize) -> ! {
 unsafe extern "C" {
     unsafe fn enter_hart_context_asm(user_frame_vaddr: usize, satp: usize, asid: usize) -> !;
     unsafe fn enter_hart_kcontext_asm(trap_frame: *const ()) -> !;
-
-    /// Setjmp-style save for a kernel thread that wants to park
-    /// without going through the trap vector. See `trap.S` for the
-    /// register save list and resume semantics. Returns 0 on the
-    /// first call; on later redispatch, sret restores GPRs from the
-    /// frame and the synthetic return value is 1.
-    unsafe fn kthread_save_resume_point(frame: *mut TrapFrame, pc_cell: *mut usize) -> usize;
-
-    /// Noreturn hand-off used by `kthread_park` after a successful
-    /// `kthread_save_resume_point`. Switches sp onto this hart's
-    /// idle stack, nulls the current-thread slot at
-    /// `current_slot_ptr` (Release), publishes `state` into
-    /// `*state_ptr` (Release), and srets to `kptr` (k_hart_loop).
-    ///
-    /// `current_slot_ptr` is the *address* of `HartContext.current`'s
-    /// storage cell — typed as `*mut *mut ()` to match
-    /// `AtomicPtr<()>::as_ptr`'s return and stay FFI-safe (the asm
-    /// only zero-stores through it). See `trap.S` for the ordering
-    /// rationale.
-    unsafe fn kthread_handoff_to_kidle(
-        state_ptr: *mut usize,
-        state_val: usize,
-        current_slot_ptr: *mut *mut (),
-        kstack_top: usize,
-        kptr: usize,
-    ) -> !;
 }
+
+/// Sentinel placed in `a7` by `kthread_park` before its `ecall`. The
+/// `s_trap` cause=9 (S-mode ecall) arm verifies this value before
+/// treating the trap as a park request — defense against accidental
+/// future S-mode ecall consumers landing in the same dispatch arm.
+/// Cause=9 is currently unused by anything else in kmain, so any
+/// non-zero value works; this one is just a memorable magic number.
+pub const KPARK_ECALL_NR: usize = 0xC0DE_0001;
 
 pub unsafe fn load_thread_into_hart_context_and_jump(
     context: &'static HartContext,
@@ -182,30 +164,37 @@ pub unsafe fn enter_hart_context(context: &'static HartContext) -> ! {
 /// were an ordinary function return — locals on the kthread's own
 /// stack survive the round trip.
 ///
-/// Replaces the per-call ad-hoc sequence (set wake_time + ticks +
-/// state, fire `ebreak`, rely on the cause=3 + `cscratch2` sidechannel
-/// in `s_trap` to switch) that lived inline in `k_net` and `k_gpu`.
-/// Compared to that path:
-///   * No trap-vector round trip — direct asm save + sret to k_hart_loop.
-///   * No `cscratch2` overload of the ebreak cause; ordinary debugger
-///     ebreaks regain their unambiguous meaning if they ever appear.
-///   * State publish happens *after* sp has switched off the kthread's
-///     stack, closing the "remote scheduler dispatches us while this
-///     hart is still using the same stack" race.
+/// Implementation: stage `(state, wake_time)` into the thread struct,
+/// then `ecall` from S-mode (cause=9, delegated to S-mode by bl's
+/// `medeleg`). The `s_trap` cause=9 arm snapshots the trap frame at
+/// `epc + 4` and calls [`exit_thread_with_state`], which publishes
+/// `current = null` (Release) and `state` (Release) and pushes the
+/// matching SLEEP_INBOX entry for `Suspended`. Resume is the canonical
+/// dispatch path — `enter_hart_kcontext_asm` restores all 32 GPRs from
+/// the saved frame and srets to `epc + 4`, landing one instruction
+/// past the ecall.
 ///
 /// Caller invariants:
 ///   * Must be running as a kernel thread (`thread.mode == Supervisor`).
 ///   * Must hold no spinlocks — handing off to k_hart_loop deadlocks
 ///     anything else trying to acquire them.
+///   * `state` must be `Suspended`. `Blocking` is rejected — kthreads
+///     wake on a `CompletionHandle` by polling `is_signaled()` between
+///     `Suspended` parks; the wake-hook dance only makes sense for
+///     user threads on the syscall-return path.
 pub fn kthread_park(state: ThreadState, wake_time: usize) {
-    // Async traps off across the save → publish window. A timer/SSWI
-    // landing between the save and the handoff would route through
-    // s_trap → check_context_and_switch and park us via the legacy
-    // path, but with thread.pc still pointing at the original
-    // (pre-save) sepc — resume would jump back into the middle of
-    // this function instead of the saved resume label, observe a
-    // partially-published state, and corrupt the loop. Same
-    // rationale as load_thread_into_hart_context_and_jump's clear.
+    // Async traps off across the entire function. Without this, a
+    // timer/SSWI landing between `get_hart_context()` and any later
+    // use of the cached `context`/`cur` register values would route
+    // through s_trap → check_context_and_switch → exit_thread_with_state(Ready),
+    // null this hart's `current`, and let the manager redispatch us
+    // on a *different* hart. On resume, `enter_hart_kcontext_asm`
+    // restores the trap-time frame — including the register that
+    // held `context` — so post-resume reads of `context.current`
+    // touch the *previous* hart's HartContext, observe the null we
+    // left behind, and fire a spurious "no current thread" panic.
+    // Same shape as `load_thread_into_hart_context_and_jump`'s clear,
+    // and exactly the smell I dropped when removing the setjmp dance.
     unsafe {
         riscv::register::sstatus::clear_sie();
     }
@@ -213,12 +202,11 @@ pub fn kthread_park(state: ThreadState, wake_time: usize) {
     let context = get_hart_context();
     let cur = context.current.load(Ordering::Acquire);
     if cur.is_null() {
-        // No current thread — nothing to park. Bail to k_hart_loop
-        // directly; matches exit_thread_with_state's null-current path.
-        unsafe {
-            let target = context.kptr.load(Ordering::Acquire);
-            jump(context, target as usize);
-        }
+        panic!(
+            "kthread_park with no current thread on hart{} — caller \
+             must be running as a kernel thread",
+            context.hart_id,
+        );
     }
     let thread = unsafe { (cur as *mut Thread).as_mut_unchecked() };
 
@@ -230,66 +218,56 @@ pub fn kthread_park(state: ThreadState, wake_time: usize) {
         );
     }
 
+    
+    let tstate = thread.state.load(Ordering::Acquire);
+    if tstate != ThreadState::Running as usize {
+        let tid = thread.tid;
+        let tlast_wake_reason = thread.last_wake_reason.load(Ordering::Acquire);
+        let twake_override = thread.wake_override.load(Ordering::Acquire);
+        error!("[ktpark] t{tid} s{tstate} lwr{tlast_wake_reason} two{twake_override}");
+    }
+
+    if state == ThreadState::Blocking {
+        panic!(
+            "kthread_park(Blocking) on tid={} — kthreads must use Suspended \
+             + a WakeEvent push from the IRQ handler, then poll \
+             `handle.is_signaled()` for the result.",
+            thread.tid
+        );
+    }
+
+    // Stage state-machine inputs the s_trap arm reads via the saved
+    // frame regs. `wake_time` lives on the thread struct so
+    // `exit_thread_with_state(Suspended)` finds it for the SLEEP_INBOX
+    // push; an async preemption between this store and the ecall is
+    // benign — we'd be redispatched, resume at the ecall, and park
+    // with the (already-consistent) value.
     thread.ticks = 0;
-    thread.wake_time = wake_time;
-
-    // Setjmp-style save. Returns 0 on the first call (we proceed to
-    // hand off); returns 1 when the scheduler later redispatches
-    // this thread (sret has restored ra/sp/s-regs, just resume the
-    // caller). The asm snapshots the live values of s-regs at the
-    // call point, so locals derived after this point but stored in
-    // s-regs would be lost across the round trip — we don't keep
-    // any: the only post-save Rust work is reading immutable
-    // context fields and calling the noreturn handoff asm.
-    let frame_ptr = thread.frame as *mut TrapFrame;
-    let pc_ptr = thread.pc.as_ptr();
-    if unsafe { kthread_save_resume_point(frame_ptr, pc_ptr) } != 0 {
-        return;
-    }
-
-    // For a Suspended park, register the new park instance with the
-    // sleep heap before the noreturn handoff. fetch_add(Release) is
-    // ordered with the state.store(Release) the handoff asm performs
-    // after the sp switch — manager observing state=Suspended is
-    // guaranteed to see the matching seq. The push happens before
-    // the handoff because we lose control after; the manager won't
-    // observe the inbox entry as live until state actually hits
-    // Suspended (which is only published after the sp switch
-    // inside `kthread_handoff_to_kidle`).
     if state == ThreadState::Suspended {
-        let seq = thread
-            .sleep_seq
-            .fetch_add(1, Ordering::Release)
-            .wrapping_add(1);
-        let notice = crate::kernel::SleepNotice {
-            wake_time: wake_time as u64,
-            sleep_seq: seq,
-            thread: cur as *mut Thread,
-        };
-        if crate::kernel::SLEEP_INBOX.push(notice).is_err() {
-            error!(
-                "SLEEP_INBOX full on kthread_park: tid={} wake_time={}",
-                thread.tid, wake_time,
-            );
-        }
+        thread.wake_time = wake_time;
     }
 
-    // First-time path. Frame is self-consistent; hand off to
-    // k_hart_loop. The handoff switches sp onto k_stack first,
-    // *then* publishes current=null (Release) and state (Release)
-    // — see trap.S for the ordering rationale.
+    // ecall → cause=9 → s_trap_vector saves the trap frame in the
+    // canonical way → s_trap dispatches on a7 == KPARK_ECALL_NR and
+    // calls exit_thread_with_state(state). That noreturn path
+    // publishes current=null + state and srets to k_hart_loop. On
+    // later redispatch, enter_hart_kcontext_asm restores the saved
+    // frame and srets to (epc + 4), landing one instruction past
+    // this ecall.
     unsafe {
-        let kstack_top = context.k_stack.stack_data.as_ptr() as usize + TRAP_STACK_SIZE - 16;
-        let kptr = context.kptr.load(Ordering::Acquire) as usize;
-        kthread_handoff_to_kidle(
-            thread.state.as_ptr(),
-            state as usize,
-            context.current.as_ptr(),
-            kstack_top,
-            kptr,
+        core::arch::asm!(
+            "ecall",
+            in("a0") state as usize,
+            in("a7") KPARK_ECALL_NR,
+            // a-regs the ecall doesn't pin are clobbered by convention;
+            // s-regs and ra/sp survive via the trap-frame save/restore.
+            lateout("a1") _, lateout("a2") _, lateout("a3") _,
+            lateout("a4") _, lateout("a5") _, lateout("a6") _,
+            options(nostack),
         );
     }
 }
+
 
 /// Stash a `FaultInfo` on the current thread and exit it. Called from the trap
 /// handler when a user thread can't continue (page fault, bad ecall, etc.).
@@ -346,8 +324,7 @@ pub unsafe fn exit_thread_with_state(state: ThreadState) -> ! {
                     thread: thread_addr as *mut Thread,
                 });
             }
-            // Null `current` first so the new `state` Release-store
-            // carries the cur=null write with it. See doc comment.
+
             context.current.store(null_mut(), Ordering::Release);
             thread.state.store(state as usize, Ordering::Release);
             if let Some(notice) = sleep_notice {
