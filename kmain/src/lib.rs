@@ -11,7 +11,7 @@ use core::{
 };
 use device::{HartContext, TrapFrame};
 use net_channel::NetChannel;
-use orbit_abi::{layout::UserVa, perms::Permissions};
+use orbit_abi::{fs::ACCESS_R_OK, layout::UserVa, perms::Permissions};
 use process::{Thread, ThreadState};
 use smoltcp::{
     iface::{PollResult, SocketHandle, SocketSet},
@@ -561,7 +561,7 @@ fn k_io_handle_spawn(
         ctx.parent_egid,
         &ctx.parent_groups,
         &stat,
-        ACCESS_X_OK,
+        ACCESS_X_OK | ACCESS_R_OK,
     ) {
         debug!("k_io: vaccess(X) EACCES path={path} mode={:#o}", stat.st_mode);
         caller_handle.signal(e.to_ret());
