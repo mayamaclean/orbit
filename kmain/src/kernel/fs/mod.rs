@@ -47,25 +47,28 @@ pub trait Filesystem: Send + Sync {
     /// Returns `NotFound` for paths the FS doesn't have.
     fn open(&self, path: &str) -> Result<Inode, FsErr>;
 
-    /// Submit one sector-sized read. `notif` carries both the
-    /// completion handle and the post-DMA action (direct signal vs.
-    /// manager-side scratch→user copy); the FS layer just forwards
-    /// it to the block driver.
+    /// Submit one page-sized read. `notif` carries both the completion
+    /// handle and the post-DMA action (direct signal vs. manager-side
+    /// scratch→user copy); the FS layer just forwards it to the block
+    /// driver.
     ///
     /// v1 contract:
-    /// - `len` must equal 512.
-    /// - `off` must be a 512-byte multiple.
-    /// - `off + len` must not exceed the inode's size (rounded up to
-    ///   the next sector — the last sector of a file is read fully and
-    ///   the caller trims).
+    /// - `len` must equal `PAGE_SIZE` (4096).
+    /// - `off` must be a `PAGE_SIZE` multiple.
+    /// - `off` must lie within the file rounded up to the next page —
+    ///   i.e. `off < round_up(size, PAGE_SIZE)`. The last page of a
+    ///   file is read fully (DMA may overrun into following sectors of
+    ///   the backing image) and the caller trims via the inode's true
+    ///   `size`.
     ///
     /// On submit failure the boxed `notif` is dropped (taking the
     /// handle inside it with it); the caller is expected to retain
     /// its own handle clone if it needs to signal an errno.
     ///
     /// # Safety
-    /// `dst_pa` must reference 512 bytes of memory the kernel keeps
-    /// mapped until the notification is dispatched.
+    /// `dst_pa` must reference `PAGE_SIZE` bytes of physically-
+    /// contiguous memory the kernel keeps mapped until the
+    /// notification is dispatched.
     unsafe fn read_async(
         &self,
         ino: Inode,

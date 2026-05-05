@@ -135,16 +135,16 @@ pub static WAKE_QUEUE: StaticThingBuf<WakeEvent, 64> = StaticThingBuf::new();
 pub static IO_QUEUE: StaticThingBuf<Option<alloc::boxed::Box<orbit_core::IoWork>>, 16> =
     StaticThingBuf::new();
 
-/// PA of `k_io`'s sector-sized DMA scratch page. Latched by
+/// PA of `k_io`'s page-sized DMA scratch buffer. Latched by
 /// `setup_io_kthread` at boot from a freshly-allocated KDMAP frame.
 /// `0` until that fires; `k_io` checks for `0` and signals `EIO` on
 /// the (impossible-in-practice) "tried to do a read before scratch
 /// was allocated" path.
 ///
 /// Single-page is sufficient because k_io is single-threaded — at
-/// most one DMA in flight at a time, sector-sized. A future
-/// throughput optimization (multi-sector batching) would replace
-/// this with a per-in-flight pool.
+/// most one DMA in flight at a time, page-sized. A future throughput
+/// optimization (overlapping the next read with the in-flight one)
+/// would replace this with a per-in-flight pool.
 pub static IO_SCRATCH_PA: AtomicU64 = AtomicU64::new(0);
 
 /// KVA of the same page as [`IO_SCRATCH_PA`]. KDMAP-mapped so `k_io`
@@ -1268,9 +1268,9 @@ impl Orbit {
                     return Errno::new(orbit_abi::errno::ENOMEM).to_ret();
                 }
             };
-            Some(crate::kernel::handle::ScratchSector {
+            Some(crate::kernel::handle::ScratchPage {
                 frame,
-                cached_sector: u64::MAX,
+                cached_page: u64::MAX,
                 valid_bytes: 0,
                 loading: false,
             })
@@ -1307,7 +1307,7 @@ impl Orbit {
         root_pa: PhysAddr,
         handle: process::CompletionHandle,
     ) {
-        const SECTOR: u64 = 512;
+        const PAGE: u64 = PAGE_SIZE as u64;
 
         // Look up the file handle and snapshot what we need.
         let Some(ph) = self.process_handles.get_mut(&pid)
@@ -1359,17 +1359,17 @@ impl Orbit {
                 }
             };
 
-        // Compute the relevant slice of the current sector. `intra`
-        // is the byte offset within the sector that we want to start
+        // Compute the relevant slice of the current page. `intra` is
+        // the byte offset within the page that we want to start
         // reading from; `visible_len` is the most we can return in
-        // this call (clipped at the sector boundary and at EOF).
-        let target_sector = prev_off / SECTOR;
-        let intra = (prev_off & (SECTOR - 1)) as u32;
-        let sector_remaining = SECTOR - intra as u64;
+        // this call (clipped at the page boundary and at EOF).
+        let target_page = prev_off / PAGE;
+        let intra = (prev_off & (PAGE - 1)) as u32;
+        let page_remaining = PAGE - intra as u64;
         let file_remaining = file_size - prev_off;
         let visible_len = core::cmp::min(
             req.len as u64,
-            core::cmp::min(sector_remaining, file_remaining),
+            core::cmp::min(page_remaining, file_remaining),
         ) as u32;
 
         // Take the scratch by &mut so we can flip `loading` in
@@ -1389,8 +1389,8 @@ impl Orbit {
         // this fd — we don't have a per-fd waiter queue in v1, and
         // we must not submit a second DMA into the same scratch
         // page. The `loading` check has to come *before* the
-        // cache-hit check: while loading is true `cached_sector` may
-        // still hold the previous valid sector, but the scratch
+        // cache-hit check: while loading is true `cached_page` may
+        // still hold the previous valid page, but the scratch
         // page is being overwritten, so cache hits would return torn
         // data.
         if scratch.loading {
@@ -1398,12 +1398,12 @@ impl Orbit {
             return;
         }
 
-        // Cache hit: the scratch already holds `target_sector`.
+        // Cache hit: the scratch already holds `target_page`.
         // Copy the slice into the user buffer through a
         // UserPageWindow (we hold MANAGER_LOCK here, so single-slot
         // serialisation is fine), advance offset, signal
         // synchronously.
-        if scratch.cached_sector == target_sector {
+        if scratch.cached_page == target_page {
             let src_kva = scratch.frame.kva().raw() + intra as u64;
             unsafe {
                 let mut w = user_page::UserPageWindow::map(user_page_pa, PAGE_SIZE);
@@ -1421,20 +1421,20 @@ impl Orbit {
         // descriptor (cloning the SharedFrame so the in-flight
         // descriptor keeps the scratch page alive across
         // close_handle / process teardown), submit, park.
-        // cached_sector / valid_bytes stay at whatever they were
-        // (empty or the previous valid sector) — they get
+        // cached_page / valid_bytes stay at whatever they were
+        // (empty or the previous valid page) — they get
         // published from run_fs_read_copy on success. Only
         // `loading` and `of.offset` move here, so the
         // submit-failure rollback below has minimal state to undo.
         let scratch_clone = scratch.frame.clone();
         let scratch_pa = scratch_clone.pa();
-        let sector_off = target_sector * SECTOR;
-        let valid_bytes = core::cmp::min(SECTOR, file_size - sector_off) as u32;
+        let page_off = target_page * PAGE;
+        let valid_bytes = core::cmp::min(PAGE, file_size - page_off) as u32;
         let notif = WorkNotification::Bounce(crate::kernel::fs::CopyDescriptor {
             handle: handle.clone(),
             pid,
             fd: req.fd,
-            target_sector,
+            target_page,
             valid_bytes,
             scratch: scratch_clone,
             user_page_pa: PhysAddr::new(user_page_pa),
@@ -1449,8 +1449,8 @@ impl Orbit {
         match unsafe {
             fs.read_async(
                 inode,
-                sector_off,
-                SECTOR as u32,
+                page_off,
+                PAGE as u32,
                 scratch_pa.get_raw(),
                 notif,
             )
@@ -1472,7 +1472,7 @@ impl Orbit {
                     of.offset = prev_off;
                     if let Some(s) = of.scratch.as_mut() {
                         s.loading = false;
-                        // cached_sector / valid_bytes stay
+                        // cached_page / valid_bytes stay
                         // unchanged — the DMA never went out, so
                         // whatever was valid before still is.
                     }
@@ -1548,7 +1548,7 @@ impl Orbit {
             // valid is now suspect).
             if let Some(s) = scratch_state {
                 s.loading = false;
-                s.cached_sector = u64::MAX;
+                s.cached_page = u64::MAX;
                 s.valid_bytes = 0;
             }
             desc.handle.signal(-(orbit_abi::errno::EIO as isize));
@@ -1584,7 +1584,7 @@ impl Orbit {
         }
 
         if let Some(s) = scratch_state {
-            s.cached_sector = desc.target_sector;
+            s.cached_page = desc.target_page;
             s.valid_bytes = desc.valid_bytes;
             s.loading = false;
         }
@@ -4166,7 +4166,6 @@ impl Orbit {
     /// `spawn_path_vaddr != 0`, which only the bootstrap shell does
     /// post-mount.)
     pub fn setup_io_kthread(&mut self) {
-        const SECTOR_SIZE: usize = 512;
         let layout = match Layout::from_size_align(PAGE_SIZE, PAGE_SIZE) {
             Ok(l) => l,
             Err(_) => {
@@ -4187,7 +4186,6 @@ impl Orbit {
         // never frees. Forget the Frame so its Drop doesn't return
         // the page to the allocator on scope exit.
         core::mem::forget(frame);
-        let _ = SECTOR_SIZE; // silence unused-const lint if future opt removes the cap
 
         let entrypoint = crate::k_io as *const () as usize;
         match self.create_kernel_thread(entrypoint, None) {

@@ -66,7 +66,7 @@ pub enum WorkNotification {
 /// needs to (1) copy `scratch[intra..intra + len]` into the user's
 /// buffer at `user_page_pa[user_page_off..]`, and (2) publish the
 /// new cache state on the originating `OpenFile` (clear `loading`,
-/// set `cached_sector` / `valid_bytes`).
+/// set `cached_page` / `valid_bytes`).
 ///
 /// The `handle` and `scratch` ride inside the descriptor so the
 /// side-table holds a single allocation per in-flight request, and
@@ -82,10 +82,10 @@ pub struct CopyDescriptor {
     pub pid: u16,
     /// fd within `pid`'s handle table.
     pub fd: u32,
-    /// File-relative sector index DMA was filling. Becomes
-    /// `cached_sector` on success.
-    pub target_sector: u64,
-    /// Bytes considered valid in the just-DMA'd sector. Becomes
+    /// File-relative page index DMA was filling. Becomes
+    /// `cached_page` on success.
+    pub target_page: u64,
+    /// Bytes considered valid in the just-DMA'd page. Becomes
     /// `valid_bytes` on success.
     pub valid_bytes: u32,
     /// Refcount clone keeping the scratch page alive across the
@@ -244,22 +244,28 @@ pub fn setup_virtio_blk(kernel_pages: &mut KernelPages) -> bool {
     true
 }
 
-/// Submit an asynchronous single-sector read at `lba` into `dst_pa`.
+/// Submit an asynchronous multi-sector read at `lba` into `dst_pa`.
 /// The IRQ handler dispatches `notif` once the chain completes:
 /// [`WorkNotification::Direct`] signals the carried handle inline;
 /// [`WorkNotification::Bounce`] enqueues a [`PendingWork::FsReadCopy`]
 /// for the manager to copy scratch→user and signal.
 ///
+/// `len` must satisfy `virtio_blk::Block::submit_read`'s contract:
+/// non-zero, multiple of `SECTOR_SIZE`, and at most
+/// [`virtio_blk::MAX_REQ_BYTES`]. Today's callers pass exactly one
+/// page.
+///
 /// Returns the descriptor head used. On `Err`, the boxed `notif`
 /// is dropped — including any `CompletionHandle` it owned.
 ///
 /// # Safety
-/// - `dst_pa` must reference `SECTOR_SIZE` bytes the kernel keeps
-///   mapped until completion.
+/// - `dst_pa` must reference `len` bytes of physically-contiguous
+///   memory the kernel keeps mapped until completion.
 /// - Caller serializes concurrent submitters on the same `Block`.
 pub unsafe fn submit_blk_read(
     lba: u64,
     dst_pa: u64,
+    len: u32,
     notif: WorkNotification,
 ) -> Result<u16, BlockError> {
     let dev = block_dev().ok_or(BlockError::QueueFull)?;
@@ -297,7 +303,7 @@ pub unsafe fn submit_blk_read(
     // wrong slot. submit_read debug_asserts head == predicted
     // internally, so a mismatch panics in dev builds; in release
     // it's silently wrong.
-    match unsafe { dev.submit_read(lba, dst_pa, SECTOR_SIZE as u32) } {
+    match unsafe { dev.submit_read(lba, dst_pa, len) } {
         Ok(actual) => {
             debug_assert!(
                 actual == head,

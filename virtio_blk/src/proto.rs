@@ -7,6 +7,17 @@ pub const VIRTIO_BLK_DEVICE_ID: u32 = 2;
 /// geometry separately, but the queue still trades in 512-B units.
 pub const SECTOR_SIZE: usize = 512;
 
+/// Maximum bytes per request the driver will submit. The wire protocol
+/// allows arbitrary multi-sector reads in one chain (one header, one
+/// data buffer of `N * SECTOR_SIZE` bytes, one status); we cap at one
+/// page so a single contiguous kernel scratch frame backs every
+/// request without splitting into multiple data descriptors.
+///
+/// Eventually this should be `min(PAGE, BlkConfig.size_max)` once we
+/// plumb the device-advertised limits through the handshake; QEMU is
+/// generous so the static cap is safe today.
+pub const MAX_REQ_BYTES: u32 = 4096;
+
 // Request types (`BlkReqHeader::ty`).
 pub const VIRTIO_BLK_T_IN: u32 = 0;
 pub const VIRTIO_BLK_T_OUT: u32 = 1;

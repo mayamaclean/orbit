@@ -515,7 +515,7 @@ fn k_io_handle_spawn(
 
     info!("k_io: handle_spawn start path={path}");
 
-    const SECTOR_SIZE: u64 = 512;
+    const CHUNK: u64 = mmu::PAGE_SIZE as u64;
     /// Mirror of the cap in `run_create_process_v2_req`. A larger ELF
     /// would also blow the v2 handler's blob.
     const MAX_ELF_BYTES: usize = 4 * 1024 * 1024;
@@ -580,9 +580,9 @@ fn k_io_handle_spawn(
         let read_handle = process::CompletionHandle::new();
         let notif = WorkNotification::Direct {
             handle: read_handle.clone(),
-            success_value: SECTOR_SIZE as isize,
+            success_value: CHUNK as isize,
         };
-        if let Err(e) = unsafe { fs.read_async(inode, offset, SECTOR_SIZE as u32, scratch_pa, notif) }
+        if let Err(e) = unsafe { fs.read_async(inode, offset, CHUNK as u32, scratch_pa, notif) }
         {
             debug!("k_io: read_async failed at off={offset}: {e:?}");
             caller_handle.signal(Errno::new(EIO).to_ret());
@@ -590,7 +590,7 @@ fn k_io_handle_spawn(
         }
 
         if offset == 0 {
-            info!("k_io: submitted first sector read, parking");
+            info!("k_io: submitted first page read, parking");
         }
 
         // Wait for the sector to land. Mirrors k_net's
@@ -611,19 +611,19 @@ fn k_io_handle_spawn(
         }
         let result = read_handle.ret(0) as isize;
         if offset == 0 {
-            info!("k_io: first sector resume, result={result}");
+            info!("k_io: first page resume, result={result}");
         }
         if result < 0 {
             debug!("k_io: read_async failed at off={offset}: result={result}");
             caller_handle.signal(Errno::new(EIO).to_ret());
             return;
         }
-        let take = core::cmp::min(SECTOR_SIZE, total - offset) as usize;
+        let take = core::cmp::min(CHUNK, total - offset) as usize;
         unsafe {
             let src = core::slice::from_raw_parts(scratch_kva as *const u8, take);
             blob.extend_from_slice(src);
         }
-        offset += SECTOR_SIZE;
+        offset += CHUNK;
     }
 
     // Hand off to the manager via PendingWork::SpawnReady. On queue

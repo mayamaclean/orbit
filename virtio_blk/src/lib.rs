@@ -9,9 +9,10 @@
 //! - [`Block::submit_read`] + [`Block::drain_used`] — IRQ-driven steady
 //!   state; the kmain glue arranges completion-handle signalling.
 //!
-//! Single-sector reads only. Multi-sector reads chunk at the caller —
-//! tarfs in §12c walks the archive a sector at a time, then later FS
-//! reads chunk by page.
+//! Multi-sector reads ride the same chain: one header, one data buffer
+//! of `N * SECTOR_SIZE` bytes (`N` up to [`MAX_REQ_BYTES`]/`SECTOR_SIZE`),
+//! one status. Caller supplies a physically-contiguous destination of
+//! the matching length.
 
 #![no_std]
 
@@ -19,4 +20,4 @@ pub mod device;
 pub mod proto;
 
 pub use device::{ARENA_BYTES, Block, BlockBacking, BlockError, QUEUE_SIZE};
-pub use proto::{BlkConfig, BlkReqHeader, SECTOR_SIZE, VIRTIO_BLK_DEVICE_ID};
+pub use proto::{BlkConfig, BlkReqHeader, MAX_REQ_BYTES, SECTOR_SIZE, VIRTIO_BLK_DEVICE_ID};

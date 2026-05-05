@@ -74,8 +74,8 @@ extern "C" fn s_trap(
     cause: usize,
     status: usize,
     frame: &mut TrapFrame,
-    code: usize,
-    sarg: usize,
+    _code: usize,
+    _sarg: usize,
 ) -> usize {
     let hart_context =
         unsafe { (riscv::register::sscratch::read() as *mut HartContext).as_mut_unchecked() };

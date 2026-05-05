@@ -11,8 +11,7 @@ extern crate alloc;
 use core::panic::PanicInfo;
 
 use orbit_abi::{
-    serialln,
-    user::{SerialWriter, exit},
+    fs::{OPEN_RDONLY, Stat}, serialln, user::{SerialWriter, exit, fs_open, fs_read, fs_stat, serial_print}
 };
 use orbit_rt as _;
 
@@ -38,10 +37,66 @@ pub extern "C" fn main() -> i32 {
         serialln!("hello argv[{i}]={s}");
     }
 
+    do_fs_read_test();
+
     #[cfg(feature = "scrollback-stress")]
     scrollback_bounding_test();
 
     42
+}
+
+#[repr(align(4096))]
+struct Page {
+    pub b: [u8; 4096]
+}
+
+fn do_fs_read_test() {
+    let mut stat = Stat::default();
+    if let Err(e) = fs_stat("/bin/hello-std", &mut stat) {
+        serialln!("do_fs_read_test failed to stat: {e:?}");
+        return
+    }
+
+    serialln!("do_fs_read_test: {stat:?}");
+
+    let fd = match fs_open("/bin/hello-std", OPEN_RDONLY) {
+        Ok(f) => f,
+        Err(e) => {
+            serialln!("do_fs_read_test failed to open: {e:?}");
+            return
+        }
+    };
+
+    let mut page = Page { b: [0u8; 4096] };
+    let file_len = stat.st_size;
+    
+    let mut total_reads = 0;
+
+    let mut read_so_far = 0;
+    while read_so_far < file_len {
+        match fs_read(fd, &mut page.b[..]) {
+            Ok(read) => {
+                read_so_far += read as i64;
+                if read < 4096 {
+                    serialln!("do_fs_read_test only read {read}B");
+                }
+            },
+            Err(e) => {
+                serialln!("do_fs_read_test failed to read: {e:?}");
+                return
+            }
+        }
+        total_reads += 1;
+    }
+
+    let expected_reads = if (file_len % 4096) == 0 {
+        file_len / 4096
+    }
+    else {
+        (file_len / 4096) + 1
+    };
+
+    serialln!("do_fs_read_test total_reads: {total_reads}, expected: {expected_reads}");
 }
 
 /// Diagnostic for the kheap stats path. Writes a max-length line

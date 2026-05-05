@@ -197,10 +197,14 @@ impl Block {
         (kva, pa)
     }
 
-    /// Submit a single-sector read at `lba`; the device DMAs directly
-    /// into `dst_pa`. Returns the descriptor head — caller stashes it
-    /// to look up the in-flight request when [`drain_used`] reports
-    /// completion.
+    /// Submit a multi-sector read at `lba`; the device DMAs `len` bytes
+    /// of consecutive sectors directly into `dst_pa`. Returns the
+    /// descriptor head — caller stashes it to look up the in-flight
+    /// request when [`drain_used`] reports completion.
+    ///
+    /// `len` must be a non-zero multiple of [`SECTOR_SIZE`] and at most
+    /// [`MAX_REQ_BYTES`]; `dst_pa..dst_pa + len` must be one
+    /// physically-contiguous span (single data descriptor).
     ///
     /// # Safety
     /// - `dst_pa` must cover `len` bytes of memory the kernel keeps
@@ -213,13 +217,19 @@ impl Block {
         dst_pa: u64,
         len: u32,
     ) -> Result<u16, BlockError> {
-        if len as usize != SECTOR_SIZE {
+        if len == 0
+            || (len as usize) % SECTOR_SIZE != 0
+            || len > MAX_REQ_BYTES
+        {
             return Err(BlockError::BadLength {
                 wanted: SECTOR_SIZE,
                 got: len,
             });
         }
-        if lba >= self.capacity_sectors {
+        let sector_count = (len as u64) / SECTOR_SIZE as u64;
+        if lba >= self.capacity_sectors
+            || self.capacity_sectors - lba < sector_count
+        {
             return Err(BlockError::OutOfRange {
                 lba,
                 capacity: self.capacity_sectors,
@@ -294,7 +304,9 @@ impl Block {
     /// Polled-completion read of one sector at `lba` into `dst`. Used
     /// at mount time only (e.g. tarfs walking the archive header by
     /// header before IRQs are wired). `dst` must be exactly
-    /// [`SECTOR_SIZE`] bytes.
+    /// [`SECTOR_SIZE`] bytes — the sync-data bounce slot in the arena
+    /// is sized for one sector. Bringing up multi-sector blocking
+    /// reads would mean enlarging that slot, which we haven't needed.
     ///
     /// # Safety
     /// Caller must serialize concurrent calls. Mixing with the async

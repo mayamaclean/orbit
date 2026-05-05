@@ -238,22 +238,26 @@ impl Filesystem for Tarfs {
         dst_pa: u64,
         notif: WorkNotification,
     ) -> Result<(), FsErr> {
+        const PAGE: u64 = mmu::PAGE_SIZE as u64;
         let entry = self.entry(ino)?;
         if !matches!(entry.kind, Kind::Reg) {
             return Err(FsErr::NotRegular);
         }
-        if len as usize != SECTOR_SIZE {
+        if len as u64 != PAGE {
             return Err(FsErr::BadRange);
         }
-        if off & (SECTOR_SIZE as u64 - 1) != 0 {
+        if !off.is_multiple_of(PAGE) {
             return Err(FsErr::BadRange);
         }
-        if off >= entry.size {
+        // Allow the last (partial) page of a file: the DMA reads a full
+        // page, which may overrun into whatever follows in the tar
+        // image, and the syscall layer trims via `entry.size`.
+        if off >= entry.size.next_multiple_of(PAGE) {
             return Err(FsErr::BadRange);
         }
         let lba = entry.data_sector + off / SECTOR_SIZE as u64;
         unsafe {
-            virtio_blk_dev::submit_blk_read(lba, dst_pa, notif).map_err(|e| {
+            virtio_blk_dev::submit_blk_read(lba, dst_pa, len, notif).map_err(|e| {
                 warn!("tarfs: submit_blk_read failed: {:?}", e);
                 FsErr::IoError
             })?;
