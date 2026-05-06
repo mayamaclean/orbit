@@ -1075,7 +1075,11 @@ fn run_identity_probe() {
             serialln!("PASS: fs_open /etc/secret (0o600 root) returned EACCES")
         }
         Ok(fd) => serialln!("FAIL: fs_open /etc/secret unexpectedly opened fd={fd}"),
-        Err(e) => serialln!("FAIL: fs_open /etc/secret errno {} (want EACCES={})", e.0, EACCES),
+        Err(e) => serialln!(
+            "FAIL: fs_open /etc/secret errno {} (want EACCES={})",
+            e.0,
+            EACCES
+        ),
     }
 
     let tid_a = gettid();

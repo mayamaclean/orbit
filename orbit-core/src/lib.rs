@@ -40,9 +40,8 @@ pub use orbit_abi::roles;
 
 pub use pending_work::{
     CloseHandleReq, CreateProcessExReq, CreateProcessReq, CreateProcessV2Req, CreateThreadReq,
-    FsOpenReq, FsReadReq, FsReaddirReq, FsStatReq, FutexWaitReq, FutexWakeReq, IoWork,
-    MAX_FS_PATH_LEN, MemMapReq, NetChannelCreationReq, PendingWork, PledgeReq, SpawnContext,
-    WaitPidReq,
+    FsOpenReq, FsReadReq, FsReaddirReq, FsStatReq, FutexWaitReq, FutexWakeReq, MAX_FS_PATH_LEN,
+    MemMapReq, NetChannelCreationReq, PendingWork, PledgeReq, SpawnContext, WaitPidReq,
 };
 
 /// Page size assumed by pure logic when bounding user-memory ranges. Must

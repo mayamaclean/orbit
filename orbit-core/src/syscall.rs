@@ -370,19 +370,28 @@ pub fn fs_open_req<H: Hardware>(
     }
 }
 
+/// Max bytes per `fs_read` call. Backed by the page cache: a 64 KiB
+/// read fans out into up to 16 cache-page slots, each contributing
+/// up to two waiters (one per straddled user page). Sized at 16
+/// pages so a single call comfortably fits inside the cache's
+/// frame pool with slack for concurrent readers; raise alongside
+/// `CACHE_PAGES` if larger reads ever pay off.
+pub const MAX_FS_READ_LEN: usize = 16 * PAGE_SIZE;
+
 /// `fs_read(fd, buf_ptr, len) → bytes | -errno`. The kernel reads at
 /// the fd's current byte offset, returns up to `len` bytes (clipped
-/// at the next sector boundary and EOF), and advances the offset by
-/// exactly the number of bytes returned. `0` indicates EOF.
+/// at EOF), and advances the offset by exactly the number of bytes
+/// returned. `0` indicates EOF.
 ///
-/// Buffer constraints: `len` is 1..=PAGE_SIZE; the buffer must lie
-/// within a single 4 KiB page (the kernel's user-page window can't
-/// straddle), and the user VA range must pass `user_range_ok`.
+/// Buffer constraints: `len` is 1..=[`MAX_FS_READ_LEN`]; the buffer
+/// VA range must pass `user_range_ok`. The kernel walks the
+/// destination page-by-page, so multi-page buffers are supported —
+/// only the total length matters.
 ///
-/// Parks on a handle the kernel signals after the underlying disk
-/// read + scratch→user copy completes. If the manager-side submit
-/// fails (bad fd, queue full, …) the retained handle clone is
-/// signaled synchronously with the errno.
+/// Parks the calling thread; the manager wakes it (writing the byte
+/// count into `regs[10]`) once every page that needs a DMA has
+/// landed. Synchronous returns happen when every page is already a
+/// cache hit. On any per-page failure the call resolves to `-EIO`.
 pub fn fs_read_req<H: Hardware>(
     thread: &mut Thread,
     frame: &TrapFrame,
@@ -399,7 +408,7 @@ pub fn fs_read_req<H: Hardware>(
         buf_vaddr,
         len: frame.regs[13],
     };
-    if req.len == 0 || req.len > PAGE_SIZE {
+    if req.len == 0 || req.len > MAX_FS_READ_LEN {
         return SyscallOutcome::Return {
             ret: Errno::new(EINVAL).to_ret(),
         };
@@ -409,28 +418,17 @@ pub fn fs_read_req<H: Hardware>(
             ret: Errno::new(EFAULT).to_ret(),
         };
     }
-    // Buffer must fit within one page so the kernel's bounce-copy
-    // path can use a single `UserPageWindow`. Multi-page reads are
-    // not supported in v1; user code chunks at the page boundary.
-    let page_off = req.buf_vaddr.raw() & (PAGE_SIZE as u64 - 1);
-    if page_off + req.len as u64 > PAGE_SIZE as u64 {
-        return SyscallOutcome::Return {
-            ret: Errno::new(EINVAL).to_ret(),
-        };
-    }
-    let handle = CompletionHandle::new();
     let work = PendingWork::FsRead {
         req,
         pid: thread.pid,
         root_pa: thread.root_table_addr(),
-        handle: handle.clone(),
+        tid: thread.tid,
     };
     if hw.push_pending_work(work).is_err() {
         return SyscallOutcome::Return {
             ret: Errno::new(EAGAIN).to_ret(),
         };
     }
-    thread.handle = Some(handle);
     SyscallOutcome::Yield {
         state: ThreadState::Blocking,
         ret: None,
@@ -1103,6 +1101,7 @@ pub fn create_process_v2_req<H: Hardware>(
         req,
         pid: thread.pid,
         root_pa: thread.root_table_addr(),
+        tid: thread.tid,
         handle: handle.clone(),
     };
     if hw.push_pending_work(work).is_err() {

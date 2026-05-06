@@ -24,7 +24,6 @@ use net_channel::NetChannel;
 
 use crate::kernel::fs::Filesystem;
 use crate::kernel::fs::Inode;
-use crate::kernel::shared_frame::SharedFrame;
 use crate::kernel::shared_user_ptr::SharedUserPtr;
 
 /// Opaque per-process resource identifier. Not a hart-global value —
@@ -59,54 +58,11 @@ pub struct OpenFile {
     /// regular-file fd returns ENOTDIR before the cursor is read.
     pub dir_cursor: u64,
 
-    /// Per-fd page cache for regular files. The kernel's underlying
-    /// `fs_read` is page-granular, but the syscall surface accepts
-    /// arbitrary byte-aligned reads of arbitrary length up to one
-    /// page per call. The bridge is this cache: reads that fall
-    /// within an already-cached page copy out synchronously; reads
-    /// that miss DMA into the scratch page, then a manager-side
-    /// post-DMA step copies the requested slice to the user buffer.
-    ///
-    /// `None` for directories (use `fs_readdir` instead, no scratch
-    /// needed) and on close-handle teardown after the backing has
-    /// been freed.
-    pub scratch: Option<ScratchPage>,
-}
-
-/// Per-`OpenFile` page-sized cache. Owns a [`SharedFrame`] clone
-/// over the underlying `kernel_pages` page; the in-flight DMA
-/// descriptor holds another clone, so a `close_handle` while the
-/// DMA is mid-flight doesn't UAF the page — it just drops the
-/// fd-side clone, and the descriptor's clone keeps it alive until
-/// the manager finishes the post-DMA copy.
-///
-/// `loading` is the in-flight flag: true while a DMA into the
-/// scratch is outstanding (scratch contents undefined; cache-hit
-/// must not be served from the page). Cleared by
-/// `run_fs_read_copy` (success or failure) and on submit-failure
-/// rollback in `run_fs_read_req`. While loading, concurrent
-/// readers on the same fd see EAGAIN — the kernel doesn't queue
-/// per-fd waiters in v1.
-pub struct ScratchPage {
-    /// Refcounted backing. `frame.pa()` is the DMA target;
-    /// `frame.kva()` is the kernel-side VA for the cache-hit
-    /// memcpy into user buffers.
-    pub frame: SharedFrame,
-    /// File-relative page index currently held in the scratch
-    /// buffer (i.e. `byte_offset / PAGE_SIZE`). `u64::MAX` means
-    /// "empty / invalid"; treat as cache miss. Filesystem-agnostic:
-    /// the underlying LBA is computed by the FS impl from inode +
-    /// page index. Only updated on successful DMA completion —
-    /// never speculatively at submit time.
-    pub cached_page: u64,
-    /// Bytes considered valid in the scratch buffer (≤ PAGE_SIZE).
-    /// Published alongside `cached_page` from `run_fs_read_copy`
-    /// on success.
-    pub valid_bytes: u32,
-    /// True iff a DMA into this scratch is currently outstanding.
-    /// Read before the cache-hit check so a stale `cached_page`
-    /// can never be served while the page is being overwritten.
-    pub loading: bool,
+    /// Snapshot of `S_IFREG`-ness at fs_open time. Lets the read /
+    /// readdir paths reject the wrong kind without a fresh `stat`.
+    /// (For tarfs this never changes mid-flight; once mutable
+    /// filesystems land we'll re-evaluate.)
+    pub is_regular: bool,
 }
 
 /// Per-process handle table + next-ID counter. Owned by `Orbit`, keyed

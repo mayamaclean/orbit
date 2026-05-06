@@ -11,7 +11,7 @@ use core::{
 };
 use device::{HartContext, TrapFrame};
 use net_channel::NetChannel;
-use orbit_abi::{fs::ACCESS_R_OK, layout::UserVa, perms::Permissions};
+use orbit_abi::{layout::UserVa, perms::Permissions};
 use process::{Thread, ThreadState};
 use smoltcp::{
     iface::{PollResult, SocketHandle, SocketSet},
@@ -428,233 +428,6 @@ fn handle_dhcp_event(
     iface
 }
 
-/// Generic "kernel reads / waits on something and reports back to
-/// manager" kthread. Owns [`crate::kernel::IO_QUEUE`]; loops drain →
-/// dispatch per [`orbit_core::IoWork`] variant.
-///
-/// Today the only variant is `Spawn`: load an ELF off disk for a
-/// path-mode `create_process_v2`, then push
-/// `PendingWork::SpawnReady` so the manager finishes the install.
-/// Future variants (signed-binary verification, network-backed
-/// resources) follow the same pattern: do the slow work, then
-/// either signal the embedded `CompletionHandle` directly or bounce
-/// back to the manager via a matching `*Ready` PendingWork variant.
-///
-/// Park shape mirrors `k_gpu`: `kthread_park(Suspended, wake_at)`
-/// with a long timer fallback so a missed wake-event push doesn't
-/// strand the queue forever; the typical wake comes from
-/// `WAKE_QUEUE.push(WakeEvent::Io)` → `wake_override` →
-/// scheduler eager-promotion of Suspended → Ready.
-///
-/// During an in-progress load, `kthread_park(Blocking, 0)` is used
-/// to wait on the per-sector DMA completion; the IRQ handler signals
-/// the embedded `CompletionHandle` and the scheduler restores us
-/// with `frame.regs[10]` carrying the read result.
-#[unsafe(no_mangle)]
-pub extern "C" fn k_io(_a0: usize) {
-    use crate::kernel::IO_QUEUE;
-    use orbit_core::IoWork;
-    use tracing::info;
-
-    unsafe {
-        riscv::register::sstatus::clear_sie();
-    }
-
-    info!("k_io: ready");
-
-    loop {
-        unsafe {
-            riscv::register::sstatus::clear_sie();
-        }
-
-        // Drain all queued work. Each pop swaps the slot with
-        // `Default::default()` (= None for Option<Box<_>>); we take
-        // ownership of the Option, drop the slot ref, and dispatch.
-        while let Some(mut slot) = IO_QUEUE.pop_ref() {
-            let work_opt = core::mem::take(&mut *slot);
-            drop(slot);
-            if let Some(work) = work_opt {
-                match *work {
-                    IoWork::Spawn { ctx, handle, path } => {
-                        k_io_handle_spawn(*ctx, handle, path);
-                    }
-                }
-            }
-        }
-
-        // Park until next WakeEvent::Io fires (or 100 ms fallback —
-        // matches k_gpu's "if a producer push got lost we'll catch
-        // up next pass" safety net). 10 MHz timebase → 1_000_000
-        // ticks ≈ 100 ms.
-        let wake_at = riscv::register::time::read64().wrapping_add(1_000_000) as usize;
-        crate::kernel::context::kthread_park(process::ThreadState::Suspended, wake_at);
-    }
-}
-
-/// Path-mode `create_process_v2` worker. Resolves the path against
-/// the active fs, runs `vaccess(X)` against the caller's snapshotted
-/// effective creds, reads the bytes off disk sector-by-sector
-/// (parking the kthread on each DMA), and pushes
-/// [`orbit_core::PendingWork::SpawnReady`] so the manager finishes
-/// the install.
-///
-/// Any error path signals `caller_handle` directly with the errno —
-/// no manager bounce needed since the spawn never started.
-fn k_io_handle_spawn(
-    ctx: orbit_core::SpawnContext,
-    caller_handle: process::CompletionHandle,
-    path: alloc::string::String,
-) {
-    use crate::drivers::virtio_blk_dev::WorkNotification;
-    use crate::kernel::fs::FsErr;
-    use crate::kernel::{IO_SCRATCH_KVA, IO_SCRATCH_PA, MANAGER_WORK};
-    use core::sync::atomic::Ordering;
-    use orbit_abi::errno::{EINVAL, EIO, ENOEXEC, ENOENT, Errno};
-    use orbit_abi::fs::{ACCESS_X_OK, S_IFMT, S_IFREG};
-    use tracing::{debug, error, info};
-
-    info!("k_io: handle_spawn start path={path}");
-
-    const CHUNK: u64 = mmu::PAGE_SIZE as u64;
-    /// Mirror of the cap in `run_create_process_v2_req`. A larger ELF
-    /// would also blow the v2 handler's blob.
-    const MAX_ELF_BYTES: usize = 4 * 1024 * 1024;
-
-    let scratch_pa = IO_SCRATCH_PA.load(Ordering::Acquire);
-    let scratch_kva = IO_SCRATCH_KVA.load(Ordering::Acquire);
-    if scratch_pa == 0 || scratch_kva == 0 {
-        error!("k_io: scratch unallocated; failing path-mode spawn");
-        caller_handle.signal(Errno::new(EIO).to_ret());
-        return;
-    }
-
-    let Some(fs) = crate::kernel::fs::mounted()
-    else {
-        debug!("k_io: no mounted fs");
-        caller_handle.signal(Errno::new(EIO).to_ret());
-        return;
-    };
-    let inode = match fs.open(&path) {
-        Ok(i) => i,
-        Err(FsErr::NotFound) => {
-            caller_handle.signal(Errno::new(ENOENT).to_ret());
-            return;
-        }
-        Err(_) => {
-            caller_handle.signal(Errno::new(EIO).to_ret());
-            return;
-        }
-    };
-    let stat = match fs.stat(inode) {
-        Ok(s) => s,
-        Err(_) => {
-            caller_handle.signal(Errno::new(EIO).to_ret());
-            return;
-        }
-    };
-    if (stat.st_mode & S_IFMT) != S_IFREG {
-        caller_handle.signal(Errno::new(ENOEXEC).to_ret());
-        return;
-    }
-    if let Err(e) = orbit_abi::fs::vaccess(
-        ctx.parent_euid,
-        ctx.parent_egid,
-        &ctx.parent_groups,
-        &stat,
-        ACCESS_X_OK | ACCESS_R_OK,
-    ) {
-        debug!("k_io: vaccess(X) EACCES path={path} mode={:#o}", stat.st_mode);
-        caller_handle.signal(e.to_ret());
-        return;
-    }
-    let total = stat.st_size as u64;
-    if total == 0 || (total as usize) > MAX_ELF_BYTES {
-        caller_handle.signal(Errno::new(EINVAL).to_ret());
-        return;
-    }
-    info!("k_io: vaccess(X) ok, reading {total} bytes from path={path}");
-
-    let mut blob: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(total as usize);
-    let mut offset: u64 = 0;
-    while offset < total {
-        let read_handle = process::CompletionHandle::new();
-        let notif = WorkNotification::Direct {
-            handle: read_handle.clone(),
-            success_value: CHUNK as isize,
-        };
-        if let Err(e) = unsafe { fs.read_async(inode, offset, CHUNK as u32, scratch_pa, notif) }
-        {
-            debug!("k_io: read_async failed at off={offset}: {e:?}");
-            caller_handle.signal(Errno::new(EIO).to_ret());
-            return;
-        }
-
-        if offset == 0 {
-            info!("k_io: submitted first page read, parking");
-        }
-
-        // Wait for the sector to land. Mirrors k_net's
-        // `WakeEvent::Net`-driven park: park Suspended with a long
-        // heartbeat, IRQ handler pushes `WakeEvent::Io` to wake us,
-        // re-check `is_signaled` after each wake. The handle's
-        // wake-hook protocol is bypassed entirely (we don't install
-        // `thread.handle`); the IRQ just signals the value into the
-        // CompletionHandle and pushes WakeEvent::Io for the wakeup.
-        const WAKE_HEARTBEAT_CYCLES: u64 = 100_000;
-        while !read_handle.is_signaled() {
-            let wake_at = riscv::register::time::read64()
-                .wrapping_add(WAKE_HEARTBEAT_CYCLES) as usize;
-            crate::kernel::context::kthread_park(
-                process::ThreadState::Suspended,
-                wake_at,
-            );
-        }
-        let result = read_handle.ret(0) as isize;
-        if offset == 0 {
-            info!("k_io: first page resume, result={result}");
-        }
-        if result < 0 {
-            debug!("k_io: read_async failed at off={offset}: result={result}");
-            caller_handle.signal(Errno::new(EIO).to_ret());
-            return;
-        }
-        let take = core::cmp::min(CHUNK, total - offset) as usize;
-        unsafe {
-            let src = core::slice::from_raw_parts(scratch_kva as *const u8, take);
-            blob.extend_from_slice(src);
-        }
-        offset += CHUNK;
-    }
-
-    // Hand off to the manager via PendingWork::SpawnReady. On queue
-    // overflow we extract the handle from the bounced item and
-    // signal EAGAIN so the caller doesn't park forever.
-    let ready = orbit_core::PendingWork::SpawnReady {
-        ctx: alloc::boxed::Box::new(ctx),
-        blob,
-        handle: caller_handle,
-    };
-    info!("k_io: read complete, pushing SpawnReady");
-    match MANAGER_WORK.push_ref() {
-        Ok(mut slot) => {
-            *slot = ready;
-            // Tickle manager hart so it picks up the bounce-back
-            // promptly. The matching scheduler scan will dispatch
-            // the SpawnReady arm on the next manager pass.
-            let _ = crate::kernel::WAKE_QUEUE.push(crate::kernel::WakeEvent::Io);
-        }
-        Err(_) => {
-            // push_ref returns Err without committing — `ready` is
-            // still owned here, so we destructure to get the handle
-            // back and signal EAGAIN inline. Caller can retry.
-            error!("k_io: MANAGER_WORK full on SpawnReady — signaling EAGAIN");
-            if let orbit_core::PendingWork::SpawnReady { handle, .. } = ready {
-                handle.signal(Errno::new(orbit_abi::errno::EAGAIN).to_ret());
-            }
-        }
-    }
-}
-
 #[unsafe(no_mangle)]
 pub extern "C" fn k_net(device: *mut NetPackage) {
     use tracing::{error, info};
@@ -933,14 +706,16 @@ pub fn check_context_and_switch() -> ! {
         else if thread_state == ThreadState::Suspended as usize {
             tracing::info!(
                 "DBG check_ctx_switch null-cur(Suspended): hart={} tid={}",
-                c.hart_id, thread.tid,
+                c.hart_id,
+                thread.tid,
             );
             c.current.store(null_mut(), Ordering::Release);
         }
         else if thread_state == ThreadState::Blocking as usize {
             tracing::info!(
                 "DBG check_ctx_switch null-cur(Blocking): hart={} tid={}",
-                c.hart_id, thread.tid,
+                c.hart_id,
+                thread.tid,
             );
             c.current.store(null_mut(), Ordering::Release);
         }

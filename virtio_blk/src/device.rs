@@ -217,19 +217,14 @@ impl Block {
         dst_pa: u64,
         len: u32,
     ) -> Result<u16, BlockError> {
-        if len == 0
-            || (len as usize) % SECTOR_SIZE != 0
-            || len > MAX_REQ_BYTES
-        {
+        if len == 0 || (len as usize) % SECTOR_SIZE != 0 || len > MAX_REQ_BYTES {
             return Err(BlockError::BadLength {
                 wanted: SECTOR_SIZE,
                 got: len,
             });
         }
         let sector_count = (len as u64) / SECTOR_SIZE as u64;
-        if lba >= self.capacity_sectors
-            || self.capacity_sectors - lba < sector_count
-        {
+        if lba >= self.capacity_sectors || self.capacity_sectors - lba < sector_count {
             return Err(BlockError::OutOfRange {
                 lba,
                 capacity: self.capacity_sectors,

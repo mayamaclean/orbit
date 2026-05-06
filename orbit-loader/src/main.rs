@@ -292,7 +292,7 @@ fn spawn_init_from_argv() {
         groups_vaddr: 0,
         groups_count: 0,
         spawn_path_len: 0,
-        spawn_path_vaddr: 0
+        spawn_path_vaddr: 0,
     };
     match create_process_v2(&args) {
         Ok(pid) => logln!(
@@ -476,7 +476,7 @@ fn spawn(body_only: &[u8]) -> Result<u16, LoaderErr> {
         groups_vaddr: 0,
         groups_count: 0,
         spawn_path_len: 0,
-        spawn_path_vaddr: 0
+        spawn_path_vaddr: 0,
     };
     create_process_v2(&args).map_err(LoaderErr::Syscall)
 }

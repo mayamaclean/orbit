@@ -372,7 +372,7 @@ pub struct Thread {
     /// Syscalls dispatched against this thread.
     pub syscall_count: AtomicU64,
     /// Cumulative kernel service ticks across this thread's syscalls
-    /// (excludes time spent parked on a `ThreadBlockReason`).
+    /// (excludes time spent parked).
     pub syscall_ticks: AtomicU64,
     /// Snapshot of the owning process's [`Permissions`] at the time
     /// the thread was created. Refreshed when the process pledges

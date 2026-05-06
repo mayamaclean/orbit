@@ -11,7 +11,9 @@ extern crate alloc;
 use core::panic::PanicInfo;
 
 use orbit_abi::{
-    fs::{OPEN_RDONLY, Stat}, serialln, user::{SerialWriter, exit, fs_open, fs_read, fs_stat, serial_print}
+    fs::{OPEN_RDONLY, Stat},
+    serialln,
+    user::{SerialWriter, exit, fs_open, fs_read, fs_stat},
 };
 use orbit_rt as _;
 
@@ -45,16 +47,13 @@ pub extern "C" fn main() -> i32 {
     42
 }
 
-#[repr(align(4096))]
-struct Page {
-    pub b: [u8; 4096]
-}
-
 fn do_fs_read_test() {
+    const RSIZE: usize = 64 * 1024;
+
     let mut stat = Stat::default();
     if let Err(e) = fs_stat("/bin/hello-std", &mut stat) {
         serialln!("do_fs_read_test failed to stat: {e:?}");
-        return
+        return;
     }
 
     serialln!("do_fs_read_test: {stat:?}");
@@ -63,37 +62,37 @@ fn do_fs_read_test() {
         Ok(f) => f,
         Err(e) => {
             serialln!("do_fs_read_test failed to open: {e:?}");
-            return
+            return;
         }
     };
 
-    let mut page = Page { b: [0u8; 4096] };
+    let mut buf = [0u8; RSIZE];
     let file_len = stat.st_size;
-    
+
     let mut total_reads = 0;
 
     let mut read_so_far = 0;
     while read_so_far < file_len {
-        match fs_read(fd, &mut page.b[..]) {
+        match fs_read(fd, &mut buf[..]) {
             Ok(read) => {
                 read_so_far += read as i64;
-                if read < 4096 {
+                if read < RSIZE {
                     serialln!("do_fs_read_test only read {read}B");
                 }
-            },
+            }
             Err(e) => {
                 serialln!("do_fs_read_test failed to read: {e:?}");
-                return
+                return;
             }
         }
         total_reads += 1;
     }
 
-    let expected_reads = if (file_len % 4096) == 0 {
-        file_len / 4096
+    let expected_reads = if (file_len % RSIZE as i64) == 0 {
+        file_len / RSIZE as i64
     }
     else {
-        (file_len / 4096) + 1
+        (file_len / RSIZE as i64) + 1
     };
 
     serialln!("do_fs_read_test total_reads: {total_reads}, expected: {expected_reads}");

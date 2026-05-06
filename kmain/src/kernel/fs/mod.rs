@@ -16,8 +16,6 @@
 
 use orbit_abi::fs::Stat;
 
-pub use crate::drivers::virtio_blk_dev::{CopyDescriptor, WorkNotification};
-
 pub mod tar;
 
 /// Filesystem-internal inode id. Stable for the lifetime of the mount.
@@ -42,41 +40,27 @@ pub enum FsErr {
 }
 
 pub trait Filesystem: Send + Sync {
+    /// Stable device id for this mount. Matches `Stat.st_dev` and
+    /// keys the page cache (`(dev, lba)`); each mount must return a
+    /// distinct value. Tarfs pins to `1` (single-mount today).
+    fn dev_id(&self) -> u8;
+
+    /// Translate a file-relative page index to the page-aligned
+    /// LBA on the backing device. Drives both the cache key
+    /// (computed at lookup time) and the DMA submission (PA derived
+    /// from this LBA + the cache slot's frame).
+    ///
+    /// Tarfs: `entry.data_sector + page_idx * (PAGE_SIZE / SECTOR_SIZE)`.
+    /// Future FSes (ext2/minix) walk indirect blocks here.
+    ///
+    /// Errors `BadInode` / `NotRegular` / `BadRange` mirror the
+    /// existing `read_async` shape.
+    fn lba_for_page(&self, ino: Inode, page_idx: u64) -> Result<u64, FsErr>;
+
     /// Resolve `path` to an inode. Path is normalized: leading `./`
     /// is stripped at parse time, lookup keys are absolute (`/foo`).
     /// Returns `NotFound` for paths the FS doesn't have.
     fn open(&self, path: &str) -> Result<Inode, FsErr>;
-
-    /// Submit one page-sized read. `notif` carries both the completion
-    /// handle and the post-DMA action (direct signal vs. manager-side
-    /// scratch→user copy); the FS layer just forwards it to the block
-    /// driver.
-    ///
-    /// v1 contract:
-    /// - `len` must equal `PAGE_SIZE` (4096).
-    /// - `off` must be a `PAGE_SIZE` multiple.
-    /// - `off` must lie within the file rounded up to the next page —
-    ///   i.e. `off < round_up(size, PAGE_SIZE)`. The last page of a
-    ///   file is read fully (DMA may overrun into following sectors of
-    ///   the backing image) and the caller trims via the inode's true
-    ///   `size`.
-    ///
-    /// On submit failure the boxed `notif` is dropped (taking the
-    /// handle inside it with it); the caller is expected to retain
-    /// its own handle clone if it needs to signal an errno.
-    ///
-    /// # Safety
-    /// `dst_pa` must reference `PAGE_SIZE` bytes of physically-
-    /// contiguous memory the kernel keeps mapped until the
-    /// notification is dispatched.
-    unsafe fn read_async(
-        &self,
-        ino: Inode,
-        off: u64,
-        len: u32,
-        dst_pa: u64,
-        notif: WorkNotification,
-    ) -> Result<(), FsErr>;
 
     /// Fill `*out` with stat info for `ino`. Synchronous — tar's
     /// table is in-memory.

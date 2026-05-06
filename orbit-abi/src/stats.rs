@@ -85,8 +85,8 @@ pub struct ProcessStats {
 
     // ─── per-process syscall service time ────────────────────────────
     /// Cumulative kernel service time across all syscalls dispatched
-    /// against threads of this process. Excludes time spent parked on
-    /// a `ThreadBlockReason` — measures kernel work, not response time.
+    /// against threads of this process. Excludes time spent parked
+    /// — measures kernel work, not response time.
     pub syscall_ticks: u64,
 
     // ─── system-wide hart accounting (summed across every hart) ──────

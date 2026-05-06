@@ -5,7 +5,7 @@ use core::sync::atomic::Ordering;
 use device::{HartContext, TRAP_STACK_SIZE};
 use process::{FaultInfo, Thread, ThreadState};
 use riscv::register::sstatus::SPP;
-use tracing::{error};
+use tracing::error;
 
 use crate::kernel::user_trap_frame_vaddr;
 
@@ -218,7 +218,6 @@ pub fn kthread_park(state: ThreadState, wake_time: usize) {
         );
     }
 
-    
     let tstate = thread.state.load(Ordering::Acquire);
     if tstate != ThreadState::Running as usize {
         let tid = thread.tid;
@@ -267,7 +266,6 @@ pub fn kthread_park(state: ThreadState, wake_time: usize) {
         );
     }
 }
-
 
 /// Stash a `FaultInfo` on the current thread and exit it. Called from the trap
 /// handler when a user thread can't continue (page fault, bad ecall, etc.).

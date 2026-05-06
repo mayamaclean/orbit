@@ -312,15 +312,9 @@ mod tests {
         assert!(vaccess(1000, 1000, &[], &s, ACCESS_R_OK).is_ok());
         assert!(vaccess(1000, 1000, &[], &s, ACCESS_X_OK).is_ok());
         assert_eq!(
-            vaccess(
-                1000,
-                1000,
-                &[],
-                &s,
-                ACCESS_R_OK | ACCESS_W_OK,
-            )
-            .unwrap_err()
-            .0,
+            vaccess(1000, 1000, &[], &s, ACCESS_R_OK | ACCESS_W_OK,)
+                .unwrap_err()
+                .0,
             crate::errno::EACCES
         );
     }

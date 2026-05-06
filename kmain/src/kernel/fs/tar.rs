@@ -15,11 +15,10 @@ use alloc::vec::Vec;
 use orbit_abi::fs::{
     DIRENT_ALIGN, DIRENT_HDR_LEN, DT_DIR, DT_REG, DirEntry, S_IFDIR, S_IFREG, STAT_BLOCK_UNIT, Stat,
 };
-use tracing::{info, warn};
+use tracing::info;
 use virtio_blk::{Block, BlockError, SECTOR_SIZE};
 
-use crate::drivers::virtio_blk_dev;
-use crate::kernel::fs::{Filesystem, FsErr, Inode, WorkNotification};
+use crate::kernel::fs::{Filesystem, FsErr, Inode};
 
 const HEADER_NAME_LEN: usize = 100;
 const HEADER_MODE_OFFSET: usize = 100;
@@ -226,43 +225,28 @@ impl Tarfs {
 }
 
 impl Filesystem for Tarfs {
-    fn open(&self, path: &str) -> Result<Inode, FsErr> {
-        self.by_path.get(path).copied().ok_or(FsErr::NotFound)
+    fn dev_id(&self) -> u8 {
+        // Single-mount today; pin to 1 so consumers can match
+        // against `Stat.st_dev` (which `stat` also pins to 1).
+        1
     }
 
-    unsafe fn read_async(
-        &self,
-        ino: Inode,
-        off: u64,
-        len: u32,
-        dst_pa: u64,
-        notif: WorkNotification,
-    ) -> Result<(), FsErr> {
+    fn lba_for_page(&self, ino: Inode, page_idx: u64) -> Result<u64, FsErr> {
         const PAGE: u64 = mmu::PAGE_SIZE as u64;
+        const SECTORS_PER_PAGE: u64 = PAGE / SECTOR_SIZE as u64;
         let entry = self.entry(ino)?;
         if !matches!(entry.kind, Kind::Reg) {
             return Err(FsErr::NotRegular);
         }
-        if len as u64 != PAGE {
+        let page_off = page_idx.checked_mul(PAGE).ok_or(FsErr::BadRange)?;
+        if page_off >= entry.size.next_multiple_of(PAGE) {
             return Err(FsErr::BadRange);
         }
-        if !off.is_multiple_of(PAGE) {
-            return Err(FsErr::BadRange);
-        }
-        // Allow the last (partial) page of a file: the DMA reads a full
-        // page, which may overrun into whatever follows in the tar
-        // image, and the syscall layer trims via `entry.size`.
-        if off >= entry.size.next_multiple_of(PAGE) {
-            return Err(FsErr::BadRange);
-        }
-        let lba = entry.data_sector + off / SECTOR_SIZE as u64;
-        unsafe {
-            virtio_blk_dev::submit_blk_read(lba, dst_pa, len, notif).map_err(|e| {
-                warn!("tarfs: submit_blk_read failed: {:?}", e);
-                FsErr::IoError
-            })?;
-        }
-        Ok(())
+        Ok(entry.data_sector + page_idx * SECTORS_PER_PAGE)
+    }
+
+    fn open(&self, path: &str) -> Result<Inode, FsErr> {
+        self.by_path.get(path).copied().ok_or(FsErr::NotFound)
     }
 
     fn stat(&self, ino: Inode) -> Result<Stat, FsErr> {

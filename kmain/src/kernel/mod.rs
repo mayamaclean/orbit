@@ -34,7 +34,7 @@ use orbit_core::{
 };
 use thingbuf::StaticThingBuf;
 
-use crate::kernel::fs::{FsErr, WorkNotification};
+use crate::kernel::fs::FsErr;
 use crate::kernel::handle::{Handle, OpenFile, ProcessHandles};
 use crate::kernel::memmap::FrameToKdmap;
 use crate::kernel::shared_user_ptr::SharedUserPtr;
@@ -60,6 +60,7 @@ pub mod handle;
 pub mod input;
 pub mod memmap;
 pub mod orbital_elf;
+pub mod page_cache;
 pub mod pci;
 pub mod pending_frees;
 pub mod shared_frame;
@@ -109,49 +110,6 @@ pub static MANAGER_WORK: StaticThingBuf<PendingWork, 32> = StaticThingBuf::new()
 /// Default slot is `WakeEvent::None` (the Default impl returns it).
 pub static WAKE_QUEUE: StaticThingBuf<WakeEvent, 64> = StaticThingBuf::new();
 
-/// Lock-free MPSC queue of work items handed to `k_io` — the generic
-/// "kernel reads / waits on something and reports back to manager"
-/// kthread. See [`orbit_core::IoWork`] for the variant set.
-///
-/// Producers: any manager arm or trap handler that needs to do
-/// blocking I/O without holding the manager up. Push a boxed
-/// [`orbit_core::IoWork`] (boxed so per-slot footprint is one
-/// pointer + an `Option` tag), then `WAKE_QUEUE.push(WakeEvent::Io)`
-/// so k_io's wake_override fires on the next manager pass.
-///
-/// Consumer: `k_io` exclusively. The kthread loops drain → dispatch
-/// per variant → either signals the embedded `CompletionHandle`
-/// directly (cheap path) or pushes a `PendingWork::*Ready` entry
-/// back through `MANAGER_WORK` for the manager to finish (when
-/// Orbit-state mutation is needed — `MANAGER_LOCK` only flips on the
-/// manager hart).
-///
-/// Cap is 16 — spawn rate is bounded by user-space "exec" calls,
-/// nowhere close to a hot path. If a future variant raises the
-/// throughput we'll bump this; full-on-push drops are best-effort
-/// shaped (caller can retry or surface `EAGAIN`).
-///
-/// Default slot is `None` so empty slots are zero-cost.
-pub static IO_QUEUE: StaticThingBuf<Option<alloc::boxed::Box<orbit_core::IoWork>>, 16> =
-    StaticThingBuf::new();
-
-/// PA of `k_io`'s page-sized DMA scratch buffer. Latched by
-/// `setup_io_kthread` at boot from a freshly-allocated KDMAP frame.
-/// `0` until that fires; `k_io` checks for `0` and signals `EIO` on
-/// the (impossible-in-practice) "tried to do a read before scratch
-/// was allocated" path.
-///
-/// Single-page is sufficient because k_io is single-threaded — at
-/// most one DMA in flight at a time, page-sized. A future throughput
-/// optimization (overlapping the next read with the in-flight one)
-/// would replace this with a per-in-flight pool.
-pub static IO_SCRATCH_PA: AtomicU64 = AtomicU64::new(0);
-
-/// KVA of the same page as [`IO_SCRATCH_PA`]. KDMAP-mapped so `k_io`
-/// can read the bytes after the IRQ signals completion (DMA writes
-/// to the PA, kernel reads from the matching KVA).
-pub static IO_SCRATCH_KVA: AtomicUsize = AtomicUsize::new(0);
-
 /// Lock-free MPSC ring of denial events produced by the dispatch-
 /// site gate. Producers: any hart's `s_trap` cause=8 arm on syscall
 /// denial. Consumer: the manager drains this alongside
@@ -186,13 +144,6 @@ pub enum WakeEvent {
     /// Wake every kernel thread (pid=0). Today that's k_net (and
     /// possibly k_gpu); a finer-grained variant can come later.
     Net,
-    /// Wake `k_io` — the generic "kernel reads / waits on something
-    /// and reports back to the manager" kthread. Pushed by manager
-    /// arms that hand work to [`IO_QUEUE`]; targets `k_io`'s tid via
-    /// the [`Orbit::io_thread_tid`] latch (falls back to coarse
-    /// pid=0 wake during the boot window before the latch fires,
-    /// same shape as [`WakeEvent::Net`]).
-    Io,
     /// Wake every thread of the given user pid. Coarse but cheap —
     /// each thread re-checks its own wait predicate on wake and
     /// re-parks if not actually ready, so over-waking is harmless.
@@ -417,13 +368,6 @@ pub struct Orbit {
     /// tid so unrelated kernel threads (k_gpu) aren't woken
     /// spuriously by every netch tickle.
     net_thread_tid: Option<u32>,
-    /// Latched tid of `k_io` once `setup_io_kthread` succeeds. Same
-    /// shape and use as [`Self::net_thread_tid`] but for the generic
-    /// "kernel reads/waits and reports back to manager" kthread that
-    /// owns [`IO_QUEUE`]. `None` during the boot window before
-    /// `k_io` is up; consumers fall back to a coarse pid=0 wake
-    /// during that window — same safety net as `net_thread_tid`.
-    io_thread_tid: Option<u32>,
     orphaned_sockets: Vec<SocketHandle>,
 
     /// Min-heap of `(wake_time, sleep_seq, *mut Thread)` for Suspended
@@ -449,6 +393,28 @@ pub struct Orbit {
     /// `SocketReq`. On process exit the table is walked to revoke
     /// every Shared mapping before the manager drops its Arcs.
     process_handles: BTreeMap<u16, ProcessHandles>,
+
+    /// Block-keyed page cache. `None` until [`setup_page_cache`]
+    /// runs at boot. Mediates every fs read: lookup → Ready (sync
+    /// copy) / Loading (register waiter) / Absent (start a fill).
+    /// Mutated only under MANAGER_LOCK.
+    pub page_cache: Option<crate::kernel::page_cache::PageCache>,
+
+    /// Per-tid in-flight fs_read state. A multi-page read may
+    /// fan out across several cache slots and several waiters; each
+    /// completion decrements `bytes_pending` and the last one
+    /// resumes the parked thread with `bytes_done` (or `-EIO` on
+    /// any per-page failure). Empty for synchronous all-hits reads
+    /// — the manager just calls `resume_thread_with_value` inline.
+    fs_reads_in_progress: BTreeMap<u32, FsReadInProgress>,
+
+    /// Per-tid in-flight path-mode spawn state machines. Created
+    /// by the path-mode arm of `run_create_process_v2_req` once
+    /// it's done validation + blob alloc + page-0 read; advanced
+    /// by `run_cache_fill` for each completing kernel waiter;
+    /// destroyed when the last page lands (install runs, handle
+    /// signaled). Replaces the old k_io kthread.
+    spawns_in_progress: BTreeMap<u32, SpawnInProgress>,
 
     /// §13a.5 — futex wait queues keyed on the *physical* page+offset
     /// of `uaddr`. Two threads in different processes that mapped the
@@ -487,6 +453,78 @@ pub struct FutexWaiter {
     /// `timeout_ns` (the timeout-scan path lands when std::sync needs
     /// it).
     pub deadline_ticks: u64,
+}
+
+/// Frame-pool size for the page cache. 64 frames × `PAGE_SIZE` =
+/// 256 KiB of cached file pages — comfortably exceeds the
+/// `MAX_FS_READ_LEN` (64 KiB → up to 16 cache pages) so a single
+/// large read can't exhaust the pool, and big enough to absorb
+/// tarfs metadata + a couple of open binaries.
+pub const PAGE_CACHE_CAPACITY: usize = 64;
+
+/// Per-tid in-flight state for a `fs_read` call that fanned out
+/// across at least one cache miss / coalesced waiter. Created in
+/// [`Orbit::run_fs_read_req`] when any waiter gets registered;
+/// destroyed by the per-waiter completion arm of
+/// [`Orbit::run_cache_fill`] once `bytes_pending` reaches zero
+/// (which then resumes the parked tid with `bytes_done` or `-EIO`).
+///
+/// All-Ready-hits reads never construct one — the manager copies
+/// inline and resumes immediately.
+#[derive(Debug)]
+pub struct FsReadInProgress {
+    /// Sum of `len` across the still-outstanding waiters. Decreases
+    /// to zero as each cache fill completes.
+    pub bytes_pending: u32,
+    /// Bytes successfully copied into the user buffer so far.
+    /// Frozen on first failure; if `failed` is set, the eventual
+    /// resume returns `-EIO` regardless of this.
+    pub bytes_done: u32,
+    /// Sticky flag: any per-page failure makes the entire read
+    /// resolve as `-EIO`. Strict POSIX-prefix semantics (return the
+    /// contiguous successful prefix, ignore subsequent failures) is
+    /// a v2 improvement.
+    pub failed: bool,
+}
+
+/// Per-tid state machine for a path-mode `create_process_v2` spawn.
+/// The manager initiates a read of page 0 inline at v2-dispatch
+/// time, parks the caller via the carried `handle`, and returns. As
+/// each per-page `CacheFill` lands the manager checks
+/// `spawns_in_progress[tid]`; if found and more pages remain, it
+/// issues the next page; if all pages have landed it runs
+/// [`Orbit::install_spawn`] and signals the handle with the new
+/// pid (or errno).
+///
+/// The state machine replaces the old k_io kthread loop, which
+/// parked synchronously on per-sector handles. Splitting the work
+/// across cache events keeps the manager non-blocking — each event
+/// handler runs short.
+pub struct SpawnInProgress {
+    /// Validated context captured at v2 dispatch time. Used to
+    /// drive `install_spawn` once the blob is fully populated.
+    pub ctx: orbit_core::SpawnContext,
+    /// Resolved inode of the spawn-source path. Used by
+    /// `lba_for_page` for each page read.
+    pub inode: crate::kernel::fs::Inode,
+    /// Growable buffer the cache fills write directly into. Sized
+    /// to the file's reported length at start.
+    pub blob: alloc::vec::Vec<u8>,
+    /// File size in bytes (`= blob.len()` once filled).
+    pub total_size: u64,
+    /// Number of pages that have completed the cache → blob copy
+    /// step. Increments per `CacheFill`. The next page to issue is
+    /// `pages_done` (when issuing matches `pages_done == issued`,
+    /// which is true here since each issue waits for completion
+    /// before issuing the next — a future optimization could
+    /// pipeline issues, at which point `pages_issued` becomes a
+    /// separate counter).
+    pub pages_done: u64,
+    /// `ceil(total_size / PAGE_SIZE)` — total page reads we'll do.
+    pub total_pages: u64,
+    /// Caller's CompletionHandle. Signaled with the new pid on
+    /// successful install, or with `-errno` on any failure.
+    pub handle: process::CompletionHandle,
 }
 
 impl Orbit {
@@ -619,7 +657,6 @@ impl Orbit {
             processes: BTreeMap::new(),
             threads: BTreeMap::new(),
             net_thread_tid: None,
-            io_thread_tid: None,
             net_pkg: NetPackage {
                 phy: None,
                 iface: None,
@@ -631,6 +668,9 @@ impl Orbit {
             sleeping: SleepHeap::new(),
             ready: ReadyQueue::new(),
             process_handles: BTreeMap::new(),
+            page_cache: None,
+            fs_reads_in_progress: BTreeMap::new(),
+            spawns_in_progress: BTreeMap::new(),
             futex_waiters: BTreeMap::new(),
             denial_ring: orbit_core::denial_ring::DenialRing::new(),
         }
@@ -1168,18 +1208,12 @@ impl Orbit {
     ///
     /// `ESRCH` if `pid` isn't in the process table — same shape as
     /// the other `run_*_req` helpers.
-    fn vaccess_pid(
-        &self,
-        pid: u16,
-        st: &orbit_abi::fs::Stat,
-        want: u32,
-    ) -> Result<(), isize> {
+    fn vaccess_pid(&self, pid: u16, st: &orbit_abi::fs::Stat, want: u32) -> Result<(), isize> {
         let proc = match self.processes.get(&pid) {
             Some(p) => p,
             None => return Err(Errno::new(ESRCH).to_ret()),
         };
-        orbit_abi::fs::vaccess(proc.euid, proc.egid, &proc.groups, st, want)
-            .map_err(|e| e.to_ret())
+        orbit_abi::fs::vaccess(proc.euid, proc.egid, &proc.groups, st, want).map_err(|e| e.to_ret())
     }
 
     /// Copy `len` bytes of a user path string into a kernel-side
@@ -1231,11 +1265,9 @@ impl Orbit {
             Err(FsErr::NotFound) => return Errno::new(orbit_abi::errno::ENOENT).to_ret(),
             Err(_) => return Errno::new(EIO).to_ret(),
         };
-        // Allocate the per-fd sector cache for regular files. Stat
-        // tells us the kind. For directories the scratch is `None` —
-        // dir reads go through `fs_readdir`, which has its own
-        // page-aligned out-buffer in user space and doesn't need the
-        // bounce.
+        // Snapshot kind for the read/readdir gate. The page cache
+        // owns all DMA scratch now, so per-fd state is just
+        // `(offset, dir_cursor, is_regular)`.
         let stat = match fs.stat(inode) {
             Ok(s) => s,
             Err(_) => return Errno::new(EIO).to_ret(),
@@ -1249,35 +1281,13 @@ impl Orbit {
         // final inode; that's already a meaningful improvement over
         // "any process can read anything that role-FS_RO permits."
         if let Err(e) = self.vaccess_pid(pid, &stat, orbit_abi::fs::ACCESS_R_OK) {
-            debug!("fs_open: vaccess EACCES pid={pid} path={path} mode={:#o}", stat.st_mode);
+            debug!(
+                "fs_open: vaccess EACCES pid={pid} path={path} mode={:#o}",
+                stat.st_mode
+            );
             return e;
         }
-        let is_reg = (stat.st_mode & orbit_abi::fs::S_IFMT) == orbit_abi::fs::S_IFREG;
-        let scratch = if is_reg {
-            let layout = match Layout::from_size_align(PAGE_SIZE, PAGE_SIZE) {
-                Ok(l) => l,
-                Err(_) => return Errno::new(EIO).to_ret(),
-            };
-            let frame = match crate::kernel::shared_frame::SharedFrame::alloc(
-                &mut self.kernel_pages,
-                layout,
-            ) {
-                Some(f) => f,
-                None => {
-                    error!("fs_open: kernel_pages exhausted; cannot allocate scratch");
-                    return Errno::new(orbit_abi::errno::ENOMEM).to_ret();
-                }
-            };
-            Some(crate::kernel::handle::ScratchPage {
-                frame,
-                cached_page: u64::MAX,
-                valid_bytes: 0,
-                loading: false,
-            })
-        }
-        else {
-            None
-        };
+        let is_regular = (stat.st_mode & orbit_abi::fs::S_IFMT) == orbit_abi::fs::S_IFREG;
         // Lazy-create the handle table — same pattern create_netch
         // uses, since a process that opens a file before ever creating
         // a NetChannel won't have an entry yet.
@@ -1290,311 +1300,335 @@ impl Orbit {
                 inode,
                 offset: 0,
                 dir_cursor: 0,
-                scratch,
+                is_regular,
             }));
         debug!("fs_open: pid={pid} path={path} → fd={fd} ino={inode}");
         fd as isize
     }
 
-    /// Owns the `handle` it's passed: either consumes it into a
-    /// `WorkNotification::Bounce` (async — IRQ + manager FsReadCopy
-    /// signal it) or signals it inline with the appropriate value.
-    /// Caller must not signal again.
-    fn run_fs_read_req(
-        &mut self,
-        req: FsReadReq,
-        pid: u16,
-        root_pa: PhysAddr,
-        handle: process::CompletionHandle,
-    ) {
+    /// Cache-driven `fs_read`. Walks the requested range page-by-
+    /// page, dispatching each user-buffer slice via the page cache:
+    /// Ready hits copy out synchronously; Loading slots register a
+    /// waiter and coalesce; Absent slots allocate + submit a DMA
+    /// (`submit_blk_read_cached`).
+    ///
+    /// All-Ready (or all-EOF) reads resume `tid` inline with the
+    /// total bytes copied. Reads that registered any waiter insert
+    /// an [`FsReadInProgress`] entry keyed by tid; the matching
+    /// completions in [`run_cache_fill`] decrement `bytes_pending`,
+    /// and the last completion resumes the parked thread.
+    ///
+    /// Per-page failures during the walk (lba lookup, virt_to_phys,
+    /// PoolExhausted, submit) truncate the read at the offset
+    /// reached so far. If at least one byte landed by then the read
+    /// completes with that byte count; if zero, it resolves to
+    /// `-EIO` (or the more specific errno for sync-error cases like
+    /// EBADF / EISDIR / EFAULT).
+    fn run_fs_read_req(&mut self, req: FsReadReq, pid: u16, root_pa: PhysAddr, tid: u32) {
         const PAGE: u64 = PAGE_SIZE as u64;
+        use crate::kernel::page_cache::{CacheKey, SlotState, Waiter};
 
-        // Look up the file handle and snapshot what we need.
-        let Some(ph) = self.process_handles.get_mut(&pid)
-        else {
-            handle.signal(Errno::new(EBADF).to_ret());
-            return;
-        };
-        let Some(handle_ref) = ph.get_mut(req.fd)
-        else {
-            handle.signal(Errno::new(EBADF).to_ret());
-            return;
-        };
-        let Handle::File(of) = handle_ref
-        else {
-            handle.signal(Errno::new(EBADF).to_ret());
-            return;
+        // Snapshot fd-side state up front, drop the handle-table
+        // borrow before touching `self.page_cache`. `is_regular`
+        // rides on the legacy per-fd scratch sentinel (Some =
+        // regular, None = directory) — the field stays for now
+        // since we'll retire it wholesale in the cleanup pass.
+        let (fs, inode, prev_off, is_regular) = {
+            let Some(ph) = self.process_handles.get_mut(&pid)
+            else {
+                self.resume_thread_with_value(tid, Errno::new(EBADF).to_ret());
+                return;
+            };
+            let Some(handle_ref) = ph.get_mut(req.fd)
+            else {
+                self.resume_thread_with_value(tid, Errno::new(EBADF).to_ret());
+                return;
+            };
+            let Handle::File(of) = handle_ref
+            else {
+                self.resume_thread_with_value(tid, Errno::new(EBADF).to_ret());
+                return;
+            };
+            (of.fs, of.inode, of.offset, of.is_regular)
         };
 
-        let fs = of.fs;
-        let inode = of.inode;
-        let prev_off = of.offset;
+        if !is_regular {
+            self.resume_thread_with_value(tid, Errno::new(orbit_abi::errno::EISDIR).to_ret());
+            return;
+        }
+        if self.page_cache.is_none() {
+            self.resume_thread_with_value(tid, Errno::new(EAGAIN).to_ret());
+            return;
+        }
 
         let file_size = match fs.size(inode) {
             Ok(s) => s,
             Err(_) => {
-                handle.signal(Errno::new(EIO).to_ret());
+                self.resume_thread_with_value(tid, Errno::new(EIO).to_ret());
                 return;
             }
         };
         if prev_off >= file_size {
-            // EOF — sync signal 0; don't touch the device.
-            handle.signal(0);
+            // EOF — sync resume with 0; don't touch the device.
+            self.resume_thread_with_value(tid, 0);
             return;
         }
 
-        // Buffer constraints already enforced at the syscall layer
-        // (one-page span, len > 0, user_range_ok). Resolve the user
-        // PA once.
+        let cap = core::cmp::min(req.len as u64, file_size - prev_off) as u32;
         let buf_va = req.buf_vaddr.raw();
         let root_table = unsafe { memmap::kernel_root_from_pa(root_pa) };
-        let page_base = buf_va & !(PAGE_SIZE as u64 - 1);
-        let user_page_off = (buf_va - page_base) as u32;
-        let user_page_pa =
-            match unsafe { mmu::mmap::virt_to_phys(&root_table, VirtAddr::new(page_base)) } {
-                Some(p) => p as u64,
-                None => {
-                    handle.signal(Errno::new(EFAULT).to_ret());
-                    return;
+        let dev_id = fs.dev_id();
+
+        // Bytes written into the user buffer synchronously
+        // (Ready-cache hits + EOF short-fills).
+        let mut bytes_done: u32 = 0;
+        // Bytes registered as outstanding waiters; resolved
+        // asynchronously via run_cache_fill.
+        let mut bytes_pending: u32 = 0;
+        // Running total `bytes_done + bytes_pending`. Sole offset
+        // beyond `buf_va` for per-slice user-VA arithmetic — the
+        // bug we fixed was double-adding `cache_offset` on top.
+        let mut total_committed: u32 = 0;
+        // Sticky: any per-page validation/submit failure flips this
+        // and breaks the walk; partial-success bytes still complete.
+        let mut walk_failed = false;
+        // Set when a Ready slot's `valid_bytes` is shorter than its
+        // slice (truncated file). Sync path; logically "EOF mid-walk".
+        let mut hit_eof = false;
+
+        // File-offset cursor (advances per outer iter) and its
+        // upper bound (`prev_off + cap`).
+        let end_off = prev_off + cap as u64;
+        let mut cur_off = prev_off;
+
+        'pages: while cur_off < end_off {
+            // File-relative page index for this cache slice.
+            let target_page = cur_off / PAGE;
+            // Byte offset *into* `target_page` where this read
+            // starts. Nonzero only on the first outer iter when the
+            // caller's `prev_off` was misaligned; subsequent iters
+            // are page-aligned.
+            let cache_intra = (cur_off & (PAGE - 1)) as u32;
+            // Bytes still wanted by this fs_read call.
+            let in_call_remaining = end_off - cur_off;
+            // Bytes from `cache_intra` to the end of this cache page.
+            let in_page_remaining = PAGE - cache_intra as u64;
+            // Bytes this outer iter will process (sum of inner-loop
+            // slice_lens for this iter equals this value).
+            let cache_slice_len = core::cmp::min(in_call_remaining, in_page_remaining) as u32;
+
+            let lba = match fs.lba_for_page(inode, target_page) {
+                Ok(l) => l,
+                Err(_) => {
+                    walk_failed = true;
+                    break 'pages;
                 }
             };
+            let key = CacheKey { dev: dev_id, lba };
+            // File offset of `target_page`'s first byte; combined
+            // with `file_size` it gives the slot's `valid_bytes`.
+            let page_off_bytes = target_page * PAGE;
+            // File-valid byte count for this whole cache page,
+            // clamped at EOF. Stored on the slot so the completion
+            // path can clamp without re-deriving from inode size.
+            let valid_bytes = core::cmp::min(PAGE, file_size - page_off_bytes) as u32;
 
-        // Compute the relevant slice of the current page. `intra` is
-        // the byte offset within the page that we want to start
-        // reading from; `visible_len` is the most we can return in
-        // this call (clipped at the page boundary and at EOF).
-        let target_page = prev_off / PAGE;
-        let intra = (prev_off & (PAGE - 1)) as u32;
-        let page_remaining = PAGE - intra as u64;
-        let file_remaining = file_size - prev_off;
-        let visible_len = core::cmp::min(
-            req.len as u64,
-            core::cmp::min(page_remaining, file_remaining),
-        ) as u32;
+            // Inner loop subdivides `cache_slice_len` across
+            // however many user pages the destination span touches.
+            // A single cache slice might land in 1 (aligned) or 2
+            // (straddling) user pages. `cache_offset` is the local
+            // progress counter; user-VA arithmetic uses
+            // `total_committed` only — see the bug note above.
+            let mut cache_offset: u32 = 0;
+            while cache_offset < cache_slice_len {
+                // User VA of the next byte to write.
+                let user_dst_va = buf_va + total_committed as u64;
+                // 4 KiB-aligned VA of the user page containing
+                // `user_dst_va`, plus the byte offset within it.
+                let user_page_va = user_dst_va & !(PAGE - 1);
+                let user_page_off = (user_dst_va - user_page_va) as u32;
+                let Some(user_page_pa) =
+                    (unsafe { mmu::mmap::virt_to_phys(&root_table, VirtAddr::new(user_page_va)) })
+                else {
+                    walk_failed = true;
+                    break 'pages;
+                };
+                let user_page_pa = PhysAddr::new(user_page_pa as u64);
 
-        // Take the scratch by &mut so we can flip `loading` in
-        // place. Regular files always have a scratch (allocated at
-        // fs_open); directories don't, but hitting fs_read on a
-        // directory should surface as EISDIR through the FS, not
-        // panic here.
-        let scratch = match &mut of.scratch {
-            Some(s) => s,
-            None => {
-                handle.signal(Errno::new(orbit_abi::errno::EISDIR).to_ret());
-                return;
-            }
-        };
+                // Bytes left in the current user page (`PAGE -
+                // user_page_off`) and the current cache slice
+                // (`cache_slice_len - cache_offset`); copy the
+                // smaller of the two this iteration.
+                let user_remaining = PAGE as u32 - user_page_off;
+                let cache_remaining = cache_slice_len - cache_offset;
+                let slice_len = core::cmp::min(user_remaining, cache_remaining);
+                // Byte offset *into the cache page* this iteration
+                // reads from. Becomes the waiter's `intra` field.
+                let waiter_intra = cache_intra + cache_offset;
 
-        // EAGAIN any concurrent reader while a DMA is in flight on
-        // this fd — we don't have a per-fd waiter queue in v1, and
-        // we must not submit a second DMA into the same scratch
-        // page. The `loading` check has to come *before* the
-        // cache-hit check: while loading is true `cached_page` may
-        // still hold the previous valid page, but the scratch
-        // page is being overwritten, so cache hits would return torn
-        // data.
-        if scratch.loading {
-            handle.signal(Errno::new(orbit_abi::errno::EAGAIN).to_ret());
-            return;
-        }
+                // Lookup. Snapshot `(kva, valid_bytes)` for hits so
+                // the borrow on cache drops before we mutate it.
+                #[derive(Copy, Clone)]
+                enum Action {
+                    Hit { src_kva: u64, valid: u32 },
+                    Loading,
+                    Absent,
+                }
+                let action = {
+                    let cache = self.page_cache.as_ref().unwrap();
+                    match cache.lookup(key) {
+                        Some(SlotState::Ready { frame, valid_bytes }) => Action::Hit {
+                            src_kva: frame.kva().raw(),
+                            valid: *valid_bytes,
+                        },
+                        Some(SlotState::Loading { .. }) => Action::Loading,
+                        None => Action::Absent,
+                    }
+                };
 
-        // Cache hit: the scratch already holds `target_page`.
-        // Copy the slice into the user buffer through a
-        // UserPageWindow (we hold MANAGER_LOCK here, so single-slot
-        // serialisation is fine), advance offset, signal
-        // synchronously.
-        if scratch.cached_page == target_page {
-            let src_kva = scratch.frame.kva().raw() + intra as u64;
-            unsafe {
-                let mut w = user_page::UserPageWindow::map(user_page_pa, PAGE_SIZE);
-                let dst = w.as_mut_slice();
-                let src = core::slice::from_raw_parts(src_kva as *const u8, visible_len as usize);
-                dst[user_page_off as usize..user_page_off as usize + visible_len as usize]
-                    .copy_from_slice(src);
-            }
-            of.offset = prev_off + visible_len as u64;
-            handle.signal(visible_len as isize);
-            return;
-        }
-
-        // Cache miss: arm the loading state, build the bounce
-        // descriptor (cloning the SharedFrame so the in-flight
-        // descriptor keeps the scratch page alive across
-        // close_handle / process teardown), submit, park.
-        // cached_page / valid_bytes stay at whatever they were
-        // (empty or the previous valid page) — they get
-        // published from run_fs_read_copy on success. Only
-        // `loading` and `of.offset` move here, so the
-        // submit-failure rollback below has minimal state to undo.
-        let scratch_clone = scratch.frame.clone();
-        let scratch_pa = scratch_clone.pa();
-        let page_off = target_page * PAGE;
-        let valid_bytes = core::cmp::min(PAGE, file_size - page_off) as u32;
-        let notif = WorkNotification::Bounce(crate::kernel::fs::CopyDescriptor {
-            handle: handle.clone(),
-            pid,
-            fd: req.fd,
-            target_page,
-            valid_bytes,
-            scratch: scratch_clone,
-            user_page_pa: PhysAddr::new(user_page_pa),
-            user_page_off,
-            intra,
-            len: visible_len,
-        });
-
-        scratch.loading = true;
-        of.offset = prev_off + visible_len as u64;
-
-        match unsafe {
-            fs.read_async(
-                inode,
-                page_off,
-                PAGE as u32,
-                scratch_pa.get_raw(),
-                notif,
-            )
-        } {
-            Ok(()) => {
-                // The notification (and its handle clone) is in the
-                // virtio-blk slot table; the IRQ + FsReadCopy will
-                // signal once the chain completes. Our retained
-                // `handle` here drops with this scope, releasing
-                // the manager-side Arc ref.
-            }
-            Err(e) => {
-                // Submit failed — no FsReadCopy will ever fire to
-                // clear `loading`, so undo the speculative state
-                // here and signal the retained handle directly.
-                if let Some(ph) = self.process_handles.get_mut(&pid)
-                    && let Some(Handle::File(of)) = ph.get_mut(req.fd)
-                {
-                    of.offset = prev_off;
-                    if let Some(s) = of.scratch.as_mut() {
-                        s.loading = false;
-                        // cached_page / valid_bytes stay
-                        // unchanged — the DMA never went out, so
-                        // whatever was valid before still is.
+                match action {
+                    Action::Hit { src_kva, valid } => {
+                        let copy_len =
+                            core::cmp::min(slice_len, valid.saturating_sub(waiter_intra));
+                        if copy_len > 0 {
+                            unsafe {
+                                let mut w = user_page::UserPageWindow::map(
+                                    user_page_pa.get_raw(),
+                                    PAGE_SIZE,
+                                );
+                                let dst = w.as_mut_slice();
+                                let src = core::slice::from_raw_parts(
+                                    (src_kva + waiter_intra as u64) as *const u8,
+                                    copy_len as usize,
+                                );
+                                dst[user_page_off as usize
+                                    ..user_page_off as usize + copy_len as usize]
+                                    .copy_from_slice(src);
+                            }
+                        }
+                        let cache = self.page_cache.as_mut().unwrap();
+                        cache.record_hit();
+                        cache.touch_lru(key);
+                        bytes_done += copy_len;
+                        total_committed += copy_len;
+                        if copy_len < slice_len {
+                            // EOF inside a Ready slot — file is
+                            // shorter than we thought (only really
+                            // happens if a writable FS truncated;
+                            // tarfs is immutable). Stop walking.
+                            hit_eof = true;
+                            break 'pages;
+                        }
+                    }
+                    Action::Loading => {
+                        let waiter = Waiter::User {
+                            tid,
+                            pid,
+                            intra: waiter_intra,
+                            user_page_pa,
+                            user_page_off,
+                            len: slice_len,
+                        };
+                        let cache = self.page_cache.as_mut().unwrap();
+                        if cache.register_waiter(key, waiter).is_err() {
+                            walk_failed = true;
+                            break 'pages;
+                        }
+                        bytes_pending += slice_len;
+                        total_committed += slice_len;
+                    }
+                    Action::Absent => {
+                        let waiter = Waiter::User {
+                            tid,
+                            pid,
+                            intra: waiter_intra,
+                            user_page_pa,
+                            user_page_off,
+                            len: slice_len,
+                        };
+                        let begin =
+                            self.page_cache
+                                .as_mut()
+                                .unwrap()
+                                .begin_load(key, valid_bytes, waiter);
+                        let dma_pa = match begin {
+                            Ok(pa) => pa,
+                            Err(_) => {
+                                walk_failed = true;
+                                break 'pages;
+                            }
+                        };
+                        let packed = crate::kernel::page_cache::pack(key);
+                        match unsafe {
+                            crate::drivers::virtio_blk_dev::submit_blk_read_cached(
+                                lba,
+                                dma_pa.get_raw(),
+                                PAGE as u32,
+                                packed,
+                            )
+                        } {
+                            Ok(_head) => {
+                                bytes_pending += slice_len;
+                                total_committed += slice_len;
+                            }
+                            Err(_) => {
+                                // Tear down the slot we just made.
+                                // complete_slot drains the lone
+                                // waiter we registered; we discard
+                                // it (no FsReadInProgress yet, so
+                                // nothing to update).
+                                let _ = self.page_cache.as_mut().unwrap().complete_slot(key, 1);
+                                walk_failed = true;
+                                break 'pages;
+                            }
+                        }
                     }
                 }
-                let errno = match e {
-                    FsErr::NotRegular => orbit_abi::errno::EISDIR,
-                    FsErr::NotADirectory => ENOTDIR,
-                    FsErr::BadInode => EBADF,
-                    FsErr::BadRange => EINVAL,
-                    FsErr::IoError => EIO,
-                    FsErr::NotFound => orbit_abi::errno::ENOENT,
-                };
-                handle.signal(Errno::new(errno).to_ret());
+
+                cache_offset += slice_len;
             }
+
+            cur_off += cache_slice_len as u64;
         }
-    }
 
-    /// Manager-side post-DMA completion for `fs_read`.
-    ///
-    /// `notif_ptr` is the same `Box<WorkNotification>` that
-    /// `submit_blk_read` stashed in the virtio-blk slot table; the
-    /// IRQ swapped it out of `IN_FLIGHT` and forwarded the pointer
-    /// through `PendingWork::FsReadCopy` for us to unbox here.
-    /// Always the `Bounce` variant — Direct is handled inline by
-    /// the IRQ.
-    ///
-    /// Three cases:
-    /// - `status != 0` (device error): clear `loading` on the fd
-    ///   (if still alive), invalidate the cache to avoid serving
-    ///   the partially-written sector, signal `-EIO`.
-    /// - Process exited mid-flight: skip the user-page copy
-    ///   (`user_page_pa` may have been reallocated to another
-    ///   tenant). Signal anyway — the parked thread is gone, so
-    ///   it's a no-op, but it releases the manager's clone.
-    /// - Otherwise: copy scratch→user, publish cache state on the
-    ///   fd if still alive (close_handle while DMA was in flight
-    ///   leaves us with no fd to update, but the user buffer is
-    ///   still mapped because the process is alive — the read
-    ///   completes as a courtesy).
-    fn run_fs_read_copy(&mut self, notif_ptr: usize, status: u8) {
-        // SAFETY: `notif_ptr` was produced by `Box::into_raw` in
-        // submit_blk_read for exactly this work item; the IRQ
-        // forwarded it through PendingWork unchanged. This is the
-        // unique consumer.
-        let notif =
-            unsafe { *Box::from_raw(notif_ptr as *mut crate::kernel::fs::WorkNotification) };
-        let desc = match notif {
-            crate::kernel::fs::WorkNotification::Bounce(d) => d,
-            crate::kernel::fs::WorkNotification::Direct { .. } => {
-                // Direct never reaches the manager — the IRQ
-                // signals it inline. If we get here something
-                // smuggled the wrong variant through PendingWork.
-                error!("run_fs_read_copy: received WorkNotification::Direct — invariant violated");
-                return;
+        // Decision time.
+        if bytes_pending == 0 {
+            // Synchronous: every slice was a Ready hit (or EOF).
+            // Advance fd offset by what we actually copied and
+            // resume the thread with that count (or `-EIO` only if
+            // the walk failed before producing any bytes).
+            if let Some(ph) = self.process_handles.get_mut(&pid)
+                && let Some(Handle::File(of)) = ph.get_mut(req.fd)
+            {
+                of.offset = prev_off + bytes_done as u64;
             }
-        };
-
-        let process_alive = self.processes.contains_key(&desc.pid);
-        let scratch_state = self
-            .process_handles
-            .get_mut(&desc.pid)
-            .and_then(|ph| ph.get_mut(desc.fd))
-            .and_then(|h| match h {
-                Handle::File(of) => of.scratch.as_mut(),
-                _ => None,
-            });
-
-        if status != 0 {
-            // Block device reported failure. Clear `loading` so the
-            // fd isn't permanently stuck at EAGAIN; conservatively
-            // invalidate the cache (a partial-sector DMA may have
-            // landed before the failure, so anything previously
-            // valid is now suspect).
-            if let Some(s) = scratch_state {
-                s.loading = false;
-                s.cached_page = u64::MAX;
-                s.valid_bytes = 0;
+            let result = if walk_failed && bytes_done == 0 {
+                Errno::new(EIO).to_ret()
             }
-            desc.handle.signal(-(orbit_abi::errno::EIO as isize));
+            else {
+                bytes_done as isize
+            };
+            self.resume_thread_with_value(tid, result);
             return;
         }
 
-        if !process_alive {
-            // Process exited mid-flight. The DMA landed in scratch
-            // (still alive via the SharedFrame clone in `desc`), but
-            // `user_page_pa` belonged to a tenant that is no longer
-            // there — writing to it would clobber whoever owns those
-            // physical pages now. Signal and return; desc drops →
-            // SharedFrame clone drops → scratch returns to
-            // pending_frees if this was the last clone.
-            desc.handle.signal(-(orbit_abi::errno::EIO as isize));
-            return;
+        // Async path: speculatively advance the offset past every
+        // committed byte. Insert FsReadInProgress so the
+        // CacheFill arms can decrement bytes_pending and resume.
+        let _ = hit_eof; // EOF inside a Ready slot already broke walking; nothing async to do.
+        if let Some(ph) = self.process_handles.get_mut(&pid)
+            && let Some(Handle::File(of)) = ph.get_mut(req.fd)
+        {
+            of.offset = prev_off + total_committed as u64;
         }
-
-        // Success path. Copy scratch→user first, then publish cache
-        // state. UserPageWindow is single-slot but we're under
-        // MANAGER_LOCK, so no contention with other manager-side
-        // copies.
-        let scratch_kva = desc.scratch.kva().raw();
-        unsafe {
-            let mut w = user_page::UserPageWindow::map(desc.user_page_pa.get_raw(), PAGE_SIZE);
-            let dst = w.as_mut_slice();
-            let src = core::slice::from_raw_parts(
-                (scratch_kva + desc.intra as u64) as *const u8,
-                desc.len as usize,
-            );
-            dst[desc.user_page_off as usize..desc.user_page_off as usize + desc.len as usize]
-                .copy_from_slice(src);
-        }
-
-        if let Some(s) = scratch_state {
-            s.cached_page = desc.target_page;
-            s.valid_bytes = desc.valid_bytes;
-            s.loading = false;
-        }
-        // If scratch_state was None, the fd was closed while the
-        // DMA was in flight. The read still completed (we wrote
-        // into the user buffer); the cache update is moot because
-        // there's no fd to consult it. desc drops here → final
-        // SharedFrame clone drops → pending_frees.
-
-        desc.handle.signal(desc.len as isize);
+        self.fs_reads_in_progress.insert(
+            tid,
+            FsReadInProgress {
+                bytes_pending,
+                bytes_done,
+                failed: walk_failed,
+            },
+        );
     }
 
     fn run_fs_stat_req(&mut self, req: FsStatReq, pid: u16, root_pa: PhysAddr) -> isize {
@@ -1970,6 +2004,7 @@ impl Orbit {
         req: orbit_core::CreateProcessV2Req,
         parent_pid: u16,
         root_pa: PhysAddr,
+        caller_tid: u32,
         handle: process::CompletionHandle,
     ) {
         use orbit_abi::denial::{DenialEvent, DenialSink};
@@ -2206,15 +2241,21 @@ impl Orbit {
         };
 
         // Spawn-source branch. Path mode (`spawn_path_vaddr != 0`)
-        // packages the validated context + path into an
-        // `IoWork::Spawn` and forwards to k_io; that kthread does the
-        // X-bit check + sector-by-sector fs.read_async, then bounces
-        // back to the manager via `PendingWork::SpawnReady` for the
-        // canonical install. Bytes mode requires LOADER role (no FS
-        // file means no X bit to check, so we trust only the
-        // privileged spawner) and runs the install inline.
+        // resolves the inode, runs the X+R access check, allocates
+        // the destination blob, and inserts a `SpawnInProgress`
+        // entry keyed by `caller_tid`. It then issues the first
+        // page's cache read and returns; subsequent pages are
+        // driven by `advance_spawn` from each completing
+        // `CacheFill` event. The final page completion runs
+        // `install_spawn` and signals `handle` with the new pid
+        // (or errno).
+        //
+        // Bytes mode requires LOADER role (no FS file means no X
+        // bit to check, so we restrict the delivery surface to the
+        // privileged spawner) and runs the install inline below.
         if args.spawn_path_vaddr != 0 {
-            // Path mode. Validate the path string, then ship it to k_io.
+            use orbit_abi::fs::{ACCESS_R_OK, ACCESS_X_OK, S_IFMT, S_IFREG};
+
             if args.spawn_path_len == 0 || args.spawn_path_len > MAX_FS_PATH_LEN {
                 bail!(orbit_abi::errno::ENAMETOOLONG);
             }
@@ -2235,7 +2276,53 @@ impl Orbit {
                 }
             };
             let resolved = self.resolve_fs_path(parent_pid, raw_path);
-            let owned_path = alloc::string::String::from(resolved.as_str());
+            let path = resolved.as_str();
+
+            // Resolve + validate the spawn target inline. Anything
+            // that fails here signals the handle synchronously and
+            // never builds a SpawnInProgress entry.
+            let Some(fs) = crate::kernel::fs::mounted()
+            else {
+                bail!(EIO);
+            };
+            let inode = match fs.open(path) {
+                Ok(i) => i,
+                Err(FsErr::NotFound) => bail!(orbit_abi::errno::ENOENT),
+                Err(_) => bail!(EIO),
+            };
+            let stat = match fs.stat(inode) {
+                Ok(s) => s,
+                Err(_) => bail!(EIO),
+            };
+            if (stat.st_mode & S_IFMT) != S_IFREG {
+                bail!(orbit_abi::errno::ENOEXEC);
+            }
+            if let Err(e) = orbit_abi::fs::vaccess(
+                parent_euid,
+                parent_egid,
+                &parent_groups,
+                &stat,
+                ACCESS_X_OK | ACCESS_R_OK,
+            ) {
+                debug!(
+                    "create_process_v2 path: vaccess EACCES path={path} mode={:#o}",
+                    stat.st_mode
+                );
+                handle.signal(e.to_ret());
+                return;
+            }
+            let total_size = stat.st_size as u64;
+            if total_size == 0 || (total_size as usize) > MAX_ELF_BYTES {
+                bail!(EINVAL);
+            }
+
+            // Allocate the destination blob, sized exactly. Cache
+            // fills will memcpy directly into `blob[page_idx *
+            // PAGE..]`, so we extend to full length up front.
+            let mut blob = alloc::vec::Vec::<u8>::with_capacity(total_size as usize);
+            blob.resize(total_size as usize, 0);
+            let total_pages = (total_size + PAGE_SIZE as u64 - 1) / PAGE_SIZE as u64;
+
             let owned_login = login_override.map(alloc::string::String::from);
             let ctx = orbit_core::SpawnContext {
                 args,
@@ -2255,24 +2342,25 @@ impl Orbit {
                 parent_login,
                 parent_groups,
             };
-            let work = orbit_core::IoWork::Spawn {
-                ctx: alloc::boxed::Box::new(ctx),
+
+            let progress = SpawnInProgress {
+                ctx,
+                inode,
+                blob,
+                total_size,
+                pages_done: 0,
+                total_pages,
                 handle: handle.clone(),
-                path: owned_path,
             };
-            match IO_QUEUE.push_ref() {
-                Ok(mut slot) => {
-                    *slot = Some(alloc::boxed::Box::new(work));
-                }
-                Err(_) => {
-                    error!("create_process_v2: IO_QUEUE full; signaling EAGAIN");
-                    bail!(EAGAIN);
-                }
-            }
-            // Tickle k_io. Drop the manager's signal — k_io will
-            // signal `handle` once the load + bounce-back + install
-            // chain finishes.
-            let _ = WAKE_QUEUE.push(WakeEvent::Io);
+            self.spawns_in_progress.insert(caller_tid, progress);
+
+            // Kick off the state machine. `issue_next_spawn_page`
+            // may resolve synchronously (cache hits) and chain
+            // through to `install_spawn` immediately if every page
+            // is already cached; otherwise it submits the next
+            // missing page's DMA and returns, with the rest driven
+            // by `CacheFill` → `advance_spawn`.
+            self.issue_next_spawn_page(caller_tid);
             return;
         }
 
@@ -3143,19 +3231,6 @@ impl Orbit {
                         }
                     }
                 }
-                WakeEvent::Io => {
-                    // Same shape as Net: target the latched k_io tid
-                    // when set, fall back to pid=0 scan during boot.
-                    // Pushed by manager arms that hand IO_QUEUE work
-                    // and by k_io itself when re-arming.
-                    match self.io_thread_tid {
-                        Some(tid) => self
-                            .set_wake_reason_where(process::wake_reason::TICKLE, |t| t.tid == tid),
-                        None => {
-                            self.set_wake_reason_where(process::wake_reason::TICKLE, |t| t.pid == 0)
-                        }
-                    }
-                }
                 WakeEvent::Pid(pid) => {
                     self.set_wake_reason_where(process::wake_reason::NET_IO, |t| t.pid == pid);
                 }
@@ -3329,14 +3404,14 @@ impl Orbit {
                     req,
                     pid,
                     root_pa,
-                    handle,
+                    tid,
                 } => {
-                    // run_fs_read_req owns the handle: it either
-                    // consumes it into a WorkNotification::Bounce
-                    // (async — the IRQ + FsReadCopy signal it) or
-                    // signals it inline (sync — cache hit, EOF, or
-                    // error). No return value to dispatch on.
-                    self.run_fs_read_req(req, pid, root_pa, handle);
+                    // Cache-driven: either resumes `tid` inline (all
+                    // pages were Ready hits, EOF, or a sync error) or
+                    // registers waiters that the eventual CacheFill
+                    // arm resumes after the per-page DMAs land. No
+                    // CompletionHandle in the loop.
+                    self.run_fs_read_req(req, pid, root_pa, tid);
                 }
                 PendingWork::FsStat {
                     req,
@@ -3406,24 +3481,435 @@ impl Orbit {
                     req,
                     pid,
                     root_pa,
+                    tid,
                     handle,
                 } => {
                     // Handler owns the signal — bytes mode signals
-                    // inline with the install result, path mode
-                    // forwards to k_io which signals later (or via
-                    // PendingWork::SpawnReady → install_spawn →
-                    // signal). Either way, no manager-side signal here.
-                    self.run_create_process_v2_req(req, pid, root_pa, handle);
+                    // inline with the install result; path mode
+                    // initiates a `SpawnInProgress` state machine
+                    // and signals later via `advance_spawn` when
+                    // the install completes. Either way, no
+                    // manager-side signal here.
+                    self.run_create_process_v2_req(req, pid, root_pa, tid, handle);
                 }
-                PendingWork::FsReadCopy { notif_ptr, status } => {
-                    self.run_fs_read_copy(notif_ptr, status);
-                }
-                PendingWork::SpawnReady { ctx, blob, handle } => {
-                    let result = self.run_spawn_ready(*ctx, &blob);
-                    handle.signal(result);
+                PendingWork::CacheFill { packed_key, status } => {
+                    self.run_cache_fill(packed_key, status);
                 }
             }
         }
+    }
+
+    /// Stub manager arm for [`PendingWork::CacheFill`]. The IRQ
+    /// handler posts these whenever a chain submitted via the
+    /// cached path completes. Once the cache is wired into
+    /// `run_fs_read_req`, this method will drain the slot's waiter
+    /// list, copy bytes per waiter, and resume the waiting tids.
+    /// IRQ → manager handler for a completed cache fill. Drains
+    /// the slot's waiter list (transitioning the slot to Ready on
+    /// success or removing it on failure), iterates each waiter
+    /// performing the appropriate copy (UserPageWindow for User
+    /// waiters, direct memcpy for Kernel waiters), and decrements
+    /// per-tid `FsReadInProgress` accounting; the last decrement
+    /// per tid resumes the parked thread with the byte count or
+    /// `-EIO`.
+    fn run_cache_fill(&mut self, packed_key: u64, status: u8) {
+        use crate::kernel::page_cache::Waiter;
+
+        let key = match crate::kernel::page_cache::unpack(packed_key) {
+            Some(k) => k,
+            None => {
+                error!("run_cache_fill: empty packed_key {packed_key:#x}");
+                return;
+            }
+        };
+
+        // Snapshot the slot frame's KVA before draining (we need
+        // it for source bytes during the per-waiter copy loop).
+        // complete_slot consumes the frame on success-publish or
+        // recycles it on failure; the SharedFrame's KVA stays
+        // valid for the entire lifetime of either branch since
+        // we're under MANAGER_LOCK and no eviction can race us.
+        let (waiters, src_kva) = {
+            let cache = match self.page_cache.as_mut() {
+                Some(c) => c,
+                None => {
+                    error!("run_cache_fill: cache not initialized");
+                    return;
+                }
+            };
+            // Snapshot the source KVA before complete_slot —
+            // success keeps the frame in the slot (still
+            // accessible), failure recycles it (we still hold a
+            // pointer through the post-borrow snapshot below; the
+            // pool keeps it alive as long as we're under the lock).
+            let src_kva = match cache.lookup(key) {
+                Some(s) => s.frame().kva().raw(),
+                None => {
+                    warn!("run_cache_fill: completion for absent key {key:?}");
+                    return;
+                }
+            };
+            let waiters = cache.complete_slot(key, status);
+            (waiters, src_kva)
+        };
+
+        // Per-waiter dispatch. Skip-if-process-dead for User
+        // waiters; tid resume happens via run_fs_read_complete_one.
+        for waiter in waiters {
+            match waiter {
+                Waiter::User {
+                    tid,
+                    pid,
+                    intra,
+                    user_page_pa,
+                    user_page_off,
+                    len,
+                } => {
+                    let process_alive = self.processes.contains_key(&pid);
+                    if status == 0 && process_alive {
+                        unsafe {
+                            let mut w =
+                                user_page::UserPageWindow::map(user_page_pa.get_raw(), PAGE_SIZE);
+                            let dst = w.as_mut_slice();
+                            let src = core::slice::from_raw_parts(
+                                (src_kva + intra as u64) as *const u8,
+                                len as usize,
+                            );
+                            dst[user_page_off as usize..user_page_off as usize + len as usize]
+                                .copy_from_slice(src);
+                        }
+                    }
+                    self.complete_fs_read_waiter(tid, status, len);
+                }
+                Waiter::Kernel {
+                    tid,
+                    intra,
+                    dst_kva,
+                    len,
+                } => {
+                    if status == 0 {
+                        unsafe {
+                            let src = core::slice::from_raw_parts(
+                                (src_kva + intra as u64) as *const u8,
+                                len as usize,
+                            );
+                            let dst =
+                                core::slice::from_raw_parts_mut(dst_kva as *mut u8, len as usize);
+                            dst.copy_from_slice(src);
+                        }
+                    }
+                    // Dispatch: spawn waiters drive the
+                    // per-page state machine; standalone
+                    // kernel-buffer reads (none today; future
+                    // demand-paged exec, etc.) just resume the
+                    // tid with `len` or `-EIO`.
+                    if self.spawns_in_progress.contains_key(&tid) {
+                        self.advance_spawn(tid, status);
+                    }
+                    else {
+                        let val = if status == 0 {
+                            len as isize
+                        }
+                        else {
+                            Errno::new(EIO).to_ret()
+                        };
+                        self.resume_thread_with_value(tid, val);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Per-User-waiter completion arm. Decrements the tid's
+    /// `FsReadInProgress` counters and resumes the parked thread
+    /// when the last waiter for this tid lands.
+    ///
+    /// `len` is the count of bytes the manager attempted to copy
+    /// (regardless of success — `bytes_pending` tracks issued
+    /// work, `bytes_done` tracks successful work). On any per-page
+    /// failure the entire read resolves to `-EIO` (sticky `failed`
+    /// flag); strict POSIX-prefix semantics is a v2 improvement.
+    fn complete_fs_read_waiter(&mut self, tid: u32, status: u8, len: u32) {
+        let Some(prog) = self.fs_reads_in_progress.get_mut(&tid)
+        else {
+            // No in-progress entry — fs_read_req resolved
+            // synchronously, or this tid never owned an entry.
+            // Bug if it fires; log and bail.
+            warn!("complete_fs_read_waiter: no FsReadInProgress for tid={tid}");
+            return;
+        };
+        prog.bytes_pending = prog.bytes_pending.saturating_sub(len);
+        if status == 0 {
+            if !prog.failed {
+                prog.bytes_done = prog.bytes_done.saturating_add(len);
+            }
+        }
+        else {
+            prog.failed = true;
+        }
+        if prog.bytes_pending == 0 {
+            let bytes_done = prog.bytes_done;
+            let failed = prog.failed;
+            let _ = self.fs_reads_in_progress.remove(&tid);
+            let result = if failed && bytes_done == 0 {
+                Errno::new(EIO).to_ret()
+            }
+            else if failed {
+                // Sticky-failure with some successful bytes:
+                // return `-EIO` per the v1 "any failure → EIO"
+                // policy. POSIX-prefix semantics later.
+                Errno::new(EIO).to_ret()
+            }
+            else {
+                bytes_done as isize
+            };
+            self.resume_thread_with_value(tid, result);
+        }
+    }
+
+    /// Manager-side analog of [`wake_blocked_inline`] for the
+    /// no-CompletionHandle path: write `value` directly into the
+    /// parked thread's `regs[10]`, mark it Ready, and queue it onto
+    /// the calling hart's READY_INBOX so the next scheduler pass
+    /// dispatches it.
+    ///
+    /// Used by the page-cache completion machinery
+    /// ([`run_cache_fill`] and forthcoming `advance_spawn` /
+    /// `complete_fs_read_waiter`): no `CompletionHandle` exists for
+    /// these waits, so the manager owns both "what value to return"
+    /// and "where to wake."
+    ///
+    /// Tid lookups against `self.threads` are O(log N) BTree —
+    /// fine; manager runs hold MANAGER_LOCK so the registry is
+    /// stable. Returns silently if the thread has already exited
+    /// (its in-progress entry was the only thing keeping the wait
+    /// alive; nothing to wake).
+    pub fn resume_thread_with_value(&mut self, tid: u32, value: isize) {
+        let Some(pt) = self.threads.get(&tid)
+        else {
+            // Thread exited mid-flight. No-op.
+            return;
+        };
+        // SAFETY: PThread.0 is the registry-owned raw ptr; the
+        // thread is alive as long as `self.threads` holds the entry.
+        // We hold MANAGER_LOCK so no concurrent mutator races us on
+        // `frame`/`state`.
+        let t = unsafe { (pt.0 as *mut Thread).as_mut_unchecked() };
+        let prior = t.state.load(Ordering::Acquire);
+        if prior != ThreadState::Blocking as usize && prior != ThreadState::Suspended as usize {
+            warn!(
+                "resume_thread_with_value: tid={tid} not Blocking/Suspended (state={prior}); writing regs anyway"
+            );
+        }
+        t.frame.regs[10] = value as usize;
+        t.state
+            .store(ThreadState::Ready as usize, Ordering::Release);
+        if push_ready_notice(pt.0).is_err() {
+            error!(
+                "resume_thread_with_value: READY_INBOX full for tid={tid} — \
+                 marked Ready but not queued",
+            );
+        }
+    }
+
+    /// Drive the path-mode spawn state machine by one step:
+    /// dispatch successive page reads against the page cache,
+    /// taking whatever path each page needs (Ready → memcpy
+    /// inline + advance; Loading → register a kernel waiter and
+    /// return; Absent → allocate slot + submit DMA + return).
+    /// When `pages_done == total_pages` the blob is fully
+    /// populated; this helper takes ownership, runs
+    /// [`install_spawn`], and signals the spawn handle with the
+    /// new pid (or errno on install failure).
+    ///
+    /// Called twice in the spawn lifecycle:
+    /// 1. From `run_create_process_v2_req` immediately after
+    ///    inserting `SpawnInProgress`, to fire the first read.
+    /// 2. From `advance_spawn` after each `CacheFill` (status==OK)
+    ///    completes a kernel waiter for this tid.
+    ///
+    /// Cache hits chain inline — a fully-cached spawn target
+    /// completes synchronously without ever yielding to the
+    /// scheduler.
+    fn issue_next_spawn_page(&mut self, tid: u32) {
+        use crate::kernel::page_cache::{CacheKey, SlotState, Waiter};
+        const PAGE: u64 = PAGE_SIZE as u64;
+
+        loop {
+            let Some(spawn) = self.spawns_in_progress.get_mut(&tid)
+            else {
+                error!("issue_next_spawn_page: no SpawnInProgress for tid={tid}");
+                return;
+            };
+
+            if spawn.pages_done >= spawn.total_pages {
+                // All pages landed — finalize. Pull `spawn` out so
+                // we can run `install_spawn` without holding a
+                // borrow on `self.spawns_in_progress`.
+                let spawn = self
+                    .spawns_in_progress
+                    .remove(&tid)
+                    .expect("just confirmed present");
+                let SpawnInProgress {
+                    ctx, blob, handle, ..
+                } = spawn;
+                let result = self.run_spawn_ready(ctx, &blob);
+                handle.signal(result);
+                return;
+            }
+
+            // Compute the next page's metadata.
+            let page_idx = spawn.pages_done;
+            let page_off = page_idx * PAGE;
+            let take = core::cmp::min(PAGE, spawn.total_size - page_off) as u32;
+            let dst_kva = unsafe { spawn.blob.as_mut_ptr().add(page_off as usize) as usize };
+            let inode = spawn.inode;
+
+            let Some(fs) = crate::kernel::fs::mounted()
+            else {
+                let spawn = self.spawns_in_progress.remove(&tid).unwrap();
+                spawn.handle.signal(Errno::new(EIO).to_ret());
+                return;
+            };
+            let lba = match fs.lba_for_page(inode, page_idx) {
+                Ok(l) => l,
+                Err(_) => {
+                    let spawn = self.spawns_in_progress.remove(&tid).unwrap();
+                    spawn.handle.signal(Errno::new(EIO).to_ret());
+                    return;
+                }
+            };
+            let key = CacheKey {
+                dev: fs.dev_id(),
+                lba,
+            };
+            // Cache valid_bytes is the file-valid count for this
+            // page — same shape as the fs_read path.
+            let valid_bytes = take;
+
+            // Look up the cache. Snapshot src_kva on Hit so the
+            // immutable borrow drops before we mutate the cache.
+            #[derive(Copy, Clone)]
+            enum Action {
+                Hit { src_kva: u64 },
+                Loading,
+                Absent,
+            }
+            let action = {
+                let cache = self.page_cache.as_ref().unwrap();
+                match cache.lookup(key) {
+                    Some(SlotState::Ready { frame, .. }) => Action::Hit {
+                        src_kva: frame.kva().raw(),
+                    },
+                    Some(SlotState::Loading { .. }) => Action::Loading,
+                    None => Action::Absent,
+                }
+            };
+
+            match action {
+                Action::Hit { src_kva } => {
+                    // Synchronous copy directly into the blob.
+                    unsafe {
+                        let src = core::slice::from_raw_parts(src_kva as *const u8, take as usize);
+                        let dst =
+                            core::slice::from_raw_parts_mut(dst_kva as *mut u8, take as usize);
+                        dst.copy_from_slice(src);
+                    }
+                    let cache = self.page_cache.as_mut().unwrap();
+                    cache.record_hit();
+                    cache.touch_lru(key);
+                    self.spawns_in_progress.get_mut(&tid).unwrap().pages_done += 1;
+                    // Continue loop — next iter handles next page
+                    // or finalizes.
+                }
+                Action::Loading => {
+                    let waiter = Waiter::Kernel {
+                        tid,
+                        intra: 0,
+                        dst_kva,
+                        len: take,
+                    };
+                    let cache = self.page_cache.as_mut().unwrap();
+                    if cache.register_waiter(key, waiter).is_err() {
+                        let spawn = self.spawns_in_progress.remove(&tid).unwrap();
+                        spawn.handle.signal(Errno::new(EIO).to_ret());
+                        return;
+                    }
+                    // Parked; advance_spawn will resume on CacheFill.
+                    return;
+                }
+                Action::Absent => {
+                    let waiter = Waiter::Kernel {
+                        tid,
+                        intra: 0,
+                        dst_kva,
+                        len: take,
+                    };
+                    let begin =
+                        self.page_cache
+                            .as_mut()
+                            .unwrap()
+                            .begin_load(key, valid_bytes, waiter);
+                    let dma_pa = match begin {
+                        Ok(pa) => pa,
+                        Err(_) => {
+                            let spawn = self.spawns_in_progress.remove(&tid).unwrap();
+                            spawn.handle.signal(Errno::new(EAGAIN).to_ret());
+                            return;
+                        }
+                    };
+                    let packed = crate::kernel::page_cache::pack(key);
+                    match unsafe {
+                        crate::drivers::virtio_blk_dev::submit_blk_read_cached(
+                            lba,
+                            dma_pa.get_raw(),
+                            PAGE as u32,
+                            packed,
+                        )
+                    } {
+                        Ok(_head) => {
+                            // DMA submitted; CacheFill →
+                            // advance_spawn drives the rest.
+                            return;
+                        }
+                        Err(_) => {
+                            let _ = self.page_cache.as_mut().unwrap().complete_slot(key, 1);
+                            let spawn = self.spawns_in_progress.remove(&tid).unwrap();
+                            spawn.handle.signal(Errno::new(EIO).to_ret());
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Per-page completion arm for path-mode spawn. Called from
+    /// [`run_cache_fill`] when a `Waiter::Kernel` for `tid`
+    /// belongs to a `SpawnInProgress` entry. The actual byte copy
+    /// already happened in `run_cache_fill`; we just bump
+    /// `pages_done` and chain to `issue_next_spawn_page` (which
+    /// either issues the next read or finalizes).
+    ///
+    /// On per-page IO failure, drops the in-progress entry and
+    /// signals the carried handle with `-EIO`.
+    fn advance_spawn(&mut self, tid: u32, status: u8) {
+        if status != 0 {
+            let Some(spawn) = self.spawns_in_progress.remove(&tid)
+            else {
+                error!("advance_spawn: no SpawnInProgress for tid={tid}");
+                return;
+            };
+            spawn.handle.signal(Errno::new(EIO).to_ret());
+            return;
+        }
+        let Some(spawn) = self.spawns_in_progress.get_mut(&tid)
+        else {
+            error!("advance_spawn: no SpawnInProgress for tid={tid}");
+            return;
+        };
+        spawn.pages_done += 1;
+        self.issue_next_spawn_page(tid);
     }
 
     /// Manager arm for [`PendingWork::SpawnReady`]. k_spawn has already
@@ -4154,47 +4640,27 @@ impl Orbit {
         }
     }
 
-    /// Allocate `k_io`'s sector-sized DMA scratch page (latches
-    /// `IO_SCRATCH_PA` / `IO_SCRATCH_KVA`) and spawn the kthread.
-    /// Called once at boot after the FS mount is up.
-    ///
-    /// On scratch-allocation failure or kthread-creation failure we
-    /// log + return without latching `io_thread_tid` — `k_io` simply
-    /// won't run, and any path-mode `create_process_v2` will time out
-    /// on its caller's `CompletionHandle`. (Today no path-mode call
-    /// happens until a non-LOADER process invokes v2 with
-    /// `spawn_path_vaddr != 0`, which only the bootstrap shell does
-    /// post-mount.)
-    pub fn setup_io_kthread(&mut self) {
-        let layout = match Layout::from_size_align(PAGE_SIZE, PAGE_SIZE) {
-            Ok(l) => l,
-            Err(_) => {
-                error!("k_io: scratch layout invalid");
-                return;
+    /// Allocate the page cache's frame pool. Sized at
+    /// [`PAGE_CACHE_CAPACITY`] frames (256 KiB at the default 64).
+    /// On allocation failure logs and leaves `self.page_cache =
+    /// None`; fs_read paths will surface `-EAGAIN` if invoked
+    /// before this completes (impossible in practice once the boot
+    /// sequence wires this in).
+    pub fn setup_page_cache(&mut self) {
+        match crate::kernel::page_cache::PageCache::with_capacity(
+            &mut self.kernel_pages,
+            PAGE_CACHE_CAPACITY,
+        ) {
+            Some(cache) => {
+                info!(
+                    "page_cache: allocated {} frames ({} KiB)",
+                    cache.capacity(),
+                    cache.capacity() * PAGE_SIZE / 1024
+                );
+                self.page_cache = Some(cache);
             }
-        };
-        let (frame, kva) = match self.kernel_pages.alloc_kdmap(layout) {
-            Some(pair) => pair,
             None => {
-                error!("k_io: kernel_pages exhausted; scratch alloc failed");
-                return;
-            }
-        };
-        IO_SCRATCH_PA.store(frame.get_raw() as u64, Ordering::Release);
-        IO_SCRATCH_KVA.store(kva.raw() as usize, Ordering::Release);
-        // Lifetime: scratch lives for the kernel's lifetime — k_io
-        // never frees. Forget the Frame so its Drop doesn't return
-        // the page to the allocator on scope exit.
-        core::mem::forget(frame);
-
-        let entrypoint = crate::k_io as *const () as usize;
-        match self.create_kernel_thread(entrypoint, None) {
-            Ok(tid) => {
-                info!("created k_io thread tid={tid}");
-                self.io_thread_tid = Some(tid);
-            }
-            Err(_) => {
-                error!("k_io: create_kernel_thread failed");
+                error!("page_cache: failed to allocate frame pool — fs_read will EAGAIN");
             }
         }
     }
@@ -4290,11 +4756,11 @@ impl Orbit {
         self.setup_virtio_gpu();
         self.setup_virtio_input();
         self.setup_virtio_blk();
-        // k_io must come up after the FS is mounted (it reads bytes
-        // off tarfs for path-mode spawns) and after kernel_pages is
-        // ready (allocates the DMA scratch). setup_virtio_blk
-        // satisfies both — the FS mount happens inside it.
-        self.setup_io_kthread();
+        // Page cache runs after virtio-blk + tarfs are up: it
+        // allocates a frame pool from kernel_pages, and the
+        // FS-backed lookups need a mounted filesystem to drive
+        // the cache keys.
+        self.setup_page_cache();
     }
 
     fn setup_plic(&mut self, fdt: &Fdt<'_>) {
@@ -5370,7 +5836,7 @@ impl Orbit {
         // `fs_readdir`; seeking on a dir fd is a separate POSIX
         // operation (`seekdir`) we don't model. Reject so callers
         // get a clear error instead of silent breakage.
-        if of.scratch.is_none() {
+        if !of.is_regular {
             return Errno::new(EBADF).to_ret();
         }
         let new_offset: i64 = match whence {

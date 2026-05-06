@@ -1197,7 +1197,7 @@ extern "C" fn rust_main(_hartid: usize, dtb: usize, serial: usize, load_addr: u6
 
         log::set_logger(&LOGGER).unwrap();
         log::set_max_level(log::LevelFilter::Debug);
-        tracing::subscriber::set_global_default(OrbitSubscriber::new(Level::DEBUG))
+        tracing::subscriber::set_global_default(OrbitSubscriber::new(Level::INFO))
             .expect("no tracing");
 
         let mut kernel_tables = kmain::kernel::memmap::TablePages::new();

@@ -274,12 +274,13 @@ pub enum PendingWork {
         req: FsReadReq,
         pid: u16,
         root_pa: PhysAddr,
-        /// User thread's handle. The manager hands a clone to the
-        /// virtio-blk IRQ slot, so the IRQ signals it directly with
-        /// `bytes_read` (success) or `-EIO` (failure). On submit
-        /// failure (queue full, bad fd, …) the manager signals the
-        /// retained clone with the errno itself.
-        handle: CompletionHandle,
+        /// Calling thread's tid. The cache-driven path resumes the
+        /// thread directly via `Orbit::resume_thread_with_value`
+        /// once every page in the read has landed (or any one
+        /// fails), bypassing `CompletionHandle` entirely. fs_read
+        /// is the first hot path on this thinner shape; remaining
+        /// blocking syscalls keep the handle protocol for now.
+        tid: u32,
     },
     FsStat {
         req: FsStatReq,
@@ -352,73 +353,39 @@ pub enum PendingWork {
         req: CreateProcessV2Req,
         pid: u16,
         root_pa: PhysAddr,
+        /// Calling thread's tid. Used as the
+        /// `SpawnInProgress` key for path-mode spawns: each
+        /// `CacheFill` event for the spawn's kernel-buffer
+        /// waiters dispatches to the right state machine via
+        /// this tid. Bytes-mode ignores it.
+        tid: u32,
         handle: CompletionHandle,
     },
-    /// Post-DMA completion step for `fs_read`. The virtio-blk IRQ
-    /// enqueues this for every successfully-completed (or failed)
-    /// bounce-path chain; the manager unboxes `notif_ptr`,
-    /// performs the scratch→user copy + cache publish + signal
-    /// under MANAGER_LOCK, and drops the box (which drops the
-    /// SharedFrame clone inside the `Bounce` variant, possibly
-    /// returning the scratch page to `pending_frees`).
+    /// Page-cache DMA completion. Posted by the virtio-blk IRQ when a
+    /// chain submitted via the cached path (`submit_blk_read_cached`)
+    /// finishes. Carries the packed `CacheKey` the manager uses to
+    /// look up the in-flight slot; manager iterates the slot's waiter
+    /// list, copies bytes (UserPageWindow for User waiters, memcpy
+    /// for Kernel waiters), and resumes each waiter's tid.
     ///
-    /// `notif_ptr` is the same `Box::into_raw` of a kmain-side
-    /// `WorkNotification` that submit_blk_read stashed in the
-    /// virtio-blk slot table — the IRQ forwards it through
-    /// unchanged so we don't double-box. orbit-core sees it as an
-    /// opaque transport pointer; valid for exactly one
-    /// `Box::from_raw` on the manager side. The variant is always
-    /// `Bounce` (Direct is signaled inline by the IRQ); the
-    /// manager matches accordingly. `status` carries the
-    /// underlying virtio status: 0 = success, non-zero = device
-    /// error.
-    FsReadCopy { notif_ptr: usize, status: u8 },
-    /// Bounce-back from `k_spawn` into the manager once the kthread
-    /// has loaded the ELF bytes off disk. k_spawn does the slow part
-    /// (vaccess(X) + sector-by-sector `fs.read_async` with parking on
-    /// each completion); the manager handles the install — page-table
-    /// allocation, ELF segment load, process insertion, perms /
-    /// credentials stamping, and signaling the original caller's
-    /// `CompletionHandle` with the new pid (or errno).
-    ///
-    /// Bytes-mode v2 spawns never go through here — the manager runs
-    /// the full pipeline inline since there's no I/O to wait on.
-    /// Only path-mode pays the bounce cost (one extra manager pass to
-    /// drain this entry), which is dwarfed by the FS-read latency
-    /// it's amortizing.
-    SpawnReady {
-        /// Validated context captured by the manager before forwarding
-        /// to k_spawn. Includes the args struct, the parent
-        /// credential/perm snapshot, the role-gated `ChildPerms`
-        /// witness, and any pre-resolved override blobs (login,
-        /// groups). Boxed so the variant stays small enough not to
-        /// bloat the `MANAGER_WORK` thingbuf slot footprint.
-        ctx: alloc::boxed::Box<SpawnContext>,
-        /// ELF bytes k_spawn loaded off disk. Owned `Vec` because
-        /// `MANAGER_WORK` slots have to outlive the originating
-        /// kthread's stack frame.
-        blob: alloc::vec::Vec<u8>,
-        /// Original caller's handle — signaled by the manager once
-        /// install completes (or fails partway).
-        handle: CompletionHandle,
-    },
+    /// `packed_key` is the bit-packed form from `kernel::page_cache::pack`;
+    /// orbit-core sees it as an opaque u64 since the layout is
+    /// kmain-internal. `status` carries the virtio status byte
+    /// (0 = OK, non-zero = device error).
+    CacheFill { packed_key: u64, status: u8 },
 }
 
 /// Validated spawn context shared between bytes-mode (which uses it
-/// inline in the manager) and path-mode (which forwards it to
-/// `k_spawn` along with the path string, then back via
-/// [`PendingWork::SpawnReady`] with the loaded blob attached).
+/// inline in the manager) and path-mode (which drives a per-page
+/// state machine on the manager via `Orbit::issue_next_spawn_page`
+/// + `advance_spawn`, finalizing through `install_spawn` once every
+/// page has been read into the in-progress blob).
 ///
 /// All "I checked this and it's good" state from the v2 syscall's
 /// pre-flight lives here so the install path (`Orbit::install_spawn`)
 /// can be a pure function of `(blob, ctx)` regardless of which
 /// front-door delivered it. Owned types throughout because the
-/// path-mode bounce travels through the manager work queue and can't
-/// borrow from the originating handler's stack frame.
-///
-/// `Clone` is required for the [`PendingWork::SpawnReady`] variant
-/// (PendingWork derives Clone for its `MANAGER_WORK` thingbuf slot
-/// shape); the actual hot path consumes the boxed ctx by value.
+/// path-mode in-progress entry outlives the originating handler.
 #[derive(Clone, Debug)]
 pub struct SpawnContext {
     /// Copy of the caller-provided args struct. Used by `install_spawn`
@@ -452,41 +419,4 @@ pub struct SpawnContext {
     pub parent_sgid: u32,
     pub parent_login: Option<alloc::string::String>,
     pub parent_groups: alloc::vec::Vec<u32>,
-}
-
-/// Work item dispatched from the manager (or a trap handler) to
-/// `k_io`, the generic "kernel reads / waits on something and reports
-/// back to the manager" kthread. Each variant corresponds to a
-/// different kind of slow operation that needs to park on a
-/// completion handle without holding the manager up.
-///
-/// New kinds (future: signed-binary verification, network-backed
-/// resources, etc.) add a variant here and a match arm in `k_io`'s
-/// dispatch loop. The contract is uniform across variants:
-/// `k_io` does the slow work, then either signals the embedded
-/// `CompletionHandle` directly (cheap, no Orbit mutation needed) or
-/// pushes a `PendingWork::*Ready` entry back through `MANAGER_WORK`
-/// for the manager to finish (when Orbit-state mutation is needed).
-///
-/// `Clone` is required by thingbuf's recycling shape (`IO_QUEUE`'s
-/// per-slot `Default` reset uses it); the actual hot path consumes
-/// the boxed work by value via `mem::take`.
-#[derive(Clone, Debug)]
-pub enum IoWork {
-    /// Path-mode `create_process_v2`. k_io opens the path, runs
-    /// `vaccess(X)` against the caller's effective creds, reads the
-    /// ELF bytes off disk, and pushes [`PendingWork::SpawnReady`]
-    /// with the loaded blob. On any failure path k_io signals
-    /// `handle` directly with the errno.
-    ///
-    /// `ctx` is heap-boxed so the enum stays small enough to fit
-    /// `IO_QUEUE`'s per-slot footprint.
-    Spawn {
-        ctx: alloc::boxed::Box<SpawnContext>,
-        handle: CompletionHandle,
-        /// Absolute, UTF-8 path to the executable. Already
-        /// `resolve_fs_path`-prefixed if the caller passed a relative
-        /// path.
-        path: alloc::string::String,
-    },
 }
