@@ -438,15 +438,18 @@ pub struct Orbit {
 /// One slot on a futex wait queue. Captured at `futex_wait` request
 /// time; consumed by `futex_wake` (signal `0`) or by `dealloc_process`
 /// when the calling thread's process exits before a wake arrives
-/// (signal `-ESRCH`, which the unblock path turns back into a
-/// detectable errno on resume).
+/// (drop-without-signal — the matching `Thread.handle` drops in
+/// `dealloc_thread`, so no consumer is left pointing at gone state).
 #[derive(Debug)]
 pub struct FutexWaiter {
     pub handle: process::CompletionHandle,
-    /// Pid of the parking thread. Used at `dealloc_process` time to
-    /// find and signal-and-drop waiters whose owner is going away,
-    /// so a futex queue keyed on a still-shared frame doesn't keep
-    /// pointing at a freed `CompletionHandle`'s consumer.
+    /// Pid of the parking thread. Read by `dealloc_process` to drop
+    /// every waiter whose owner is going away — without that sweep,
+    /// `futex_waiters` retains entries past the death of the parking
+    /// thread, and a later `futex_wake` on the same PA dereferences
+    /// freed `Thread` storage via `wake_blocked_inline`. See
+    /// [docs/dev/bugs.md](../../../../docs/dev/bugs.md) "futex_waiters
+    /// outlives parking process" for the chain.
     pub pid: u16,
     /// Reserved: absolute tick deadline for `-ETIMEDOUT`. `0` = no
     /// timeout. v1 always parks `0` regardless of the user-supplied
@@ -3965,6 +3968,62 @@ impl Orbit {
         self.ready.pop_for(hart_mask).map(PThread)
     }
 
+    /// POSIX `_exit(2)` / `exit_group(2)` semantics for sysno 0:
+    /// terminate every thread of `pid`, finalize the exit code, and
+    /// IPI any hart still running a doomed sibling so it traps and
+    /// drops the thread on the next `check_context_and_switch` pass.
+    ///
+    /// The calling thread is the one whose `tid == leader_tid`; this
+    /// method does **not** touch the caller's state (the dispatch
+    /// site falls through to `exit_thread_with_state(Exited)` after
+    /// this returns). Siblings get state Released to `Exited` here so
+    /// the manager's next `cleanup_threads_and_processes` reaps them.
+    ///
+    /// Caller must hold `MANAGER_LOCK` — we mutate `proc.exit_code`,
+    /// `proc.exit_finalized`, and walk `self.threads` directly.
+    pub fn request_exit_group(&mut self, pid: u16, leader_tid: u32, exit_code: i32) {
+        let proc = match self.processes.get_mut(&pid) {
+            Some(p) => p,
+            None => return,
+        };
+        proc.exit_code = exit_code;
+        proc.exit_finalized = true;
+
+        // Collect sibling tids; can't borrow `self.threads` mutably
+        // while iterating `proc.threads`. The set is small (≤ NGROUPS-
+        // ish in practice; rayon's pool is `cpu_count`).
+        let siblings: alloc::vec::Vec<u32> = proc
+            .threads
+            .iter()
+            .copied()
+            .filter(|tid| *tid != leader_tid)
+            .collect();
+
+        for tid in &siblings {
+            if let Some(pt) = self.threads.get(tid) {
+                let t = unsafe { pt.0.as_ref_unchecked() };
+                t.state
+                    .store(ThreadState::Exited as usize, Ordering::Release);
+            }
+        }
+
+        // Forward-progress IPI: any hart currently running a doomed
+        // sibling needs to trap so its `check_context_and_switch` arm
+        // notices `state == Exited` and bails to k_idle. Without this
+        // we'd wait for the next timer tick on that hart — bounded
+        // (sub-ms with Sstc) but not immediate.
+        crate::kernel::accounting::for_each_hart_context(|h| {
+            let cur = h.current.load(Ordering::Acquire);
+            if cur.is_null() {
+                return;
+            }
+            let cur_t = unsafe { (cur as *const Thread).as_ref_unchecked() };
+            if cur_t.pid == pid && cur_t.tid != leader_tid {
+                crate::supervisor_wake_hart(h.hart_id as usize);
+            }
+        });
+    }
+
     fn dealloc_thread(&mut self, mut thread: Box<Thread>) {
         match (thread.slot, thread.pid) {
             (None, 0) => {
@@ -4076,6 +4135,22 @@ impl Orbit {
 
     fn dealloc_process(&mut self, mut process: Process) {
         let process_root_table_pa = PhysAddr::from(process.satp);
+
+        // Drop every `futex_waiters` entry whose owner is this dying
+        // process. Their `CompletionHandle` clones drop with the entry;
+        // the matching `Thread.handle` drops in `dealloc_thread` after
+        // we return. Without this sweep a later `futex_wake` on the
+        // same PA (e.g. a child process re-using the same physical
+        // page in its private heap) would walk the stale entry and
+        // dereference the dead Thread via the wake hook —
+        // `wake_blocked_inline` reads `t.handle.take().ret_count()` on
+        // freed memory and faults inside `CompletionHandle::ret_count`.
+        // FutexWaiter.pid was reserved for exactly this sweep.
+        let dead_pid = process.pid;
+        self.futex_waiters.retain(|_pa, waiters| {
+            waiters.retain(|w| w.pid != dead_pid);
+            !waiters.is_empty()
+        });
 
         // §13a.2 — three exit paths:
         //  1. Parent already parked on `wait_pid` → signal the waiter
@@ -4280,7 +4355,15 @@ impl Orbit {
                         None => {
                             let status = t.frame.regs[11] as isize;
                             info!("tid{} dead, removing status={status}", t.tid);
-                            proc.exit_code = status as i32;
+                            // exit-group: the EXIT-caller already
+                            // stamped `exit_code` with the value it
+                            // passed; sibling threads reaped after it
+                            // (rayon workers parked in futex_wait, etc.)
+                            // would otherwise clobber it with whatever
+                            // their stale `regs[11]` happens to be.
+                            if !proc.exit_finalized {
+                                proc.exit_code = status as i32;
+                            }
                         }
                     }
                 }

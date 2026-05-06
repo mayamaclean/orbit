@@ -236,10 +236,24 @@ pub unsafe fn ecall4_ret2(
 
 // --- high-level wrappers -------------------------------------------------
 
-/// Terminate the current process with `code`. Never returns.
+/// Terminate the current process with `code`. Never returns. POSIX
+/// `_exit(2)` shape — sibling threads of the calling process are
+/// torn down by the kernel as part of the exit-group sweep.
+///
+/// To exit only the calling thread (e.g. from a worker's trampoline),
+/// use [`thread_exit`] instead.
 #[inline]
 pub fn exit(code: isize) -> ! {
     unsafe { ecall1_noreturn(syscall::EXIT, code as usize) }
+}
+
+/// Terminate the calling thread, leaving sibling threads of the same
+/// process running. Never returns. Used by std's thread trampoline
+/// when a worker's closure returns; status surfaces through the
+/// joiner's futex word, not the kernel.
+#[inline]
+pub fn thread_exit() -> ! {
+    unsafe { ecall1_noreturn(syscall::THREAD_EXIT, 0) }
 }
 
 /// Print `len` bytes starting at `ptr` through the kernel's tagged
@@ -728,8 +742,8 @@ pub fn wait_pid(pid: u16) -> Result<i32, Errno> {
 ///
 /// Use case: latency micro-benchmarks (sleep accuracy, RTT, throughput
 /// timing) that don't want platform-coupled raw ticks. For wallclock,
-/// add a future `get_realtime` syscall — `get_micros` is monotonic
-/// only, no time-of-day offset.
+/// see [`get_realtime`] — `get_micros` is monotonic only, no
+/// time-of-day offset.
 ///
 /// A direct `csrr time` from U-mode (the §13a.4 zero-syscall idea)
 /// is gated behind a CSR-emulation handler we don't have yet —
@@ -741,6 +755,18 @@ pub fn wait_pid(pid: u16) -> Result<i32, Errno> {
 pub fn get_micros() -> u64 {
     let r = unsafe { ecall1(syscall::GET_MICROS, 0) };
     r as u64
+}
+
+/// Wall-clock time since the UNIX epoch, returned as `(secs, nanos)`.
+/// Backed by the kernel's Goldfish RTC driver on QEMU's `virt`
+/// machine; `nanos ∈ [0, 999_999_999]`.
+///
+/// **Not monotonic.** The host RTC can step backward (suspend/resume,
+/// NTP correction) — for interval timing use [`get_micros`].
+#[inline]
+pub fn get_realtime() -> (i64, u32) {
+    let (s, ns) = unsafe { ecall0_ret2(syscall::GET_REALTIME) };
+    (s as i64, ns as u32)
 }
 
 /// Return `(current, allowed)` for the calling thread's affinity mask.

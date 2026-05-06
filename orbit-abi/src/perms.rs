@@ -157,7 +157,7 @@ pub mod class {
     }
 
     /// `serial_print`, `console_write`, `read_stdin`, `get_micros`,
-    /// `close_handle`. The last is in stdio rather than its own class
+    /// `get_realtime`, `close_handle`. The last is in stdio rather than its own class
     /// because closing handles is a destructor — denying it strands
     /// resources, never a useful sandboxing tool.
     pub const STDIO: ClassMask = ClassMask::from_raw(raw::STDIO);
@@ -660,6 +660,7 @@ impl Permissions {
     pub const fn class_for(sysno: usize) -> ClassMask {
         match sysno {
             syscall::EXIT => class::PROC_LIFE,
+            syscall::THREAD_EXIT => class::PROC_LIFE,
             syscall::SERIAL_PRINT => class::STDIO,
             syscall::SLEEP_MS => class::SCHED,
             syscall::CONSOLE_WRITE => class::STDIO,
@@ -668,6 +669,7 @@ impl Permissions {
             syscall::GET_AFFINITY => class::SCHED,
             syscall::GET_HART_ID => class::SCHED,
             syscall::GET_MICROS => class::STDIO,
+            syscall::GET_REALTIME => class::STDIO,
             syscall::PLEDGE => class::PLEDGE,
             syscall::MMAP => class::VMEM,
             syscall::CREATE_NETCH => class::NETCH,
@@ -955,6 +957,7 @@ mod tests {
         use crate::syscall::*;
         let all = [
             EXIT,
+            THREAD_EXIT,
             SERIAL_PRINT,
             SLEEP_MS,
             CONSOLE_WRITE,
@@ -963,6 +966,7 @@ mod tests {
             GET_AFFINITY,
             GET_HART_ID,
             GET_MICROS,
+            GET_REALTIME,
             PLEDGE,
             MMAP,
             CREATE_NETCH,
@@ -1500,6 +1504,7 @@ mod tests {
         let p = Permissions::ALL;
         for s in [
             EXIT,
+            THREAD_EXIT,
             SERIAL_PRINT,
             SLEEP_MS,
             CONSOLE_WRITE,
@@ -1508,6 +1513,7 @@ mod tests {
             GET_AFFINITY,
             GET_HART_ID,
             GET_MICROS,
+            GET_REALTIME,
             PLEDGE,
             MMAP,
             CREATE_NETCH,

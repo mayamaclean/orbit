@@ -771,6 +771,56 @@ pub fn update_thread_and_trap_frame(
     orbit_core::trap::update_trap_frame(thread, epc, frame, from_user);
 }
 
+/// `exit(code)` (sysno 0) — POSIX `_exit(2)` / `exit_group(2)` shape.
+///
+/// Terminates the *whole calling process*, not just the calling
+/// thread. Marks every sibling thread `Exited` and IPIs any hart
+/// still running one so it traps and bails to k_idle. The manager's
+/// next `cleanup_threads_and_processes` pass reaps the process.
+///
+/// Why exit-group instead of thread-exit: every consumer of sysno 0
+/// (orbit-rt's `_start`, std-on-orbit's `_start`) calls it as the
+/// process's final act after `main` returns. A binary that uses any
+/// thread pool (rayon, the std test harness, `Command`'s reaper)
+/// leaves daemon threads parked in `futex_wait` after main exits;
+/// thread-exit only takes the leader, so the process dangles.
+/// Promote thread-exit semantics to a separate syscall (e.g.
+/// `THREAD_EXIT` paired with `pthread_exit`) when a real consumer
+/// needs it.
+///
+/// Noreturn: ends with `exit_thread_with_state(Exited)` for the
+/// calling thread, which jumps to k_idle.
+#[unsafe(no_mangle)]
+pub unsafe fn handle_exit(
+    epc: usize,
+    hart_context: &'static HartContext,
+    frame: &mut TrapFrame,
+    from_user: bool,
+) -> ! {
+    update_thread_and_trap_frame(epc, hart_context, frame, from_user);
+
+    let exit_code = frame.regs[11] as i32;
+    let cur = hart_context.current.load(Ordering::Acquire);
+    if !cur.is_null() {
+        let t = unsafe { (cur as *const Thread).as_ref_unchecked() };
+        let pid = t.pid;
+        let leader_tid = t.tid;
+        let orbit = unsafe { (hart_context.cscratch as *mut kernel::Orbit).as_mut_unchecked() };
+        // Brief manager spin — exit is not a hot path. Holding the
+        // lock here keeps `assign_threads` from picking up a sibling
+        // we haven't marked Exited yet.
+        while !try_acquire_manager() {
+            core::hint::spin_loop();
+        }
+        orbit.request_exit_group(pid, leader_tid, exit_code);
+        release_manager();
+    }
+
+    unsafe {
+        kernel::context::exit_thread_with_state(ThreadState::Exited);
+    }
+}
+
 pub fn handle_serial_print(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
     dispatch_syscall(epc, hart_context, frame, |t, f| {
         orbit_core::syscall::serial_print(t, f, &mut crate::hw::RiscvHardware)
@@ -1444,6 +1494,28 @@ pub fn handle_get_micros(epc: usize, hart_context: &'static HartContext, frame: 
     dispatch_syscall(epc, hart_context, frame, |_t, _f| {
         orbit_core::SyscallOutcome::Return {
             ret: micros as isize,
+        }
+    });
+}
+
+/// `get_realtime()` — wall-clock seconds + nanoseconds since the UNIX
+/// epoch. Two-register return: secs in `a0`, nsec in `a1`.
+///
+/// Backed by the Goldfish RTC at PA `0x101000` on QEMU virt
+/// (driver: [`crate::drivers::goldfish_rtc`]). The device returns
+/// nanoseconds since the epoch as a 64-bit value; we split into
+/// `(secs, nsec)` here so the user side can build a `(secs, nsec)`
+/// `SystemTime` without a follow-up divmod. Synchronous; no manager
+/// round-trip.
+#[unsafe(no_mangle)]
+pub fn handle_get_realtime(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
+    let nanos = crate::drivers::goldfish_rtc::now_nanos();
+    let secs = (nanos / 1_000_000_000) as isize;
+    let nsec = (nanos % 1_000_000_000) as isize;
+    dispatch_syscall(epc, hart_context, frame, |_t, _f| {
+        orbit_core::SyscallOutcome::Return2 {
+            ret0: secs,
+            ret1: nsec,
         }
     });
 }

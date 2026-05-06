@@ -71,6 +71,7 @@ The syscall layer (`orbit-core::syscall`) enforces the priv/shared split at the 
 - `2` — sleep_ms(ms)
 - `3` — console_write(ptr, len)
 - `4` — read_stdin(ptr, len, flags)
+- `10` — get_realtime() → (secs, nsec) — wall-clock since UNIX epoch via Goldfish RTC at PA `0x101000` (driver: [kmain/src/drivers/goldfish_rtc.rs](kmain/src/drivers/goldfish_rtc.rs)). Two-register return; `nsec ∈ [0, 999_999_999]`. Not monotonic — for intervals use `get_micros` (8). Backs `SystemTime::now()` and `FileAttr::{modified,accessed,created}` in std PAL.
 - `4096` — mmap(vaddr, len, perms, share_with_kernel) — vaddr must be in `UPROC_PRIV_BASE..UPROC_PRIV_END` when `share_with_kernel=false`, in `UPROC_SHARED_BASE..UPROC_SHARED_END` when `=true`
 - `4097` — create_netch(vaddr_hint, region_size, sock_type) → (user_va, fd) — vaddr_hint must be in `UPROC_SHARED_BASE..UPROC_SHARED_END`
 - `4098` — close_handle(fd)

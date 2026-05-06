@@ -244,6 +244,13 @@ pub const KRO: u64 = PagePermissions::R as u64 | PagePermissions::G as u64;
 
 pub const CLINT_MSIP_BASE: u64 = 0x0200_0000;
 pub const ACLINT_SSWI_BASE: u64 = 0x02F0_0000;
+/// Goldfish RTC base on QEMU's RISC-V `virt` machine (`compatible =
+/// "google,goldfish-rtc"`). 32-byte register window; only the first 8
+/// bytes (`TIME_LOW` / `TIME_HIGH`) are read by the driver. Hardcoded
+/// rather than DTB-walked for parity with `CLINT_MSIP_BASE` /
+/// `ACLINT_SSWI_BASE`; promote to discovery when a non-virt platform
+/// shows up.
+pub const GOLDFISH_RTC_BASE: u64 = 0x0010_1000;
 
 // Kernel link base — must match `. = 0x1000;` in kmain/memory.x. The kernel
 // stays linked at low-half; relocation slide at runtime is `ktext_base -
@@ -279,6 +286,10 @@ pub fn kmmio_clint() -> u64 {
 #[inline]
 pub fn kmmio_sswi() -> u64 {
     kmmio_base() + 2 * PAGE_SIZE as u64
+}
+#[inline]
+pub fn kmmio_rtc() -> u64 {
+    kmmio_base() + 3 * PAGE_SIZE as u64
 }
 
 /// Offset within the KMMIO window past the fixed-slot pages where the
@@ -734,6 +745,14 @@ unsafe fn map_kernel_high_half(
                 ACLINT_SSWI_BASE..ACLINT_SSWI_BASE + PAGE_SIZE as u64,
                 KRW,
                 "aclint.sswi.hh",
+            )?;
+            map_region_va(
+                rt,
+                pa,
+                kmmio_rtc(),
+                GOLDFISH_RTC_BASE..GOLDFISH_RTC_BASE + PAGE_SIZE as u64,
+                KRW,
+                "goldfish.rtc.hh",
             )?;
         }
     }

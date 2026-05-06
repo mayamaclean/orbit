@@ -14,6 +14,22 @@ fn main() {
         then.duration_since(now).as_micros()
     );
 
+    // SystemTime via Goldfish RTC. Sanity check that we got a
+    // post-2020 timestamp (anything before that means RTC didn't
+    // wire). Year 2020 = 1577836800 secs since epoch.
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) if d.as_secs() > 1_577_836_800 => {
+            println!("PASS: SystemTime::now epoch_secs={}", d.as_secs());
+        }
+        Ok(d) => {
+            println!(
+                "FAIL: SystemTime::now too early: epoch_secs={}",
+                d.as_secs()
+            );
+        }
+        Err(e) => println!("FAIL: SystemTime::now: {e}"),
+    }
+
     // §13e — std::thread::spawn round trip.
     let counter = Arc::new(AtomicU32::new(0));
     let worker_counter = counter.clone();
@@ -219,6 +235,16 @@ fn main() {
                         md.is_file(),
                         md.len(),
                     );
+                }
+                match md.modified() {
+                    Ok(t) => match t.duration_since(std::time::UNIX_EPOCH) {
+                        Ok(d) => println!(
+                            "PASS: std::fs::metadata /README modified epoch_secs={}",
+                            d.as_secs(),
+                        ),
+                        Err(e) => println!("FAIL: /README modified pre-epoch: {e}"),
+                    },
+                    Err(e) => println!("FAIL: /README modified: {e}"),
                 }
             }
             Err(e) => println!("FAIL: std::fs::metadata /README: {e}"),

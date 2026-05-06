@@ -80,6 +80,7 @@ pub static SYSCALL_STATS: [SyscallSlot; Sysno::COUNT] = [
     SyscallSlot::new(),
     SyscallSlot::new(),
     SyscallSlot::new(),
+    SyscallSlot::new(),
     // GetUid, GetEuid, GetGid, GetEgid, GetGroups, GetLogin —
     // ordinals 35..=40, appended when POSIX credential read syscalls
     // landed.
@@ -95,10 +96,13 @@ pub static SYSCALL_STATS: [SyscallSlot; Sysno::COUNT] = [
     SyscallSlot::new(),
     SyscallSlot::new(),
     SyscallSlot::new(),
+    // GetRealtime — ordinal 45, Goldfish RTC wallclock.
+    // ThreadExit — ordinal 46, pthread_exit shape.
+    SyscallSlot::new(),
 ];
 
 const _: () = assert!(
-    Sysno::COUNT == 45,
+    Sysno::COUNT == 47,
     "SYSCALL_STATS literal must be resized when Sysno::COUNT changes"
 );
 

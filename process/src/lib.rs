@@ -446,10 +446,16 @@ pub struct Process {
     /// Last exit status observed for this process — written when the
     /// thread that empties `threads` reports its `exit(code)` value.
     /// Read by `dealloc_process` to signal `exit_waiter` (if any).
-    /// Multi-threaded processes are last-writer-wins, matching POSIX's
-    /// "process exit status is what the calling thread passed to
-    /// exit()" looseness.
+    /// Multi-threaded processes are last-writer-wins by default; the
+    /// `exit_finalized` flag (set by exit-group) suppresses subsequent
+    /// overwrites so the caller's status is preserved even after
+    /// rayon-style worker reaps.
     pub exit_code: i32,
+    /// Set by `EXIT` (sysno 0) when it kicks off process-wide
+    /// teardown. While true, `cleanup_threads_and_processes` leaves
+    /// `exit_code` alone — the value the exit-caller passed wins,
+    /// regardless of the order in which sibling threads are reaped.
+    pub exit_finalized: bool,
     /// Single-waiter slot for §13a.2 `wait_pid`. v1 contract: at most
     /// one parent thread parks here at a time; a second `wait_pid`
     /// call returns EBUSY. Multi-waiter wants a `Vec<CompletionHandle>`
@@ -610,6 +616,7 @@ impl Process {
             pid,
             parent_pid,
             exit_code: 0,
+            exit_finalized: false,
             exit_waiter: None,
             dead_children: BTreeMap::new(),
             argv_blob: None,

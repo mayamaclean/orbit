@@ -17,6 +17,30 @@ pub const GET_HART_ID: usize = 7;
 /// returned in `a0`. Opaque base: only differences are meaningful.
 pub const GET_MICROS: usize = 8;
 
+/// `get_realtime() -> (secs: i64, nsec: u32)` — wall-clock time
+/// since the UNIX epoch. Two-return ecall: seconds in `a0`, nanoseconds
+/// in `a1`. Backed by the Goldfish RTC on QEMU's `virt` machine
+/// (nanosecond resolution at the device; the syscall does the
+/// `divmod 1_000_000_000` so callers can build a `(secs, nsec)`
+/// `SystemTime` directly).
+///
+/// `nsec ∈ [0, 999_999_999]`. No errno path — the device read can't
+/// fail. Time can step backward across host suspend/resume; for
+/// monotonic intervals use [`GET_MICROS`].
+pub const GET_REALTIME: usize = 10;
+
+/// `thread_exit() -> !` — terminate just the calling thread, leaving
+/// sibling threads of the same process running. Used by std's thread
+/// trampoline (and any future `pthread_exit`-shaped caller) when a
+/// worker's closure returns; the *process* is only torn down via
+/// [`EXIT`], which is now exit-group.
+///
+/// No exit code: thread-level status surfaces through std's
+/// `JoinHandle` futex word (`EXITED`/`RUNNING`), not through the
+/// kernel. The arg slot is reserved for a future `pthread_exit_value`
+/// pattern — for now any value passed is ignored.
+pub const THREAD_EXIT: usize = 11;
+
 /// `pledge(req: *const PermsRequest) -> 0 | -errno` — narrow this
 /// process's `perms` and `allowed_perms` masks. The kernel mutates
 /// `Process.permissions` and propagates the narrowed snapshot to
@@ -259,6 +283,8 @@ pub enum Sysno {
     GetAffinity = GET_AFFINITY,
     GetHartId = GET_HART_ID,
     GetMicros = GET_MICROS,
+    GetRealtime = GET_REALTIME,
+    ThreadExit = THREAD_EXIT,
     Pledge = PLEDGE,
     Mmap = MMAP,
     CreateNetch = CREATE_NETCH,
@@ -309,6 +335,8 @@ impl Sysno {
             GET_AFFINITY => Self::GetAffinity,
             GET_HART_ID => Self::GetHartId,
             GET_MICROS => Self::GetMicros,
+            GET_REALTIME => Self::GetRealtime,
+            THREAD_EXIT => Self::ThreadExit,
             PLEDGE => Self::Pledge,
             MMAP => Self::Mmap,
             CREATE_NETCH => Self::CreateNetch,
@@ -400,6 +428,8 @@ impl Sysno {
             Self::SetGid => 42,
             Self::SetGroups => 43,
             Self::SetLogin => 44,
+            Self::GetRealtime => 45,
+            Self::ThreadExit => 46,
         }
     }
 
@@ -408,7 +438,7 @@ impl Sysno {
     /// when adding a `Sysno` variant. Older userland with a smaller
     /// COUNT reads a prefix of the kernel's table; newer userland with
     /// a larger COUNT treats the kernel's missing slots as zero.
-    pub const COUNT: usize = 45;
+    pub const COUNT: usize = 47;
 }
 
 #[cfg(test)]
@@ -426,6 +456,8 @@ mod tests {
         assert_eq!(Sysno::from_usize(GET_AFFINITY), Some(Sysno::GetAffinity));
         assert_eq!(Sysno::from_usize(GET_HART_ID), Some(Sysno::GetHartId));
         assert_eq!(Sysno::from_usize(GET_MICROS), Some(Sysno::GetMicros));
+        assert_eq!(Sysno::from_usize(GET_REALTIME), Some(Sysno::GetRealtime));
+        assert_eq!(Sysno::from_usize(THREAD_EXIT), Some(Sysno::ThreadExit));
         assert_eq!(Sysno::from_usize(MMAP), Some(Sysno::Mmap));
         assert_eq!(Sysno::from_usize(CREATE_NETCH), Some(Sysno::CreateNetch));
         assert_eq!(Sysno::from_usize(CLOSE_HANDLE), Some(Sysno::CloseHandle));
@@ -481,8 +513,9 @@ mod tests {
 
     #[test]
     fn unknown_returns_none() {
-        // 9 is PLEDGE — used to be a hole below 4096, now decodes.
-        assert_eq!(Sysno::from_usize(10), None);
+        // 9 is PLEDGE, 10 is GET_REALTIME, 11 is THREAD_EXIT — used to
+        // be holes below 4096.
+        assert_eq!(Sysno::from_usize(12), None);
         assert_eq!(Sysno::from_usize(4095), None);
         // 4105..=4118 are now CREATE_PROCESS_V2 / QUERY_DENIAL_LOG /
         // CHDIR / GETCWD / GETUID / GETEUID / GETGID / GETEGID /
@@ -507,6 +540,8 @@ mod tests {
         assert_eq!(Sysno::GetAffinity as usize, GET_AFFINITY);
         assert_eq!(Sysno::GetHartId as usize, GET_HART_ID);
         assert_eq!(Sysno::GetMicros as usize, GET_MICROS);
+        assert_eq!(Sysno::GetRealtime as usize, GET_REALTIME);
+        assert_eq!(Sysno::ThreadExit as usize, THREAD_EXIT);
         assert_eq!(Sysno::Mmap as usize, MMAP);
         assert_eq!(Sysno::CreateNetch as usize, CREATE_NETCH);
         assert_eq!(Sysno::CloseHandle as usize, CLOSE_HANDLE);
@@ -558,6 +593,8 @@ mod tests {
         assert_eq!(GET_AFFINITY, 6);
         assert_eq!(GET_HART_ID, 7);
         assert_eq!(GET_MICROS, 8);
+        assert_eq!(GET_REALTIME, 10);
+        assert_eq!(THREAD_EXIT, 11);
         assert_eq!(MMAP, 4096);
         assert_eq!(CREATE_NETCH, 4097);
         assert_eq!(CLOSE_HANDLE, 4098);
@@ -646,6 +683,8 @@ mod tests {
             Sysno::SetGid,
             Sysno::SetGroups,
             Sysno::SetLogin,
+            Sysno::GetRealtime,
+            Sysno::ThreadExit,
         ];
         assert_eq!(all.len(), Sysno::COUNT);
         let mut seen = [false; Sysno::COUNT];

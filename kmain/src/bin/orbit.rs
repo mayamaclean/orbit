@@ -277,8 +277,20 @@ extern "C" fn s_trap(
                 }
                 else {
                     match syscall {
-                        // exit
+                        // exit — POSIX `_exit(2)` / `exit_group(2)`
+                        // semantics: terminate the whole calling
+                        // process, not just the calling thread. Rayon
+                        // pools and similar daemon threads stay parked
+                        // in futex_wait when a single-thread `exit`
+                        // returns, leaving the process alive forever.
                         0 => unsafe {
+                            kmain::handle_exit(epc, hart_context, frame, from_user);
+                        },
+                        // thread_exit — pthread_exit shape. Only the
+                        // calling thread dies; sibling threads keep
+                        // running. Used by std's thread trampoline
+                        // when a worker's closure returns.
+                        11 => unsafe {
                             kmain::update_thread_and_trap_frame(
                                 epc,
                                 hart_context,
@@ -314,6 +326,9 @@ extern "C" fn s_trap(
                         }
                         9 => {
                             kmain::handle_pledge(epc, hart_context, frame);
+                        }
+                        10 => {
+                            kmain::handle_get_realtime(epc, hart_context, frame);
                         }
                         4096 => {
                             debug!("orbit handling u mode ecall({syscall})");
@@ -513,6 +528,12 @@ pub extern "C" fn k_smpstart() {
     unsafe {
         serial::init_serial(kmain::kernel::memmap::kmmio_uart() as usize);
     }
+
+    // Stash the KMMIO VA of the Goldfish RTC. Reads happen via the
+    // `get_realtime` syscall; backing leaf was installed by
+    // `map_kernel_shared` and is reachable under the orbit satp now
+    // active.
+    kmain::drivers::goldfish_rtc::init(kmain::kernel::memmap::kmmio_rtc());
 
     let hart_context =
         unsafe { (riscv::register::sscratch::read() as *const HartContext).as_ref_unchecked() };

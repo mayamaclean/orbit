@@ -2,6 +2,7 @@ pub mod display;
 pub mod e1000;
 pub mod fb;
 pub mod fonts;
+pub mod goldfish_rtc;
 pub mod k_gpu;
 pub mod plic;
 pub mod virtio_blk_dev;
