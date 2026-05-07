@@ -10,7 +10,7 @@ use dtoolkit::fdt::FdtNode;
 use dtoolkit::{Node, fdt::Fdt};
 use elf::endian::LittleEndian;
 use mem::{round_u64_down, round_u64_up};
-use mmu::mmap::{PageAlloc, map_address_range, unmap, unmap_page};
+use mmu::mmap::{PageAlloc, map_address_range, unmap, unmap_page, unmap_range};
 use mmu::sv48::{PageTable, PhysAddr, VirtAddr};
 // `PAGE_SIZE` (usize) intentionally shadows the u64 re-export from
 // `orbit_abi::layout::*` below — kmain consumes the usize form internally.
@@ -28,9 +28,9 @@ use orbit_abi::errno::{
 use orbit_core::ready_queue::ReadyQueue;
 use orbit_core::sleep_heap::SleepHeap;
 use orbit_core::{
-    CloseHandleReq, CreateProcessExReq, CreateProcessReq, CreateThreadReq, FsOpenReq, FsReadReq,
-    FsReaddirReq, FsStatReq, FutexWaitReq, FutexWakeReq, MAX_FS_PATH_LEN, MemMapReq,
-    NetChannelCreationReq, PendingWork, WaitPidReq,
+    CloseHandleReq, CreateProcessExReq, CreateProcessReq, CreateThreadReq, FbSurfaceCreateReq,
+    FbSurfaceDestroyReq, FsOpenReq, FsReadReq, FsReaddirReq, FsStatReq, FutexWaitReq, FutexWakeReq,
+    MAX_FS_PATH_LEN, MemMapReq, NetChannelCreationReq, PendingWork, WaitPidReq,
 };
 use thingbuf::StaticThingBuf;
 
@@ -67,6 +67,7 @@ pub mod shared_frame;
 pub mod shared_user_ptr;
 pub mod shootdown;
 pub mod stdin;
+pub mod surface;
 pub mod user_page;
 
 pub use memmap::KernelLayout;
@@ -975,6 +976,228 @@ impl Orbit {
 
         info!("fulfilled {req:?}:\n\tpa={backing_pa:016X?} {layout:08X?}");
 
+        0
+    }
+
+    /// `fb_surface_create(w, h, format)` — allocate a `kernel_pages`-
+    /// backed pixel surface, map it user-writable in the calling
+    /// process's shared range, and register a per-process surface table
+    /// entry. Returns `(handle_id, user_va)` on success; the caller of
+    /// the manager wraps these as `signal_pair` args.
+    ///
+    /// Errnos surface via the negative isize convention; both return
+    /// slots carry the errno on failure (caller looks at the first).
+    fn run_fb_surface_create_req(
+        &mut self,
+        req: FbSurfaceCreateReq,
+        pid: u16,
+        root_pa: PhysAddr,
+    ) -> (isize, isize) {
+        use orbit_abi::fb::FbFormat;
+
+        // Format already validated at the syscall boundary; defensive
+        // re-check here lets the manager assume well-formed input.
+        let Some(format) = FbFormat::from_u32(req.format_raw)
+        else {
+            return (Errno::new(EINVAL).to_ret(), 0);
+        };
+        if req.width == 0 || req.height == 0 {
+            return (Errno::new(EINVAL).to_ret(), 0);
+        }
+
+        let bpp = format.bytes_per_pixel() as usize;
+        let Some(pixel_bytes) = (req.width as usize)
+            .checked_mul(req.height as usize)
+            .and_then(|n| n.checked_mul(bpp))
+        else {
+            return (Errno::new(EINVAL).to_ret(), 0);
+        };
+
+        // Round size up to PAGE_SIZE so the mapping is page-aligned at
+        // both ends. v1 uses 4 KiB pages always — large surfaces still
+        // map at page granularity. Megapage promotion is a follow-up.
+        let size_bytes = (pixel_bytes + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+
+        let layout = match Layout::from_size_align(size_bytes, PAGE_SIZE) {
+            Ok(l) => l,
+            Err(_) => return (Errno::new(EINVAL).to_ret(), 0),
+        };
+
+        // Allocate from kernel_pages so the compositor's per-frame blit
+        // can run through the KDMAP alias without going back through the
+        // user PT.
+        let Some((frame, kva)) = self.kernel_pages.alloc_kdmap(layout)
+        else {
+            warn!(
+                "fb_surface_create: kernel_pages alloc failed for {} bytes",
+                size_bytes
+            );
+            return (Errno::new(ENOMEM).to_ret(), 0);
+        };
+
+        // Zero the surface bytes before the user PTE exists — same
+        // hygiene as run_nc_create_req. Previous tenant pixels can't
+        // leak across processes.
+        unsafe {
+            core::ptr::write_bytes(kva.as_mut_ptr::<u8>(), 0, size_bytes);
+        }
+
+        // Look up the per-process surface registry; lazily register
+        // (the create_new_process hook should have done this already
+        // but defending against it lets a runtime-spawned source still
+        // work).
+        let surfaces = match crate::kernel::surface::get(pid) {
+            Some(s) => s,
+            None => {
+                crate::kernel::surface::register(pid);
+                match crate::kernel::surface::get(pid) {
+                    Some(s) => s,
+                    None => {
+                        self.kernel_pages.free(frame, layout);
+                        return (Errno::new(ESRCH).to_ret(), 0);
+                    }
+                }
+            }
+        };
+
+        // Reserve a fresh shared-range VA. Cursor only ever increases;
+        // destroyed surfaces don't recycle their VA. 62 TiB shared
+        // range absorbs millions of creates per process before
+        // exhaustion.
+        let user_va = surfaces.alloc_va(size_bytes as u64);
+        if user_va + size_bytes as u64 > orbit_abi::layout::UPROC_SHARED_END {
+            self.kernel_pages.free(frame, layout);
+            warn!("fb_surface_create: pid={pid} exhausted shared VA range");
+            return (Errno::new(ENOMEM).to_ret(), 0);
+        }
+
+        let config = MappingConfig {
+            permissions: (PagePermissions::R as u64)
+                | (PagePermissions::W as u64)
+                | (PagePermissions::U as u64),
+            levels: 4,
+            page_size: PAGE_SIZE as u64,
+            vaddr: VirtAddr::new(user_va),
+            paddr: frame.raw(),
+            log: false,
+            // SupervisorTag::None — surfaces are managed via the
+            // explicit fb_surface_destroy / dealloc_process paths,
+            // not the SharedUserPtr revoke walk.
+            supervisor_tag: SupervisorTag::None,
+        };
+
+        let vend = VirtAddr::new(user_va + size_bytes as u64);
+        let pend = PhysAddr::new(frame.get_raw() + size_bytes as u64);
+
+        unsafe {
+            let root_table = memmap::kernel_root_from_pa(root_pa);
+            let mut pages = PageAlloc::FA(self.table_pages.frames_mut());
+            if map_address_range(&root_table, &mut pages, &config, vend, pend).is_err() {
+                warn!(
+                    "fb_surface_create: map_address_range failed for pid={pid} va=0x{user_va:X}"
+                );
+                self.kernel_pages.free(frame, layout);
+                return (Errno::new(ENOMEM).to_ret(), 0);
+            }
+        }
+
+        if !self.processes.contains_key(&pid) {
+            // Process disappeared between the cursor bump and the map.
+            // Roll back the mapping (best effort) and free the frame.
+            unsafe {
+                let root_table = memmap::kernel_root_from_pa(root_pa);
+                let _ = unmap_range(&root_table, user_va..user_va + size_bytes as u64);
+            }
+            self.kernel_pages.free(frame, layout);
+            return (Errno::new(ESRCH).to_ret(), 0);
+        }
+
+        let id = surfaces.alloc_id();
+        let entry = crate::kernel::surface::SurfaceEntry {
+            user_va,
+            kdmap_kva: kva.raw(),
+            width: req.width,
+            height: req.height,
+            format,
+            size_bytes,
+            backing: PhysBacking::Shared { frame, layout },
+        };
+        surfaces.insert(id, entry);
+
+        core::sync::atomic::fence(Ordering::SeqCst);
+        riscv::asm::sfence_vma(pid as usize, 0);
+        crate::kernel::shootdown::broadcast(0, 0);
+
+        info!(
+            "fb_surface_create: pid={pid} id={id} {}x{} user_va=0x{:X} kva=0x{:016X} size={}",
+            req.width,
+            req.height,
+            user_va,
+            kva.raw(),
+            size_bytes
+        );
+        (id as isize, user_va as isize)
+    }
+
+    /// `fb_surface_destroy(handle)` — remove the surface from the
+    /// per-process table, unmap its user VA range, and return the
+    /// backing frame to `kernel_pages`.
+    ///
+    /// Note: there is a brief window between `Cmd::RemoveSource`
+    /// being queued and k_gpu draining it where the Display still
+    /// references the soon-to-be-freed kdmap KVA. For surface
+    /// destroy specifically (not process teardown) we rely on the
+    /// caller having stopped issuing `fb_present` on this handle —
+    /// any lingering damage from prior presents is rendered with
+    /// stale-but-still-mapped bytes one last time before the unmap
+    /// lands. Process-exit teardown has the same race; v1 accepts
+    /// both as best-effort.
+    fn run_fb_surface_destroy_req(
+        &mut self,
+        req: FbSurfaceDestroyReq,
+        pid: u16,
+        root_pa: PhysAddr,
+    ) -> isize {
+        let Some(surfaces) = crate::kernel::surface::get(pid)
+        else {
+            return Errno::new(ESRCH).to_ret();
+        };
+
+        let Some(entry) = surfaces.remove(req.handle)
+        else {
+            return Errno::new(EBADF).to_ret();
+        };
+
+        // Clear leaf PTEs across the surface's user VA range.
+        // unmap_range expects 4 KiB-aligned bounds — surface VA was
+        // chosen page-aligned at create time and size_bytes was rounded
+        // up to PAGE_SIZE, so the bounds are clean.
+        unsafe {
+            let root_table = memmap::kernel_root_from_pa(root_pa);
+            if let Err(()) =
+                unmap_range(&root_table, entry.user_va..entry.user_va + entry.size_bytes as u64)
+            {
+                warn!(
+                    "fb_surface_destroy: unmap_range failed pid={pid} handle={} va=0x{:X}",
+                    req.handle, entry.user_va
+                );
+                // Continue anyway — leaving stale PTEs would be worse
+                // than letting the free path proceed; the user PT is
+                // about to be freed at next dealloc anyway.
+            }
+        }
+
+        core::sync::atomic::fence(Ordering::SeqCst);
+        riscv::asm::sfence_vma(pid as usize, 0);
+        crate::kernel::shootdown::broadcast(0, 0);
+
+        // Return the backing to kernel_pages.
+        self.free_backing(entry.backing);
+
+        info!(
+            "fb_surface_destroy: pid={pid} handle={} user_va=0x{:X}",
+            req.handle, entry.user_va
+        );
         0
     }
 
@@ -3495,6 +3718,24 @@ impl Orbit {
                     // manager-side signal here.
                     self.run_create_process_v2_req(req, pid, root_pa, tid, handle);
                 }
+                PendingWork::FbSurfaceCreate {
+                    req,
+                    pid,
+                    root_pa,
+                    handle,
+                } => {
+                    let (r, e) = self.run_fb_surface_create_req(req, pid, root_pa);
+                    handle.signal_pair(r, e);
+                }
+                PendingWork::FbSurfaceDestroy {
+                    req,
+                    pid,
+                    root_pa,
+                    handle,
+                } => {
+                    let result = self.run_fb_surface_destroy_req(req, pid, root_pa);
+                    handle.signal(result);
+                }
                 PendingWork::CacheFill { packed_key, status } => {
                     self.run_cache_fill(packed_key, status);
                 }
@@ -4194,6 +4435,24 @@ impl Orbit {
         // this only fires if a thread parks an instant before the
         // owning process exits — rare).
         crate::kernel::stdin::unregister(process.pid);
+
+        // Tear down the per-process surface table. Each remaining
+        // entry's backing frame goes back to `kernel_pages`. The user
+        // PT is freed wholesale by the `unmap` call later in this
+        // function, so per-entry `unmap_range` is unnecessary; we
+        // only need to recover the physical pages.
+        //
+        // Race with k_gpu: the `push_remove_source` above will be
+        // drained by k_gpu and clear any active SurfaceState for this
+        // pid before any further repaint runs. Between the push and
+        // the drain, k_gpu may briefly hold a kdmap_kva that we're
+        // about to free below. v1 accepts this — the worst case is
+        // one frame of stale pixels before the source is removed.
+        if let Some(surfaces) = crate::kernel::surface::unregister(process.pid) {
+            for (_id, entry) in surfaces.drain_all() {
+                self.free_backing(entry.backing);
+            }
+        }
 
         while let Some(socket_handle) = process.sockets.pop_last() {
             if let Err(e) = self.net_pkg.socket_deletions.enqueue(socket_handle) {
@@ -5508,6 +5767,12 @@ impl Orbit {
         // place to deliver keystrokes once the process becomes the
         // active source. Removed by `dealloc_process` on teardown.
         crate::kernel::stdin::register(pid);
+
+        // Register a per-process surface table so `fb_surface_create`
+        // has a slot to insert into without taking the slow path of
+        // lazily registering under MANAGER_LOCK. Drained by
+        // `dealloc_process`.
+        crate::kernel::surface::register(pid);
 
         // Install argv / envp blobs if the caller provided them.
         // Same warn-but-continue policy as `run_create_process_ex_req`:

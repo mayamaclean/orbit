@@ -127,6 +127,14 @@ impl FrameBuffer {
     pub fn height(&self) -> u32 {
         self.height
     }
+    /// Raw KDMAP pointer to the first pixel. Exposed for the
+    /// surface-mode compositor's per-row blit, which writes pixel
+    /// strides directly via `write_volatile`. All accesses must
+    /// stay within `width * height * 4` bytes; the caller is
+    /// responsible for clipping.
+    pub fn base_ptr(&self) -> *mut u32 {
+        self.base
+    }
     pub fn size_bytes(&self) -> usize {
         self.width as usize * self.height as usize * 4
     }

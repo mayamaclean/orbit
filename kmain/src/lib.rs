@@ -1712,3 +1712,175 @@ pub fn handle_query_syscall_stats(
         }
     });
 }
+
+/// `fb_query(&mut FbInfo) -> 0 | -errno` — sync. Read the active
+/// framebuffer dims off `k_gpu`'s installed package and copy a `FbInfo`
+/// payload into the user buffer. Returns `EAGAIN` until k_gpu has
+/// installed its package at boot — every legitimate caller hits this
+/// long after init, so the race window is theoretical.
+#[unsafe(no_mangle)]
+pub fn handle_fb_query(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
+    use orbit_abi::errno::{EAGAIN, EFAULT, EINVAL};
+    use orbit_abi::fb::{FbFormat, FbInfo};
+    use orbit_abi::layout::user_range_ok;
+
+    dispatch_syscall(epc, hart_context, frame, |t, f| {
+        let Ok(buf_va) = UserVa::new(f.regs[11] as u64)
+        else {
+            return orbit_core::SyscallOutcome::Return {
+                ret: -(EFAULT as isize),
+            };
+        };
+        let buf_len = core::mem::size_of::<FbInfo>();
+
+        if !user_range_ok(buf_va.raw(), buf_len as u64) {
+            return orbit_core::SyscallOutcome::Return {
+                ret: -(EFAULT as isize),
+            };
+        }
+        // FbInfo is 16 bytes — fits in one page comfortably; reject
+        // straddling so the SUM-gated copy below can be a single
+        // bounded write.
+        if (buf_va.raw() as usize & (mmu::PAGE_SIZE - 1))
+            + buf_len
+            > mmu::PAGE_SIZE
+        {
+            return orbit_core::SyscallOutcome::Return {
+                ret: -(EINVAL as isize),
+            };
+        }
+        // Verify the start page is mapped under the caller's satp.
+        // The straddle check above + this single resolve cover the
+        // whole copy.
+        use orbit_core::Hardware;
+        if !crate::hw::RiscvHardware.user_va_translates(t.root_table_addr(), buf_va) {
+            return orbit_core::SyscallOutcome::Return {
+                ret: -(EFAULT as isize),
+            };
+        }
+
+        let (w, h) = match crate::drivers::k_gpu::fb_size() {
+            Some(d) => d,
+            None => {
+                return orbit_core::SyscallOutcome::Return {
+                    ret: -(EAGAIN as isize),
+                };
+            }
+        };
+        let info = FbInfo {
+            width: w,
+            height: h,
+            format: FbFormat::Bgra8888 as u32,
+            flags: 0,
+        };
+
+        let guard = UserAccess::enter();
+        unsafe {
+            let dst = guard.slice_mut(buf_va, buf_len);
+            let src = core::slice::from_raw_parts(&info as *const FbInfo as *const u8, buf_len);
+            dst.copy_from_slice(src);
+        }
+        drop(guard);
+
+        orbit_core::SyscallOutcome::Return { ret: 0 }
+    });
+}
+
+/// `fb_surface_create(w, h, format) -> (handle, user_va) | -errno` —
+/// async, manager-handled. Pure forwarder: orbit-core builds the
+/// `PendingWork::FbSurfaceCreate` and parks the caller; the manager
+/// runs the alloc + map + register and signals back via `signal_pair`.
+#[unsafe(no_mangle)]
+pub fn handle_fb_surface_create(
+    epc: usize,
+    hart_context: &'static HartContext,
+    frame: &mut TrapFrame,
+) {
+    dispatch_syscall(epc, hart_context, frame, |t, f| {
+        orbit_core::syscall::fb_surface_create_req(t, f, &mut crate::hw::RiscvHardware)
+    });
+}
+
+/// `fb_surface_destroy(handle) -> 0 | -errno` — async, manager-handled.
+/// Same forwarder shape as create.
+#[unsafe(no_mangle)]
+pub fn handle_fb_surface_destroy(
+    epc: usize,
+    hart_context: &'static HartContext,
+    frame: &mut TrapFrame,
+) {
+    dispatch_syscall(epc, hart_context, frame, |t, f| {
+        orbit_core::syscall::fb_surface_destroy_req(t, f, &mut crate::hw::RiscvHardware)
+    });
+}
+
+/// `fb_present(handle, x, y, w, h) -> 0 | -errno` — sync. Look up the
+/// caller's surface table entry, validate the rect, and push a
+/// `Cmd::PresentSurface` carrying the snapshot onto k_gpu's ring.
+/// `k_gpu` does the per-row blit + virtio-gpu transfer on its next
+/// drain.
+#[unsafe(no_mangle)]
+pub fn handle_fb_present(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
+    use crate::drivers::display::Source;
+    use crate::drivers::k_gpu::{PresentArgs, push_present};
+    use orbit_abi::errno::{EAGAIN, EBADF, EINVAL};
+
+    dispatch_syscall(epc, hart_context, frame, |t, f| {
+        let handle = f.regs[11] as u32;
+        let rect_x = f.regs[12] as u32;
+        let rect_y = f.regs[13] as u32;
+        let rect_w = f.regs[14] as u32;
+        let rect_h = f.regs[15] as u32;
+
+        if rect_w == 0 || rect_h == 0 {
+            return orbit_core::SyscallOutcome::Return {
+                ret: -(EINVAL as isize),
+            };
+        }
+
+        let Some(surfaces) = crate::kernel::surface::get(t.pid)
+        else {
+            // No surface table for this pid → certainly no handle.
+            return orbit_core::SyscallOutcome::Return {
+                ret: -(EBADF as isize),
+            };
+        };
+
+        let Some(snapshot) = surfaces.snapshot(handle)
+        else {
+            return orbit_core::SyscallOutcome::Return {
+                ret: -(EBADF as isize),
+            };
+        };
+
+        // Reject rects that extend past the surface dims. Saturating
+        // adds catch the overflow case — a malicious caller passing
+        // u32::MAX in `w` would otherwise wrap.
+        let x_end = rect_x.saturating_add(rect_w);
+        let y_end = rect_y.saturating_add(rect_h);
+        if x_end > snapshot.width || y_end > snapshot.height {
+            return orbit_core::SyscallOutcome::Return {
+                ret: -(EINVAL as isize),
+            };
+        }
+
+        let args = PresentArgs {
+            kdmap_kva: snapshot.kdmap_kva,
+            width: snapshot.width,
+            height: snapshot.height,
+            rect_x,
+            rect_y,
+            rect_w,
+            rect_h,
+            format_raw: snapshot.format as u32,
+        };
+
+        if !push_present(Source::Process(t.pid), args) {
+            return orbit_core::SyscallOutcome::Return {
+                ret: -(EAGAIN as isize),
+            };
+        }
+
+        orbit_core::SyscallOutcome::Return { ret: 0 }
+    });
+}

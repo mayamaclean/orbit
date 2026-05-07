@@ -219,6 +219,29 @@ pub struct CreateProcessExReq {
     pub envp_vaddr: UserVa,
 }
 
+/// `fb_surface_create(w, h, format)` request. The manager allocates a
+/// `kernel_pages` frame sized to `w * h * bytes_per_pixel(format)`
+/// (rounded up to a page), maps it user-writable in the calling
+/// process's shared range, registers the entry in the per-process
+/// surface table, and signals the handle with `(handle_id, user_va)`.
+#[derive(Debug, Clone, Copy)]
+pub struct FbSurfaceCreateReq {
+    pub width: u32,
+    pub height: u32,
+    /// Encoded `crate::fb::FbFormat` discriminant (validated by the
+    /// manager via `FbFormat::from_u32`).
+    pub format_raw: u32,
+}
+
+/// `fb_surface_destroy(handle)` request. Manager looks up the surface
+/// in the calling process's table, unmaps the user VA, drops the
+/// table entry, and frees the backing frame back to `kernel_pages`.
+/// Signals `0` on success or a negative errno.
+#[derive(Debug, Clone, Copy)]
+pub struct FbSurfaceDestroyReq {
+    pub handle: u32,
+}
+
 /// One slot in the manager's MPSC work ring. Fixed-size by virtue of
 /// the variants — the largest payload (`CreateProcessReq`) is two
 /// words; the handle is one Arc.
@@ -359,6 +382,24 @@ pub enum PendingWork {
         /// waiters dispatches to the right state machine via
         /// this tid. Bytes-mode ignores it.
         tid: u32,
+        handle: CompletionHandle,
+    },
+    /// `fb_surface_create(w, h, format)` — manager allocates the
+    /// pixel surface, maps it into the user PT, registers the
+    /// per-process surface table entry, and signals the handle with
+    /// `(handle_id, user_va)`.
+    FbSurfaceCreate {
+        req: FbSurfaceCreateReq,
+        pid: u16,
+        root_pa: PhysAddr,
+        handle: CompletionHandle,
+    },
+    /// `fb_surface_destroy(handle)` — manager unmaps + frees the
+    /// surface and signals `0` (or `-EBADF` if the handle was unknown).
+    FbSurfaceDestroy {
+        req: FbSurfaceDestroyReq,
+        pid: u16,
+        root_pa: PhysAddr,
         handle: CompletionHandle,
     },
     /// Page-cache DMA completion. Posted by the virtio-blk IRQ when a

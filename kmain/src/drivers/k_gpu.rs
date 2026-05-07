@@ -36,6 +36,34 @@ pub enum CmdKind {
     CycleActive,
     InsertSource,
     RemoveSource,
+    /// User-side `fb_present(handle, rect)` request. Carries an
+    /// embedded snapshot of the surface (kdmap KVA, dims, format) so
+    /// `k_gpu`'s drain loop never has to touch the per-process surface
+    /// table. The user-side syscall handler validates the handle +
+    /// rect at submission time.
+    PresentSurface,
+}
+
+/// Args carried by a [`CmdKind::PresentSurface`] slot. Snapshot of the
+/// surface metadata + the damage rect to compose. Fixed-size so the
+/// outer `Cmd` stays `Default + Clone` for `StaticThingBuf` slot reuse.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PresentArgs {
+    /// Kernel-side KDMAP alias of the surface's first byte. The
+    /// compositor reads pixels straight from here for the per-row blit.
+    pub kdmap_kva: u64,
+    /// Surface dimensions in pixels.
+    pub width: u32,
+    pub height: u32,
+    /// Damage rect inside the surface, validated against `(width,
+    /// height)` at submit time.
+    pub rect_x: u32,
+    pub rect_y: u32,
+    pub rect_w: u32,
+    pub rect_h: u32,
+    /// `FbFormat` discriminant. `1 = Bgra8888` is the only value v1
+    /// emits; reserved for future formats.
+    pub format_raw: u32,
 }
 
 /// One queue slot. Fixed-size so slot-reuse (`push_ref` / `pop_ref`)
@@ -43,11 +71,15 @@ pub enum CmdKind {
 #[derive(Clone)]
 pub struct Cmd {
     pub kind: CmdKind,
-    /// Only meaningful for `WriteChunk`.
+    /// Only meaningful for `WriteChunk` / `PresentSurface` /
+    /// `InsertSource` / `RemoveSource`. The compositor uses this to
+    /// route per-source state mutations.
     pub source: Source,
     /// Valid length in `bytes`; 0 for non-chunk commands.
     pub len: u16,
     pub bytes: [u8; CMD_BYTES],
+    /// Only meaningful for `PresentSurface`. Zeroed for other kinds.
+    pub present: PresentArgs,
 }
 
 impl Default for Cmd {
@@ -57,6 +89,7 @@ impl Default for Cmd {
             source: Source::Kernel,
             len: 0,
             bytes: [0u8; CMD_BYTES],
+            present: PresentArgs::default(),
         }
     }
 }
@@ -98,6 +131,21 @@ pub fn is_ready() -> bool {
     !PKG_PTR.load(Ordering::Acquire).is_null()
 }
 
+/// Snapshot of the active framebuffer dimensions. Returns `None` until
+/// `install_package` runs at boot. Stable for the life of the system
+/// in v1 (no display-mode changes).
+pub fn fb_size() -> Option<(u32, u32)> {
+    let p = PKG_PTR.load(Ordering::Acquire);
+    if p.is_null() {
+        return None;
+    }
+    // SAFETY: PKG_PTR is install-once; the FrameBuffer dims are
+    // immutable after install. Reading width/height through the
+    // shared reference races nothing.
+    let pkg = unsafe { &*p };
+    Some((pkg.display.fb.width(), pkg.display.fb.height()))
+}
+
 /// Push a single chunk command. Returns false if the ring was full.
 pub fn push_chunk(source: Source, bytes: &[u8]) -> bool {
     let Ok(mut slot) = CONSOLE_RING.push_ref()
@@ -133,6 +181,23 @@ pub fn push_insert_source(source: Source) -> bool {
     slot.kind = CmdKind::InsertSource;
     slot.source = source;
     slot.len = 0;
+    true
+}
+
+/// Push a present-surface command. The args carry an immutable
+/// snapshot of the surface (`kdmap_kva`, dims, format) plus the damage
+/// rect inside the surface; the syscall handler is responsible for
+/// validating the handle and rect bounds before submission. Returns
+/// `false` if the ring was full.
+pub fn push_present(source: Source, args: PresentArgs) -> bool {
+    let Ok(mut slot) = CONSOLE_RING.push_ref()
+    else {
+        return false;
+    };
+    slot.kind = CmdKind::PresentSurface;
+    slot.source = source;
+    slot.len = 0;
+    slot.present = args;
     true
 }
 
@@ -188,22 +253,32 @@ pub extern "C" fn k_gpu(_a0: usize) {
                 CmdKind::RemoveSource => {
                     pkg.display.remove_source(cmd.source);
                 }
+                CmdKind::PresentSurface => {
+                    pkg.display.present_surface(cmd.source, &cmd.present);
+                }
                 CmdKind::Noop => {}
             }
         }
 
         // One transfer + flush per drain pass. `repaint` returns
-        // `false` when nothing changed, in which case we skip the
-        // round-trip entirely.
-        if pkg.display.repaint() {
+        // `None` when nothing changed; otherwise we transfer the
+        // damage rect (smaller than full-screen for surface-mode
+        // partial updates).
+        if let Some(rect) = pkg.display.repaint() {
             if let Some(gpu) = virtio_gpu_dev::gpu() {
-                let w = pkg.display.fb.width();
-                let h = pkg.display.fb.height();
                 unsafe {
-                    if let Err(e) = gpu.transfer_to_host_2d(pkg.fb_resource_id, 0, 0, w, h) {
+                    if let Err(e) = gpu.transfer_to_host_2d(
+                        pkg.fb_resource_id,
+                        rect.x,
+                        rect.y,
+                        rect.w,
+                        rect.h,
+                    ) {
                         error!("k_gpu: transfer failed: {:?}", e);
                     }
-                    if let Err(e) = gpu.flush(pkg.fb_resource_id, 0, 0, w, h) {
+                    if let Err(e) =
+                        gpu.flush(pkg.fb_resource_id, rect.x, rect.y, rect.w, rect.h)
+                    {
                         error!("k_gpu: flush failed: {:?}", e);
                     }
                 }

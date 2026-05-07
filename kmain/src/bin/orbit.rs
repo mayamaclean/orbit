@@ -447,6 +447,18 @@ extern "C" fn s_trap(
                         6005 => {
                             kmain::handle_fs_fstat(epc, hart_context, frame);
                         }
+                        7000 => {
+                            kmain::handle_fb_query(epc, hart_context, frame);
+                        }
+                        7001 => {
+                            kmain::handle_fb_surface_create(epc, hart_context, frame);
+                        }
+                        7002 => {
+                            kmain::handle_fb_surface_destroy(epc, hart_context, frame);
+                        }
+                        7003 => {
+                            kmain::handle_fb_present(epc, hart_context, frame);
+                        }
                         _ => {
                             debug!("orbit handling u mode ecall({syscall})");
                             kmain::update_thread_and_trap_frame(

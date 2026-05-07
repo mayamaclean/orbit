@@ -1,0 +1,13 @@
+[package]
+name = "hello-fb"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+orbit-abi = { path = "../orbit-abi" }
+orbit-rt  = { path = "../orbit-rt" }
+
+# Marker for tools/build-disk.sh — presence of this section flags the
+# crate as a simple disk binary (default toolchain, default target,
+# install name == crate name).
+[package.metadata.disk]

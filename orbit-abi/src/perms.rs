@@ -718,6 +718,18 @@ impl Permissions {
             syscall::SETGID => class::PROC_CRED,
             syscall::SETGROUPS => class::PROC_CRED,
             syscall::SETLOGIN => class::PROC_CRED,
+            // Framebuffer / drawing surfaces. STDIO covers the
+            // user-facing output channels (serial/console/stdin); fb
+            // is another such channel — a process that can paint
+            // pixels has the same UI reach as one that can
+            // `console_write`. A future split into a dedicated
+            // `DISPLAY` class is foreseeable if the policy ever wants
+            // to allow text I/O while denying graphics; not motivated
+            // yet.
+            syscall::FB_QUERY => class::STDIO,
+            syscall::FB_SURFACE_CREATE => class::STDIO,
+            syscall::FB_SURFACE_DESTROY => class::STDIO,
+            syscall::FB_PRESENT => class::STDIO,
             _ => ClassMask::EMPTY,
         }
     }
@@ -1003,6 +1015,10 @@ mod tests {
             SETGID,
             SETGROUPS,
             SETLOGIN,
+            FB_QUERY,
+            FB_SURFACE_CREATE,
+            FB_SURFACE_DESTROY,
+            FB_PRESENT,
         ];
         for s in all {
             let cls = Permissions::class_for(s);
@@ -1549,6 +1565,10 @@ mod tests {
             SETGID,
             SETGROUPS,
             SETLOGIN,
+            FB_QUERY,
+            FB_SURFACE_CREATE,
+            FB_SURFACE_DESTROY,
+            FB_PRESENT,
         ] {
             assert!(p.allows(s), "ALL.allows({s}) should be true");
         }

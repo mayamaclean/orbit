@@ -256,6 +256,70 @@ pub const FS_READDIR: usize = 6003;
 /// - `EIO`   — backing fs lookup failed.
 pub const FS_FSTAT: usize = 6005;
 
+// 7000+ — display / framebuffer. Graphics surfaces live in a
+// distinct category from fs (`6000+`) and SMP control (`5000+`) so the
+// dispatch table makes the user-facing concept obvious; same shape
+// rationale that put fs in its own bucket.
+//
+// Surfaces are kernel_pages-backed shared mappings landed in
+// `UPROC_SHARED_BASE..UPROC_SHARED_END`. Create/destroy go through the
+// manager (page-table mutation); query/present are sync.
+
+/// `fb_query(&mut FbInfo) -> 0 | -errno` — fill `*info` with the active
+/// display dimensions and pixel format. Snapshot is stable for the
+/// lifetime of the system in v1; callers can cache the result.
+///
+/// Errnos:
+/// - `EFAULT` — `info` doesn't translate under the caller's satp.
+/// - `EINVAL` — `info` straddles a page (single `UserPageWindow`
+///   constraint, same as `fs_stat`).
+/// - `EAGAIN` — display not yet initialized (boot race; retry).
+pub const FB_QUERY: usize = 7000;
+
+/// `fb_surface_create(w, h, format) -> (handle, user_va) | -errno` —
+/// allocate a kernel_pages-backed pixel surface of `w * h` pixels in
+/// `format` (see [`crate::fb::FbFormat`]) and map it user-writable in
+/// the calling process's shared range. Returns the new handle in `a0`
+/// and the mapped user VA in `a1`.
+///
+/// Frame backing tracks in `Process.heap_pages` for free teardown on
+/// exit; the per-process surface table records the metadata k_gpu needs
+/// for compositing.
+///
+/// Errnos:
+/// - `EINVAL` — width or height zero, format unknown, or computed size
+///   not page-multiple.
+/// - `ENOMEM` — `kernel_pages` exhausted, or no shared-VA range fits.
+/// - `EAGAIN` — manager work ring full.
+pub const FB_SURFACE_CREATE: usize = 7001;
+
+/// `fb_surface_destroy(handle) -> 0 | -errno` — release the surface
+/// identified by `handle`. Unmaps the user VA, removes the entry from
+/// the per-process surface table, and returns the backing frame to
+/// `kernel_pages`. If the surface was the active source's display
+/// surface, k_gpu reverts that source to text mode on its next drain.
+///
+/// Errnos:
+/// - `EBADF` — `handle` not registered for the calling process.
+/// - `EAGAIN` — manager work ring full.
+pub const FB_SURFACE_DESTROY: usize = 7002;
+
+/// `fb_present(handle, x, y, w, h) -> 0 | -errno` — submit a damage rect
+/// for the surface at `handle`. The compositor unions damage across
+/// multiple `fb_present` calls between drains, then issues a single
+/// `transfer_to_host_2d` + `flush` on the union. Synchronous; no manager
+/// round-trip.
+///
+/// Calling `fb_present` on a process whose source is currently text mode
+/// flips it to surface mode (subsequent text writes still accumulate in
+/// the source's scrollback but are no longer rendered).
+///
+/// Errnos:
+/// - `EBADF`  — `handle` not registered for the calling process.
+/// - `EINVAL` — rect extends past the surface dims, or `w == 0 || h == 0`.
+/// - `EAGAIN` — k_gpu ring full (caller should retry after a yield).
+pub const FB_PRESENT: usize = 7003;
+
 /// `fs_seek(fd, offset, whence) -> new_offset | -errno` — reposition
 /// the byte cursor on a regular-file fd. `whence` follows POSIX:
 /// `SEEK_SET = 0` (absolute), `SEEK_CUR = 1` (relative to current
@@ -321,6 +385,10 @@ pub enum Sysno {
     FsReaddir = FS_READDIR,
     FsSeek = FS_SEEK,
     FsFstat = FS_FSTAT,
+    FbQuery = FB_QUERY,
+    FbSurfaceCreate = FB_SURFACE_CREATE,
+    FbSurfaceDestroy = FB_SURFACE_DESTROY,
+    FbPresent = FB_PRESENT,
 }
 
 impl Sysno {
@@ -373,6 +441,10 @@ impl Sysno {
             FS_READDIR => Self::FsReaddir,
             FS_SEEK => Self::FsSeek,
             FS_FSTAT => Self::FsFstat,
+            FB_QUERY => Self::FbQuery,
+            FB_SURFACE_CREATE => Self::FbSurfaceCreate,
+            FB_SURFACE_DESTROY => Self::FbSurfaceDestroy,
+            FB_PRESENT => Self::FbPresent,
             _ => return None,
         })
     }
@@ -430,6 +502,10 @@ impl Sysno {
             Self::SetLogin => 44,
             Self::GetRealtime => 45,
             Self::ThreadExit => 46,
+            Self::FbQuery => 47,
+            Self::FbSurfaceCreate => 48,
+            Self::FbSurfaceDestroy => 49,
+            Self::FbPresent => 50,
         }
     }
 
@@ -438,7 +514,7 @@ impl Sysno {
     /// when adding a `Sysno` variant. Older userland with a smaller
     /// COUNT reads a prefix of the kernel's table; newer userland with
     /// a larger COUNT treats the kernel's missing slots as zero.
-    pub const COUNT: usize = 47;
+    pub const COUNT: usize = 51;
 }
 
 #[cfg(test)]
@@ -509,6 +585,16 @@ mod tests {
         assert_eq!(Sysno::from_usize(SETGID), Some(Sysno::SetGid));
         assert_eq!(Sysno::from_usize(SETGROUPS), Some(Sysno::SetGroups));
         assert_eq!(Sysno::from_usize(SETLOGIN), Some(Sysno::SetLogin));
+        assert_eq!(Sysno::from_usize(FB_QUERY), Some(Sysno::FbQuery));
+        assert_eq!(
+            Sysno::from_usize(FB_SURFACE_CREATE),
+            Some(Sysno::FbSurfaceCreate)
+        );
+        assert_eq!(
+            Sysno::from_usize(FB_SURFACE_DESTROY),
+            Some(Sysno::FbSurfaceDestroy)
+        );
+        assert_eq!(Sysno::from_usize(FB_PRESENT), Some(Sysno::FbPresent));
     }
 
     #[test]
@@ -526,6 +612,10 @@ mod tests {
         assert_eq!(Sysno::from_usize(5999), None);
         // 6004 / 6005 are now FS_SEEK / FS_FSTAT.
         assert_eq!(Sysno::from_usize(6006), None);
+        // 7000..=7003 are FB_QUERY / FB_SURFACE_CREATE /
+        // FB_SURFACE_DESTROY / FB_PRESENT.
+        assert_eq!(Sysno::from_usize(6999), None);
+        assert_eq!(Sysno::from_usize(7004), None);
         assert_eq!(Sysno::from_usize(usize::MAX), None);
     }
 
@@ -578,6 +668,10 @@ mod tests {
         assert_eq!(Sysno::SetGid as usize, SETGID);
         assert_eq!(Sysno::SetGroups as usize, SETGROUPS);
         assert_eq!(Sysno::SetLogin as usize, SETLOGIN);
+        assert_eq!(Sysno::FbQuery as usize, FB_QUERY);
+        assert_eq!(Sysno::FbSurfaceCreate as usize, FB_SURFACE_CREATE);
+        assert_eq!(Sysno::FbSurfaceDestroy as usize, FB_SURFACE_DESTROY);
+        assert_eq!(Sysno::FbPresent as usize, FB_PRESENT);
     }
 
     #[test]
@@ -631,6 +725,10 @@ mod tests {
         assert_eq!(SETGID, 4116);
         assert_eq!(SETGROUPS, 4117);
         assert_eq!(SETLOGIN, 4118);
+        assert_eq!(FB_QUERY, 7000);
+        assert_eq!(FB_SURFACE_CREATE, 7001);
+        assert_eq!(FB_SURFACE_DESTROY, 7002);
+        assert_eq!(FB_PRESENT, 7003);
     }
 
     #[test]
@@ -685,6 +783,10 @@ mod tests {
             Sysno::SetLogin,
             Sysno::GetRealtime,
             Sysno::ThreadExit,
+            Sysno::FbQuery,
+            Sysno::FbSurfaceCreate,
+            Sysno::FbSurfaceDestroy,
+            Sysno::FbPresent,
         ];
         assert_eq!(all.len(), Sysno::COUNT);
         let mut seen = [false; Sysno::COUNT];

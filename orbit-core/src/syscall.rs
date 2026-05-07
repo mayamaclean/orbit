@@ -14,10 +14,11 @@ use tracing::error;
 
 use crate::{
     CloseHandleReq, CreateProcessExReq, CreateProcessReq, CreateProcessV2Req, CreateThreadReq,
-    FsOpenReq, FsReadReq, FsReaddirReq, FsStatReq, FutexWaitReq, FutexWakeReq, Hardware,
-    MAX_FS_PATH_LEN, MemMapReq, NetChannelCreationReq, PAGE_SIZE, PendingWork, PledgeReq,
-    SyscallOutcome, WaitPidReq,
+    FbSurfaceCreateReq, FbSurfaceDestroyReq, FsOpenReq, FsReadReq, FsReaddirReq, FsStatReq,
+    FutexWaitReq, FutexWakeReq, Hardware, MAX_FS_PATH_LEN, MemMapReq, NetChannelCreationReq,
+    PAGE_SIZE, PendingWork, PledgeReq, SyscallOutcome, WaitPidReq,
 };
+use orbit_abi::fb::FbFormat;
 use net_channel::BindSpec;
 
 /// Cap on `sleep_ms(ms)` arguments. Anything at or above this returns
@@ -119,6 +120,106 @@ pub fn mmap_req<H: Hardware>(thread: &mut Thread, frame: &TrapFrame, hw: &mut H)
 
     let handle = CompletionHandle::new();
     let work = PendingWork::MemMap {
+        req,
+        pid: thread.pid,
+        root_pa: thread.root_table_addr(),
+        handle: handle.clone(),
+    };
+    if hw.push_pending_work(work).is_err() {
+        return SyscallOutcome::Return {
+            ret: Errno::new(EAGAIN).to_ret(),
+        };
+    }
+    thread.handle = Some(handle);
+    SyscallOutcome::Yield {
+        state: ThreadState::Blocking,
+        ret: None,
+    }
+}
+
+/// `fb_surface_create(w, h, format)` — park the calling thread on a
+/// completion handle and queue a [`PendingWork::FbSurfaceCreate`]. The
+/// manager validates dims/format, allocates a `kernel_pages` frame
+/// sized to `w * h * bpp` (rounded up to `PAGE_SIZE`), maps it into
+/// the user PT in the shared range, registers the per-process surface
+/// table entry, and signals `(handle_id, user_va)` via `signal_pair`.
+///
+/// Validation here at the syscall boundary is light because the
+/// allocator/mapper validates again — but we cheaply reject obviously
+/// bad input (zero dims, unknown format) before queueing manager work.
+pub fn fb_surface_create_req<H: Hardware>(
+    thread: &mut Thread,
+    frame: &TrapFrame,
+    hw: &mut H,
+) -> SyscallOutcome {
+    let width = frame.regs[11] as u32;
+    let height = frame.regs[12] as u32;
+    let format_raw = frame.regs[13] as u32;
+
+    if width == 0 || height == 0 {
+        return SyscallOutcome::Return {
+            ret: Errno::new(EINVAL).to_ret(),
+        };
+    }
+    if FbFormat::from_u32(format_raw).is_none() {
+        return SyscallOutcome::Return {
+            ret: Errno::new(EINVAL).to_ret(),
+        };
+    }
+    // Size sanity check: `w * h * 4` must not overflow usize. The
+    // manager will round up to PAGE_SIZE anyway; reject the hopeless
+    // cases here so the manager arm doesn't have to defend against
+    // them.
+    let bpp = FbFormat::from_u32(format_raw)
+        .map(|f| f.bytes_per_pixel())
+        .unwrap_or(4);
+    let Some(_total) = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|n| n.checked_mul(bpp as usize))
+    else {
+        return SyscallOutcome::Return {
+            ret: Errno::new(EINVAL).to_ret(),
+        };
+    };
+
+    let req = FbSurfaceCreateReq {
+        width,
+        height,
+        format_raw,
+    };
+    let handle = CompletionHandle::new();
+    let work = PendingWork::FbSurfaceCreate {
+        req,
+        pid: thread.pid,
+        root_pa: thread.root_table_addr(),
+        handle: handle.clone(),
+    };
+    if hw.push_pending_work(work).is_err() {
+        return SyscallOutcome::Return {
+            ret: Errno::new(EAGAIN).to_ret(),
+        };
+    }
+    thread.handle = Some(handle);
+    SyscallOutcome::Yield {
+        state: ThreadState::Blocking,
+        ret: None,
+    }
+}
+
+/// `fb_surface_destroy(handle)` — park the caller on a completion
+/// handle and queue a [`PendingWork::FbSurfaceDestroy`]. Manager
+/// looks up the surface, unmaps its user VA, removes the per-process
+/// table entry, and frees the backing frame to `kernel_pages`.
+pub fn fb_surface_destroy_req<H: Hardware>(
+    thread: &mut Thread,
+    frame: &TrapFrame,
+    hw: &mut H,
+) -> SyscallOutcome {
+    let req = FbSurfaceDestroyReq {
+        handle: frame.regs[11] as u32,
+    };
+    let handle = CompletionHandle::new();
+    let work = PendingWork::FbSurfaceDestroy {
         req,
         pid: thread.pid,
         root_pa: thread.root_table_addr(),

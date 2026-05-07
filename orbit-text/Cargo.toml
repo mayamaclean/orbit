@@ -1,0 +1,22 @@
+[package]
+name = "orbit-text"
+version = "0.1.0"
+edition = "2024"
+description = "Glyph cache + text composition for orbit framebuffer surfaces"
+
+[features]
+default = []
+# Adds `std::error::Error` impls and the `Default` shorthand path. Core
+# functionality is no_std + alloc; consumers under std (hello-fb-std,
+# eventually graphical apps using std::fs to load fonts) opt in.
+std = []
+
+[dependencies]
+ab_glyph = { version = "0.2.32", default-features = false, features = ["libm"] }
+# `default-hasher` gives us hashbrown's foldhash, no allocator-api2,
+# no equivalent — enough for our small key (`u16 + u32`).
+hashbrown = { version = "0.17", default-features = false, features = ["default-hasher", "allocator-api2"] }
+# floor / ceil are intrinsics under std but routed through libm under
+# no_std. ab_glyph already brings libm in via its own feature; declaring
+# it here too keeps our call sites self-contained.
+libm = "0.2.16"

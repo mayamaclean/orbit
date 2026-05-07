@@ -99,10 +99,15 @@ pub static SYSCALL_STATS: [SyscallSlot; Sysno::COUNT] = [
     // GetRealtime — ordinal 45, Goldfish RTC wallclock.
     // ThreadExit — ordinal 46, pthread_exit shape.
     SyscallSlot::new(),
+    // graphics
+    SyscallSlot::new(),
+    SyscallSlot::new(),
+    SyscallSlot::new(),
+    SyscallSlot::new()
 ];
 
 const _: () = assert!(
-    Sysno::COUNT == 47,
+    Sysno::COUNT == 51,
     "SYSCALL_STATS literal must be resized when Sysno::COUNT changes"
 );
 

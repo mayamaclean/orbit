@@ -66,9 +66,13 @@ if rustup toolchain list 2>/dev/null | grep -q '^orbit-stage1\b'; then
     note "building hello-std (+orbit-stage1, release) → /bin/hello-std"
     ( cd hello-std && cargo +orbit-stage1 build --release >/dev/null )
     cp hello-std/target/riscv64gc-unknown-orbit/release/hello-std rootfs/bin/hello-std
+
+    note "building hello-fb-std (+orbit-stage1, release) → /bin/hello-fb-std"
+    ( cd hello-fb-std && cargo +orbit-stage1 build --release >/dev/null )
+    cp hello-fb-std/target/riscv64gc-unknown-orbit/release/hello-fb-std rootfs/bin/hello-fb-std
 else
-    rm -f rootfs/bin/hello-std
-    printf 'warn: orbit-stage1 toolchain not linked; skipping /bin/hello-std\n' >&2
+    rm -f rootfs/bin/hello-std rootfs/bin/hello-fb-std
+    printf 'warn: orbit-stage1 toolchain not linked; skipping /bin/hello-std and /bin/hello-fb-std\n' >&2
 fi
 
 # eza — modern `ls` replacement, out-of-tree at ../eza. Built against

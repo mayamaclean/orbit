@@ -235,6 +235,12 @@ fn syscall_name(ordinal: usize) -> &'static str {
         42 => "setgid",
         43 => "setgroups",
         44 => "setlogin",
+        45 => "get_realtime",
+        46 => "thread_exit",
+        47 => "fb_query",
+        48 => "fb_surface_create",
+        49 => "fb_surface_destroy",
+        50 => "fb_present",
         _ => "?",
     }
 }

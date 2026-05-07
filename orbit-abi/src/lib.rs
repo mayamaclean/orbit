@@ -4,6 +4,7 @@ pub mod argv;
 pub mod denial;
 pub mod envp;
 pub mod errno;
+pub mod fb;
 pub mod fs;
 pub mod layout;
 pub mod mmap;

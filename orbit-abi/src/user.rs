@@ -150,6 +150,60 @@ pub unsafe fn ecall7(
     r
 }
 
+/// Five-argument syscall returning an `isize` in `a0`. Used by
+/// `fb_present(handle, x, y, w, h)` so the rect doesn't have to be
+/// packed into a smaller arg.
+#[inline]
+pub unsafe fn ecall5(
+    code: usize,
+    arg0: usize,
+    arg1: usize,
+    arg2: usize,
+    arg3: usize,
+    arg4: usize,
+) -> isize {
+    let r: isize;
+    unsafe {
+        asm!(
+            "ecall",
+            in("a0") code,
+            in("a1") arg0,
+            in("a2") arg1,
+            in("a3") arg2,
+            in("a4") arg3,
+            in("a5") arg4,
+            lateout("a0") r,
+        );
+    }
+    r
+}
+
+/// Three-argument syscall returning a pair of `isize` in `a0, a1`. Used
+/// by `fb_surface_create(w, h, format)` to hand back `(handle, user_va)`
+/// in one trap.
+#[inline]
+pub unsafe fn ecall3_ret2(
+    code: usize,
+    arg0: usize,
+    arg1: usize,
+    arg2: usize,
+) -> (isize, isize) {
+    let r0: isize;
+    let r1: isize;
+    unsafe {
+        asm!(
+            "ecall",
+            in("a0") code,
+            in("a1") arg0,
+            in("a2") arg1,
+            in("a3") arg2,
+            lateout("a0") r0,
+            lateout("a1") r1,
+        );
+    }
+    (r0, r1)
+}
+
 /// Four-argument syscall returning an `isize` in `a0`.
 #[inline]
 pub unsafe fn ecall4(code: usize, arg0: usize, arg1: usize, arg2: usize, arg3: usize) -> isize {
@@ -1071,6 +1125,78 @@ pub fn query_syscall_stats(buf: &mut [u8]) -> Result<(SyscallStatsHeader, &[Sysc
         )
     };
     Ok((hdr, entries))
+}
+
+/// `fb_query(&mut info)` — fill `info` with active display dims and
+/// pixel format. Stable for the system's lifetime in v1; cache the
+/// result.
+///
+/// Errnos: `EFAULT` (`info` doesn't translate), `EINVAL` (straddles a
+/// page), `EAGAIN` (display not yet initialized).
+#[inline]
+pub fn fb_query(info: &mut crate::fb::FbInfo) -> Result<(), Errno> {
+    Errno::from_ret(unsafe { ecall1(syscall::FB_QUERY, info as *mut _ as usize) }).map(|_| ())
+}
+
+/// `fb_surface_create(w, h, format)` — allocate a pixel surface and map
+/// it into the calling process's shared range. Returns `(handle,
+/// user_va)`. The mapping is user-writable BGRA8888; the kernel keeps a
+/// KDMAP alias for the compositor.
+///
+/// Errnos: `EINVAL` (bad dims/format/size), `ENOMEM` (out of pages /
+/// no shared VA), `EAGAIN` (manager ring full).
+#[inline]
+pub fn fb_surface_create(
+    width: u32,
+    height: u32,
+    format: crate::fb::FbFormat,
+) -> Result<(crate::fb::FbHandle, usize), Errno> {
+    let (r0, r1) = unsafe {
+        ecall3_ret2(
+            syscall::FB_SURFACE_CREATE,
+            width as usize,
+            height as usize,
+            format as u32 as usize,
+        )
+    };
+    Errno::from_ret(r0).map(|h| (crate::fb::FbHandle(h as u32), r1 as usize))
+}
+
+/// `fb_surface_destroy(handle)` — release the surface, unmap its user
+/// VA, and return the backing frame to `kernel_pages`.
+///
+/// Errnos: `EBADF` (unknown handle), `EAGAIN` (manager ring full).
+#[inline]
+pub fn fb_surface_destroy(handle: crate::fb::FbHandle) -> Result<(), Errno> {
+    Errno::from_ret(unsafe { ecall1(syscall::FB_SURFACE_DESTROY, handle.raw() as usize) })
+        .map(|_| ())
+}
+
+/// `fb_present(handle, x, y, w, h)` — submit a damage rect for the
+/// surface. The compositor unions damage across multiple presents
+/// between drains, then issues a single transfer + flush.
+///
+/// Errnos: `EBADF` (unknown handle), `EINVAL` (rect out of bounds /
+/// zero-area), `EAGAIN` (compositor ring full).
+#[inline]
+pub fn fb_present(
+    handle: crate::fb::FbHandle,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+) -> Result<(), Errno> {
+    Errno::from_ret(unsafe {
+        ecall5(
+            syscall::FB_PRESENT,
+            handle.raw() as usize,
+            x as usize,
+            y as usize,
+            width as usize,
+            height as usize,
+        )
+    })
+    .map(|_| ())
 }
 
 pub struct ConsoleWriter {
