@@ -1,0 +1,7 @@
+[build]
+target = "riscv64gc-unknown-orbit"
+
+[target.riscv64gc-unknown-orbit]
+rustflags = [
+  "-Clink-arg=-Tmemory.x",
+]

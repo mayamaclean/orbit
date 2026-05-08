@@ -312,6 +312,9 @@ extern "C" fn s_trap(
                         4 => {
                             kmain::handle_read_stdin(epc, hart_context, frame);
                         }
+                        12 => {
+                            kmain::handle_read_key_event(epc, hart_context, frame);
+                        }
                         5 => {
                             kmain::handle_set_affinity(epc, hart_context, frame);
                         }

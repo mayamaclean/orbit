@@ -88,12 +88,7 @@ impl From<ab_glyph::Rect> for PxRect {
         let y_max = libm::ceilf(r.max.y) as i32;
         let w = (x_max - x_min).max(0).min(u16::MAX as i32) as u16;
         let h = (y_max - y_min).max(0).min(u16::MAX as i32) as u16;
-        Self {
-            x_min,
-            y_min,
-            w,
-            h,
-        }
+        Self { x_min, y_min, w, h }
     }
 }
 
@@ -197,8 +192,7 @@ impl GlyphCache {
                 let glyph = glyph_id.with_scale_and_position(scale, point(0.0, 0.0));
                 font.outline_glyph(glyph).map(|outlined| {
                     let bounds: PxRect = outlined.px_bounds().into();
-                    let mut coverage: Box<[u8]> =
-                        vec![0u8; bounds.area()].into_boxed_slice();
+                    let mut coverage: Box<[u8]> = vec![0u8; bounds.area()].into_boxed_slice();
                     let w = bounds.w as usize;
                     if w > 0 {
                         let h = bounds.h as usize;
@@ -357,6 +351,97 @@ fn blit_glyph(
             let b = ((fg.2 as u16 * cov16 + bg_b * inv + 127) / 255) as u8;
             surface.pixels[idx] = SurfaceMut::pack_bgra(r, g, b);
         }
+    }
+}
+
+/// Cell-grid metrics derived from a `(font, scale)` pair. Sized to the
+/// `'M'` advance for cell width — correct for monospace fonts (every
+/// glyph has the same advance) and the right "design intent" answer for
+/// proportional fonts forced into a cell grid.
+///
+/// Heights round up so consecutive rows never overlap. Baseline is the
+/// per-cell top-down offset where glyphs anchor: `ascent` rounded up.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CellMetrics {
+    /// Pixel width of one cell.
+    pub width: u32,
+    /// Pixel height of one cell (one line's vertical advance).
+    pub height: u32,
+    /// Offset from the cell's top edge to the glyph baseline.
+    pub baseline: u32,
+}
+
+impl CellMetrics {
+    /// Compute cell metrics from a font + scale. Uses `'M'` as the
+    /// width reference (any printable ASCII would work for a monospace
+    /// font; `'M'` is conventional). Returns sane non-zero values even
+    /// when the font lacks `'M'` — falls back to scale.x.
+    pub fn from_font<F: Font>(font: &F, scale: PxScale) -> Self {
+        let scaled = font.as_scaled(scale);
+        let m_id = scaled.glyph_id('M');
+        let raw_w = scaled.h_advance(m_id);
+        let width = if raw_w > 0.0 {
+            libm::ceilf(raw_w) as u32
+        }
+        else {
+            libm::ceilf(scale.x) as u32
+        }
+        .max(1);
+        let ascent = scaled.ascent();
+        let descent = scaled.descent();
+        let line_gap = scaled.line_gap();
+        let height = libm::ceilf(ascent - descent + line_gap) as u32;
+        let height = height.max(1);
+        let baseline = libm::ceilf(ascent) as u32;
+        Self {
+            width,
+            height,
+            baseline,
+        }
+    }
+
+    /// Top-left pixel coordinate of cell `(col, row)`.
+    #[inline]
+    pub fn cell_origin(&self, col: u32, row: u32) -> (i32, i32) {
+        ((col * self.width) as i32, (row * self.height) as i32)
+    }
+}
+
+/// Render one character into a cell of `(col, row)` on the grid implied
+/// by `metrics`. Fills the cell with `bg`, then blits the glyph in `fg`
+/// at the cell's baseline. Out-of-bounds cells are clipped by
+/// `fill_rect` and `blit_glyph`.
+///
+/// Use this for ratatui-style cell-by-cell rendering. For proportional
+/// flowing text, use `render_str` instead.
+pub fn render_cell<F: Font>(
+    surface: &mut SurfaceMut<'_>,
+    font: &F,
+    scale: PxScale,
+    metrics: &CellMetrics,
+    col: u32,
+    row: u32,
+    ch: char,
+    fg: (u8, u8, u8),
+    bg: (u8, u8, u8),
+    cache: &mut GlyphCache,
+) {
+    let (cx, cy) = metrics.cell_origin(col, row);
+    surface.fill_rect(
+        cx,
+        cy,
+        metrics.width,
+        metrics.height,
+        SurfaceMut::pack_bgra(bg.0, bg.1, bg.2),
+    );
+
+    let scaled = font.as_scaled(scale);
+    let glyph_id = scaled.glyph_id(ch);
+    if let Some(cached) = cache.get_or_render(font, glyph_id, scale) {
+        let baseline_int = cy + metrics.baseline as i32;
+        let dst_x = cx + cached.bounds.x_min;
+        let dst_y = baseline_int + cached.bounds.y_min;
+        blit_glyph(surface, cached, dst_x, dst_y, fg);
     }
 }
 

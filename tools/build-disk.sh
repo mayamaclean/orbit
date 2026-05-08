@@ -70,9 +70,17 @@ if rustup toolchain list 2>/dev/null | grep -q '^orbit-stage1\b'; then
     note "building hello-fb-std (+orbit-stage1, release) → /bin/hello-fb-std"
     ( cd hello-fb-std && cargo +orbit-stage1 build --release >/dev/null )
     cp hello-fb-std/target/riscv64gc-unknown-orbit/release/hello-fb-std rootfs/bin/hello-fb-std
+
+    note "building hello-ratatui-std (+orbit-stage1, release) → /bin/hello-ratatui-std"
+    ( cd hello-ratatui-std && cargo +orbit-stage1 build --release >/dev/null )
+    cp hello-ratatui-std/target/riscv64gc-unknown-orbit/release/hello-ratatui-std rootfs/bin/hello-ratatui-std
+
+    note "building orbit-top-std (+orbit-stage1, release) → /bin/orbit-top-std"
+    ( cd orbit-top-std && cargo +orbit-stage1 build --release >/dev/null )
+    cp orbit-top-std/target/riscv64gc-unknown-orbit/release/orbit-top-std rootfs/bin/orbit-top-std
 else
-    rm -f rootfs/bin/hello-std rootfs/bin/hello-fb-std
-    printf 'warn: orbit-stage1 toolchain not linked; skipping /bin/hello-std and /bin/hello-fb-std\n' >&2
+    rm -f rootfs/bin/hello-std rootfs/bin/hello-fb-std rootfs/bin/hello-ratatui-std rootfs/bin/orbit-top-std
+    printf 'warn: orbit-stage1 toolchain not linked; skipping /bin/hello-std, /bin/hello-fb-std, /bin/hello-ratatui-std, and /bin/orbit-top-std\n' >&2
 fi
 
 # eza — modern `ls` replacement, out-of-tree at ../eza. Built against
@@ -126,4 +134,10 @@ if [ -d rootfs/etc ]; then
 else
   tar --format=ustar -cf disk.img -C rootfs .
 fi
+
+# No tail padding needed — `submit_blk_read_cached` clamps the DMA to
+# the disk's `capacity_sectors` and zero-fills the cache slot's tail
+# via the kdmap alias. tar lays files at 512-byte boundaries, so a
+# file's last page can ask for sectors past the disk end; the kernel
+# absorbs that natively now. See [kmain/src/drivers/virtio_blk_dev.rs].
 printf 'built %s/disk.img (%s bytes) from rootfs/\n' "$ROOT" "$(stat -c %s disk.img)"

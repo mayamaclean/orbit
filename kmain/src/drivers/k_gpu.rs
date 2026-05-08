@@ -267,18 +267,12 @@ pub extern "C" fn k_gpu(_a0: usize) {
         if let Some(rect) = pkg.display.repaint() {
             if let Some(gpu) = virtio_gpu_dev::gpu() {
                 unsafe {
-                    if let Err(e) = gpu.transfer_to_host_2d(
-                        pkg.fb_resource_id,
-                        rect.x,
-                        rect.y,
-                        rect.w,
-                        rect.h,
-                    ) {
+                    if let Err(e) =
+                        gpu.transfer_to_host_2d(pkg.fb_resource_id, rect.x, rect.y, rect.w, rect.h)
+                    {
                         error!("k_gpu: transfer failed: {:?}", e);
                     }
-                    if let Err(e) =
-                        gpu.flush(pkg.fb_resource_id, rect.x, rect.y, rect.w, rect.h)
-                    {
+                    if let Err(e) = gpu.flush(pkg.fb_resource_id, rect.x, rect.y, rect.w, rect.h) {
                         error!("k_gpu: flush failed: {:?}", e);
                     }
                 }

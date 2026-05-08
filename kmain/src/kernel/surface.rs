@@ -144,7 +144,8 @@ impl ProcessSurfaces {
     /// recover backings + unmap VAs after the process's teardown.
     pub fn drain_all(&self) -> alloc::vec::Vec<(u32, SurfaceEntry)> {
         let mut g = self.surfaces.lock();
-        let drained: alloc::vec::Vec<(u32, SurfaceEntry)> = core::mem::take(&mut *g).into_iter().collect();
+        let drained: alloc::vec::Vec<(u32, SurfaceEntry)> =
+            core::mem::take(&mut *g).into_iter().collect();
         drained
     }
 }

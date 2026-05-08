@@ -241,6 +241,7 @@ fn syscall_name(ordinal: usize) -> &'static str {
         48 => "fb_surface_create",
         49 => "fb_surface_destroy",
         50 => "fb_present",
+        51 => "read_key_event",
         _ => "?",
     }
 }

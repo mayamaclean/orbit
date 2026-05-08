@@ -18,9 +18,11 @@ use riscv::register::{satp::Satp, sstatus::SPP};
 use smoltcp::iface::SocketHandle;
 
 pub mod completion;
+pub mod key_events;
 pub mod spsc;
 pub mod stdin;
 pub use completion::{AckCounter, CompletionHandle};
+pub use key_events::ProcessKeyEvents;
 pub use spsc::SpscQueue;
 pub use stdin::ProcessStdin;
 
@@ -48,6 +50,12 @@ pub mod wake_reason {
     pub const DEVICE_IO: u64 = 1 << 2;
     /// POSIX-style signal delivery (future use).
     pub const SIGNAL: u64 = 1 << 3;
+    /// Structured key event arrived in the thread's process's
+    /// `ProcessKeyEvents` ring. Set by `kernel::input::dispatch` after
+    /// each `push_event`, targeting the tid that called
+    /// `read_key_event` and parked. Suspended thread is eagerly
+    /// promoted to Ready so the syscall re-runs and drains.
+    pub const INPUT_IO: u64 = 1 << 4;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

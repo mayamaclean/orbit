@@ -26,8 +26,9 @@ use virtio_blk::{
 use orbit_core::PendingWork;
 
 use crate::drivers::{plic, virtio_probe};
-use crate::kernel::memmap::KernelPages;
+use crate::kernel::memmap::{KernelPages, phys_to_kdmap};
 use crate::kernel::shootdown::CPU_COUNT;
+use mmu::sv48::PhysAddr;
 
 // Queue page layout matches virtio_input_dev / virtio_gpu_dev — one
 // page holds desc / avail / used with comfortable slack at the chosen
@@ -245,6 +246,51 @@ pub unsafe fn submit_blk_read_cached(
     // mid-sequence. See QUEUE_LOCK's doc for the cross-hart race
     // this guards against.
     let _g = QUEUE_LOCK.lock();
+
+    // Clamp the DMA to disk capacity. tar packs files at 512-byte
+    // boundaries, so a file's last page can ask for sectors past the
+    // disk end. Without the clamp `dev.submit_read` rejects with
+    // `OutOfRange` and the consumer surfaces EIO at the file tail —
+    // breaks any file whose last page would overrun. The slot's
+    // `valid_bytes` already bounds what consumers read out, so the
+    // bytes past the actual disk are just hygiene-zeros for accidental
+    // over-reads. Pre-fills via the kdmap alias before the DMA
+    // launches — the device only touches the leading `actual_len`
+    // bytes; the trailing zeros stay intact.
+    let cap_sectors = dev.capacity_sectors();
+    let sector_size = SECTOR_SIZE as u64;
+    debug_assert!(
+        len as u64 % sector_size == 0,
+        "submit_blk_read_cached: len {len} not sector-multiple"
+    );
+    let req_sectors = len as u64 / sector_size;
+    let avail_sectors = cap_sectors.saturating_sub(lba);
+    if avail_sectors == 0 {
+        // First sector itself is past the disk — that's a real bug
+        // (page cache asked for a page entirely past EOF), surface
+        // it. Caller's `complete_slot(_, err)` tears down the slot.
+        return Err(BlockError::OutOfRange {
+            lba,
+            capacity: cap_sectors,
+        });
+    }
+    let actual_sectors = req_sectors.min(avail_sectors);
+    let actual_len = (actual_sectors * sector_size) as u32;
+    let zero_bytes = ((req_sectors - actual_sectors) * sector_size) as usize;
+    if zero_bytes > 0 {
+        // SAFETY: `dst_pa` references a page-cache slot frame the
+        // caller pinned via `begin_load`'s `SharedFrame`. The frame
+        // is `len` bytes; we write to its tail starting at
+        // `actual_len`. kdmap maps every kernel-pool frame at boot,
+        // so `phys_to_kdmap(dst_pa + actual_len)` is a valid kernel
+        // VA for the duration of this call.
+        let zero_pa = PhysAddr::new(dst_pa + actual_len as u64);
+        let dst = phys_to_kdmap(zero_pa).as_mut_ptr::<u8>();
+        unsafe {
+            core::ptr::write_bytes(dst, 0, zero_bytes);
+        }
+    }
+
     let head = dev.peek_next_head().ok_or(BlockError::QueueFull)?;
     let prev = IN_FLIGHT[head as usize].swap(packed_key, Ordering::AcqRel);
     if prev != 0 {
@@ -256,7 +302,7 @@ pub unsafe fn submit_blk_read_cached(
         );
     }
 
-    match unsafe { dev.submit_read(lba, dst_pa, len) } {
+    match unsafe { dev.submit_read(lba, dst_pa, actual_len) } {
         Ok(actual) => {
             debug_assert!(
                 actual == head,

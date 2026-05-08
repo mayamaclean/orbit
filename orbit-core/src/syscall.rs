@@ -18,8 +18,8 @@ use crate::{
     FutexWaitReq, FutexWakeReq, Hardware, MAX_FS_PATH_LEN, MemMapReq, NetChannelCreationReq,
     PAGE_SIZE, PendingWork, PledgeReq, SyscallOutcome, WaitPidReq,
 };
-use orbit_abi::fb::FbFormat;
 use net_channel::BindSpec;
+use orbit_abi::fb::FbFormat;
 
 /// Cap on `sleep_ms(ms)` arguments. Anything at or above this returns
 /// `-EINVAL` without touching thread state.
@@ -1022,6 +1022,143 @@ pub fn read_stdin<H: Hardware>(
     thread.handle = Some(handle);
     SyscallOutcome::YieldRetry {
         state: ThreadState::Blocking,
+    }
+}
+
+/// Bit set in `read_key_event`'s `flags` arg: return `EAGAIN` instead
+/// of blocking when the ring is empty. Mirror of `READ_STDIN_NONBLOCK`.
+pub const READ_KEY_EVENT_NONBLOCK: usize = 1;
+
+/// Cap on `read_key_event(...)`'s `timeout_ms`. Mirrors `MAX_SLEEP_MS`
+/// — anything at or above returns `-EINVAL`. Beyond the cap the caller
+/// passes `usize::MAX` to mean "block indefinitely" (same idiom as
+/// std's `Duration::MAX` on a condition variable).
+pub const READ_KEY_EVENT_MAX_TIMEOUT_MS: usize = 60 * 60 * 1000;
+/// Sentinel for "block indefinitely" in `timeout_ms`. The handler
+/// programs `wake_time = u64::MAX` so the sleep_heap entry never
+/// pops; only `wake_override` (set by `input::dispatch` on the
+/// next event) wakes the thread.
+pub const READ_KEY_EVENT_INDEFINITE: usize = usize::MAX;
+
+/// `read_key_event(buf, count, flags, timeout_ms)` — drain up to
+/// `count` 16-byte `KeyEvent`s from the caller's structured-event
+/// ring into `buf`.
+///
+/// Park shape (same as `nc_yield`'s ms_sleep + wake_override):
+/// - `flags & READ_KEY_EVENT_NONBLOCK` — never park; return
+///   immediately with the events drained or `EAGAIN`.
+/// - `timeout_ms == 0` (no NONBLOCK) — drain available; if empty,
+///   return synchronously with 0. Effectively "peek".
+/// - `timeout_ms == READ_KEY_EVENT_INDEFINITE` — block until the
+///   next event arrives. `wake_time = u64::MAX`; only the
+///   wake_override path wakes us.
+/// - `0 < timeout_ms < MAX_TIMEOUT` — block up to `timeout_ms`. The
+///   sleep_heap deadline OR the next event wakes us; whichever
+///   fires first.
+///
+/// `count` is in events, so the byte length the kernel writes into
+/// the user buffer is `count * 16`. The whole thing must fit in a
+/// page — 256 events cap, which matches the ring's
+/// [`process::ProcessKeyEvents`] capacity.
+///
+/// Returns `EBUSY` if another tid is already parked on this ring
+/// (single-reader invariant).
+pub fn read_key_event<H: Hardware>(
+    thread: &mut Thread,
+    frame: &TrapFrame,
+    hw: &mut H,
+) -> SyscallOutcome {
+    use orbit_abi::input::KeyEvent;
+    const KEY_EVENT_SIZE: usize = core::mem::size_of::<KeyEvent>();
+
+    let Ok(user_va) = UserVa::new(frame.regs[11] as u64)
+    else {
+        return ready(Errno::new(EFAULT).to_ret());
+    };
+    let count = frame.regs[12];
+    let flags = frame.regs[13];
+    let timeout_ms = frame.regs[14];
+
+    if count == 0 {
+        return ready(Errno::new(EINVAL).to_ret());
+    }
+    let Some(byte_len) = count.checked_mul(KEY_EVENT_SIZE)
+    else {
+        return ready(Errno::new(EINVAL).to_ret());
+    };
+    if byte_len > PAGE_SIZE {
+        return ready(Errno::new(EINVAL).to_ret());
+    }
+    if !user_range_ok(user_va.raw(), byte_len as u64) {
+        return ready(Errno::new(EFAULT).to_ret());
+    }
+    if !hw.user_va_translates(thread.root_table_addr(), user_va) {
+        return ready(Errno::new(EFAULT).to_ret());
+    }
+    // Reject finite timeouts that match nc_yield's sleep cap. Anything
+    // larger than the cap and *not* the sentinel is almost certainly a
+    // caller treating ms_t as ns_t or similar — fail loud.
+    if timeout_ms != READ_KEY_EVENT_INDEFINITE && timeout_ms >= READ_KEY_EVENT_MAX_TIMEOUT_MS {
+        return ready(Errno::new(EINVAL).to_ret());
+    }
+
+    // Synchronous drain attempt.
+    let n = hw.read_key_events_drain(thread.pid, user_va, count);
+    if n > 0 {
+        return ready(n as isize);
+    }
+
+    if flags & READ_KEY_EVENT_NONBLOCK != 0 {
+        return ready(Errno::new(EAGAIN).to_ret());
+    }
+    if timeout_ms == 0 {
+        // Peek shape: empty ring + no timeout = return 0 synchronously.
+        return ready(0);
+    }
+
+    // Park path. Three branches based on the parker slot's prior state:
+    //
+    // - `Installed`: first park. Re-drain (close park-vs-push race),
+    //   then yield Suspended with the deadline programmed.
+    // - `AlreadyOwned`: re-entry from a timer wake (sleep_heap popped
+    //   the deadline; no producer push cleared the slot). Clear the
+    //   slot so the *next* userspace call can park afresh, then
+    //   return 0 — that's the timeout signal a poll-with-timeout
+    //   loop wants. Without the clear, the next call hits
+    //   AlreadyOwned immediately and busy-loops. Without the
+    //   AlreadyOwned branch entirely, the syscall re-parks into a
+    //   fresh deadline forever and never returns on pure-timer
+    //   wakes.
+    // - `Busy`: another tid claimed the ring; single-reader violation.
+    use process::key_events::ParkOutcome;
+    match hw.set_key_event_parker(thread.pid, thread.tid) {
+        ParkOutcome::Installed => {}
+        ParkOutcome::AlreadyOwned => {
+            let _ = hw.clear_key_event_parker_if(thread.pid, thread.tid);
+            return ready(0);
+        }
+        ParkOutcome::Busy => return ready(Errno::new(EBUSY).to_ret()),
+    }
+
+    let n2 = hw.read_key_events_drain(thread.pid, user_va, count);
+    if n2 > 0 {
+        let _ = hw.clear_key_event_parker_if(thread.pid, thread.tid);
+        return ready(n2 as isize);
+    }
+
+    // Schedule the deadline. Indefinite → u64::MAX (sleep_heap entry
+    // never fires; wake_override is the only wake path).
+    if timeout_ms == READ_KEY_EVENT_INDEFINITE {
+        thread.wake_time = usize::MAX;
+    }
+    else {
+        let now = hw.now_ticks() as usize;
+        let ticks = timeout_ms.wrapping_mul(hw.ticks_per_ms() as usize);
+        thread.wake_time = now.wrapping_add(ticks);
+    }
+
+    SyscallOutcome::YieldRetry {
+        state: ThreadState::Suspended,
     }
 }
 

@@ -19,6 +19,7 @@
 
 use core::sync::atomic::{AtomicU8, Ordering};
 
+use orbit_abi::input::{KeyCode, KeyEvent, KeyEventKind, Modifiers};
 use virtio_input::InputEvent;
 use virtio_input::proto::{
     EV_KEY, KEY_0, KEY_1, KEY_2, KEY_3, KEY_4, KEY_5, KEY_6, KEY_7, KEY_8, KEY_9, KEY_A,
@@ -32,7 +33,7 @@ use virtio_input::proto::{
 };
 
 use crate::drivers::k_gpu;
-use crate::kernel::stdin;
+use crate::kernel::{key_events, stdin};
 
 const MOD_SHIFT: u8 = 1 << 0;
 const MOD_CTRL: u8 = 1 << 1;
@@ -50,6 +51,9 @@ pub fn dispatch(ev: InputEvent) {
 
     // Update modifier state on shift/ctrl/alt transitions. Press =
     // value 1, release = value 0, repeat = value 2 (treat as held).
+    // Modifier-only events don't fan out — neither byte path
+    // (no encoding) nor structured path (crossterm-shape consumers
+    // don't emit modifier-only events outside Kitty protocol).
     if let Some(bit) = modifier_bit(ev.code) {
         match ev.value {
             VAL_PRESS | VAL_REPEAT => {
@@ -63,41 +67,156 @@ pub fn dispatch(ev: InputEvent) {
         return;
     }
 
-    // Bindings + character translation fire on key-down (and on
-    // repeat for typing — repeat at 0.5+ Hz is what the user
-    // expects when they hold a key). Pane cycling stays press-only
-    // so a held Ctrl+Tab doesn't spam through panes.
-    let is_repeat = ev.value == VAL_REPEAT;
-    if ev.value != VAL_PRESS && !is_repeat {
-        return;
-    }
-
     let mods = MODS.load(Ordering::Relaxed);
+    let kind = match ev.value {
+        VAL_PRESS => KeyEventKind::Press,
+        VAL_RELEASE => KeyEventKind::Release,
+        VAL_REPEAT => KeyEventKind::Repeat,
+        _ => return,
+    };
+    let is_press = matches!(kind, KeyEventKind::Press);
 
-    if !is_repeat && ev.code == KEY_TAB && mods & MOD_CTRL != 0 {
+    // Ctrl+Tab cycles the active pane and is consumed here — neither
+    // path forwards it. Press-only so a held combination doesn't spam
+    // pane switches.
+    if is_press && ev.code == KEY_TAB && mods & MOD_CTRL != 0 {
         // Floor return value: ring full at human typing rates means a
         // dropped pane switch, which is fine — user can press again.
         let _ = k_gpu::push_cycle_active();
         return;
     }
 
-    // Route printable / nav keys to the active process's stdin.
-    // No active process (kernel pane) → drop. No registered stdin
-    // for the active pid → drop (race with process teardown).
+    // Resolve the active pid once for both delivery paths.
     let Some(pid) = stdin::active_pid()
     else {
         return;
     };
+
+    // ---- Structured event ring ----
+    //
+    // Push for Press, Release, *and* Repeat — ratatui consumers can
+    // filter on `kind` if they only want Press. The byte path below
+    // already filters Release out implicitly.
+    if let Some(struct_ev) = encode_key_event(ev.code, mods, kind) {
+        key_events::push_and_wake(pid, struct_ev);
+    }
+
+    // ---- Byte ring (unchanged) ----
+    //
+    // Bytes only flow on Press/Repeat — the legacy stdin shape doesn't
+    // express releases. Skip Release here so existing shells / line
+    // editors see the same byte stream they always have.
+    if !matches!(kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+        return;
+    }
     let Some(stdin_arc) = stdin::get(pid)
     else {
         return;
     };
-
     let mut buf = [0u8; 4];
     let n = evdev_to_bytes(ev.code, mods, &mut buf);
     for &b in &buf[..n] {
         stdin_arc.push_byte(b);
     }
+}
+
+/// Translate an evdev key code + modifier mask into a structured
+/// [`KeyEvent`]. Returns `None` for keys we don't model (mostly the
+/// caps/num/scroll-lock indicators today). Rules:
+///
+/// - Letters: codepoint reflects shift state ('a' vs 'A'). Modifier
+///   bits stay set even for the case-shifted variant — ratatui
+///   consumers see `Char('A'), SHIFT` rather than the byte path's
+///   uppercase-with-no-modifier.
+/// - Number row / symbols: shift switches between the two glyphs the
+///   key produces (`1` / `!`, `;` / `:`, etc.). Modifier bits stay
+///   set, same rationale.
+/// - Tab + Shift: emits [`KeyCode::BackTab`] (matches crossterm).
+/// - Ctrl+letter: codepoint stays the bare letter, modifier carries
+///   CONTROL. The byte path collapses this to control characters
+///   (Ctrl-C → 0x03); structured consumers see the original letter.
+fn encode_key_event(code: u16, mods_bits: u8, kind: KeyEventKind) -> Option<KeyEvent> {
+    let shift = mods_bits & MOD_SHIFT != 0;
+    let mut modifiers = Modifiers::NONE;
+    if mods_bits & MOD_SHIFT != 0 {
+        modifiers = modifiers.union(Modifiers::SHIFT);
+    }
+    if mods_bits & MOD_CTRL != 0 {
+        modifiers = modifiers.union(Modifiers::CONTROL);
+    }
+    if mods_bits & MOD_ALT != 0 {
+        modifiers = modifiers.union(Modifiers::ALT);
+    }
+
+    let code_word = match code {
+        KEY_BACKSPACE => KeyCode::Backspace.encode(),
+        KEY_ENTER => KeyCode::Enter.encode(),
+        KEY_TAB => {
+            if shift {
+                KeyCode::BackTab.encode()
+            }
+            else {
+                KeyCode::Tab.encode()
+            }
+        }
+        KEY_ESC => KeyCode::Escape.encode(),
+        KEY_DELETE => KeyCode::Delete.encode(),
+        KEY_LEFT => KeyCode::Left.encode(),
+        KEY_RIGHT => KeyCode::Right.encode(),
+        KEY_UP => KeyCode::Up.encode(),
+        KEY_DOWN => KeyCode::Down.encode(),
+        KEY_HOME => KeyCode::Home.encode(),
+        KEY_END => KeyCode::End.encode(),
+        KEY_SPACE => KeyCode::encode_char(' '),
+        _ => {
+            // Letters: codepoint reflects shift state. Letter index is
+            // 0..=25; map to 'a' or 'A' base.
+            if let Some(idx) = letter_index(code) {
+                let c = if shift {
+                    (b'A' + idx) as char
+                }
+                else {
+                    (b'a' + idx) as char
+                };
+                KeyCode::encode_char(c)
+            }
+            else {
+                // Number row + symbols. Shift selects the upper glyph.
+                let (lo, hi) = match code {
+                    KEY_1 => (b'1', b'!'),
+                    KEY_2 => (b'2', b'@'),
+                    KEY_3 => (b'3', b'#'),
+                    KEY_4 => (b'4', b'$'),
+                    KEY_5 => (b'5', b'%'),
+                    KEY_6 => (b'6', b'^'),
+                    KEY_7 => (b'7', b'&'),
+                    KEY_8 => (b'8', b'*'),
+                    KEY_9 => (b'9', b'('),
+                    KEY_0 => (b'0', b')'),
+                    KEY_MINUS => (b'-', b'_'),
+                    KEY_EQUAL => (b'=', b'+'),
+                    KEY_LEFTBRACE => (b'[', b'{'),
+                    KEY_RIGHTBRACE => (b']', b'}'),
+                    KEY_BACKSLASH => (b'\\', b'|'),
+                    KEY_SEMICOLON => (b';', b':'),
+                    KEY_APOSTROPHE => (b'\'', b'"'),
+                    KEY_GRAVE => (b'`', b'~'),
+                    KEY_COMMA => (b',', b'<'),
+                    KEY_DOT => (b'.', b'>'),
+                    KEY_SLASH => (b'/', b'?'),
+                    _ => return None,
+                };
+                KeyCode::encode_char(if shift { hi as char } else { lo as char })
+            }
+        }
+    };
+
+    Some(KeyEvent {
+        code: code_word,
+        modifiers: modifiers.bits(),
+        kind: kind as u32,
+        _reserved: 0,
+    })
 }
 
 /// Translate an evdev key code + modifier mask into UTF-8 bytes. Up

@@ -971,6 +971,17 @@ pub fn handle_read_stdin(epc: usize, hart_context: &'static HartContext, frame: 
 }
 
 #[unsafe(no_mangle)]
+pub fn handle_read_key_event(
+    epc: usize,
+    hart_context: &'static HartContext,
+    frame: &mut TrapFrame,
+) {
+    dispatch_syscall(epc, hart_context, frame, |t, f| {
+        orbit_core::syscall::read_key_event(t, f, &mut crate::hw::RiscvHardware)
+    });
+}
+
+#[unsafe(no_mangle)]
 pub fn handle_close_req(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
     dispatch_syscall(epc, hart_context, frame, |t, f| {
         orbit_core::syscall::close_req(t, f, &mut crate::hw::RiscvHardware)
@@ -1741,10 +1752,7 @@ pub fn handle_fb_query(epc: usize, hart_context: &'static HartContext, frame: &m
         // FbInfo is 16 bytes — fits in one page comfortably; reject
         // straddling so the SUM-gated copy below can be a single
         // bounded write.
-        if (buf_va.raw() as usize & (mmu::PAGE_SIZE - 1))
-            + buf_len
-            > mmu::PAGE_SIZE
-        {
+        if (buf_va.raw() as usize & (mmu::PAGE_SIZE - 1)) + buf_len > mmu::PAGE_SIZE {
             return orbit_core::SyscallOutcome::Return {
                 ret: -(EINVAL as isize),
             };

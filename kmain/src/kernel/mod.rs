@@ -58,6 +58,7 @@ pub mod context;
 pub mod fs;
 pub mod handle;
 pub mod input;
+pub mod key_events;
 pub mod memmap;
 pub mod orbital_elf;
 pub mod page_cache;
@@ -153,6 +154,13 @@ pub enum WakeEvent {
     /// owner wake-ups where we know exactly which thread is parked
     /// on a given NetCh.
     Tid(u32),
+    /// Wake the thread parked on a process's `ProcessKeyEvents` ring.
+    /// Carries the tid latched at park time. Pushed by
+    /// `kernel::input::dispatch` from trap context after a
+    /// `push_event`; the manager's `drain_wakes` runs
+    /// `set_wake_reason_where(INPUT_IO, |t| t.tid == tid)` which
+    /// eagerly promotes the Suspended thread to Ready.
+    InputTid(u32),
 }
 
 impl Default for WakeEvent {
@@ -1093,9 +1101,7 @@ impl Orbit {
             let root_table = memmap::kernel_root_from_pa(root_pa);
             let mut pages = PageAlloc::FA(self.table_pages.frames_mut());
             if map_address_range(&root_table, &mut pages, &config, vend, pend).is_err() {
-                warn!(
-                    "fb_surface_create: map_address_range failed for pid={pid} va=0x{user_va:X}"
-                );
+                warn!("fb_surface_create: map_address_range failed for pid={pid} va=0x{user_va:X}");
                 self.kernel_pages.free(frame, layout);
                 return (Errno::new(ENOMEM).to_ret(), 0);
             }
@@ -1174,9 +1180,10 @@ impl Orbit {
         // up to PAGE_SIZE, so the bounds are clean.
         unsafe {
             let root_table = memmap::kernel_root_from_pa(root_pa);
-            if let Err(()) =
-                unmap_range(&root_table, entry.user_va..entry.user_va + entry.size_bytes as u64)
-            {
+            if let Err(()) = unmap_range(
+                &root_table,
+                entry.user_va..entry.user_va + entry.size_bytes as u64,
+            ) {
                 warn!(
                     "fb_surface_destroy: unmap_range failed pid={pid} handle={} va=0x{:X}",
                     req.handle, entry.user_va
@@ -3463,6 +3470,9 @@ impl Orbit {
                 WakeEvent::Tid(tid) => {
                     self.set_wake_reason_where(process::wake_reason::NET_IO, |t| t.tid == tid);
                 }
+                WakeEvent::InputTid(tid) => {
+                    self.set_wake_reason_where(process::wake_reason::INPUT_IO, |t| t.tid == tid);
+                }
             }
         }
     }
@@ -4435,6 +4445,11 @@ impl Orbit {
         // this only fires if a thread parks an instant before the
         // owning process exits — rare).
         crate::kernel::stdin::unregister(process.pid);
+
+        // Same teardown shape for the structured-event ring; signals
+        // any parked `read_key_event` reader so the blocked thread
+        // unblocks and falls through to ENOENT on retry.
+        crate::kernel::key_events::unregister(process.pid);
 
         // Tear down the per-process surface table. Each remaining
         // entry's backing frame goes back to `kernel_pages`. The user
@@ -5767,6 +5782,12 @@ impl Orbit {
         // place to deliver keystrokes once the process becomes the
         // active source. Removed by `dealloc_process` on teardown.
         crate::kernel::stdin::register(pid);
+
+        // Register the structured key-event ring next to stdin —
+        // input::dispatch fans the same key out to both, the byte
+        // path stays for shells while ratatui-shaped consumers read
+        // KeyEvents via `read_key_event`.
+        crate::kernel::key_events::register(pid);
 
         // Register a per-process surface table so `fb_surface_create`
         // has a slot to insert into without taking the slow path of

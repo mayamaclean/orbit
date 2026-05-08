@@ -103,11 +103,13 @@ pub static SYSCALL_STATS: [SyscallSlot; Sysno::COUNT] = [
     SyscallSlot::new(),
     SyscallSlot::new(),
     SyscallSlot::new(),
-    SyscallSlot::new()
+    SyscallSlot::new(),
+    // ReadKeyEvent — ordinal 51, structured key-event ring drain.
+    SyscallSlot::new(),
 ];
 
 const _: () = assert!(
-    Sysno::COUNT == 51,
+    Sysno::COUNT == 52,
     "SYSCALL_STATS literal must be resized when Sysno::COUNT changes"
 );
 

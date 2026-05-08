@@ -1,0 +1,39 @@
+[package]
+name = "hello-ratatui-std"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "hello-ratatui-std"
+path = "src/main.rs"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+
+[dependencies]
+ab_glyph = "0.2.32"
+orbit-abi = { path = "../orbit-abi" }
+orbit-text = { path = "../orbit-text" }
+orbit-ratatui = { path = "../orbit-ratatui" }
+# Pull ratatui without crossterm (we provide our own backend) and
+# without the `std` feature. Why no std on ratatui:
+#  - ratatui-widgets's `std` feature enables `time/local-offset`,
+#    which needs `libc::localtime_r` / `libc::tm` — neither is in
+#    orbit's vendored libc shape today.
+#  - The bits we get from std (layout-cache, palette, calendar) are
+#    not load-bearing for this static-frame demo. ratatui runs
+#    no_std + alloc internally; the binary itself still uses
+#    orbit's std for `std::fs` and `std::thread::sleep`.
+# Block / Paragraph / List / Table / Gauge / Sparkline / etc. compile
+# without any feature flag.
+ratatui = { version = "0.30", default-features = false }
+
+# Even without `std`, ratatui-widgets pulls `time` as a non-optional
+# transitive dep, and `time` pulls libc. Redirect to orbit's vendored
+# libc so the dep graph resolves on `riscv64gc-unknown-orbit`. Same
+# pattern as eza / ripgrep.
+[patch.crates-io]
+libc = { path = "../rust/library/libc" }

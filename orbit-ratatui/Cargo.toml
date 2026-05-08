@@ -1,0 +1,19 @@
+[package]
+name = "orbit-ratatui"
+version = "0.1.0"
+edition = "2024"
+description = "ratatui Backend that draws into an orbit framebuffer surface via orbit-text"
+
+[features]
+default = []
+# Forwarded to ratatui-core for consumers built against orbit's std.
+# orbit-ratatui itself is no_std + alloc; this just toggles whether
+# downstream depends on the std-feature surface of ratatui-core (used
+# by std widgets, layout-cache, etc.).
+std = ["ratatui-core/std"]
+
+[dependencies]
+orbit-abi = { path = "../orbit-abi" }
+orbit-text = { path = "../orbit-text" }
+ab_glyph = { version = "0.2.32", default-features = false, features = ["libm"] }
+ratatui-core = { version = "0.1", default-features = false }

@@ -783,8 +783,7 @@ impl Display {
             let src_base = surf.kdmap_kva as *const u32;
             for row in rect.y..y_end {
                 let cols = x_end - rect.x;
-                let src_row =
-                    src_base.add(row as usize * surf.width as usize + rect.x as usize);
+                let src_row = src_base.add(row as usize * surf.width as usize + rect.x as usize);
                 let dst_row = fb_base.add(row as usize * fb_w + rect.x as usize);
                 for col in 0..cols as usize {
                     let px = src_row.add(col).read_volatile();

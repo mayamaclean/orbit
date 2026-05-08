@@ -730,6 +730,9 @@ impl Permissions {
             syscall::FB_SURFACE_CREATE => class::STDIO,
             syscall::FB_SURFACE_DESTROY => class::STDIO,
             syscall::FB_PRESENT => class::STDIO,
+            // Same family as READ_STDIN — the structured-event
+            // counterpart shares its policy class.
+            syscall::READ_KEY_EVENT => class::STDIO,
             _ => ClassMask::EMPTY,
         }
     }
@@ -1019,6 +1022,7 @@ mod tests {
             FB_SURFACE_CREATE,
             FB_SURFACE_DESTROY,
             FB_PRESENT,
+            READ_KEY_EVENT,
         ];
         for s in all {
             let cls = Permissions::class_for(s);
@@ -1569,6 +1573,7 @@ mod tests {
             FB_SURFACE_CREATE,
             FB_SURFACE_DESTROY,
             FB_PRESENT,
+            READ_KEY_EVENT,
         ] {
             assert!(p.allows(s), "ALL.allows({s}) should be true");
         }

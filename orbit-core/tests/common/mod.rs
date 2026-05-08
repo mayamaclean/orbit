@@ -77,8 +77,12 @@ pub fn make_thread(state: ThreadState, mode: SPP) -> Thread {
             syscall_ticks: AtomicU64::new(0),
             permissions: orbit_abi::perms::Permissions::ZERO,
             stdout_redirect: None,
-            egid: 0, euid: 0, gid: 0,
-            sgid: 0, suid: 0, uid: 0
+            egid: 0,
+            euid: 0,
+            gid: 0,
+            sgid: 0,
+            suid: 0,
+            uid: 0,
         }
     }
 }
@@ -283,5 +287,20 @@ impl Hardware for FakeHw {
         else {
             Err(work)
         }
+    }
+
+    // No FakeHw test exercises the structured key-event ring today; the
+    // stubs here just satisfy the trait. Add real recording state when
+    // a `read_key_event` integration test lands.
+    fn read_key_events_drain(&mut self, _pid: u16, _user_va: UserVa, _max_count: usize) -> usize {
+        0
+    }
+
+    fn set_key_event_parker(&mut self, _pid: u16, _tid: u32) -> process::key_events::ParkOutcome {
+        process::key_events::ParkOutcome::Busy
+    }
+
+    fn clear_key_event_parker_if(&mut self, _pid: u16, _tid: u32) -> bool {
+        false
     }
 }

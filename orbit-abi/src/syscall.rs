@@ -29,6 +29,28 @@ pub const GET_MICROS: usize = 8;
 /// monotonic intervals use [`GET_MICROS`].
 pub const GET_REALTIME: usize = 10;
 
+/// `read_key_event(buf: *mut KeyEvent, count: usize, flags: usize) -> n | -errno`
+/// — drain up to `count` structured key events from the calling
+/// process's event ring into `buf`. Companion to [`READ_STDIN`]:
+/// same producer (`kernel::input::dispatch`), but exposes the raw
+/// `KeyEvent` (KeyCode + Modifiers + KeyEventKind) before lossy
+/// encoding to UTF-8 + ANSI escapes. Used by ratatui-shaped TUI
+/// consumers that need release events, F-keys, modifier-preserved
+/// arrows, etc.
+///
+/// Bit 0 of `flags` is `READ_KEY_EVENT_NONBLOCK`: returns `EAGAIN`
+/// when the ring is empty instead of parking. Same blocking shape
+/// as [`READ_STDIN`] otherwise — yields with `YieldRetry` so the
+/// resumed thread re-enters the syscall and drains the events that
+/// woke it.
+///
+/// Errnos:
+/// - `EFAULT` — `buf` doesn't translate under the caller's satp.
+/// - `EINVAL` — `count == 0` or the buffer would exceed `PAGE_SIZE`.
+/// - `EAGAIN` — empty + nonblock.
+/// - `EBUSY`  — another reader is already parked on the ring.
+pub const READ_KEY_EVENT: usize = 12;
+
 /// `thread_exit() -> !` — terminate just the calling thread, leaving
 /// sibling threads of the same process running. Used by std's thread
 /// trampoline (and any future `pthread_exit`-shaped caller) when a
@@ -349,6 +371,7 @@ pub enum Sysno {
     GetMicros = GET_MICROS,
     GetRealtime = GET_REALTIME,
     ThreadExit = THREAD_EXIT,
+    ReadKeyEvent = READ_KEY_EVENT,
     Pledge = PLEDGE,
     Mmap = MMAP,
     CreateNetch = CREATE_NETCH,
@@ -405,6 +428,7 @@ impl Sysno {
             GET_MICROS => Self::GetMicros,
             GET_REALTIME => Self::GetRealtime,
             THREAD_EXIT => Self::ThreadExit,
+            READ_KEY_EVENT => Self::ReadKeyEvent,
             PLEDGE => Self::Pledge,
             MMAP => Self::Mmap,
             CREATE_NETCH => Self::CreateNetch,
@@ -506,6 +530,7 @@ impl Sysno {
             Self::FbSurfaceCreate => 48,
             Self::FbSurfaceDestroy => 49,
             Self::FbPresent => 50,
+            Self::ReadKeyEvent => 51,
         }
     }
 
@@ -514,7 +539,7 @@ impl Sysno {
     /// when adding a `Sysno` variant. Older userland with a smaller
     /// COUNT reads a prefix of the kernel's table; newer userland with
     /// a larger COUNT treats the kernel's missing slots as zero.
-    pub const COUNT: usize = 51;
+    pub const COUNT: usize = 52;
 }
 
 #[cfg(test)]
@@ -595,13 +620,14 @@ mod tests {
             Some(Sysno::FbSurfaceDestroy)
         );
         assert_eq!(Sysno::from_usize(FB_PRESENT), Some(Sysno::FbPresent));
+        assert_eq!(Sysno::from_usize(READ_KEY_EVENT), Some(Sysno::ReadKeyEvent));
     }
 
     #[test]
     fn unknown_returns_none() {
-        // 9 is PLEDGE, 10 is GET_REALTIME, 11 is THREAD_EXIT — used to
-        // be holes below 4096.
-        assert_eq!(Sysno::from_usize(12), None);
+        // 9 is PLEDGE, 10 is GET_REALTIME, 11 is THREAD_EXIT, 12 is
+        // READ_KEY_EVENT — used to be holes below 4096.
+        assert_eq!(Sysno::from_usize(13), None);
         assert_eq!(Sysno::from_usize(4095), None);
         // 4105..=4118 are now CREATE_PROCESS_V2 / QUERY_DENIAL_LOG /
         // CHDIR / GETCWD / GETUID / GETEUID / GETGID / GETEGID /
@@ -672,6 +698,7 @@ mod tests {
         assert_eq!(Sysno::FbSurfaceCreate as usize, FB_SURFACE_CREATE);
         assert_eq!(Sysno::FbSurfaceDestroy as usize, FB_SURFACE_DESTROY);
         assert_eq!(Sysno::FbPresent as usize, FB_PRESENT);
+        assert_eq!(Sysno::ReadKeyEvent as usize, READ_KEY_EVENT);
     }
 
     #[test]
@@ -729,6 +756,7 @@ mod tests {
         assert_eq!(FB_SURFACE_CREATE, 7001);
         assert_eq!(FB_SURFACE_DESTROY, 7002);
         assert_eq!(FB_PRESENT, 7003);
+        assert_eq!(READ_KEY_EVENT, 12);
     }
 
     #[test]
@@ -787,6 +815,7 @@ mod tests {
             Sysno::FbSurfaceCreate,
             Sysno::FbSurfaceDestroy,
             Sysno::FbPresent,
+            Sysno::ReadKeyEvent,
         ];
         assert_eq!(all.len(), Sysno::COUNT);
         let mut seen = [false; Sysno::COUNT];

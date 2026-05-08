@@ -120,6 +120,27 @@ pub trait Hardware {
     /// Returns `true` if there was a parked reader to cancel; the
     /// impl drops the handle.
     fn unpark_stdin_reader(&mut self, pid: u16) -> bool;
+
+    /// Drain up to `max_count` `KeyEvent`s from `pid`'s structured
+    /// event ring directly into the user buffer at `user_va`. Returns
+    /// the count drained (0 if empty or `pid` not registered). Same
+    /// shape as [`Hardware::read_stdin_drain`] but for the structured
+    /// counterpart.
+    fn read_key_events_drain(&mut self, pid: u16, user_va: UserVa, max_count: usize) -> usize;
+
+    /// Stamp `tid` as the parked reader on `pid`'s key-event ring.
+    /// See [`process::key_events::ParkOutcome`] for the three result
+    /// states. Returns `Busy` if `pid` isn't registered (treats
+    /// "no ring" the same as "another tid is parked" — both should
+    /// fail the syscall with EBUSY rather than silently parking
+    /// against a missing ring).
+    fn set_key_event_parker(&mut self, pid: u16, tid: u32) -> process::key_events::ParkOutcome;
+
+    /// Clear `pid`'s key-event parker if it currently holds `tid`.
+    /// Used by the read-side re-check race after stamping our tid:
+    /// if events arrived during the park-vs-push window we cancel
+    /// the park rather than yield Suspended.
+    fn clear_key_event_parker_if(&mut self, pid: u16, tid: u32) -> bool;
 }
 
 /// What a pure syscall handler tells the shim to do after it returns.

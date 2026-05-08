@@ -6,6 +6,7 @@ pub mod envp;
 pub mod errno;
 pub mod fb;
 pub mod fs;
+pub mod input;
 pub mod layout;
 pub mod mmap;
 pub mod net;

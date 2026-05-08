@@ -182,12 +182,7 @@ pub unsafe fn ecall5(
 /// by `fb_surface_create(w, h, format)` to hand back `(handle, user_va)`
 /// in one trap.
 #[inline]
-pub unsafe fn ecall3_ret2(
-    code: usize,
-    arg0: usize,
-    arg1: usize,
-    arg2: usize,
-) -> (isize, isize) {
+pub unsafe fn ecall3_ret2(code: usize, arg0: usize, arg1: usize, arg2: usize) -> (isize, isize) {
     let r0: isize;
     let r1: isize;
     unsafe {
@@ -349,6 +344,46 @@ pub const READ_STDIN_NONBLOCK: usize = 1;
 #[inline]
 pub fn read_stdin(ptr: usize, len: usize, flags: usize) -> Result<usize, Errno> {
     Errno::from_ret(unsafe { ecall3(syscall::READ_STDIN, ptr, len, flags) })
+}
+
+/// Drain up to `count` `KeyEvent`s from the calling process's
+/// structured-event ring into `buf`. Companion to [`read_stdin`] —
+/// same producer, different encoding (no UTF-8 + ANSI round-trip).
+///
+/// `timeout_ms` selects the park shape (no NONBLOCK):
+/// - `0` — peek; drain available, return synchronously with 0 if
+///   the ring is empty.
+/// - `usize::MAX` ([`READ_KEY_EVENT_INDEFINITE`]) — block until the
+///   next event.
+/// - any value in `1..(60*60*1000)` — block up to that many
+///   milliseconds; return early on the next event.
+///
+/// `flags & READ_KEY_EVENT_NONBLOCK` overrides `timeout_ms` and
+/// returns `EAGAIN` immediately on empty.
+///
+/// Errors:
+/// - `EINVAL` — `count == 0`, buffer exceeds one page, or
+///   `timeout_ms` is in the rejected band (≥ 1 hour and not the
+///   sentinel).
+/// - `EFAULT` — `buf` doesn't translate under the caller's satp.
+/// - `EAGAIN` — empty + nonblock.
+/// - `EBUSY`  — another reader is parked on the ring.
+#[inline]
+pub fn read_key_event(
+    buf: *mut crate::input::KeyEvent,
+    count: usize,
+    flags: usize,
+    timeout_ms: usize,
+) -> Result<usize, Errno> {
+    Errno::from_ret(unsafe {
+        ecall4(
+            syscall::READ_KEY_EVENT,
+            buf as usize,
+            count,
+            flags,
+            timeout_ms,
+        )
+    })
 }
 
 /// Block the calling thread for `ms` milliseconds. Kernel caps the
