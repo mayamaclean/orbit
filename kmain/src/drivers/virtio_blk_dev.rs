@@ -202,7 +202,7 @@ pub fn setup_virtio_blk(kernel_pages: &mut KernelPages) -> bool {
     if plic::plic_register(
         slot.irq,
         virtio_blk_handler,
-        core::cmp::min(1, CPU_COUNT.load(Ordering::Relaxed) - 1),
+        CPU_COUNT.load(Ordering::Relaxed).saturating_sub(1),
     )
     .is_err()
     {

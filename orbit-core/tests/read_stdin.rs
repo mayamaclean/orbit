@@ -81,7 +81,10 @@ fn block_empty_parks_then_yields_retry() {
             state: ThreadState::Blocking
         }
     ));
-    assert!(t.handle.is_some(), "thread parked on a handle");
+    assert!(
+        t.handle.is_none(),
+        "no Arc'd handle on the on-thread completion path"
+    );
     assert_eq!(hw.stdin_parked.len(), 1, "park called exactly once");
     assert_eq!(hw.stdin_parked[0].0, PID);
     assert!(

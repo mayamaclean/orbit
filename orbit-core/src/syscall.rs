@@ -6,7 +6,7 @@
 use device::TrapFrame;
 use mmu::PagePermissions;
 use orbit_abi::layout::UserVa;
-use process::{CompletionHandle, Thread, ThreadState};
+use process::{Thread, ThreadState};
 
 use orbit_abi::errno::{EAGAIN, EBUSY, EFAULT, EINVAL, EIO, EPERM, Errno};
 use orbit_abi::layout::{user_priv_range_ok, user_range_ok, user_shared_range_ok};
@@ -118,19 +118,17 @@ pub fn mmap_req<H: Hardware>(thread: &mut Thread, frame: &TrapFrame, hw: &mut H)
         };
     }
 
-    let handle = CompletionHandle::new();
     let work = PendingWork::MemMap {
         req,
         pid: thread.pid,
         root_pa: thread.root_table_addr(),
-        handle: handle.clone(),
+        tid: thread.tid,
     };
     if hw.push_pending_work(work).is_err() {
         return SyscallOutcome::Return {
             ret: Errno::new(EAGAIN).to_ret(),
         };
     }
-    thread.handle = Some(handle);
     SyscallOutcome::Yield {
         state: ThreadState::Blocking,
         ret: None,
@@ -187,19 +185,17 @@ pub fn fb_surface_create_req<H: Hardware>(
         height,
         format_raw,
     };
-    let handle = CompletionHandle::new();
     let work = PendingWork::FbSurfaceCreate {
         req,
         pid: thread.pid,
         root_pa: thread.root_table_addr(),
-        handle: handle.clone(),
+        tid: thread.tid,
     };
     if hw.push_pending_work(work).is_err() {
         return SyscallOutcome::Return {
             ret: Errno::new(EAGAIN).to_ret(),
         };
     }
-    thread.handle = Some(handle);
     SyscallOutcome::Yield {
         state: ThreadState::Blocking,
         ret: None,
@@ -218,19 +214,17 @@ pub fn fb_surface_destroy_req<H: Hardware>(
     let req = FbSurfaceDestroyReq {
         handle: frame.regs[11] as u32,
     };
-    let handle = CompletionHandle::new();
     let work = PendingWork::FbSurfaceDestroy {
         req,
         pid: thread.pid,
         root_pa: thread.root_table_addr(),
-        handle: handle.clone(),
+        tid: thread.tid,
     };
     if hw.push_pending_work(work).is_err() {
         return SyscallOutcome::Return {
             ret: Errno::new(EAGAIN).to_ret(),
         };
     }
-    thread.handle = Some(handle);
     SyscallOutcome::Yield {
         state: ThreadState::Blocking,
         ret: None,
@@ -279,19 +273,17 @@ pub fn nc_create_req<H: Hardware>(
             ret: Errno::new(EINVAL).to_ret(),
         };
     }
-    let handle = CompletionHandle::new();
     let work = PendingWork::NetChannelCreation {
         req,
         pid: thread.pid,
         root_pa: thread.root_table_addr(),
-        handle: handle.clone(),
+        tid: thread.tid,
     };
     if hw.push_pending_work(work).is_err() {
         return SyscallOutcome::Return {
             ret: Errno::new(EAGAIN).to_ret(),
         };
     }
-    thread.handle = Some(handle);
     SyscallOutcome::Yield {
         state: ThreadState::Blocking,
         ret: None,
@@ -309,19 +301,17 @@ pub fn close_req<H: Hardware>(
     let req = CloseHandleReq {
         fd: frame.regs[11] as u32,
     };
-    let handle = CompletionHandle::new();
     let work = PendingWork::CloseHandle {
         req,
         pid: thread.pid,
         root_pa: thread.root_table_addr(),
-        handle: handle.clone(),
+        tid: thread.tid,
     };
     if hw.push_pending_work(work).is_err() {
         return SyscallOutcome::Return {
             ret: Errno::new(EAGAIN).to_ret(),
         };
     }
-    thread.handle = Some(handle);
     SyscallOutcome::Yield {
         state: ThreadState::Blocking,
         ret: None,
@@ -366,19 +356,17 @@ pub fn create_process_req<H: Hardware>(
         };
     }
 
-    let handle = CompletionHandle::new();
     let work = PendingWork::CreateProcess {
         req,
         pid: thread.pid,
         root_pa: thread.root_table_addr(),
-        handle: handle.clone(),
+        tid: thread.tid,
     };
     if hw.push_pending_work(work).is_err() {
         return SyscallOutcome::Return {
             ret: Errno::new(EAGAIN).to_ret(),
         };
     }
-    thread.handle = Some(handle);
     SyscallOutcome::Yield {
         state: ThreadState::Blocking,
         ret: None,
@@ -404,18 +392,16 @@ pub fn wait_pid_req<H: Hardware>(
         };
     }
     let req = WaitPidReq { target_pid };
-    let handle = CompletionHandle::new();
     let work = PendingWork::WaitPid {
         req,
         pid: thread.pid,
-        handle: handle.clone(),
+        tid: thread.tid,
     };
     if hw.push_pending_work(work).is_err() {
         return SyscallOutcome::Return {
             ret: Errno::new(EAGAIN).to_ret(),
         };
     }
-    thread.handle = Some(handle);
     SyscallOutcome::Yield {
         state: ThreadState::Blocking,
         ret: None,
@@ -452,19 +438,17 @@ pub fn fs_open_req<H: Hardware>(
             ret: Errno::new(EFAULT).to_ret(),
         };
     }
-    let handle = CompletionHandle::new();
     let work = PendingWork::FsOpen {
         req,
         pid: thread.pid,
         root_pa: thread.root_table_addr(),
-        handle: handle.clone(),
+        tid: thread.tid,
     };
     if hw.push_pending_work(work).is_err() {
         return SyscallOutcome::Return {
             ret: Errno::new(EAGAIN).to_ret(),
         };
     }
-    thread.handle = Some(handle);
     SyscallOutcome::Yield {
         state: ThreadState::Blocking,
         ret: None,
@@ -580,19 +564,17 @@ pub fn fs_stat_req<H: Hardware>(
             ret: Errno::new(EFAULT).to_ret(),
         };
     }
-    let handle = CompletionHandle::new();
     let work = PendingWork::FsStat {
         req,
         pid: thread.pid,
         root_pa: thread.root_table_addr(),
-        handle: handle.clone(),
+        tid: thread.tid,
     };
     if hw.push_pending_work(work).is_err() {
         return SyscallOutcome::Return {
             ret: Errno::new(EAGAIN).to_ret(),
         };
     }
-    thread.handle = Some(handle);
     SyscallOutcome::Yield {
         state: ThreadState::Blocking,
         ret: None,
@@ -632,19 +614,17 @@ pub fn fs_readdir_req<H: Hardware>(
             ret: Errno::new(EFAULT).to_ret(),
         };
     }
-    let handle = CompletionHandle::new();
     let work = PendingWork::FsReaddir {
         req,
         pid: thread.pid,
         root_pa: thread.root_table_addr(),
-        handle: handle.clone(),
+        tid: thread.tid,
     };
     if hw.push_pending_work(work).is_err() {
         return SyscallOutcome::Return {
             ret: Errno::new(EAGAIN).to_ret(),
         };
     }
-    thread.handle = Some(handle);
     SyscallOutcome::Yield {
         state: ThreadState::Blocking,
         ret: None,
@@ -743,19 +723,17 @@ pub fn create_process_ex_req<H: Hardware>(
             };
         }
     }
-    let handle = CompletionHandle::new();
     let work = PendingWork::CreateProcessEx {
         req,
         pid: thread.pid,
         root_pa: thread.root_table_addr(),
-        handle: handle.clone(),
+        tid: thread.tid,
     };
     if hw.push_pending_work(work).is_err() {
         return SyscallOutcome::Return {
             ret: Errno::new(EAGAIN).to_ret(),
         };
     }
-    thread.handle = Some(handle);
     SyscallOutcome::Yield {
         state: ThreadState::Blocking,
         ret: None,
@@ -800,19 +778,17 @@ pub fn futex_wait_req<H: Hardware>(
         expected,
         timeout_ns,
     };
-    let handle = CompletionHandle::new();
     let work = PendingWork::FutexWait {
         req,
         pid: thread.pid,
         root_pa: thread.root_table_addr(),
-        handle: handle.clone(),
+        tid: thread.tid,
     };
     if hw.push_pending_work(work).is_err() {
         return SyscallOutcome::Return {
             ret: Errno::new(EAGAIN).to_ret(),
         };
     }
-    thread.handle = Some(handle);
     SyscallOutcome::Yield {
         state: ThreadState::Blocking,
         ret: None,
@@ -850,19 +826,17 @@ pub fn futex_wake_req<H: Hardware>(
         };
     };
     let req = FutexWakeReq { uaddr, n };
-    let handle = CompletionHandle::new();
     let work = PendingWork::FutexWake {
         req,
         pid: thread.pid,
         root_pa: thread.root_table_addr(),
-        handle: handle.clone(),
+        tid: thread.tid,
     };
     if hw.push_pending_work(work).is_err() {
         return SyscallOutcome::Return {
             ret: Errno::new(EAGAIN).to_ret(),
         };
     }
-    thread.handle = Some(handle);
     SyscallOutcome::Yield {
         state: ThreadState::Blocking,
         ret: None,
@@ -1000,16 +974,19 @@ pub fn read_stdin<H: Hardware>(
         return ready(Errno::new(EAGAIN).to_ret());
     }
 
-    // Block path. Allocate a handle, park it on the per-process
-    // slot, then re-check the ring to close the park-vs-signal
-    // window before yielding.
-    let handle = CompletionHandle::new();
-    if !hw.park_stdin_reader(thread.pid, handle.clone()) {
+    // Block path. Stamp the caller's tid on the per-process slot,
+    // then re-check the ring to close the park-vs-push window before
+    // yielding. No Arc allocation — `push_byte` swaps the slot back
+    // to empty and returns the parked tid; the trap-context caller
+    // (kmain's `input::dispatch`) issues
+    // `WAKE_QUEUE.push(WakeEvent::InputTid(tid))` so the manager
+    // resumes the parker.
+    if !hw.park_stdin_reader(thread.pid, thread.tid) {
         return ready(Errno::new(EBUSY).to_ret());
     }
 
     // Re-check: a byte that arrived between try_drain and park
-    // would have observed `parked == null` and not signaled. By
+    // would have observed `parked_tid == 0` and not woken anyone. By
     // re-draining after the park is visible, either we observe the
     // byte here (cancel the park, return synchronously) or we know
     // no producer raced us (yield safely).
@@ -1019,7 +996,6 @@ pub fn read_stdin<H: Hardware>(
         return ready(n2 as isize);
     }
 
-    thread.handle = Some(handle);
     SyscallOutcome::YieldRetry {
         state: ThreadState::Blocking,
     }
@@ -1208,19 +1184,17 @@ pub fn create_thread<H: Hardware>(
             ret: Errno::new(EINVAL).to_ret(),
         };
     }
-    let handle = CompletionHandle::new();
     let work = PendingWork::CreateThread {
         req,
         pid: thread.pid,
         parent_allowed: thread.allowed_affinity,
-        handle: handle.clone(),
+        tid: thread.tid,
     };
     if hw.push_pending_work(work).is_err() {
         return SyscallOutcome::Return {
             ret: Errno::new(EAGAIN).to_ret(),
         };
     }
-    thread.handle = Some(handle);
     SyscallOutcome::Yield {
         state: ThreadState::Blocking,
         ret: None,
@@ -1270,19 +1244,17 @@ pub fn pledge_req<H: Hardware>(
         };
     };
     let req = PledgeReq { req_vaddr };
-    let handle = CompletionHandle::new();
     let work = PendingWork::Pledge {
         req,
         pid: thread.pid,
         root_pa: thread.root_table_addr(),
-        handle: handle.clone(),
+        tid: thread.tid,
     };
     if hw.push_pending_work(work).is_err() {
         return SyscallOutcome::Return {
             ret: Errno::new(EAGAIN).to_ret(),
         };
     }
-    thread.handle = Some(handle);
     SyscallOutcome::Yield {
         state: ThreadState::Blocking,
         ret: None,
@@ -1334,20 +1306,17 @@ pub fn create_process_v2_req<H: Hardware>(
     };
 
     let req = CreateProcessV2Req { args_vaddr };
-    let handle = CompletionHandle::new();
     let work = PendingWork::CreateProcessV2 {
         req,
         pid: thread.pid,
         root_pa: thread.root_table_addr(),
         tid: thread.tid,
-        handle: handle.clone(),
     };
     if hw.push_pending_work(work).is_err() {
         return SyscallOutcome::Return {
             ret: Errno::new(EAGAIN).to_ret(),
         };
     }
-    thread.handle = Some(handle);
     SyscallOutcome::Yield {
         state: ThreadState::Blocking,
         ret: None,

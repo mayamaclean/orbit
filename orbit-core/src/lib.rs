@@ -108,17 +108,18 @@ pub trait Hardware {
     /// (0 if the ring is empty or `pid` isn't registered).
     fn read_stdin_drain(&mut self, pid: u16, user_va: UserVa, max_len: usize) -> usize;
 
-    /// Park `handle` on `pid`'s stdin slot. Returns `false` if a
-    /// reader was already parked (caller emits EBUSY) or `pid` isn't
-    /// registered. The handle is moved in; on success the impl
-    /// retains the Arc, which `unpark_stdin_reader` (or
-    /// `input::dispatch`'s push-and-signal) later reclaims.
-    fn park_stdin_reader(&mut self, pid: u16, handle: process::CompletionHandle) -> bool;
+    /// Park `tid` on `pid`'s stdin slot. Returns `false` if a reader
+    /// was already parked (caller emits EBUSY) or `pid` isn't
+    /// registered. Producer's `push_byte` swaps the slot back to
+    /// "empty" and returns the parked tid; the trap-context caller
+    /// (kmain's `input::dispatch`) then issues a
+    /// `WAKE_QUEUE.push(WakeEvent::InputTid(tid))` so the manager
+    /// resumes the parker.
+    fn park_stdin_reader(&mut self, pid: u16, tid: u32) -> bool;
 
     /// Cancel a park on `pid`'s stdin slot. Used by the read_stdin
     /// re-check path when bytes arrive between try_drain and park.
-    /// Returns `true` if there was a parked reader to cancel; the
-    /// impl drops the handle.
+    /// Returns `true` if there was a parked reader to cancel.
     fn unpark_stdin_reader(&mut self, pid: u16) -> bool;
 
     /// Drain up to `max_count` `KeyEvent`s from `pid`'s structured

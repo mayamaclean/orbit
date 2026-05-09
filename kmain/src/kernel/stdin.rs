@@ -48,19 +48,21 @@ pub fn register(pid: u16) {
     t.entry(pid).or_insert_with(ProcessStdin::new);
 }
 
-/// Remove `pid`'s stdin slot. If a reader was parked on it, signal
-/// the handle (with empty value list) so the manager-scan unblocks
-/// the thread; the resumed thread re-enters `read_stdin` which sees
-/// the missing entry and returns an error.
+/// Remove `pid`'s stdin slot. If a reader was parked on it, push a
+/// `WakeEvent::InputTid(tid)` so the manager unblocks the thread;
+/// the resumed thread re-enters `read_stdin` which sees the missing
+/// entry and returns an error. Mirrors
+/// `key_events::unregister`'s shape now that both rings use the
+/// on-thread completion path.
 pub fn unregister(pid: u16) {
     let entry = STDIN_TABLE.lock().remove(&pid);
     if let Some(stdin) = entry {
-        if let Some(h) = stdin.unpark() {
-            h.signal_n(&[]);
+        if let Some(tid) = stdin.unpark() {
+            let _ = crate::kernel::wake_queue_push(crate::kernel::WakeEvent::InputTid(tid));
         }
-        // `stdin` (the Arc) drops here. The `ProcessStdin::Drop` impl
-        // reclaims any leftover parked Arc — defensive against a
-        // signaler racing our take above.
+        // `stdin` (the Arc) drops here. No Arc-reclaim sleight of
+        // hand needed post-Phase-6 — the parked-tid slot is just an
+        // AtomicU32, no resources tied to it.
     }
 }
 

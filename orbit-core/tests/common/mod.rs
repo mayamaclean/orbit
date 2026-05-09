@@ -4,7 +4,7 @@
 
 use std::alloc::{Layout, alloc_zeroed};
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, AtomicUsize};
+use std::sync::atomic::{AtomicI64, AtomicU8, AtomicU64, AtomicUsize};
 
 use device::{HartContext, Stack, TrapFrame};
 use mmu::sv48::PhysAddr;
@@ -14,7 +14,6 @@ use riscv::register::satp::Satp;
 use riscv::register::sstatus::SPP;
 
 use orbit_core::{Hardware, PendingWork};
-use process::CompletionHandle;
 
 #[cfg(miri)]
 unsafe extern "Rust" {
@@ -61,6 +60,14 @@ pub fn make_thread(state: ThreadState, mode: SPP) -> Thread {
             satp: Satp::from_bits(0),
             mode,
             handle: None,
+            pending_rets: [
+                AtomicI64::new(0),
+                AtomicI64::new(0),
+                AtomicI64::new(0),
+                AtomicI64::new(0),
+            ],
+            pending_state: AtomicU8::new(0),
+            pending_ret_count: AtomicU8::new(0),
             tid: 1,
             pid: 1,
             ticks: 0,
@@ -169,8 +176,8 @@ pub struct FakeHw {
     /// destination.
     pub stdin_drain_writes: Vec<(u16, u64, Vec<u8>)>,
 
-    /// Records of `(pid, handle)` from `park_stdin_reader` calls.
-    pub stdin_parked: Vec<(u16, CompletionHandle)>,
+    /// Records of `(pid, tid)` from `park_stdin_reader` calls.
+    pub stdin_parked: Vec<(u16, u32)>,
 
     /// Records of pids passed to `unpark_stdin_reader`.
     pub stdin_unparked: Vec<u16>,
@@ -260,11 +267,11 @@ impl Hardware for FakeHw {
             None => 0,
         }
     }
-    fn park_stdin_reader(&mut self, pid: u16, handle: CompletionHandle) -> bool {
+    fn park_stdin_reader(&mut self, pid: u16, tid: u32) -> bool {
         if !self.stdin_park_ok {
             return false;
         }
-        self.stdin_parked.push((pid, handle));
+        self.stdin_parked.push((pid, tid));
         true
     }
     fn unpark_stdin_reader(&mut self, pid: u16) -> bool {

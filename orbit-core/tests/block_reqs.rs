@@ -40,21 +40,20 @@ fn mmap_req_shared_marshals_args_and_blocks() {
             ret: None
         }
     );
-    assert!(t.handle.is_some(), "thread should be parked on a handle");
+    // mmap migrated to the on-thread completion path: no handle is
+    // installed on the parker; the manager later calls
+    // `Orbit::publish_pending_for_tid(tid, &[result])` and the parker's
+    // post-publish re-check picks up the SIGNALED state.
+    assert!(t.handle.is_none(), "no Arc'd handle on the migrated path");
     assert_eq!(hw.pending_work.len(), 1);
     match &hw.pending_work[0] {
-        PendingWork::MemMap {
-            req, pid, handle, ..
-        } => {
+        PendingWork::MemMap { req, pid, tid, .. } => {
             assert_eq!(req.vaddr.raw(), SHARED_VA as u64);
             assert_eq!(req.size, 4096);
             assert_eq!(req.page_permissions, 0x17);
             assert!(req.share_with_kernel);
             assert_eq!(*pid, t.pid);
-            // Handle on the queue and on the thread are clones of the
-            // same Arc — signaling either side wakes the other.
-            handle.signal(0);
-            assert!(t.handle.as_ref().unwrap().is_signaled());
+            assert_eq!(*tid, t.tid);
         }
         other => panic!("unexpected pending work: {other:?}"),
     }
@@ -121,14 +120,15 @@ fn nc_create_req_marshals_args_and_blocks() {
             ret: None
         }
     );
-    assert!(t.handle.is_some());
+    assert!(t.handle.is_none(), "no Arc'd handle on the migrated path");
     match &hw.pending_work[0] {
-        PendingWork::NetChannelCreation { req, pid, .. } => {
+        PendingWork::NetChannelCreation { req, pid, tid, .. } => {
             assert_eq!(req.nc_vaddr.raw(), SHARED_VA as u64);
             assert_eq!(req.region_size, 4096);
             assert_eq!(req.nc_type, 0);
             assert_eq!(req.bind, bind);
             assert_eq!(*pid, t.pid);
+            assert_eq!(*tid, t.tid);
         }
         other => panic!("unexpected pending work: {other:?}"),
     }
@@ -175,11 +175,12 @@ fn close_req_marshals_fd_and_blocks() {
             ret: None
         }
     );
-    assert!(t.handle.is_some());
+    assert!(t.handle.is_none(), "no Arc'd handle on the migrated path");
     match &hw.pending_work[0] {
-        PendingWork::CloseHandle { req, pid, .. } => {
+        PendingWork::CloseHandle { req, pid, tid, .. } => {
             assert_eq!(req.fd, 7);
             assert_eq!(*pid, t.pid);
+            assert_eq!(*tid, t.tid);
         }
         other => panic!("unexpected pending work: {other:?}"),
     }
@@ -219,17 +220,14 @@ fn create_process_req_marshals_args_and_blocks() {
             ret: None
         }
     );
-    assert!(t.handle.is_some(), "thread should be parked on a handle");
+    assert!(t.handle.is_none(), "no Arc'd handle on the migrated path");
     assert_eq!(hw.pending_work.len(), 1);
     match &hw.pending_work[0] {
-        PendingWork::CreateProcess {
-            req, pid, handle, ..
-        } => {
+        PendingWork::CreateProcess { req, pid, tid, .. } => {
             assert_eq!(req.elf_vaddr.raw(), 0x2_2000_0000);
             assert_eq!(req.elf_len, 0x4000);
             assert_eq!(*pid, t.pid);
-            handle.signal(7);
-            assert!(t.handle.as_ref().unwrap().is_signaled());
+            assert_eq!(*tid, t.tid);
         }
         other => panic!("unexpected pending work: {other:?}"),
     }
@@ -254,22 +252,21 @@ fn create_thread_req_marshals_args_and_blocks() {
             ret: None
         }
     );
-    assert!(t.handle.is_some(), "thread should be parked on a handle");
+    assert!(t.handle.is_none(), "no Arc'd handle on the migrated path");
     assert_eq!(hw.pending_work.len(), 1);
     match &hw.pending_work[0] {
         PendingWork::CreateThread {
             req,
             pid,
             parent_allowed,
-            handle,
+            tid,
         } => {
             assert_eq!(req.entry.raw(), USER_TEXT_BASE + 0x100);
             assert_eq!(req.allowed_affinity, 0xF);
             assert_eq!(req.affinity, 0x4);
             assert_eq!(*pid, t.pid);
             assert_eq!(*parent_allowed, 0xF);
-            handle.signal(99);
-            assert!(t.handle.as_ref().unwrap().is_signaled());
+            assert_eq!(*tid, t.tid);
         }
         other => panic!("unexpected pending work: {other:?}"),
     }

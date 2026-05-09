@@ -182,6 +182,13 @@ fn stats_cmd() {
     let _ = writeln!(w, "  kernel_ms        {}", ms(stats.hart_kernel_ticks));
     let _ = writeln!(w, "  scheduler_ms     {}", ms(stats.hart_scheduler_ticks));
     let _ = writeln!(w, "  idle_ms          {}", ms(stats.hart_idle_ticks));
+    let _ = writeln!(w, "wake_queue:");
+    let _ = writeln!(
+        w,
+        "  peak / cap       {} / {}",
+        stats.wake_queue_peak, stats.wake_queue_capacity,
+    );
+    let _ = writeln!(w, "  drops            {}", stats.wake_queue_drops);
     w.flush();
 }
 
@@ -270,8 +277,8 @@ fn syscall_stats_cmd() {
     let mut w = LineWriter::new();
     let _ = writeln!(
         w,
-        "{:<22}{:>12}{:>14}{:>12}",
-        "syscall", "count", "total_ms", "avg_us",
+        "{:<22}{:>12}{:>14}{:>12}{:>12}",
+        "syscall", "count", "total_ms", "avg_us", "max_us",
     );
     for i in 0..n {
         let e = &entries[i];
@@ -281,13 +288,15 @@ fn syscall_stats_cmd() {
         else {
             0
         };
+        let max_us = e.max_ticks / 10;
         let _ = writeln!(
             w,
-            "{:<22}{:>12}{:>14}{:>12}",
+            "{:<22}{:>12}{:>14}{:>12}{:>12}",
             syscall_name(i),
             e.count,
             to_ms(e.total_ticks),
             avg_us,
+            max_us,
         );
     }
     w.flush();

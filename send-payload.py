@@ -133,13 +133,10 @@ def main() -> int:
           file=sys.stderr)
 
     with socket.create_connection((args.host, args.port)) as s:
-        s.sendall(header)
-        s.sendall(body)
-        # Half-close so the guest sees FIN and leaves ESTABLISHED.
-        try:
-            s.shutdown(socket.SHUT_WR)
-        except OSError:
-            pass
+        s.sendmsg([header, body])
+        s.shutdown(socket.SHUT_WR)
+        resp = s.recv(1, socket.MSG_WAITALL)
+        print(f"resp={resp}")
 
     print("send-payload: done", file=sys.stderr)
     return 0

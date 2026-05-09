@@ -50,6 +50,12 @@ pub struct SyscallEntry {
     pub count: u64,
     /// Cumulative service ticks (excludes parked-thread wait time).
     pub total_ticks: u64,
+    /// Longest single dispatch ever recorded for this syscall.
+    /// Combined with `total_ticks / count` (mean) gives a quick
+    /// outlier signal — useful for migration A/B comparisons where
+    /// a regression can hide in tail latency even if the mean looks
+    /// flat. Zero before the first call.
+    pub max_ticks: u64,
 }
 
 /// Wire-format size for the kernel's current [`Sysno::COUNT`]. Userland
@@ -69,14 +75,14 @@ mod tests {
     }
 
     #[test]
-    fn entry_is_16_bytes() {
-        assert_eq!(core::mem::size_of::<SyscallEntry>(), 16);
+    fn entry_is_24_bytes() {
+        assert_eq!(core::mem::size_of::<SyscallEntry>(), 24);
     }
 
     #[test]
     fn payload_size_matches_count() {
-        // 8-byte header + 16 bytes per ordinal slot.
-        assert_eq!(payload_size(), 8 + Sysno::COUNT * 16);
+        // 8-byte header + 24 bytes per ordinal slot.
+        assert_eq!(payload_size(), 8 + Sysno::COUNT * 24);
     }
 
     #[test]
@@ -92,32 +98,33 @@ mod tests {
     }
 
     #[test]
-    fn entry_layout_count_first_then_total_ticks() {
+    fn entry_layout_count_total_max() {
         let e = SyscallEntry::default();
         let base = &e as *const _ as usize;
         assert_eq!(&e.count as *const _ as usize - base, 0);
         assert_eq!(&e.total_ticks as *const _ as usize - base, 8);
+        assert_eq!(&e.max_ticks as *const _ as usize - base, 16);
     }
 
     #[test]
     fn truncated_buffer_yields_partial_entries() {
-        // Kernel writes Sysno::COUNT entries (16 B each) + 8-byte
+        // Kernel writes Sysno::COUNT entries (24 B each) + 8-byte
         // header. User has a 100-byte buffer: kernel must clamp to
-        // floor((100-8)/16) = 5 full entries + header = 88 bytes
-        // written, header declares count=5. Trailing 12 bytes of user
+        // floor((100-8)/24) = 3 full entries + header = 80 bytes
+        // written, header declares count=3. Trailing 20 bytes of user
         // buffer untouched.
         let kernel_total =
             SYSCALL_STATS_MIN_LEN + Sysno::COUNT * core::mem::size_of::<SyscallEntry>();
-        assert_eq!(kernel_total, 8 + Sysno::COUNT * 16);
+        assert_eq!(kernel_total, 8 + Sysno::COUNT * 24);
 
         let user_buf_len: usize = 100;
         let entries_capacity =
             (user_buf_len - SYSCALL_STATS_MIN_LEN) / core::mem::size_of::<SyscallEntry>();
-        assert_eq!(entries_capacity, 5);
+        assert_eq!(entries_capacity, 3);
 
         let written =
             SYSCALL_STATS_MIN_LEN + entries_capacity * core::mem::size_of::<SyscallEntry>();
-        assert_eq!(written, 88);
+        assert_eq!(written, 80);
         assert!(written <= user_buf_len);
     }
 

@@ -201,3 +201,52 @@ fn multiple_remotes_each_observe_their_own_thread() {
     seen.sort();
     assert_eq!(seen, vec![100, 101, 102, 103]);
 }
+
+/// Regression: prior to the `is_busy()` guard on the self-view branch,
+/// `assign_threads` would clobber `self_view.current` if a peer hart
+/// had raced ahead and assigned a thread to us between kmain's
+/// pre-MANAGER_LOCK `hart_has_thread()` check and our own
+/// `assign_threads` call. The clobber leaked the peer-assigned thread
+/// (stuck in `Assigned` state, never dispatched).
+///
+/// We simulate the race by pre-populating `self_slot` with a sentinel
+/// pointer (representing the peer's assignment) and then invoking
+/// `assign_threads` with a single thread available in the scheduler.
+/// With the guard, the self_view branch sees `is_busy() == true` and
+/// skips both `next_runnable` and the assignment — `self_slot` keeps
+/// the peer's pointer and the scheduler's thread stays queued for a
+/// later pass.
+#[test]
+fn self_view_busy_skips_assignment_does_not_clobber() {
+    // A non-null sentinel for the peer-assigned `current`. Doesn't
+    // need to point at a real Thread for this test — `assign_threads`
+    // never derefs it; it only reads it via `is_busy()`.
+    let peer_sentinel: usize = 0xDEAD_BEEF;
+    let self_slot: AtomicPtr<()> = AtomicPtr::new(core::ptr::without_provenance_mut(peer_sentinel));
+
+    let thread = make_thread(ThreadState::Ready, SPP::User);
+    let mut sched = OneShotSched::new(thread);
+
+    let self_view = HartView {
+        hart_id: 0,
+        current: &self_slot,
+    };
+    let mut hw = FakeHw::default();
+
+    // Empty `remotes` so the only candidate slot is self_view, which
+    // is busy.
+    assign_threads(&self_view, std::iter::empty(), &mut sched, &mut hw);
+
+    // Peer's assignment must survive untouched.
+    assert_eq!(
+        self_slot.load(Ordering::Acquire) as usize,
+        peer_sentinel,
+        "self_view.current was clobbered despite is_busy() — guard regression"
+    );
+    // And the scheduler's thread must still be queued: the busy guard
+    // skips `next_runnable`, so a later pass can pick it up.
+    assert!(
+        !sched.handed_out,
+        "scheduler should not have been polled when self_view was busy"
+    );
+}

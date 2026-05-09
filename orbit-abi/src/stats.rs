@@ -117,6 +117,24 @@ pub struct ProcessStats {
     /// records the audit event and bumps this counter inline
     /// (under MANAGER_LOCK) before returning `-EPERM`.
     pub role_denials: u64,
+
+    // ─── kernel-wide WAKE_QUEUE telemetry ────────────────────────────
+    /// High-water mark of `WAKE_QUEUE` depth observed across the
+    /// kernel's lifetime. Sampled `fetch_max` after each successful
+    /// push, so it never decreases. Combined with `wake_queue_capacity`
+    /// gives "how close did we come to dropping?" — a peak approaching
+    /// cap is the cue to bump the cap.
+    pub wake_queue_peak: u64,
+    /// Cumulative count of `WAKE_QUEUE.push()` attempts that EAGAIN'd
+    /// because the ring was full. Each drop is a missed wake;
+    /// callers today either coalesce naturally (net) or rely on a
+    /// heartbeat fallback (k_net 10 ms). Non-zero is a signal that
+    /// the cap is undersized for the workload.
+    pub wake_queue_drops: u64,
+    /// Build-time capacity of `WAKE_QUEUE`. Reported in the snapshot
+    /// so userland can compute headroom without depending on a
+    /// kernel-side const that might change. Today's value: 64.
+    pub wake_queue_capacity: u64,
 }
 
 #[cfg(test)]
@@ -124,13 +142,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn layout_is_144_bytes() {
+    fn layout_is_168_bytes() {
         // Pinning the size keeps reviewers honest about ABI growth.
         // Bump only when appending fields (and update the kernel's
-        // matching write path in lockstep). The trailing two u64s
-        // (`perm_denials` + `role_denials`) bring the size from
-        // 128 to 144.
-        assert_eq!(core::mem::size_of::<ProcessStats>(), 144);
+        // matching write path in lockstep). The trailing three u64s
+        // (`wake_queue_peak` + `wake_queue_drops` + `wake_queue_capacity`)
+        // appended for migration measurement bring the size from
+        // 144 to 168.
+        assert_eq!(core::mem::size_of::<ProcessStats>(), 168);
     }
 
     #[test]

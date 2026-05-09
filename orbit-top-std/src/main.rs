@@ -363,10 +363,19 @@ fn render_summary(frame: &mut ratatui::Frame, area: Rect, curr: &Snapshot) {
         kv("upages", fmt_bytes(curr.proc.kernel_user_pages_bytes)),
         kv("ktables", fmt_bytes(curr.proc.kernel_ktables_bytes)),
         kv("kheap", fmt_bytes(curr.proc.kernel_heap_bytes)),
+        kv(
+            "wake_q",
+            format!(
+                "peak {}/{}  ·  drops {}",
+                curr.proc.wake_queue_peak,
+                curr.proc.wake_queue_capacity,
+                curr.proc.wake_queue_drops,
+            ),
+        ),
     ])
     .block(
         Block::default()
-            .title(" kernel memory ")
+            .title(" kernel runtime ")
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::DarkGray)),
     );
@@ -431,8 +440,8 @@ fn render_syscalls(
         return;
     }
 
-    // Build (ordinal, delta_count, total_count, total_ticks) tuples.
-    let mut rows: Vec<(usize, u64, u64, u64)> = curr
+    // Build (ordinal, delta_count, total_count, total_ticks, max_ticks) tuples.
+    let mut rows: Vec<(usize, u64, u64, u64, u64)> = curr
         .syscall
         .iter()
         .enumerate()
@@ -441,24 +450,30 @@ fn render_syscalls(
                 Some(p) if i < p.syscall.len() => e.count.saturating_sub(p.syscall[i].count),
                 _ => e.count,
             };
-            (i, delta, e.count, e.total_ticks)
+            (i, delta, e.count, e.total_ticks, e.max_ticks)
         })
-        .filter(|(_, _, total, _)| *total > 0)
+        .filter(|(_, _, total, _, _)| *total > 0)
         .collect();
     rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.2.cmp(&a.2)));
-    let max_delta = rows.iter().map(|(_, d, _, _)| *d).max().unwrap_or(1).max(1);
+    let max_delta = rows
+        .iter()
+        .map(|(_, d, _, _, _)| *d)
+        .max()
+        .unwrap_or(1)
+        .max(1);
 
     // Column budget: name 20, gap 1, Δcount 6, gap 2, total 7, gap 2,
-    // ticks 12. Longest sysno_name today is `query_syscall_stats`
-    // (19 chars); pin to 20 with `{:<20.20}` so a future longer name
-    // truncates rather than shoves the bar right.
+    // total_ms 12, gap 2, max_us 9. Longest sysno_name today is
+    // `query_syscall_stats` (19 chars); pin to 20 with `{:<20.20}` so a
+    // future longer name truncates rather than shoves the bar right.
     const NAME_W: usize = 20;
-    const TAIL_BUDGET: usize = 1 /*gap*/ + 6 /*Δ*/ + 2 + 7 /*total*/ + 2 + 12 /*ticks*/;
+    const TAIL_BUDGET: usize =
+        1 /*gap*/ + 6 /*Δ*/ + 2 + 7 /*total*/ + 2 + 12 /*total_ms*/ + 2 + 9 /*max_us*/;
     let row_count = (inner.height as usize).min(rows.len());
     let lines: Vec<Line> = rows
         .iter()
         .take(row_count)
-        .map(|(ord, delta, total, ticks)| {
+        .map(|(ord, delta, total, ticks, max_ticks)| {
             let name = sysno_name(*ord);
             let bar_width = (inner.width as usize).saturating_sub(NAME_W + TAIL_BUDGET);
             let filled = if max_delta == 0 {
@@ -470,6 +485,8 @@ fn render_syscalls(
             let filled = filled.min(bar_width);
             let bar = "█".repeat(filled);
             let pad = " ".repeat(bar_width.saturating_sub(filled));
+            // `time` CSR is 10 MHz on qemu-virt — 10 ticks per µs.
+            let max_us = max_ticks / 10;
             Line::from(vec![
                 Span::styled(
                     format!("{:<NAME_W$.NAME_W$}", name),
@@ -485,6 +502,11 @@ fn render_syscalls(
                 Span::styled(
                     format!("{:>12}", fmt_ticks_ms(*ticks)),
                     Style::default().fg(Color::DarkGray),
+                ),
+                Span::raw("  "),
+                Span::styled(
+                    format!("{:>6}µs", max_us),
+                    Style::default().fg(Color::LightRed),
                 ),
             ])
         })

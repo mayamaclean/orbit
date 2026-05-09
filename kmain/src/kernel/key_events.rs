@@ -17,7 +17,7 @@ use orbit_abi::input::KeyEvent;
 use process::ProcessKeyEvents;
 use spin::Mutex;
 
-use crate::kernel::{WAKE_QUEUE, WakeEvent};
+use crate::kernel::{WakeEvent, wake_queue_push};
 
 /// pid → key-event ring. Manager-side mutations (register/unregister)
 /// and producer/consumer reads (input::dispatch + read_key_event) all
@@ -40,7 +40,7 @@ pub fn unregister(pid: u16) {
     let entry = KEY_EVENTS_TABLE.lock().remove(&pid);
     if let Some(events) = entry {
         if let Some(tid) = events.take_parker() {
-            let _ = WAKE_QUEUE.push(WakeEvent::InputTid(tid));
+            let _ = wake_queue_push(WakeEvent::InputTid(tid));
         }
         // The Arc drops here; ring + parked_tid go with it.
     }
@@ -60,6 +60,6 @@ pub fn push_and_wake(pid: u16, ev: KeyEvent) {
         return;
     };
     if let Some(tid) = events.push_event(ev) {
-        let _ = WAKE_QUEUE.push(WakeEvent::InputTid(tid));
+        let _ = wake_queue_push(WakeEvent::InputTid(tid));
     }
 }

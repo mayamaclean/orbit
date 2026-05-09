@@ -8,7 +8,6 @@
 use core::sync::atomic::{AtomicPtr, Ordering};
 
 use process::{Thread, ThreadState};
-use tracing::error;
 
 use crate::Hardware;
 
@@ -115,29 +114,20 @@ where
         hw.wake_hart(hart.hart_id);
     }
 
-    if let Some(t) = sched.next_runnable(self_view.affinity_bit()) {
-        // Unlike the remote loop, no `is_busy()` gate here — the kmain
-        // caller invariant is that `self_view.current == null` at this
-        // point (k_hart_loop only reaches assign_threads when
-        // hart_has_thread() returned false). If that invariant has been
-        // violated by some path we haven't traced, log it loudly: a
-        // self-view clobber is the *only* way `assign_thread_to` can
-        // overwrite an existing non-null `current` without going
-        // through the gate, and would explain the
-        // "U-ecall arrives with cur=kthread" race.
-        let prev = self_view.current.load(Ordering::Acquire);
-        if !prev.is_null() {
-            // This is a no_std crate, so we go via the `log` facade
-            // (already pulled in by tracing on the kmain side); host
-            // tests won't notice.
-            error!(
-                "assign_threads: self_view (hart{}) clobbering non-null current={:p} \
-                 with thread={:p} — invariant violation",
-                self_view.hart_id, prev, t,
-            );
+    // Symmetric `is_busy()` guard with the remotes loop above. The
+    // kmain caller reaches this with a stale "I'm idle" view from
+    // `hart_has_thread()` taken *before* MANAGER_LOCK was acquired;
+    // in the window between that check and our acquire, a peer hart
+    // running its own `assign_threads` pass under the lock could have
+    // assigned a thread to us via its `remotes` arm and written to
+    // `self_view.current`. Skipping self-assignment in that case lets
+    // k_hart_loop dispatch the peer-supplied thread on its next
+    // `hart_has_thread()` poll.
+    if !self_view.is_busy() {
+        if let Some(t) = sched.next_runnable(self_view.affinity_bit()) {
+            // SAFETY: as above.
+            unsafe { assign_thread_to(self_view, t) };
         }
-        // SAFETY: as above.
-        unsafe { assign_thread_to(self_view, t) };
     }
 }
 

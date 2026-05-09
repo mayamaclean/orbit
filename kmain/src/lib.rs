@@ -302,6 +302,14 @@ pub extern "C" fn k_hart_loop() -> ! {
             // by the next scheduler scan in this same critical section.
             orbit.drain_wakes();
             orbit.check_net();
+            // End-of-pass batched nudge: every CONSOLE_RING push that
+            // landed during this pass (manager-side handlers + concurrent
+            // trap-context `push_chunk` from user-hart syscalls) gets a
+            // single Ready transition for k_gpu instead of one wake per
+            // push. Runs *before* `assign_threads` so the readied k_gpu
+            // is dispatched this same pass — no extra manager-pass of
+            // latency. See `Orbit::nudge_gpu_if_pending` for rationale.
+            orbit.nudge_gpu_if_pending();
             orbit.assign_threads(hart_context);
 
             // Read the next sleep deadline while still holding the
@@ -494,7 +502,11 @@ pub extern "C" fn k_net(device: *mut NetPackage) {
             core::arch::asm!("fence iorw, iorw");
         }
 
-        while iface.poll(timestamp, &mut phy, &mut sockets) != PollResult::None {
+        for _ in 0..8 {
+            if iface.poll(timestamp, &mut phy, &mut sockets) == PollResult::None {
+                break;
+            }
+
             now = riscv::register::time::read();
             timestamp = smoltcp::time::Instant::from_micros(now as i64 / 10);
 
@@ -524,6 +536,7 @@ pub extern "C" fn k_net(device: *mut NetPackage) {
         // unit applies here. Keep the shift in one place.
         let now_us = (now / 10) as u64;
 
+        let mut do_second_poll = false;
         for (sock_handle, req) in user_conns.iter_mut() {
             if let Some(nc) = req.netchan.try_as_ref() {
                 if req.nc_type == 0 {
@@ -541,7 +554,9 @@ pub extern "C" fn k_net(device: *mut NetPackage) {
                     // actually ready).
                     if outcome.should_wake_user() {
                         let _ =
-                            crate::kernel::WAKE_QUEUE.push(crate::kernel::WakeEvent::Pid(req.pid));
+                            crate::kernel::wake_queue_push(crate::kernel::WakeEvent::Pid(req.pid));
+
+                        do_second_poll = true;
                     }
                 }
             }
@@ -553,6 +568,35 @@ pub extern "C" fn k_net(device: *mut NetPackage) {
         orbit_core::net::prune_revoked_conns(&mut user_conns, &mut user_revocations, |h| {
             sockets.remove(h);
         });
+
+        // Re-poll after update_tcp. update_tcp's `socket.recv()` calls
+        // advance the rx pointer (freeing window space) and `socket.send()`
+        // calls queue tx data — both leave segments smoltcp wants to
+        // emit *now* (window updates, outgoing data, piggybacked ACKs).
+        // Without this second pass, those segments wait for the next
+        // wake-up event — typically the keep-alive timer. With a 5 s
+        // keep-alive, sustained transfers throttled to that cadence and
+        // bursts arrived ~once per keep-alive period.
+        if do_second_poll {
+            unsafe {
+                core::arch::asm!("fence iorw, iorw");
+            }
+            for _ in 0..8 {
+                if iface.poll(timestamp, &mut phy, &mut sockets) == PollResult::None {
+                    break;
+                }
+
+                now = riscv::register::time::read();
+                timestamp = smoltcp::time::Instant::from_micros(now as i64 / 10);
+
+                if let Some(event) = sockets.get_mut::<dhcpv4::Socket>(dhcp_handle).poll() {
+                    iface = handle_dhcp_event(iface, event);
+                }
+            }
+            unsafe {
+                core::arch::asm!("fence iorw, iorw");
+            }
+        }
 
         let default_wake = now + 1_000_000;
         let wake_time = iface
@@ -574,8 +618,21 @@ pub extern "C" fn k_net(device: *mut NetPackage) {
                         txr.len()
                     );
 
-                    let tx_buffer = RingBuffer::new(txr);
-                    let rx_buffer = RingBuffer::new(rxr);
+                    // Lockstep-offsets mode: the kernel publishes
+                    // `(offset, len)` slices to userspace via
+                    // `get_next_tx`/`get_next_rx`, and userspace
+                    // writes directly into the shared storage at
+                    // those offsets. smoltcp's default
+                    // empty-ring `read_at = 0` snap-back would
+                    // rebase the write pointer away from where
+                    // userspace just wrote, causing stale-byte
+                    // retransmits on the wire. See
+                    // `RingBuffer::set_lockstep_offsets` for the
+                    // full rationale.
+                    let mut tx_buffer = RingBuffer::new(txr);
+                    tx_buffer.set_lockstep_offsets(true);
+                    let mut rx_buffer = RingBuffer::new(rxr);
+                    rx_buffer.set_lockstep_offsets(true);
 
                     let mut sock = smoltcp::socket::tcp::Socket::new(rx_buffer, tx_buffer);
                     // Keep-alive: smoltcp emits an ACK with current
@@ -588,7 +645,7 @@ pub extern "C" fn k_net(device: *mut NetPackage) {
                     // before its RTO doubles to noticeable territory,
                     // long enough to not flood normal traffic with
                     // probes (steady-state ACKs reset the timer anyway).
-                    sock.set_keep_alive(Some(smoltcp::time::Duration::from_millis(100)));
+                    sock.set_keep_alive(Some(smoltcp::time::Duration::from_millis(1000)));
                     let handle = sockets.add(sock);
 
                     info!("net: created tcp socket: {handle:?}");
@@ -1013,7 +1070,7 @@ pub fn handle_nc_create_req(epc: usize, hart_context: &'static HartContext, fram
 #[unsafe(no_mangle)]
 pub fn handle_nc_yield(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
     dispatch_syscall(epc, hart_context, frame, |t, f| {
-        let _ = crate::kernel::WAKE_QUEUE.push(crate::kernel::WakeEvent::Net);
+        let _ = crate::kernel::wake_queue_push(crate::kernel::WakeEvent::Net);
         let timeout_ms = f.regs[11];
         if timeout_ms == 0 {
             orbit_core::SyscallOutcome::Return { ret: 0 }
@@ -1704,6 +1761,7 @@ pub fn handle_query_syscall_stats(
                 let entry = SyscallEntry {
                     count: slot.count.load(Ordering::Relaxed),
                     total_ticks: slot.total_ticks.load(Ordering::Relaxed),
+                    max_ticks: slot.max_ticks.load(Ordering::Relaxed),
                 };
                 let dst = guard.slice_mut(
                     buf_va.wrapping_add((hdr_size + i * entry_size) as u64),

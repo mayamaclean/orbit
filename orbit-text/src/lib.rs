@@ -298,12 +298,27 @@ impl<'a> SurfaceMut<'a> {
 /// `dst_*` are absolute surface coordinates of the glyph bounding box's
 /// top-left corner. Coverage is interpreted as straight alpha; bg is
 /// read back from the surface and blended with `fg` per pixel.
+///
+/// `clip = (clip_x, clip_y, clip_w, clip_h)` is an optional bounding
+/// rect (surface coords) outside which no pixels are written. Pass
+/// `None` for "clip only to the surface bounds" (the original
+/// behavior; appropriate for free-flowing `render_str` output). Pass
+/// `Some(...)` to constrain the blit to a smaller region — `render_cell`
+/// uses this with the cell rect so a glyph whose bounding box is taller
+/// than `metrics.height` (block-drawing characters at certain scales,
+/// glyphs with descenders larger than the line gap) can't bleed pixels
+/// into the next cell or into the trailing surface strip below the
+/// last cell row. Without this clip the bleed pixels persist until
+/// `clear()` runs, which never happens during incremental ratatui
+/// updates — the visible artifact is "stale row of pixels under a
+/// shrinking bar gauge."
 fn blit_glyph(
     surface: &mut SurfaceMut<'_>,
     glyph: &CachedGlyph,
     dst_x: i32,
     dst_y: i32,
     fg: (u8, u8, u8),
+    clip: Option<(i32, i32, u32, u32)>,
 ) {
     if glyph.bounds.is_empty() {
         return;
@@ -313,11 +328,28 @@ fn blit_glyph(
     let surf_w = surface.width as i32;
     let surf_h = surface.height as i32;
 
+    // Effective clip = caller's clip ∩ surface. Caller's clip defaults
+    // to "the whole surface" when None.
+    let (cx0, cy0, cx1, cy1) = match clip {
+        Some((cx, cy, cw, ch)) => (
+            cx.max(0),
+            cy.max(0),
+            (cx + cw as i32).min(surf_w),
+            (cy + ch as i32).min(surf_h),
+        ),
+        None => (0, 0, surf_w, surf_h),
+    };
+    if cx1 <= cx0 || cy1 <= cy0 {
+        return;
+    }
+
     // Pre-clip rows + cols so the inner loop has no per-pixel branches.
-    let gy_lo = (-dst_y).max(0);
-    let gy_hi = (surf_h - dst_y).min(h);
-    let gx_lo = (-dst_x).max(0);
-    let gx_hi = (surf_w - dst_x).min(w);
+    // Translate the clip rect into glyph-local space — `gy/gx` index
+    // into `glyph.coverage`, `dst_y + gy` is the surface y.
+    let gy_lo = (cy0 - dst_y).max(0);
+    let gy_hi = (cy1 - dst_y).min(h);
+    let gx_lo = (cx0 - dst_x).max(0);
+    let gx_hi = (cx1 - dst_x).min(w);
     if gy_hi <= gy_lo || gx_hi <= gx_lo {
         return;
     }
@@ -441,7 +473,19 @@ pub fn render_cell<F: Font>(
         let baseline_int = cy + metrics.baseline as i32;
         let dst_x = cx + cached.bounds.x_min;
         let dst_y = baseline_int + cached.bounds.y_min;
-        blit_glyph(surface, cached, dst_x, dst_y, fg);
+        // Clip to the cell rect so a glyph whose bounds extend below
+        // `metrics.height` (typical for block-drawing chars used by
+        // ratatui's bar gauges) doesn't bleed pixels into adjacent
+        // cells or — for the bottom row — into the surface's trailing
+        // strip that no cell ever covers.
+        blit_glyph(
+            surface,
+            cached,
+            dst_x,
+            dst_y,
+            fg,
+            Some((cx, cy, metrics.width, metrics.height)),
+        );
     }
 }
 
@@ -485,7 +529,10 @@ pub fn render_str<F: Font>(
             let baseline_int = libm::floorf(baseline_y) as i32;
             let dst_x = caret_int + cached.bounds.x_min;
             let dst_y = baseline_int + cached.bounds.y_min;
-            blit_glyph(surface, cached, dst_x, dst_y, fg);
+            // No cell-level clip for free-flowing text — let the glyph
+            // span as much as its bounds dictate, only clipped to the
+            // surface itself.
+            blit_glyph(surface, cached, dst_x, dst_y, fg, None);
         }
 
         caret_x += scaled.h_advance(glyph_id);

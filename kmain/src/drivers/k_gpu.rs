@@ -146,6 +146,15 @@ pub fn fb_size() -> Option<(u32, u32)> {
     Some((pkg.display.fb.width(), pkg.display.fb.height()))
 }
 
+// Producers no longer wake k_gpu directly. The manager nudges k_gpu
+// once at the end of every pass (`Orbit::nudge_gpu_if_pending` in
+// `kernel/mod.rs`) — this batches every push that landed during the
+// pass (whether from manager-side handlers or from concurrent
+// trap-context syscalls on user harts) into a single wake. That
+// avoids both the per-push WAKE_QUEUE flood (which previously caused a
+// system-wide hang when orbit-top-std launched mid-stress-run) and the
+// 50 ms latency of waiting for k_gpu's park timer to expire.
+
 /// Push a single chunk command. Returns false if the ring was full.
 pub fn push_chunk(source: Source, bytes: &[u8]) -> bool {
     let Ok(mut slot) = CONSOLE_RING.push_ref()
@@ -189,6 +198,15 @@ pub fn push_insert_source(source: Source) -> bool {
 /// rect inside the surface; the syscall handler is responsible for
 /// validating the handle and rect bounds before submission. Returns
 /// `false` if the ring was full.
+/// **Intentionally does not nudge k_gpu** — same reasoning as
+/// [`push_chunk`]. Surface-mode apps (orbit-top-std, ratatui consumers)
+/// can hit `fb_present` at their refresh rate; a per-call wake bursts
+/// the wake queue and pinned k_gpu Ready continuously, starving k_net
+/// and the manager (concrete repro: starting orbit-top-std mid-run
+/// caused a system-wide hang). The 50 ms park ceiling caps the worst-
+/// case present latency at one frame at 20 fps; for sustained
+/// rendering we'll want a 0→non-empty-transition gate or a present-
+/// completion IRQ from virtio-gpu instead of a wake-per-push.
 pub fn push_present(source: Source, args: PresentArgs) -> bool {
     let Ok(mut slot) = CONSOLE_RING.push_ref()
     else {

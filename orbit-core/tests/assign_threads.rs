@@ -221,12 +221,17 @@ fn remotes_exhaust_queue_before_self_tries() {
 }
 
 #[test]
-fn self_overwrites_own_current_unconditionally() {
-    // The live kmain code doesn't gate the self-assignment on is_busy —
-    // if self already has a current thread, it's clobbered. Preserve that.
+fn self_busy_preserves_existing_current() {
+    // A peer hart can race ahead and assign a thread to us via its
+    // `remotes` arm between kmain's pre-MANAGER_LOCK `hart_has_thread`
+    // check and our own `assign_threads` call. The self-view branch
+    // must observe `is_busy() == true` and skip both `next_runnable`
+    // and the assignment — clobbering the peer's pointer would leak
+    // that thread (stuck in `Assigned`, never dispatched). See the
+    // companion regression test in `assign_threads_concurrent.rs`.
     let slots = make_slots(2); // self + 1 remote
-    let stale_sentinel = Box::into_raw(Box::new(0u8)) as *mut ();
-    slots[0].store(stale_sentinel, Ordering::Release);
+    let peer_sentinel = Box::into_raw(Box::new(0u8)) as *mut ();
+    slots[0].store(peer_sentinel, Ordering::Release);
 
     let (self_view, remote_views) = views(&slots);
     let mut sched = FakeSched::with(2);
@@ -239,17 +244,22 @@ fn self_overwrites_own_current_unconditionally() {
         &mut hw,
     );
 
-    // Remote got first thread; self clobbered with second.
+    // Remote got the first thread; self was already busy so nothing
+    // touched its slot. The second thread stayed in the scheduler for
+    // a future pass to pick up.
     assert!(assigned(&slots[1]));
-    let self_ptr = slots[0].load(Ordering::Acquire);
-    assert!(!self_ptr.is_null());
-    assert_ne!(
-        self_ptr, stale_sentinel,
-        "self's current should have been overwritten",
+    assert_eq!(
+        slots[0].load(Ordering::Acquire),
+        peer_sentinel,
+        "peer-assigned current must survive when self_view.is_busy()",
     );
     assert_eq!(hw.wakes, vec![1]);
+    assert_eq!(
+        sched.next, 1,
+        "second thread should still be queued — busy self skipped next_runnable",
+    );
 
-    unsafe { drop(Box::from_raw(stale_sentinel as *mut u8)) };
+    unsafe { drop(Box::from_raw(peer_sentinel as *mut u8)) };
 }
 
 #[test]

@@ -16,7 +16,12 @@
 use mmu::sv48::PhysAddr;
 use net_channel::BindSpec;
 use orbit_abi::layout::UserVa;
-use process::CompletionHandle;
+// CompletionHandle is no longer carried in any PendingWork variant —
+// all blocking syscalls now use the on-thread completion path
+// (`tid: u32` carried here; manager calls `publish_pending_for_tid`).
+// Import removed to silence the unused-import warning. Reintroduce if
+// a future variant needs trap-context signaling (e.g. an IRQ-driven
+// resume path).
 
 #[derive(Debug, Clone, Copy)]
 pub struct MemMapReq {
@@ -257,25 +262,34 @@ pub enum PendingWork {
         req: MemMapReq,
         pid: u16,
         root_pa: PhysAddr,
-        handle: CompletionHandle,
+        /// Tid of the parked thread. Manager runs `run_mmap_req`,
+        /// then resumes via `resume_thread_with_values(tid, &[result])`
+        /// and pushes `WakeEvent::Tid(tid)` — the no-Arc replacement
+        /// for the `CompletionHandle` round-trip. Stale tids (thread
+        /// exited mid-flight) are silently dropped by the resume
+        /// helper.
+        tid: u32,
     },
     NetChannelCreation {
         req: NetChannelCreationReq,
         pid: u16,
         root_pa: PhysAddr,
-        handle: CompletionHandle,
+        /// Caller's tid. Manager runs `run_nc_create_req` and resumes
+        /// via `publish_pending_for_tid(tid, &[vaddr, fd])` — the
+        /// two-register return analog of `signal_pair`.
+        tid: u32,
     },
     CloseHandle {
         req: CloseHandleReq,
         pid: u16,
         root_pa: PhysAddr,
-        handle: CompletionHandle,
+        tid: u32,
     },
     CreateProcess {
         req: CreateProcessReq,
         pid: u16,
         root_pa: PhysAddr,
-        handle: CompletionHandle,
+        tid: u32,
     },
     CreateThread {
         req: CreateThreadReq,
@@ -285,13 +299,13 @@ pub enum PendingWork {
         /// the new thread's `allowed_affinity`/`affinity` pair, so a
         /// thread can't widen the family's reach.
         parent_allowed: u64,
-        handle: CompletionHandle,
+        tid: u32,
     },
     FsOpen {
         req: FsOpenReq,
         pid: u16,
         root_pa: PhysAddr,
-        handle: CompletionHandle,
+        tid: u32,
     },
     FsRead {
         req: FsReadReq,
@@ -309,50 +323,49 @@ pub enum PendingWork {
         req: FsStatReq,
         pid: u16,
         root_pa: PhysAddr,
-        handle: CompletionHandle,
+        tid: u32,
     },
     FsReaddir {
         req: FsReaddirReq,
         pid: u16,
         root_pa: PhysAddr,
-        handle: CompletionHandle,
+        tid: u32,
     },
     WaitPid {
         req: WaitPidReq,
         /// Caller's pid — manager checks this against the target's
         /// `parent_pid` for the EPERM gate.
         pid: u16,
-        /// Caller's handle. On success the manager installs this on
-        /// the target's `exit_waiter` slot and returns without
-        /// signaling — `dealloc_process` signals it later with the
-        /// child's exit code. Sync errors (ECHILD / EPERM / EBUSY)
-        /// signal here in the manager arm.
-        handle: CompletionHandle,
+        /// Caller's tid. On success the manager installs this on the
+        /// target's `exit_waiter` slot and returns without publishing
+        /// — `dealloc_process` later resumes via
+        /// `publish_pending_for_tid(tid, &[0, exit_code])` when the
+        /// child exits. Sync errors (ECHILD / EPERM / EBUSY) publish
+        /// here in the manager arm.
+        tid: u32,
     },
     CreateProcessEx {
         req: CreateProcessExReq,
         pid: u16,
         root_pa: PhysAddr,
-        handle: CompletionHandle,
+        tid: u32,
     },
     FutexWait {
         req: FutexWaitReq,
         pid: u16,
         root_pa: PhysAddr,
-        /// Caller's handle. The manager either signals it
-        /// synchronously with `-EAGAIN` (value mismatch) or installs
-        /// it on the per-PA wait queue; a later `futex_wake` (or
-        /// timeout scan) signals with `0` / `-ETIMEDOUT`.
-        handle: CompletionHandle,
+        /// Caller's tid. The manager either publishes synchronously
+        /// with `-EAGAIN` (value mismatch) / `-EFAULT` (translation
+        /// failure), or installs it on the per-PA waiter queue; a
+        /// later `futex_wake` (or timeout scan) resumes via
+        /// `publish_pending_for_tid(tid, &[0])` / `[-ETIMEDOUT]`.
+        tid: u32,
     },
     FutexWake {
         req: FutexWakeReq,
         pid: u16,
         root_pa: PhysAddr,
-        /// Caller's handle. Signaled synchronously with the count of
-        /// waiters actually woken (≤ `req.n`) or a negative errno on
-        /// translation failure.
-        handle: CompletionHandle,
+        tid: u32,
     },
     /// `pledge(*const PermsRequest)` — narrow this process's
     /// effective + cap masks. Manager copies the request struct from
@@ -364,7 +377,7 @@ pub enum PendingWork {
         req: PledgeReq,
         pid: u16,
         root_pa: PhysAddr,
-        handle: CompletionHandle,
+        tid: u32,
     },
     /// `create_process_v2(*const CreateProcessV2Args)` — role-aware
     /// spawn. Manager copies the args struct, runs the role
@@ -376,31 +389,34 @@ pub enum PendingWork {
         req: CreateProcessV2Req,
         pid: u16,
         root_pa: PhysAddr,
-        /// Calling thread's tid. Used as the
-        /// `SpawnInProgress` key for path-mode spawns: each
-        /// `CacheFill` event for the spawn's kernel-buffer
-        /// waiters dispatches to the right state machine via
-        /// this tid. Bytes-mode ignores it.
+        /// Calling thread's tid. Used as the `SpawnInProgress` key
+        /// for path-mode spawns (each `CacheFill` for the spawn's
+        /// kernel-buffer waiters dispatches via this tid), and as
+        /// the resume target for both bytes-mode (synchronous, via
+        /// `publish_pending_for_tid` in the manager arm) and
+        /// path-mode (deferred, via `advance_spawn` /
+        /// `issue_next_spawn_page` once all pages land or any read
+        /// fails).
         tid: u32,
-        handle: CompletionHandle,
     },
     /// `fb_surface_create(w, h, format)` — manager allocates the
     /// pixel surface, maps it into the user PT, registers the
-    /// per-process surface table entry, and signals the handle with
-    /// `(handle_id, user_va)`.
+    /// per-process surface table entry, and resumes the caller via
+    /// `publish_pending_for_tid(tid, &[handle_id, user_va])`.
     FbSurfaceCreate {
         req: FbSurfaceCreateReq,
         pid: u16,
         root_pa: PhysAddr,
-        handle: CompletionHandle,
+        tid: u32,
     },
     /// `fb_surface_destroy(handle)` — manager unmaps + frees the
-    /// surface and signals `0` (or `-EBADF` if the handle was unknown).
+    /// surface and resumes via `publish_pending_for_tid` with `0`
+    /// (or `-EBADF` if the handle was unknown).
     FbSurfaceDestroy {
         req: FbSurfaceDestroyReq,
         pid: u16,
         root_pa: PhysAddr,
-        handle: CompletionHandle,
+        tid: u32,
     },
     /// Page-cache DMA completion. Posted by the virtio-blk IRQ when a
     /// chain submitted via the cached path (`submit_blk_read_cached`)

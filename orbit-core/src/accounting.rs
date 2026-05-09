@@ -91,14 +91,21 @@ pub fn switch_bucket(hart: &HartContext, new: HartBucket, now: u64) {
     }
 }
 
-/// One row of the per-syscall stats table. Two atomics keep the
-/// pair tear-safe under concurrent dispatch from multiple harts;
-/// `Relaxed` is fine since the count and ticks aren't required to be
-/// observed atomically as a pair.
+/// One row of the per-syscall stats table. Three atomics keep the
+/// triple tear-safe under concurrent dispatch from multiple harts;
+/// `Relaxed` is fine since the count, total, and max aren't required
+/// to be observed atomically as a group.
+///
+/// `max_ticks` tracks the longest single dispatch ever recorded.
+/// Combined with `total_ticks / count` (mean) this gives a quick
+/// outlier signal without a full histogram — primary consumer is
+/// migration A/B comparisons where a regression can hide in tail
+/// latency even if the mean looks flat.
 #[repr(C)]
 pub struct SyscallSlot {
     pub count: AtomicU64,
     pub total_ticks: AtomicU64,
+    pub max_ticks: AtomicU64,
 }
 
 impl SyscallSlot {
@@ -106,6 +113,7 @@ impl SyscallSlot {
         Self {
             count: AtomicU64::new(0),
             total_ticks: AtomicU64::new(0),
+            max_ticks: AtomicU64::new(0),
         }
     }
 }
@@ -126,6 +134,7 @@ pub fn record_syscall(slot: Option<&SyscallSlot>, thread: &Thread, start: u64, e
     if let Some(s) = slot {
         s.count.fetch_add(1, Ordering::Relaxed);
         s.total_ticks.fetch_add(elapsed, Ordering::Relaxed);
+        s.max_ticks.fetch_max(elapsed, Ordering::Relaxed);
     }
     thread.syscall_count.fetch_add(1, Ordering::Relaxed);
     thread.syscall_ticks.fetch_add(elapsed, Ordering::Relaxed);

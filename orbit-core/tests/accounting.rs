@@ -224,8 +224,22 @@ fn record_syscall_accumulates_across_calls() {
 
     assert_eq!(slot.count.load(Ordering::Relaxed), 3);
     assert_eq!(slot.total_ticks.load(Ordering::Relaxed), 100 + 50 + 200);
+    assert_eq!(slot.max_ticks.load(Ordering::Relaxed), 200);
     assert_eq!(thread.syscall_count.load(Ordering::Relaxed), 3);
     assert_eq!(thread.syscall_ticks.load(Ordering::Relaxed), 350);
+}
+
+#[test]
+fn record_syscall_max_ticks_tracks_peak_not_latest() {
+    // max_ticks is fetch_max, so a later short call must not lower it.
+    let thread = make_thread(ThreadState::Running, SPP::User);
+    let slot = SyscallSlot::new();
+
+    record_syscall(Some(&slot), &thread, 1000, 1500); // 500
+    record_syscall(Some(&slot), &thread, 2000, 2010); // 10
+    record_syscall(Some(&slot), &thread, 3000, 3100); // 100
+
+    assert_eq!(slot.max_ticks.load(Ordering::Relaxed), 500);
 }
 
 #[test]

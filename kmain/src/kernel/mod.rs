@@ -1,5 +1,5 @@
 use core::alloc::Layout;
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicI64, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use core::time::Duration;
 
 use alloc::collections::btree_map::BTreeMap;
@@ -110,7 +110,58 @@ pub static MANAGER_WORK: StaticThingBuf<PendingWork, 32> = StaticThingBuf::new()
 /// signal — the scheduler still does the actual dispatch.
 ///
 /// Default slot is `WakeEvent::None` (the Default impl returns it).
-pub static WAKE_QUEUE: StaticThingBuf<WakeEvent, 64> = StaticThingBuf::new();
+///
+/// Cap bumped 64 → 128 alongside the on-thread completion migration:
+/// every manager-resolved blocking syscall now pushes a `Tid` event
+/// per signal (instead of routing through `CompletionHandle`'s wake
+/// hook), so a manager pass that resolves a burst of pending work
+/// pushes one event per resolved item. Telemetry — `wake_queue_peak`
+/// and `wake_queue_drops` exported via `query_stats` — reports
+/// whether 128 is sufficient for the live workload.
+pub static WAKE_QUEUE: StaticThingBuf<WakeEvent, 128> = StaticThingBuf::new();
+
+/// High-water mark of `WAKE_QUEUE.len()` observed at any push. Sampled
+/// after each successful push via [`wake_queue_push`] (`fetch_max`),
+/// so the value is monotonic for the kernel's lifetime. Surfaces queue
+/// pressure: a peak approaching cap (currently 64) is the cue to bump
+/// the cap, since drops are silent in most callers. Read by
+/// `query_stats` for the userspace stats command.
+pub static WAKE_QUEUE_PEAK: AtomicU64 = AtomicU64::new(0);
+
+/// Count of `WAKE_QUEUE.push()` attempts that EAGAIN'd because the
+/// ring was full. Each drop is a missed wake — semantically harmless
+/// in the cases that exist today (e1000 IRQ has a 10 ms heartbeat
+/// fallback; net pushes coalesce), but a non-zero counter is the
+/// signal that the cap is undersized for the workload. Bumped from
+/// any hart via the [`wake_queue_push`] helper.
+pub static WAKE_QUEUE_DROPS: AtomicU64 = AtomicU64::new(0);
+
+/// Push a [`WakeEvent`] onto [`WAKE_QUEUE`] and update telemetry.
+/// Returns `Err(ev)` if the queue is full — caller decides whether to
+/// log the drop, retry, or coalesce. The drop counter is bumped here
+/// regardless so a global "are we losing wakes?" answer is always
+/// available without the call sites needing to coordinate.
+///
+/// Trap-context-safe: two atomic ops (push + counter) on success,
+/// one on failure. No allocations, no locks.
+pub fn wake_queue_push(ev: WakeEvent) -> Result<(), WakeEvent> {
+    match WAKE_QUEUE.push(ev) {
+        Ok(()) => {
+            // `len()` after the push gives the post-push depth. Racy
+            // across pushers (a concurrent pop can shrink it before
+            // we sample), but `fetch_max` is monotonic so under-
+            // sampling can never inflate the peak — only miss it,
+            // which is fine for a high-water diagnostic.
+            let depth = WAKE_QUEUE.len() as u64;
+            let _ = WAKE_QUEUE_PEAK.fetch_max(depth, Ordering::Relaxed);
+            Ok(())
+        }
+        Err(e) => {
+            WAKE_QUEUE_DROPS.fetch_add(1, Ordering::Relaxed);
+            Err(e.into_inner())
+        }
+    }
+}
 
 /// Lock-free MPSC ring of denial events produced by the dispatch-
 /// site gate. Producers: any hart's `s_trap` cause=8 arm on syscall
@@ -161,6 +212,17 @@ pub enum WakeEvent {
     /// `set_wake_reason_where(INPUT_IO, |t| t.tid == tid)` which
     /// eagerly promotes the Suspended thread to Ready.
     InputTid(u32),
+    /// Wake the k_gpu compositor thread. Pushed by every producer
+    /// that adds a command to `CONSOLE_RING` (`push_chunk`,
+    /// `push_cycle_active`, `push_insert_source`,
+    /// `push_present_surface`). Without this, k_gpu sleeps out its
+    /// 50 ms park before draining new commands — visible to the user
+    /// as up-to-50 ms latency on pane cycles, redraws, and
+    /// console echoes, plus dropped commands once `CONSOLE_RING`
+    /// fills before the next park-expiry. Targets `gpu_thread_tid`
+    /// (latched in `setup_virtio_gpu`); falls back to "wake all
+    /// pid=0 kthreads" during the boot window.
+    Gpu,
 }
 
 impl Default for WakeEvent {
@@ -297,6 +359,63 @@ pub fn install_completion_wake_hook() {
     process::completion::set_wake_hook(wake_blocked_inline);
 }
 
+/// On-thread completion analog of [`wake_blocked_inline`]. If the
+/// thread has a SIGNALED `pending_state`, marshal `pending_rets` into
+/// `frame.regs[10..]`, clear the signal, transition Ready, and push
+/// the per-hart `READY_INBOX` notice. Returns `true` on a signal hit,
+/// `false` if no rets were pending (the cheap path: one Acquire load).
+///
+/// Same call-site contract as `wake_blocked_inline`: invoked from the
+/// parker's post-publish re-check in `apply_syscall_outcome`. Takes
+/// `*mut Thread` (rather than `&Thread`) so the brief `&mut Thread`
+/// reborrow needed for the `frame.regs` write doesn't alias the outer
+/// `&Thread` binding the caller holds for atomic ops.
+pub fn try_wake_pending_inline(thread_ptr: *mut Thread) -> bool {
+    if thread_ptr.is_null() {
+        return false;
+    }
+    // SAFETY: caller (the parker on its own hart) just Release-stored
+    // `state == Blocking` and `current == null`, so no other hart can
+    // be running this thread or hold a competing reference. The
+    // `&mut Thread` here is the only live access for the duration of
+    // this call.
+    // Probe through `&Thread` first — `take_pending_results` is a CAS
+    // claim, so we don't materialize a `&mut Thread` until we've won
+    // exclusive logical ownership. If we lose to the manager-side
+    // drain, no `&mut` ever existed and the parker just returns to
+    // the kernel loop with `state == Blocking` (the manager's drain
+    // already transitioned it to Ready).
+    let t = unsafe { (thread_ptr as *const Thread).as_ref_unchecked() };
+    let mut rets = [0i64; 4];
+    let Some(n) = t.take_pending_results(&mut rets)
+    else {
+        return false;
+    };
+    let tid = t.tid;
+    // `t_ref: &Thread` is Copy and its borrow ends at the last
+    // use above; the &mut reborrow below doesn't alias.
+    //
+    // SAFETY: the take CAS just succeeded. The competing path
+    // (`set_wake_reason_where`'s eager-promote arm) will see NONE
+    // and bail without forming a `&mut` of its own. We have
+    // exclusive logical ownership of `frame.regs` and `state` for
+    // the duration of this call.
+    let t = unsafe { (thread_ptr as *mut Thread).as_mut_unchecked() };
+    for i in 0..n {
+        t.frame.regs[10 + i] = rets[i] as usize;
+    }
+    t.state
+        .store(ThreadState::Ready as usize, Ordering::Release);
+    if push_ready_notice(thread_ptr).is_err() {
+        error!(
+            "READY_INBOX full on post-publish re-check: tid={} — \
+             thread marked Ready but not queued",
+            tid,
+        );
+    }
+    true
+}
+
 /// Push `thread` onto the calling hart's `READY_INBOXES` slot. Used
 /// by non-manager paths to publish a Ready transition without
 /// touching `Orbit::ready` (which is manager-only).
@@ -339,7 +458,7 @@ pub fn push_ready_notice(thread: *mut Thread) -> Result<(), ()> {
 /// heartbeat is the safety net.
 pub fn e1000_plic_handler(src: u32) {
     let icr = crate::drivers::e1000::ack_irq_static();
-    let pushed = WAKE_QUEUE.push(WakeEvent::Net).is_ok();
+    let pushed = wake_queue_push(WakeEvent::Net).is_ok();
     let hart_id = unsafe {
         (riscv::register::sscratch::read() as *const HartContext)
             .as_ref_unchecked()
@@ -377,6 +496,15 @@ pub struct Orbit {
     /// tid so unrelated kernel threads (k_gpu) aren't woken
     /// spuriously by every netch tickle.
     net_thread_tid: Option<u32>,
+    /// TID of the k_gpu compositor thread. Latched in
+    /// `setup_virtio_gpu` after the kthread is created; consumed by
+    /// `WakeEvent::Gpu` to nudge k_gpu out of its 50 ms park as soon
+    /// as a producer (`push_chunk`, `push_cycle_active`,
+    /// `push_insert_source`, `push_present_surface`) lands a command
+    /// on `CONSOLE_RING`. `None` during the boot window before
+    /// virtio-gpu init completes; `WakeEvent::Gpu` falls back to
+    /// "wake all pid=0 kthreads" in that case.
+    gpu_thread_tid: Option<u32>,
     orphaned_sockets: Vec<SocketHandle>,
 
     /// Min-heap of `(wake_time, sleep_seq, *mut Thread)` for Suspended
@@ -451,14 +579,18 @@ pub struct Orbit {
 /// `dealloc_thread`, so no consumer is left pointing at gone state).
 #[derive(Debug)]
 pub struct FutexWaiter {
-    pub handle: process::CompletionHandle,
+    /// Tid of the parking thread. `run_futex_wake_req` resumes each
+    /// woken waiter via `Orbit::publish_pending_for_tid(tid, &[0])`
+    /// — the on-thread completion analog of the prior
+    /// `handle.signal(0)`. Stale tids (parker exited before wake)
+    /// are silently dropped by the resume helper.
+    pub tid: u32,
     /// Pid of the parking thread. Read by `dealloc_process` to drop
     /// every waiter whose owner is going away — without that sweep,
     /// `futex_waiters` retains entries past the death of the parking
-    /// thread, and a later `futex_wake` on the same PA dereferences
-    /// freed `Thread` storage via `wake_blocked_inline`. See
-    /// [docs/dev/bugs.md](../../../../docs/dev/bugs.md) "futex_waiters
-    /// outlives parking process" for the chain.
+    /// thread, and a later `futex_wake` on the same PA would resolve
+    /// the stale tid (now potentially recycled into a new thread).
+    /// FutexWaiter.pid was reserved for exactly this sweep.
     pub pid: u16,
     /// Reserved: absolute tick deadline for `-ETIMEDOUT`. `0` = no
     /// timeout. v1 always parks `0` regardless of the user-supplied
@@ -534,9 +666,10 @@ pub struct SpawnInProgress {
     pub pages_done: u64,
     /// `ceil(total_size / PAGE_SIZE)` — total page reads we'll do.
     pub total_pages: u64,
-    /// Caller's CompletionHandle. Signaled with the new pid on
-    /// successful install, or with `-errno` on any failure.
-    pub handle: process::CompletionHandle,
+    // Caller's parker tid is the BTreeMap key (`spawns_in_progress`),
+    // not stored here. `advance_spawn` / `issue_next_spawn_page` use
+    // their `tid` argument directly when calling
+    // `Orbit::publish_pending_for_tid` to resume the parker.
 }
 
 impl Orbit {
@@ -632,6 +765,9 @@ impl Orbit {
             hart_idle_ticks,
             perm_denials: proc.perm_denials.load(Ordering::Relaxed),
             role_denials: proc.role_denials.load(Ordering::Relaxed),
+            wake_queue_peak: WAKE_QUEUE_PEAK.load(Ordering::Relaxed),
+            wake_queue_drops: WAKE_QUEUE_DROPS.load(Ordering::Relaxed),
+            wake_queue_capacity: WAKE_QUEUE.capacity() as u64,
         })
     }
 
@@ -669,6 +805,7 @@ impl Orbit {
             processes: BTreeMap::new(),
             threads: BTreeMap::new(),
             net_thread_tid: None,
+            gpu_thread_tid: None,
             net_pkg: NetPackage {
                 phy: None,
                 iface: None,
@@ -830,6 +967,14 @@ impl Orbit {
             last_wake_reason: AtomicU64::new(0),
             sleep_seq: AtomicU64::new(0),
             handle: None,
+            pending_rets: [
+                AtomicI64::new(0),
+                AtomicI64::new(0),
+                AtomicI64::new(0),
+                AtomicI64::new(0),
+            ],
+            pending_state: AtomicU8::new(0),
+            pending_ret_count: AtomicU8::new(0),
             slot: None,
             fault_info: None,
             allowed_affinity: all_harts,
@@ -2238,18 +2383,18 @@ impl Orbit {
         parent_pid: u16,
         root_pa: PhysAddr,
         caller_tid: u32,
-        handle: process::CompletionHandle,
     ) {
         use orbit_abi::denial::{DenialEvent, DenialSink};
         use orbit_abi::perms::CreateProcessV2Args;
         use orbit_core::roles::{check_transition, deny_reason_code, derive_child_perms};
 
-        // Macro to bail with an errno: signal the handle and return.
-        // Replaces the previous `return Errno::new(...).to_ret()`
-        // pattern now that the function owns the signal call.
+        // Macro to bail with an errno: resume the parker on the on-
+        // thread completion path and return. Replaces the previous
+        // `handle.signal(...)` pattern now that we use the no-Arc
+        // resume helper.
         macro_rules! bail {
             ($errno:expr) => {{
-                handle.signal(Errno::new($errno).to_ret());
+                self.publish_pending_for_tid(caller_tid, &[Errno::new($errno).to_ret()]);
                 return;
             }};
         }
@@ -2384,7 +2529,7 @@ impl Orbit {
             ) {
                 Ok(s) => s,
                 Err(e) => {
-                    handle.signal(e);
+                    self.publish_pending_for_tid(caller_tid, &[e]);
                     return;
                 }
             };
@@ -2504,7 +2649,7 @@ impl Orbit {
             ) {
                 Ok(s) => s,
                 Err(e) => {
-                    handle.signal(e);
+                    self.publish_pending_for_tid(caller_tid, &[e]);
                     return;
                 }
             };
@@ -2512,7 +2657,7 @@ impl Orbit {
             let path = resolved.as_str();
 
             // Resolve + validate the spawn target inline. Anything
-            // that fails here signals the handle synchronously and
+            // that fails here resumes the parker synchronously and
             // never builds a SpawnInProgress entry.
             let Some(fs) = crate::kernel::fs::mounted()
             else {
@@ -2541,7 +2686,7 @@ impl Orbit {
                     "create_process_v2 path: vaccess EACCES path={path} mode={:#o}",
                     stat.st_mode
                 );
-                handle.signal(e.to_ret());
+                self.publish_pending_for_tid(caller_tid, &[e.to_ret()]);
                 return;
             }
             let total_size = stat.st_size as u64;
@@ -2583,7 +2728,6 @@ impl Orbit {
                 total_size,
                 pages_done: 0,
                 total_pages,
-                handle: handle.clone(),
             };
             self.spawns_in_progress.insert(caller_tid, progress);
 
@@ -2665,7 +2809,7 @@ impl Orbit {
             parent_login,
             parent_groups,
         );
-        handle.signal(result);
+        self.publish_pending_for_tid(caller_tid, &[result]);
     }
 
     /// Post-blob spawn-install: validate affinity, resolve cwd/argv/envp
@@ -3091,12 +3235,7 @@ impl Orbit {
     /// `(0, exit_code)`. The pair shape (a0 = success/errno, a1 =
     /// exit_code) keeps the negative-as-errno convention orthogonal
     /// to negative exit codes — see `orbit-abi/src/user.rs::wait_pid`.
-    fn run_wait_pid_req(
-        &mut self,
-        req: WaitPidReq,
-        caller_pid: u16,
-        handle: process::CompletionHandle,
-    ) {
+    fn run_wait_pid_req(&mut self, req: WaitPidReq, caller_pid: u16, caller_tid: u32) {
         // First check the caller's `dead_children` — covers the race
         // where the target exited before this wait_pid syscall ran.
         // dealloc_process stashed (target_pid → exit_code) on the
@@ -3104,7 +3243,7 @@ impl Orbit {
         if let Some(parent) = self.processes.get_mut(&caller_pid)
             && let Some(code) = parent.dead_children.remove(&req.target_pid)
         {
-            handle.signal_pair(0, code as isize);
+            self.publish_pending_for_tid(caller_tid, &[0, code as isize]);
             return;
         }
 
@@ -3112,24 +3251,31 @@ impl Orbit {
         else {
             // Never existed (or exited and the parent's already gone
             // / wasn't tracked) — POSIX surfaces this as ECHILD.
-            handle.signal_pair(Errno::new(orbit_abi::errno::ECHILD).to_ret(), 0);
+            self.publish_pending_for_tid(
+                caller_tid,
+                &[Errno::new(orbit_abi::errno::ECHILD).to_ret(), 0],
+            );
             return;
         };
         if target.parent_pid != caller_pid {
-            handle.signal_pair(Errno::new(EPERM).to_ret(), 0);
+            self.publish_pending_for_tid(caller_tid, &[Errno::new(EPERM).to_ret(), 0]);
             return;
         }
         if target.exit_waiter.is_some() {
             // Single-waiter v1 — multi-waiter wants a Vec and lands
             // with futex (§13a.5).
-            handle.signal_pair(Errno::new(orbit_abi::errno::EBUSY).to_ret(), 0);
+            self.publish_pending_for_tid(
+                caller_tid,
+                &[Errno::new(orbit_abi::errno::EBUSY).to_ret(), 0],
+            );
             return;
         }
-        // Install the parent's handle on the target. dealloc_process
-        // will take + signal it with the child's exit code.
-        target.exit_waiter = Some(handle);
+        // Install the parent's tid on the target. dealloc_process
+        // will take + resume via `publish_pending_for_tid` with the
+        // child's exit code.
+        target.exit_waiter = Some(caller_tid);
         info!(
-            "wait_pid: pid={caller_pid} parked on target={} exit",
+            "wait_pid: pid={caller_pid} tid={caller_tid} parked on target={} exit",
             req.target_pid
         );
     }
@@ -3143,19 +3289,13 @@ impl Orbit {
     /// `futex_wake` because both run on the manager hart under
     /// `MANAGER_LOCK`. A wake that drains the queue runs to
     /// completion before this wait arm sees it.
-    fn run_futex_wait_req(
-        &mut self,
-        req: FutexWaitReq,
-        pid: u16,
-        root_pa: PhysAddr,
-        handle: process::CompletionHandle,
-    ) {
+    fn run_futex_wait_req(&mut self, req: FutexWaitReq, pid: u16, root_pa: PhysAddr, tid: u32) {
         let root_table = unsafe { memmap::kernel_root_from_pa(root_pa) };
         let pa =
             match unsafe { mmu::mmap::virt_to_phys(&root_table, VirtAddr::new(req.uaddr.raw())) } {
                 Some(p) => p as u64,
                 None => {
-                    handle.signal(Errno::new(EFAULT).to_ret());
+                    self.publish_pending_for_tid(tid, &[Errno::new(EFAULT).to_ret()]);
                     return;
                 }
             };
@@ -3174,40 +3314,36 @@ impl Orbit {
             core::ptr::read_volatile(win.as_mut_ptr().add(page_off) as *const u32)
         };
         if observed != req.expected {
-            handle.signal(Errno::new(EAGAIN).to_ret());
+            self.publish_pending_for_tid(tid, &[Errno::new(EAGAIN).to_ret()]);
             return;
         }
         // Park: install the waiter on the per-PA queue. v1 ignores
         // `timeout_ns` — the field is reserved; the wait blocks
         // until a `futex_wake` (or `dealloc_process`) drains it.
         let waiter = FutexWaiter {
-            handle,
+            tid,
             pid,
             deadline_ticks: 0,
         };
         self.futex_waiters.entry(pa).or_default().push(waiter);
-        trace!("futex_wait: pid={pid} pa={pa:#x} expected={}", req.expected);
+        trace!(
+            "futex_wait: pid={pid} tid={tid} pa={pa:#x} expected={}",
+            req.expected
+        );
     }
 
     /// §13a.5 — futex wake. Drains up to `req.n` waiters from
-    /// `futex_waiters[pa]`, signals each with `0`, and signals the
-    /// caller's handle with the count (or a negative errno on
-    /// translation failure).
-    fn run_futex_wake_req(
-        &mut self,
-        req: FutexWakeReq,
-        _pid: u16,
-        root_pa: PhysAddr,
-        handle: process::CompletionHandle,
-    ) {
+    /// `futex_waiters[pa]`, resumes each via
+    /// `publish_pending_for_tid(w.tid, &[0])`, and returns the count
+    /// of waiters woken (or a negative errno on translation failure).
+    /// The caller arm in `drain_pending_work` then resumes the
+    /// wake-caller's parked thread via the same helper with the count.
+    fn run_futex_wake_req(&mut self, req: FutexWakeReq, _pid: u16, root_pa: PhysAddr) -> isize {
         let root_table = unsafe { memmap::kernel_root_from_pa(root_pa) };
         let pa =
             match unsafe { mmu::mmap::virt_to_phys(&root_table, VirtAddr::new(req.uaddr.raw())) } {
                 Some(p) => p as u64,
-                None => {
-                    handle.signal(Errno::new(EFAULT).to_ret());
-                    return;
-                }
+                None => return Errno::new(EFAULT).to_ret(),
             };
         let n_woken = match self.futex_waiters.get_mut(&pa) {
             Some(waiters) => {
@@ -3220,14 +3356,14 @@ impl Orbit {
                     self.futex_waiters.remove(&pa);
                 }
                 for w in drained {
-                    w.handle.signal(0);
+                    self.publish_pending_for_tid(w.tid, &[0]);
                 }
                 take as isize
             }
             None => 0,
         };
-        handle.signal(n_woken);
         trace!("futex_wake: pa={pa:#x} requested={} woke={n_woken}", req.n);
+        n_woken
     }
 
     fn run_create_thread_req(
@@ -3473,6 +3609,23 @@ impl Orbit {
                 WakeEvent::InputTid(tid) => {
                     self.set_wake_reason_where(process::wake_reason::INPUT_IO, |t| t.tid == tid);
                 }
+                WakeEvent::Gpu => {
+                    // Mirror of the `WakeEvent::Net` branch: target
+                    // k_gpu specifically once `setup_virtio_gpu` has
+                    // latched its tid; before then (boot window),
+                    // fall back to a coarse pid=0 scan. By the time
+                    // any producer pushes `WakeEvent::Gpu` for real
+                    // (a console_write / pane-cycle / surface-present
+                    // path), virtio-gpu init has run and the tid is
+                    // latched, so the fallback is just a safety net.
+                    match self.gpu_thread_tid {
+                        Some(tid) => self
+                            .set_wake_reason_where(process::wake_reason::TICKLE, |t| t.tid == tid),
+                        None => {
+                            self.set_wake_reason_where(process::wake_reason::TICKLE, |t| t.pid == 0)
+                        }
+                    }
+                }
             }
         }
     }
@@ -3505,26 +3658,69 @@ impl Orbit {
             // that hadn't yet committed its park (Running on its way
             // to Suspended) will see the override on its next
             // dispatch via the sleep-heap path.
-            if thread
+            // Eager-promote both Suspended (sleep-heap parkers,
+            // e.g. read_key_event) and Blocking (manager-resolved
+            // syscall parkers, e.g. migrated mmap). Pre-migration the
+            // Blocking branch was unreachable from the wake-event
+            // path: blocking syscalls used `CompletionHandle`, which
+            // signaled inline via the wake hook, transitioning
+            // Blocking → Ready synchronously. Migrated syscalls drop
+            // the handle and rely on `WakeEvent::Tid` instead, so
+            // this CAS is the canonical wake.
+            //
+            // `fetch_update` lets us accept either Blocking or
+            // Suspended as the prior state without two CAS round-
+            // trips. Other states (Ready / Running / Assigned /
+            // Exited) bail out — the wake_override OR above already
+            // recorded the reason for the next dispatch to consume.
+            let promoted = thread
                 .state
-                .compare_exchange(
-                    ThreadState::Suspended as usize,
-                    ThreadState::Ready as usize,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_ok()
-            {
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |s| {
+                    if s == ThreadState::Blocking as usize || s == ThreadState::Suspended as usize {
+                        Some(ThreadState::Ready as usize)
+                    }
+                    else {
+                        None
+                    }
+                })
+                .is_ok();
+            if promoted {
+                // On-thread completion path: if a manager-resolved
+                // syscall published return values via
+                // `Thread::publish_results` before pushing this
+                // wake event, marshal them into `frame.regs[10..]`
+                // and clear the SIGNALED state. We hold MANAGER_LOCK
+                // and the prior state was Blocking-or-Suspended
+                // (no hart is running it), so writing `frame.regs`
+                // here doesn't race a dispatch. No-op for wakes that
+                // don't carry rets (coarse pid/net wakes,
+                // input-ring retries) — `take_pending_results`
+                // returns `None` when `pending_state == NONE`.
+                // `take_pending_results` is a CAS-claim: only one of
+                // {this drain, the parker's post-publish re-check}
+                // wins. If we lose, the parker already marshaled rets
+                // and transitioned state itself — leave its work
+                // alone. If we win, the rets snapshot is exclusively
+                // ours and writing `frame.regs` here is uncontended.
+                let mut rets = [0i64; 4];
+                if let Some(n) = thread.take_pending_results(&mut rets) {
+                    for i in 0..n {
+                        thread.frame.regs[10 + i] = rets[i] as usize;
+                    }
+                }
                 let pending = thread.wake_override.swap(0, Ordering::AcqRel);
                 thread.last_wake_reason.store(pending, Ordering::Release);
-                // Just promoted Suspended → Ready; queue it so
-                // get_runnable_thread picks it up this same pass.
-                // The sleep-heap entry becomes stale (state mismatch)
+                // Just promoted Blocking/Suspended → Ready; queue it
+                // so get_runnable_thread picks it up this same pass.
+                // Any sleep-heap entry becomes stale (state mismatch)
                 // and is reaped on the next drain_woken.
                 self.ready.push(p.0);
             }
             else {
-                debug!("[set_wake_reason] non suspended thread #{}", thread.tid);
+                //trace!(
+                //    "[set_wake_reason] thread #{} not in Blocking/Suspended",
+                //    thread.tid,
+                //);
             }
         }
     }
@@ -3586,55 +3782,55 @@ impl Orbit {
                     req,
                     pid,
                     root_pa,
-                    handle,
+                    tid,
                 } => {
                     let result = self.run_mmap_req(req, pid, root_pa);
-                    handle.signal(result);
+                    self.publish_pending_for_tid(tid, &[result]);
                 }
                 PendingWork::NetChannelCreation {
                     req,
                     pid,
                     root_pa,
-                    handle,
+                    tid,
                 } => {
                     let (r, e) = self.run_nc_create_req(req, pid, root_pa);
-                    handle.signal_pair(r, e);
+                    self.publish_pending_for_tid(tid, &[r, e]);
                 }
                 PendingWork::CloseHandle {
                     req,
                     pid,
                     root_pa,
-                    handle,
+                    tid,
                 } => {
                     let result = self.run_close_req(req, pid, root_pa);
-                    handle.signal(result);
+                    self.publish_pending_for_tid(tid, &[result]);
                 }
                 PendingWork::CreateProcess {
                     req,
                     pid,
                     root_pa,
-                    handle,
+                    tid,
                 } => {
                     let result = self.run_create_process_req(req, pid, root_pa);
-                    handle.signal(result);
+                    self.publish_pending_for_tid(tid, &[result]);
                 }
                 PendingWork::CreateThread {
                     req,
                     pid,
                     parent_allowed,
-                    handle,
+                    tid,
                 } => {
                     let result = self.run_create_thread_req(req, pid, parent_allowed);
-                    handle.signal(result);
+                    self.publish_pending_for_tid(tid, &[result]);
                 }
                 PendingWork::FsOpen {
                     req,
                     pid,
                     root_pa,
-                    handle,
+                    tid,
                 } => {
                     let result = self.run_fs_open_req(req, pid, root_pa);
-                    handle.signal(result);
+                    self.publish_pending_for_tid(tid, &[result]);
                 }
                 PendingWork::FsRead {
                     req,
@@ -3653,98 +3849,100 @@ impl Orbit {
                     req,
                     pid,
                     root_pa,
-                    handle,
+                    tid,
                 } => {
                     let result = self.run_fs_stat_req(req, pid, root_pa);
-                    handle.signal(result);
+                    self.publish_pending_for_tid(tid, &[result]);
                 }
                 PendingWork::FsReaddir {
                     req,
                     pid,
                     root_pa,
-                    handle,
+                    tid,
                 } => {
                     let result = self.run_fs_readdir_req(req, pid, root_pa);
-                    handle.signal(result);
+                    self.publish_pending_for_tid(tid, &[result]);
                 }
-                PendingWork::WaitPid { req, pid, handle } => {
-                    // run_wait_pid_req owns the signaling — sync
-                    // errors signal (errno, 0); the async success
-                    // path installs the handle on the target's
-                    // exit_waiter slot and dealloc_process signals
-                    // (0, exit_code) when the child exits.
-                    self.run_wait_pid_req(req, pid, handle);
+                PendingWork::WaitPid { req, pid, tid } => {
+                    // run_wait_pid_req owns the resume — sync errors
+                    // publish (errno, 0); the async success path
+                    // installs the tid on the target's exit_waiter
+                    // slot and dealloc_process publishes (0, exit_code)
+                    // when the child exits.
+                    self.run_wait_pid_req(req, pid, tid);
                 }
                 PendingWork::CreateProcessEx {
                     req,
                     pid,
                     root_pa,
-                    handle,
+                    tid,
                 } => {
                     let result = self.run_create_process_ex_req(req, pid, root_pa);
-                    handle.signal(result);
+                    self.publish_pending_for_tid(tid, &[result]);
                 }
                 PendingWork::FutexWait {
                     req,
                     pid,
                     root_pa,
-                    handle,
+                    tid,
                 } => {
-                    // run_futex_wait_req owns the signaling — sync
-                    // EAGAIN/EFAULT signal here; the async park
-                    // installs the handle on `futex_waiters[pa]` and
-                    // a later `futex_wake` signals it with `0`.
-                    self.run_futex_wait_req(req, pid, root_pa, handle);
+                    // run_futex_wait_req owns the resume — sync
+                    // EAGAIN/EFAULT publish here; the async park
+                    // installs the tid on `futex_waiters[pa]` and a
+                    // later `futex_wake` resumes via
+                    // `publish_pending_for_tid(tid, &[0])`.
+                    self.run_futex_wait_req(req, pid, root_pa, tid);
                 }
                 PendingWork::FutexWake {
                     req,
                     pid,
                     root_pa,
-                    handle,
+                    tid,
                 } => {
-                    self.run_futex_wake_req(req, pid, root_pa, handle);
+                    let result = self.run_futex_wake_req(req, pid, root_pa);
+                    self.publish_pending_for_tid(tid, &[result]);
                 }
                 PendingWork::Pledge {
                     req,
                     pid,
                     root_pa,
-                    handle,
+                    tid,
                 } => {
                     let result = self.run_pledge_req(req, pid, root_pa);
-                    handle.signal(result);
+                    self.publish_pending_for_tid(tid, &[result]);
                 }
                 PendingWork::CreateProcessV2 {
                     req,
                     pid,
                     root_pa,
                     tid,
-                    handle,
                 } => {
-                    // Handler owns the signal — bytes mode signals
+                    // Handler owns the resume — bytes mode publishes
                     // inline with the install result; path mode
                     // initiates a `SpawnInProgress` state machine
-                    // and signals later via `advance_spawn` when
-                    // the install completes. Either way, no
-                    // manager-side signal here.
-                    self.run_create_process_v2_req(req, pid, root_pa, tid, handle);
+                    // and publishes later via `advance_spawn` /
+                    // `issue_next_spawn_page` when the install
+                    // completes. Either way, no manager-side
+                    // publish here.
+                    self.run_create_process_v2_req(req, pid, root_pa, tid);
                 }
                 PendingWork::FbSurfaceCreate {
                     req,
                     pid,
                     root_pa,
-                    handle,
+                    tid,
                 } => {
                     let (r, e) = self.run_fb_surface_create_req(req, pid, root_pa);
-                    handle.signal_pair(r, e);
+                    self.publish_pending_for_tid(tid, &[r, e]);
                 }
                 PendingWork::FbSurfaceDestroy {
                     req,
                     pid,
                     root_pa,
-                    handle,
+                    tid,
                 } => {
                     let result = self.run_fb_surface_destroy_req(req, pid, root_pa);
-                    handle.signal(result);
+                    self.publish_pending_for_tid(tid, &[result]);
                 }
                 PendingWork::CacheFill { packed_key, status } => {
                     self.run_cache_fill(packed_key, status);
@@ -3939,6 +4137,61 @@ impl Orbit {
     /// (its in-progress entry was the only thing keeping the wait
     /// alive; nothing to wake).
     pub fn resume_thread_with_value(&mut self, tid: u32, value: isize) {
+        self.resume_thread_with_values(tid, &[value]);
+    }
+
+    /// Publish completion results for a thread parked on a manager-
+    /// resolved blocking syscall, then push `WakeEvent::Tid` so any
+    /// hart's `drain_wakes` (typically the same pass as ours) covers
+    /// the Suspended-parker case.
+    ///
+    /// Why this and not [`Self::resume_thread_with_values`]: the
+    /// blocking-syscall parker runs `exit_thread_with_state(Blocking)`
+    /// which Release-stores `state = Blocking` *after* the manager has
+    /// (potentially) already drained the work item and processed the
+    /// resume. If we wrote `state = Ready` directly, that
+    /// unconditional `store(Blocking)` from the parker would clobber
+    /// us and the wake would vanish. Publishing into the on-thread
+    /// completion slot side-steps the race: the parker's post-publish
+    /// re-check in `apply_syscall_outcome` checks
+    /// `take_pending_results` *after* its own `state.store(Blocking)`
+    /// and self-promotes to Ready if a signal landed. Mirrors the
+    /// `CompletionHandle::set_waiter` / `is_signaled` shape, just
+    /// with a per-thread atom instead of an Arc.
+    ///
+    /// `WakeEvent::Tid` push covers the Suspended branch: future
+    /// migrations (read_stdin, read_key_event in Phase 6) park in
+    /// `Suspended` rather than `Blocking`, and the eager
+    /// `Suspended → Ready` CAS in `set_wake_reason_where` handles
+    /// those — already extended in Phase 1.5 to marshal
+    /// `pending_rets` before promoting.
+    pub fn publish_pending_for_tid(&self, tid: u32, vals: &[isize]) {
+        let Some(pt) = self.threads.get(&tid)
+        else {
+            // Thread exited mid-flight. No-op.
+            return;
+        };
+        // SAFETY: registry-owned raw ptr; thread is alive while the
+        // entry is in `self.threads` (we hold MANAGER_LOCK on the
+        // calling path).
+        let thread = unsafe { (pt.0 as *const Thread).as_ref_unchecked() };
+        thread.publish_results(vals);
+        let _ = wake_queue_push(WakeEvent::Tid(tid));
+    }
+
+    /// Multi-register variant of [`Self::resume_thread_with_value`]:
+    /// write up to 4 return values into `frame.regs[10..10+vals.len()]`,
+    /// mark the parked thread Ready, and queue the wake. `vals` is
+    /// clamped to 4; excess slots are silently dropped (mirrors
+    /// [`process::CompletionHandle::signal_n`]). An empty `vals` writes
+    /// no rets — the thread resumes with its trap-entry register
+    /// snapshot intact, the same pattern `read_stdin` uses to mean
+    /// "wake and retry."
+    ///
+    /// Same call-site contract as the single-arg version: hold
+    /// MANAGER_LOCK, target should be Blocking or Suspended (warn but
+    /// proceed otherwise — turns ABA-induced misuse into a loud noop).
+    pub fn resume_thread_with_values(&mut self, tid: u32, vals: &[isize]) {
         let Some(pt) = self.threads.get(&tid)
         else {
             // Thread exited mid-flight. No-op.
@@ -3952,15 +4205,25 @@ impl Orbit {
         let prior = t.state.load(Ordering::Acquire);
         if prior != ThreadState::Blocking as usize && prior != ThreadState::Suspended as usize {
             warn!(
-                "resume_thread_with_value: tid={tid} not Blocking/Suspended (state={prior}); writing regs anyway"
+                "resume_thread_with_values: tid={tid} not Blocking/Suspended (state={prior}); writing regs anyway"
             );
         }
-        t.frame.regs[10] = value as usize;
+        let n = vals.len().min(4);
+        for (i, &v) in vals.iter().enumerate().take(n) {
+            t.frame.regs[10 + i] = v as usize;
+        }
+        // Reset the on-thread completion slot so a subsequent syscall
+        // on this thread doesn't observe stale SIGNALED state. The
+        // canonical writer for `pending_state` is `publish_results`;
+        // resuming via the manager-direct path bypasses that, so we
+        // clear here to keep the invariant ("SIGNALED ⇒ rets are
+        // valid and unread") intact.
+        t.reset_pending();
         t.state
             .store(ThreadState::Ready as usize, Ordering::Release);
         if push_ready_notice(pt.0).is_err() {
             error!(
-                "resume_thread_with_value: READY_INBOX full for tid={tid} — \
+                "resume_thread_with_values: READY_INBOX full for tid={tid} — \
                  marked Ready but not queued",
             );
         }
@@ -4004,11 +4267,9 @@ impl Orbit {
                     .spawns_in_progress
                     .remove(&tid)
                     .expect("just confirmed present");
-                let SpawnInProgress {
-                    ctx, blob, handle, ..
-                } = spawn;
+                let SpawnInProgress { ctx, blob, .. } = spawn;
                 let result = self.run_spawn_ready(ctx, &blob);
-                handle.signal(result);
+                self.publish_pending_for_tid(tid, &[result]);
                 return;
             }
 
@@ -4021,15 +4282,15 @@ impl Orbit {
 
             let Some(fs) = crate::kernel::fs::mounted()
             else {
-                let spawn = self.spawns_in_progress.remove(&tid).unwrap();
-                spawn.handle.signal(Errno::new(EIO).to_ret());
+                self.spawns_in_progress.remove(&tid);
+                self.publish_pending_for_tid(tid, &[Errno::new(EIO).to_ret()]);
                 return;
             };
             let lba = match fs.lba_for_page(inode, page_idx) {
                 Ok(l) => l,
                 Err(_) => {
-                    let spawn = self.spawns_in_progress.remove(&tid).unwrap();
-                    spawn.handle.signal(Errno::new(EIO).to_ret());
+                    self.spawns_in_progress.remove(&tid);
+                    self.publish_pending_for_tid(tid, &[Errno::new(EIO).to_ret()]);
                     return;
                 }
             };
@@ -4085,8 +4346,8 @@ impl Orbit {
                     };
                     let cache = self.page_cache.as_mut().unwrap();
                     if cache.register_waiter(key, waiter).is_err() {
-                        let spawn = self.spawns_in_progress.remove(&tid).unwrap();
-                        spawn.handle.signal(Errno::new(EIO).to_ret());
+                        self.spawns_in_progress.remove(&tid);
+                        self.publish_pending_for_tid(tid, &[Errno::new(EIO).to_ret()]);
                         return;
                     }
                     // Parked; advance_spawn will resume on CacheFill.
@@ -4107,8 +4368,8 @@ impl Orbit {
                     let dma_pa = match begin {
                         Ok(pa) => pa,
                         Err(_) => {
-                            let spawn = self.spawns_in_progress.remove(&tid).unwrap();
-                            spawn.handle.signal(Errno::new(EAGAIN).to_ret());
+                            self.spawns_in_progress.remove(&tid);
+                            self.publish_pending_for_tid(tid, &[Errno::new(EAGAIN).to_ret()]);
                             return;
                         }
                     };
@@ -4128,8 +4389,8 @@ impl Orbit {
                         }
                         Err(_) => {
                             let _ = self.page_cache.as_mut().unwrap().complete_slot(key, 1);
-                            let spawn = self.spawns_in_progress.remove(&tid).unwrap();
-                            spawn.handle.signal(Errno::new(EIO).to_ret());
+                            self.spawns_in_progress.remove(&tid);
+                            self.publish_pending_for_tid(tid, &[Errno::new(EIO).to_ret()]);
                             return;
                         }
                     }
@@ -4149,12 +4410,11 @@ impl Orbit {
     /// signals the carried handle with `-EIO`.
     fn advance_spawn(&mut self, tid: u32, status: u8) {
         if status != 0 {
-            let Some(spawn) = self.spawns_in_progress.remove(&tid)
-            else {
+            if self.spawns_in_progress.remove(&tid).is_none() {
                 error!("advance_spawn: no SpawnInProgress for tid={tid}");
                 return;
-            };
-            spawn.handle.signal(Errno::new(EIO).to_ret());
+            }
+            self.publish_pending_for_tid(tid, &[Errno::new(EIO).to_ret()]);
             return;
         }
         let Some(spawn) = self.spawns_in_progress.get_mut(&tid)
@@ -4414,8 +4674,8 @@ impl Orbit {
         //     parent can park.
         //  3. No parent (boot init) or parent already gone → drop
         //     the exit code on the floor.
-        if let Some(handle) = process.exit_waiter.take() {
-            handle.signal_pair(0, process.exit_code as isize);
+        if let Some(waiter_tid) = process.exit_waiter.take() {
+            self.publish_pending_for_tid(waiter_tid, &[0, process.exit_code as isize]);
         }
         else if process.parent_pid != 0
             && let Some(parent) = self.processes.get_mut(&process.parent_pid)
@@ -4968,7 +5228,7 @@ impl Orbit {
             if let Err(()) = crate::drivers::plic::plic_register(
                 plic_irq,
                 e1000_plic_handler,
-                self.cpu_count - 1,
+                core::cmp::min(1, self.cpu_count - 1),
             ) {
                 error!("e1000: plic_register failed for irq {}", plic_irq);
             }
@@ -5151,8 +5411,19 @@ impl Orbit {
         crate::drivers::k_gpu::install_package(pkg);
 
         let entrypoint = crate::drivers::k_gpu::k_gpu as *const () as usize;
-        if self.create_kernel_thread(entrypoint, None).is_err() {
-            error!("virtio-gpu: failed to spawn k_gpu thread");
+        match self.create_kernel_thread(entrypoint, None) {
+            Ok(tid) => {
+                info!("created kgpu thread tid={tid}");
+                // Latch the tid so `WakeEvent::Gpu` targets this
+                // thread specifically. Without the latch the wake
+                // would fan out to every kernel thread (k_net, etc.)
+                // — pulls them out of their parks unnecessarily and
+                // muddles per-thread wake-reason accounting.
+                self.gpu_thread_tid = Some(tid);
+            }
+            Err(_) => {
+                error!("virtio-gpu: failed to spawn k_gpu thread");
+            }
         }
     }
 
@@ -5594,6 +5865,14 @@ impl Orbit {
             last_wake_reason: AtomicU64::new(0),
             sleep_seq: AtomicU64::new(0),
             handle: None,
+            pending_rets: [
+                AtomicI64::new(0),
+                AtomicI64::new(0),
+                AtomicI64::new(0),
+                AtomicI64::new(0),
+            ],
+            pending_state: AtomicU8::new(0),
+            pending_ret_count: AtomicU8::new(0),
             slot: Some(slot),
             fault_info: None,
             allowed_affinity,
@@ -6645,6 +6924,39 @@ impl Orbit {
         self.current_process_id = next;
 
         next
+    }
+
+    /// End-of-manager-pass nudge for k_gpu. Called from `k_manage`'s
+    /// loop after `drain_wakes` + `check_net` and before
+    /// `assign_threads`, so any k_gpu-readying CAS lands in `self.ready`
+    /// in time for this same pass to dispatch.
+    ///
+    /// Why batch here instead of nudging from each `CONSOLE_RING`
+    /// producer? Per-producer wakes worked for low-rate paths
+    /// (cycle / insert / remove) but flooded `WAKE_QUEUE` once high-rate
+    /// paths (`push_chunk` from console_write spam, `push_present` from
+    /// orbit-top-std at 4 Hz) joined in — pinned k_gpu Ready
+    /// continuously and starved k_net + manager. Concrete repro:
+    /// launching orbit-top-std mid-eza-stress wedged the whole system
+    /// silently. Batching at end-of-pass collapses every push that
+    /// landed during the pass — manager-side handler push, trap-context
+    /// `push_chunk` from a concurrent user-hart syscall — into a
+    /// single Ready transition.
+    ///
+    /// `set_wake_reason_where`'s CAS is a no-op when k_gpu is already
+    /// Ready / Running / Assigned; it only flips Suspended/Blocking →
+    /// Ready. So the call is cheap and idempotent — calling it on an
+    /// already-running k_gpu just OR's TICKLE into wake_override and
+    /// returns.
+    pub fn nudge_gpu_if_pending(&mut self) {
+        if crate::drivers::k_gpu::CONSOLE_RING.is_empty() {
+            return;
+        }
+        let Some(tid) = self.gpu_thread_tid
+        else {
+            return;
+        };
+        self.set_wake_reason_where(process::wake_reason::TICKLE, |t| t.tid == tid);
     }
 
     pub fn check_net(&mut self) {

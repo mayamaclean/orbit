@@ -597,6 +597,13 @@ impl UpdateOutcome {
     pub fn should_wake_user(self) -> bool {
         self.session_state_changed || self.ring_progress
     }
+
+    pub const fn new(session_state_changed: bool, ring_progress: bool) -> Self {
+        Self {
+            session_state_changed,
+            ring_progress,
+        }
+    }
 }
 
 /// Capped exponential backoff for client-retain reconnects. Doubles per
@@ -667,10 +674,19 @@ fn schedule_retry(ctx: &mut ChannelCtx, now_us: u64) {
 }
 
 /// Ring holding `(offset, len)` pairs pointing into [`NetChannelQueue::buf`].
-/// N=2 → capacity 1.
-type SliceQueue = SpscQueue<(usize, usize), 2>;
-/// Ring of byte counts the consumer has advanced past. N=2 → capacity 1.
-type IncrementQueue = SpscQueue<usize, 2>;
+///
+/// Sized to match the e1000 RX ring (8 descriptors): a PLIC IRQ batch
+/// can land 8 frames into smoltcp at once, and we want the staging path
+/// to absorb that without forcing a `nc_yield` round-trip per frame.
+/// N=16 → capacity 15 (one slot reserved for the empty/full sentinel),
+/// so up to 15 staged slices in flight before the user has to wait on
+/// the kernel to drain.
+type SliceQueue = SpscQueue<(usize, usize), 16>;
+/// Ring of byte counts the consumer has advanced past. Sized in lockstep
+/// with `SliceQueue` so the pipelining is symmetric: every staged slice
+/// has room for its eventual increment without backpressuring user-side
+/// reads. N=16 → capacity 15.
+type IncrementQueue = SpscQueue<usize, 16>;
 
 /// Shared producer/consumer queues + payload ring for one direction.
 /// `#[repr(C)]` pins the field order so kernel- and user-side
@@ -1183,7 +1199,15 @@ impl NetChannel {
             let tx = self.tx();
             let rx = self.rx();
 
-            if socket.may_recv() {
+            // `may_recv()` is true while the *transport* allows new data
+            // (Established / FIN-WAIT-1/2) OR when the rx_buffer still has
+            // queued octets — smoltcp folds the "data already buffered"
+            // case into may_recv via its `_ if self.can_recv()` arm. We
+            // OR `recv_queue() > 0` explicitly anyway: it's documentation
+            // for the case that actually matters here (CloseWait with
+            // bytes still pending) and a guard if a future smoltcp tightens
+            // may_recv to the strict-state-only definition.
+            if socket.may_recv() || socket.recv_queue() > 0 {
                 // SAFETY: kernel is the sole consumer of rx.increments.
                 while let Some(user_rx_count) = unsafe { rx.dequeue_increment() } {
                     if let Err(e) = socket.recv(|_b| (user_rx_count, user_rx_count)) {
@@ -1300,10 +1324,10 @@ impl NetChannel {
     {
         let cur = self.current();
 
-        let channel_state = cur.state.load(Ordering::Acquire);
-        if channel_state < 2 {
-            return Err(channel_state as isize);
-        }
+        //let channel_state = cur.state.load(Ordering::Acquire);
+        //if channel_state < 2 {
+        //    return Err(channel_state as isize);
+        //}
 
         let rx = self.rx();
 

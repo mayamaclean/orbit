@@ -382,6 +382,20 @@ pub unsafe fn exit_thread_with_state(state: ThreadState) -> ! {
                         }
                     }
                 }
+                // On-thread completion path: same race as the handle
+                // re-check above, but for manager-resolved syscalls
+                // that published rets via `Thread::publish_results`.
+                // The manager's `WakeEvent::Tid` push handles the
+                // Suspended branch (eager promote in `drain_wakes`),
+                // but a parker in `Blocking` is invisible to that
+                // path — the post-publish re-check here is what
+                // recovers a wake that landed before our `state.store`
+                // of Blocking made the parker observable.
+                //
+                // Helper takes `*mut Thread` so the brief `&mut`
+                // reborrow needed for the `frame.regs` write doesn't
+                // alias the outer `&Thread` binding above.
+                crate::kernel::try_wake_pending_inline(thread_addr as *mut Thread);
             }
         }
 

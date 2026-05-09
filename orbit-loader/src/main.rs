@@ -105,6 +105,7 @@ enum LoaderErr {
     Cbor,
     NetCh(Errno),
     Syscall(Errno),
+    BadAck(isize),
 }
 
 #[unsafe(no_mangle)]
@@ -122,7 +123,7 @@ pub extern "C" fn main() -> i32 {
     log_boot_env();
     spawn_init_from_argv();
 
-    if let Err(e) = sleep_ms(2000) {
+    if let Err(e) = sleep_ms(1000) {
         return e.to_ret() as i32;
     }
 
@@ -379,6 +380,9 @@ fn recv_payload(s: &Session<'_>) -> Result<(Vec<u8>, String), LoaderErr> {
     while scratch.len() < total {
         drain_some(s, &mut scratch)?;
     }
+
+    s.write_all(&[0xFF])
+        .map_err(|e| LoaderErr::BadAck(e.to_ret()))?;
 
     let body = &scratch[8..total];
 

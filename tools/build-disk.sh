@@ -78,9 +78,13 @@ if rustup toolchain list 2>/dev/null | grep -q '^orbit-stage1\b'; then
     note "building orbit-top-std (+orbit-stage1, release) → /bin/orbit-top-std"
     ( cd orbit-top-std && cargo +orbit-stage1 build --release >/dev/null )
     cp orbit-top-std/target/riscv64gc-unknown-orbit/release/orbit-top-std rootfs/bin/orbit-top-std
+
+    note "building orbit-metricd (+orbit-stage1, release) → /bin/orbit-metricd"
+    ( cd orbit-metricd && cargo +orbit-stage1 build --release >/dev/null )
+    cp orbit-metricd/target/riscv64gc-unknown-orbit/release/orbit-metricd rootfs/bin/orbit-metricd
 else
-    rm -f rootfs/bin/hello-std rootfs/bin/hello-fb-std rootfs/bin/hello-ratatui-std rootfs/bin/orbit-top-std
-    printf 'warn: orbit-stage1 toolchain not linked; skipping /bin/hello-std, /bin/hello-fb-std, /bin/hello-ratatui-std, and /bin/orbit-top-std\n' >&2
+    rm -f rootfs/bin/hello-std rootfs/bin/hello-fb-std rootfs/bin/hello-ratatui-std rootfs/bin/orbit-top-std rootfs/bin/orbit-metricd
+    printf 'warn: orbit-stage1 toolchain not linked; skipping /bin/hello-std, /bin/hello-fb-std, /bin/hello-ratatui-std, /bin/orbit-top-std, and /bin/orbit-metricd\n' >&2
 fi
 
 # eza — modern `ls` replacement, out-of-tree at ../eza. Built against

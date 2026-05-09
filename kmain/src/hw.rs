@@ -7,7 +7,8 @@ use mmu::PAGE_SIZE;
 use mmu::sv48::{PhysAddr, VirtAddr};
 use orbit_abi::layout::UserVa;
 use orbit_core::{Hardware, PendingWork};
-use process::CompletionHandle;
+// CompletionHandle no longer referenced — the on-thread completion
+// path replaced the stdin park-handle protocol in Phase 6.
 
 use crate::UserAccess;
 use crate::kernel::MANAGER_WORK;
@@ -119,12 +120,12 @@ impl Hardware for RiscvHardware {
         n
     }
 
-    fn park_stdin_reader(&mut self, pid: u16, handle: CompletionHandle) -> bool {
+    fn park_stdin_reader(&mut self, pid: u16, tid: u32) -> bool {
         let Some(stdin) = crate::kernel::stdin::get(pid)
         else {
             return false;
         };
-        stdin.park(handle).is_ok()
+        stdin.park(tid)
     }
 
     fn unpark_stdin_reader(&mut self, pid: u16) -> bool {

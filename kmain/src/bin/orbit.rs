@@ -1232,7 +1232,7 @@ extern "C" fn rust_main(_hartid: usize, dtb: usize, serial: usize, load_addr: u6
         static LOGGER: kmain::ktrace::OrbitLogger = kmain::ktrace::OrbitLogger;
 
         log::set_logger(&LOGGER).unwrap();
-        log::set_max_level(log::LevelFilter::Debug);
+        log::set_max_level(log::LevelFilter::Info);
         tracing::subscriber::set_global_default(OrbitSubscriber::new(Level::INFO))
             .expect("no tracing");
 

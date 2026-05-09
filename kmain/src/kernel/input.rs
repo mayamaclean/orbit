@@ -115,8 +115,35 @@ pub fn dispatch(ev: InputEvent) {
     };
     let mut buf = [0u8; 4];
     let n = evdev_to_bytes(ev.code, mods, &mut buf);
+    let mut wake_tid: Option<u32> = None;
     for &b in &buf[..n] {
-        stdin_arc.push_byte(b);
+        match stdin_arc.push_byte(b) {
+            // No parker — bytes accumulate in the ring until a
+            // reader does `read_stdin`.
+            Ok(None) => {}
+            // Captured a parker: keep the tid for a single
+            // post-loop wake. First byte that finds a parker wins;
+            // subsequent bytes in this multi-byte burst (e.g. the
+            // four-byte CSI sequence for an arrow key) just
+            // enqueue, since the slot is now empty.
+            Ok(Some(tid)) => wake_tid = Some(tid),
+            // Ring is full — drop the rest. The reader will drain
+            // what's enqueued; further bytes from this burst are
+            // lost. (4 KiB ring vs. ≤ 4 bytes per key = the only
+            // way this fires is if a reader has been parked away
+            // for a long time.)
+            Err(()) => break,
+        }
+    }
+    if let Some(tid) = wake_tid {
+        // Trap-context-safe: atomic ring push, no allocations. The
+        // manager's `drain_wakes` resumes the parker via
+        // `set_wake_reason_where` (eager Blocking/Suspended →
+        // Ready). No `pending_results` are published — the wake
+        // leaves regs untouched, and the parker's user-side
+        // `read_stdin` retry contract re-issues the syscall, which
+        // then drains the bytes we just enqueued.
+        let _ = crate::kernel::wake_queue_push(crate::kernel::WakeEvent::InputTid(tid));
     }
 }
 

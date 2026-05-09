@@ -5,7 +5,7 @@ extern crate alloc;
 use core::alloc::Layout;
 use core::fmt;
 use core::marker::PhantomData;
-use core::sync::atomic::{AtomicU64, AtomicUsize};
+use core::sync::atomic::{AtomicI64, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
 use alloc::collections::{btree_map::BTreeMap, btree_set::BTreeSet};
 use alloc::string::{String, ToString};
@@ -343,20 +343,42 @@ pub struct Thread {
     pub kernel_trap_frame: Option<Frame<Shared>>,
     pub satp: Satp,
     pub mode: SPP,
+    /// Set by the trap handler when this thread is killed by a fault.
+    /// `None` means the thread exited cleanly (e.g. via the exit syscall).
+    pub fault_info: Option<FaultInfo>,
     /// Wait/signal handle this thread is parked on while
     /// `state == Blocking`. The manager scans for signaled handles each
     /// scheduler pass; on a hit it writes `result()` / `extra()` into
     /// `frame.regs[10]` / `frame.regs[11]`, clears the slot, and marks
     /// the thread `Ready`.
     pub handle: Option<CompletionHandle>,
-    pub tid: u32,
-    pub pid: u16,
-    pub ticks: u8,
-    /// Per-process slot index. `None` for kernel threads.
-    pub slot: Option<u16>,
-    /// Set by the trap handler when this thread is killed by a fault.
-    /// `None` means the thread exited cleanly (e.g. via the exit syscall).
-    pub fault_info: Option<FaultInfo>,
+    /// On-thread completion-result slots used by manager-resolved
+    /// blocking syscalls — the no-Arc alternative to [`Self::handle`].
+    /// The manager drains a `PendingWork` keyed on this thread's tid,
+    /// writes return values via [`Self::publish_results`], then pushes
+    /// `WakeEvent::Tid(tid)` onto `WAKE_QUEUE`. The wake drain marshals
+    /// `pending_rets[..pending_ret_count]` into `frame.regs[10..]`
+    /// before promoting Suspended → Ready.
+    ///
+    /// Only the manager (under MANAGER_LOCK) writes these. The parker
+    /// reads them at most once on the post-publish re-check or via the
+    /// drain path; both happen *after* the manager's Release-store of
+    /// `pending_state = SIGNALED`, which Acquire-paired loads observe.
+    /// Trap-context signalers (read_stdin's `push_byte`, future IRQ
+    /// paths) keep using [`Self::handle`] instead — the swap-of-waiter
+    /// protocol is what makes that case safe without the lock.
+    pub pending_rets: [AtomicI64; 4],
+    /// Snapshot of the owning process's [`Permissions`] at the time
+    /// the thread was created. Refreshed when the process pledges
+    /// (manager-side: walks every thread of the process under
+    /// MANAGER_LOCK and rewrites this field).
+    ///
+    /// The dispatch site reads this snapshot without locking, calls
+    /// `permissions.allows(sysno)`, and on `false` records to the
+    /// kernel-wide `DenialRing` + bumps the owning process's
+    /// `perm_denials` counter, then short-circuits the syscall with
+    /// `-EPERM`.
+    pub permissions: Permissions,
     /// Immutable upper bound on which harts this thread can ever run on.
     /// Bit `i` set ⇔ hart `i` permitted. Set at construction; `set_affinity`
     /// rejects any mask that escapes this bound (Windows-style: a parent
@@ -367,7 +389,6 @@ pub struct Thread {
     /// `affinity & !allowed_affinity` is always zero. Atomic so the
     /// scheduler reads it without locking the process table.
     pub affinity: AtomicU64,
-
     // ─── per-thread accounting (read by query_stats from any hart) ──
     /// Cumulative user-mode CPU time in `time` CSR ticks. Credited at
     /// each User → ¬User hart-bucket transition by the owning hart;
@@ -382,17 +403,6 @@ pub struct Thread {
     /// Cumulative kernel service ticks across this thread's syscalls
     /// (excludes time spent parked).
     pub syscall_ticks: AtomicU64,
-    /// Snapshot of the owning process's [`Permissions`] at the time
-    /// the thread was created. Refreshed when the process pledges
-    /// (manager-side: walks every thread of the process under
-    /// MANAGER_LOCK and rewrites this field).
-    ///
-    /// The dispatch site reads this snapshot without locking, calls
-    /// `permissions.allows(sysno)`, and on `false` records to the
-    /// kernel-wide `DenialRing` + bumps the owning process's
-    /// `perm_denials` counter, then short-circuits the syscall with
-    /// `-EPERM`.
-    pub permissions: Permissions,
     /// Snapshot of the owning process's POSIX credential triplet. Read
     /// without locking by the `getuid`/`geteuid`/`getgid`/`getegid`
     /// fast paths; refreshed alongside [`Self::permissions`] when the
@@ -410,6 +420,10 @@ pub struct Thread {
     pub gid: u32,
     pub egid: u32,
     pub sgid: u32,
+    pub tid: u32,
+    pub pid: u16,
+    /// Per-process slot index. `None` for kernel threads.
+    pub slot: Option<u16>,
     /// Snapshot of [`Process::stdout_redirect`] taken at thread
     /// construction. The `console_write` syscall reads this without
     /// locking the process table; immutable for the thread's
@@ -418,11 +432,106 @@ pub struct Thread {
     /// own pid pane (today's behavior); `Some(target)` ⇒ writes
     /// route to `Source::Process(target)` instead.
     pub stdout_redirect: Option<u16>,
+    /// State byte for the on-thread completion path. `PENDING_STATE_NONE`
+    /// (0) is the initial value and the post-consume reset; any
+    /// non-zero value (today only `PENDING_STATE_SIGNALED` = 1) means
+    /// `pending_rets[..pending_ret_count]` carries valid return data.
+    /// Ordering: the manager's Release-store of SIGNALED publishes the
+    /// rets writes; the wake drain's Acquire-load synchronizes against
+    /// it before reading rets.
+    pub pending_state: AtomicU8,
+    /// Number of valid slots in `pending_rets` (0..=4). Manager writes
+    /// before the SIGNALED store; readers Acquire-load via [`Self::pending_state`]
+    /// and then trust this count.
+    pub pending_ret_count: AtomicU8,
+    pub ticks: u8,
 }
+
+/// Initial / consumed state for [`Thread::pending_state`].
+pub const PENDING_STATE_NONE: u8 = 0;
+/// Manager has published return values into [`Thread::pending_rets`]
+/// and the parker (or the drain path) should marshal them into
+/// `frame.regs[10..]` on resume.
+pub const PENDING_STATE_SIGNALED: u8 = 1;
 
 impl Thread {
     pub fn root_table_addr(&self) -> PhysAddr {
         PhysAddr::from(self.satp)
+    }
+
+    /// Reset the on-thread completion slot to its post-consume state.
+    /// The manager calls this on every dispatch so a successor syscall
+    /// never observes stale rets from a prior call. Cheap: two
+    /// `Relaxed` stores. Per-thread single-writer at the dispatch path,
+    /// so no atomicity drama with concurrent reads — there are none in
+    /// flight at this point (the thread is `Running` on this hart, no
+    /// sibling can be reading its rets).
+    #[inline]
+    pub fn reset_pending(&self) {
+        self.pending_state
+            .store(PENDING_STATE_NONE, Ordering::Relaxed);
+        self.pending_ret_count.store(0, Ordering::Relaxed);
+    }
+
+    /// Manager-side: publish up to 4 return values to this thread.
+    /// `vals.len()` is clamped to [`pending_rets`]'s width. The store
+    /// order is rets → count → state, all `Relaxed` until the final
+    /// state store, which is `Release` — that single ordering point
+    /// publishes every prior write to any Acquire-paired reader of
+    /// `pending_state`.
+    ///
+    /// Caller-required invariant: only the manager (under MANAGER_LOCK)
+    /// invokes this. Thread state must be `Blocking` or `Suspended` so
+    /// the parker isn't observing `frame.regs` on another hart at the
+    /// same time. The wake drain or the parker's post-publish re-check
+    /// is responsible for actually moving the rets into `frame.regs`.
+    ///
+    /// [`pending_rets`]: Self::pending_rets
+    pub fn publish_results(&self, vals: &[isize]) {
+        let n = vals.len().min(self.pending_rets.len());
+        for (i, &v) in vals.iter().enumerate().take(n) {
+            self.pending_rets[i].store(v as i64, Ordering::Relaxed);
+        }
+        self.pending_ret_count.store(n as u8, Ordering::Relaxed);
+        self.pending_state
+            .store(PENDING_STATE_SIGNALED, Ordering::Release);
+    }
+
+    /// Reader-side: atomically claim the SIGNALED state and return
+    /// the published return values. CAS-claim shape (SIGNALED →
+    /// NONE) is the at-most-once gate: when the parker (post-park
+    /// re-check) and the manager (`set_wake_reason_where` drain) both
+    /// race to wake a thread, exactly one wins this CAS — the other
+    /// gets `None` and bails out. Without this, both paths would
+    /// marshal regs + transition state + push the thread onto a ready
+    /// queue, and `assign_threads` would dispatch the same thread to
+    /// two harts simultaneously (double-dispatch corruption).
+    ///
+    /// The successful CAS uses AcqRel: the Acquire half synchronizes
+    /// with the manager's Release store in [`publish_results`] so the
+    /// subsequent `pending_rets` loads observe a coherent snapshot;
+    /// the Release half (paired with Acquire failure-ordering on the
+    /// loser side) ensures any reader that observes NONE also sees
+    /// the winner's later writes (frame regs, state).
+    pub fn take_pending_results(&self, out: &mut [i64; 4]) -> Option<usize> {
+        if self
+            .pending_state
+            .compare_exchange(
+                PENDING_STATE_SIGNALED,
+                PENDING_STATE_NONE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return None;
+        }
+        let n = self.pending_ret_count.load(Ordering::Relaxed) as usize;
+        let n = n.min(out.len());
+        for i in 0..n {
+            out[i] = self.pending_rets[i].load(Ordering::Relaxed);
+        }
+        Some(n)
     }
 }
 
@@ -466,9 +575,15 @@ pub struct Process {
     pub exit_finalized: bool,
     /// Single-waiter slot for §13a.2 `wait_pid`. v1 contract: at most
     /// one parent thread parks here at a time; a second `wait_pid`
-    /// call returns EBUSY. Multi-waiter wants a `Vec<CompletionHandle>`
-    /// and lands with futex (§13a.5).
-    pub exit_waiter: Option<crate::CompletionHandle>,
+    /// call returns EBUSY. Multi-waiter wants a `Vec<u32>` and lands
+    /// with futex (§13a.5).
+    ///
+    /// Stores the parker's tid. `dealloc_process` resolves it via
+    /// `Orbit::publish_pending_for_tid(tid, &[0, exit_code])` — the
+    /// on-thread completion path's two-register publish. Stale tids
+    /// (parker exited mid-wait) are silently dropped by the resume
+    /// helper.
+    pub exit_waiter: Option<u32>,
     /// Already-exited children whose parent (this process) hasn't
     /// called `wait_pid` yet. Keyed by child pid → child's exit code.
     /// Drained when the parent waits, or freed wholesale when the
