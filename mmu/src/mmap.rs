@@ -3,7 +3,8 @@ use core::ops::Range;
 
 #[cfg(feature = "alloc")]
 use mem::frame::FrameAllocator;
-use serial::println;
+#[cfg(feature = "alloc")]
+use tracing::trace;
 
 use crate::{
     GB, MB, MappingConfig, PAGE_SIZE,
@@ -169,6 +170,7 @@ pub unsafe fn walk_to_table_materialize<'a, 'p>(
     pages: &mut PageAlloc<'p>,
     vaddr: VirtAddr,
     target_level: Level,
+    #[allow(unused_variables)]
     log: bool,
 ) -> Result<&'a PageTable, ()> {
     let mut table = root.table;
@@ -177,8 +179,9 @@ pub unsafe fn walk_to_table_materialize<'a, 'p>(
         let pte = &table.entries[idx];
 
         if pte.is_leaf() {
+            #[cfg(feature = "alloc")]
             if log {
-                println!("\twalk_materialize: unexpected leaf at level {lvl}");
+                trace!("\twalk_materialize: unexpected leaf at level {lvl}");
             }
             return Err(());
         }
@@ -191,8 +194,10 @@ pub unsafe fn walk_to_table_materialize<'a, 'p>(
             new_table.entries.iter().for_each(|e| e.set_raw(0));
             let ppn = new_table_pa / PAGE_SIZE as u64;
             pte.set_raw(crate::sv48::PageTableEntry::pack_table(ppn));
+
+            #[cfg(feature = "alloc")]
             if log {
-                println!(
+                trace!(
                     "\ttable@0x{:08X}[vpn{lvl}={idx}]={:08x}",
                     table as *const _ as usize, new_table_pa
                 );
@@ -201,8 +206,10 @@ pub unsafe fn walk_to_table_materialize<'a, 'p>(
         }
         else {
             let next_pa = pte.ppn() * PAGE_SIZE as u64;
+
+            #[cfg(feature = "alloc")]
             if log {
-                println!(
+                trace!(
                     "\ttable@0x{:08X}[vpn{lvl}={idx}]={:08x}",
                     table as *const _ as usize, next_pa
                 );
@@ -222,14 +229,16 @@ pub unsafe fn map_address_page<'a>(
     if (config.paddr.get_raw() % config.page_size) != 0
         || (config.vaddr.get_raw() % config.page_size) != 0
     {
+        #[cfg(feature = "alloc")]
         if config.log {
-            println!("misaligned map call: {config:?}");
+            trace!("misaligned map call: {config:?}");
         }
         return Err(());
     }
 
+    #[cfg(feature = "alloc")]
     if config.log {
-        println!("\n{:08x?}", &config);
+        trace!("\n{:08x?}", &config);
     }
 
     let target_level = (4 - config.levels) as Level;
@@ -239,10 +248,11 @@ pub unsafe fn map_address_page<'a>(
 
     let idx = config.vaddr.vpn_n(target_level as usize) as usize;
     let pte = &table.entries[idx];
-
+    
     if pte.is_valid() {
+        #[cfg(feature = "alloc")]
         if config.log {
-            println!("leaf pte already exists");
+            trace!("leaf pte already exists");
         }
         return Err(());
     }
@@ -254,8 +264,9 @@ pub unsafe fn map_address_page<'a>(
         config.supervisor_tag as u8,
     ));
 
+    #[cfg(feature = "alloc")]
     if config.log {
-        println!(
+        trace!(
             "\tleaf in table@0x{:08X}[vpn{}={idx}]=0x{:08x}",
             table as *const _ as usize,
             config.levels,
@@ -334,8 +345,9 @@ pub unsafe fn map_address_range<'a>(
     let vstart = config.vaddr.get_raw();
     let vend = vend.get_raw();
 
+    #[cfg(feature = "alloc")]
     if config.log {
-        println!(
+        trace!(
             "map range: p0x{pstart:016X?}..p0x{pend:016X?}, v0x{vstart:016X?}..v0x{vend:016X?}"
         );
     }
@@ -343,15 +355,17 @@ pub unsafe fn map_address_range<'a>(
     let vlen = vend - vstart;
 
     if vlen != plen {
+        #[cfg(feature = "alloc")]
         if config.log {
-            println!("virtual and physical address ranges are differnt lengths");
+            trace!("virtual and physical address ranges are differnt lengths");
         }
         return Err(());
     }
 
     if (pstart % config.page_size) != 0 || (vstart % config.page_size) != 0 {
+        #[cfg(feature = "alloc")]
         if config.log {
-            println!("virtual or physical address was not aligned to requested page size");
+            trace!("virtual or physical address was not aligned to requested page size");
         }
         return Err(());
     }
@@ -521,14 +535,16 @@ pub unsafe fn map_page<'a>(
     if (config.paddr.get_raw() % config.page_size) != 0
         || (config.vaddr.get_raw() % config.page_size) != 0
     {
+        #[cfg(feature = "alloc")]
         if config.log {
-            println!("misaligned map call: {config:?}");
+            trace!("misaligned map call: {config:?}");
         }
         return Err(());
     }
 
+    #[cfg(feature = "alloc")]
     if config.log {
-        println!("\n{:08x?}", &config);
+        trace!("\n{:08x?}", &config);
     }
 
     let target_level = (4 - config.levels) as Level;
@@ -545,8 +561,9 @@ pub unsafe fn map_page<'a>(
         config.supervisor_tag as u8,
     ));
 
+    #[cfg(feature = "alloc")]
     if config.log {
-        println!(
+        trace!(
             "\tleaf in table@0x{:08X}[vpn{}={idx}]=0x{:08x}",
             table as *const _ as usize,
             target_level,
@@ -589,8 +606,9 @@ pub unsafe fn map_va_range<'a>(
     let mut report = IdMapReport::default();
 
     if pa_range.end < pa_range.start {
+        #[cfg(feature = "alloc")]
         if base_config.log {
-            println!("bad map range: {pa_range:016X?}");
+            trace!("bad map range: {pa_range:016X?}");
         }
         return Err(());
     }
@@ -623,8 +641,9 @@ pub unsafe fn map_va_range<'a>(
         };
 
         if unsafe { map_page(root_table, pages, &config).is_err() } {
+            #[cfg(feature = "alloc")]
             if base_config.log {
-                println!("failed to map v0x{cur_va:016X}..p0x{cur_pa:016X}");
+                trace!("failed to map v0x{cur_va:016X}..p0x{cur_pa:016X}");
             }
             return Err(());
         }
@@ -653,14 +672,16 @@ pub unsafe fn id_map_range<'a>(
     let mut id_report = IdMapReport::default();
 
     if range.end < range.start {
+        #[cfg(feature = "alloc")]
         if base_config.log {
-            println!("bad mmap range: {range:016X?} {base_config:?}");
+            trace!("bad mmap range: {range:016X?} {base_config:?}");
         }
         return Err(());
     }
 
+    #[cfg(feature = "alloc")]
     if base_config.log {
-        println!("starting id map: {base_config:016?}");
+        trace!("starting id map: {base_config:016?}");
     }
 
     let mut cur_page_addr = range.start;
@@ -692,8 +713,9 @@ pub unsafe fn id_map_range<'a>(
         };
 
         if unsafe { map_page(root_table, pages, &config).is_err() } {
+            #[cfg(feature = "alloc")]
             if base_config.log {
-                println!("failed to id map 0x{:016x?}", cur_page_addr);
+                trace!("failed to id map 0x{:016x?}", cur_page_addr);
             }
             return Err(());
         }
@@ -706,7 +728,8 @@ pub unsafe fn id_map_range<'a>(
             }
         }
 
-        //println!("mapped page, {rem_ram}B remaining");
+        //#[cfg(feature = "alloc")]
+        //trace!("mapped page, {rem_ram}B remaining");
 
         cur_page_addr += page_size;
         rem_ram -= page_size;

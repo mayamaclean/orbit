@@ -223,6 +223,14 @@ pub enum WakeEvent {
     /// (latched in `setup_virtio_gpu`); falls back to "wake all
     /// pid=0 kthreads" during the boot window.
     Gpu,
+    /// Wake the k_serial UART-drain thread. Mirror of `Gpu` for the
+    /// serial side — `ktrace::emit` (and any future serial producer)
+    /// pushes onto `SERIAL_RING`, the manager folds those into one
+    /// nudge per pass via `nudge_serial_if_pending`. Targets
+    /// `serial_thread_tid` (latched in `setup_serial_kthread`);
+    /// falls back to a coarse pid=0 scan during the boot window
+    /// before the latch.
+    Serial,
 }
 
 impl Default for WakeEvent {
@@ -505,6 +513,13 @@ pub struct Orbit {
     /// virtio-gpu init completes; `WakeEvent::Gpu` falls back to
     /// "wake all pid=0 kthreads" in that case.
     gpu_thread_tid: Option<u32>,
+    /// TID of the k_serial UART-drain thread. Latched in
+    /// `setup_serial_kthread`; consumed by `WakeEvent::Serial` to
+    /// pull k_serial out of its 50 ms park as soon as a producer
+    /// (`ktrace::emit`) lands a chunk on `SERIAL_RING`. `None` during
+    /// the boot window before the kthread spawns; the wake falls back
+    /// to a coarse pid=0 scan in that case.
+    serial_thread_tid: Option<u32>,
     orphaned_sockets: Vec<SocketHandle>,
 
     /// Min-heap of `(wake_time, sleep_seq, *mut Thread)` for Suspended
@@ -806,6 +821,7 @@ impl Orbit {
             threads: BTreeMap::new(),
             net_thread_tid: None,
             gpu_thread_tid: None,
+            serial_thread_tid: None,
             net_pkg: NetPackage {
                 phy: None,
                 iface: None,
@@ -3626,6 +3642,19 @@ impl Orbit {
                         }
                     }
                 }
+                WakeEvent::Serial => {
+                    // Same shape as `WakeEvent::Gpu` — target
+                    // k_serial once `setup_serial_kthread` has latched
+                    // its tid; coarse pid=0 fallback during the boot
+                    // window before the latch.
+                    match self.serial_thread_tid {
+                        Some(tid) => self
+                            .set_wake_reason_where(process::wake_reason::TICKLE, |t| t.tid == tid),
+                        None => {
+                            self.set_wake_reason_where(process::wake_reason::TICKLE, |t| t.pid == 0)
+                        }
+                    }
+                }
             }
         }
     }
@@ -5335,6 +5364,13 @@ impl Orbit {
     }
 
     pub fn get_environment_info(&mut self) {
+        // Spawn k_serial first so device-bringup tracing routes
+        // through the lock-free ring instead of contending on
+        // `serial::SERIAL`'s spinlock once multiple harts come up.
+        // Producers that fire before this point fall back to the
+        // spinlock path via `k_serial::is_ready()`.
+        self.setup_serial_kthread();
+
         // Access the DTB through its KDMAP alias — map_kernel_self installs
         // it at `phys_to_kdmap(dtb_phys)` and no longer identity-maps the
         // dtb guard.
@@ -5391,6 +5427,28 @@ impl Orbit {
     fn discover_virtio(&mut self, fdt: &Fdt<'_>) {
         let ort = self.root();
         crate::drivers::virtio_probe::discover(fdt, &ort, &mut self.table_pages);
+    }
+
+    /// Spawn the k_serial UART-drain kthread. Once running, every
+    /// `ktrace::emit` call routes through `SERIAL_RING` instead of
+    /// taking the UART spinlock, so multi-hart trace bursts no longer
+    /// serialize on `serial::SERIAL`'s lock.
+    ///
+    /// Safe to call once during boot; called from `get_environment_info`
+    /// before device init so device-bringup logging benefits from the
+    /// queue. Pre-spawn `emit` calls fall back to the spinlock path
+    /// via `k_serial::is_ready()` returning `false`.
+    pub fn setup_serial_kthread(&mut self) {
+        let entrypoint = crate::drivers::k_serial::k_serial as *const () as usize;
+        match self.create_kernel_thread(entrypoint, None) {
+            Ok(tid) => {
+                info!("created k_serial thread tid={tid}");
+                self.serial_thread_tid = Some(tid);
+            }
+            Err(_) => {
+                error!("failed to spawn k_serial thread");
+            }
+        }
     }
 
     fn setup_virtio_gpu(&mut self) {
@@ -6953,6 +7011,25 @@ impl Orbit {
             return;
         }
         let Some(tid) = self.gpu_thread_tid
+        else {
+            return;
+        };
+        self.set_wake_reason_where(process::wake_reason::TICKLE, |t| t.tid == tid);
+    }
+
+    /// Manager-end batched nudge for k_serial. Same shape and rationale
+    /// as `nudge_gpu_if_pending`: every `SERIAL_RING` push that landed
+    /// during this manager pass (trace from any hart in any context)
+    /// gets folded into one TICKLE → Ready transition for k_serial.
+    /// Without this, k_serial would sleep out its 50 ms park before
+    /// draining trace lines, and a sustained burst would fill the ring
+    /// and force producers onto the spinlock fallback — which was the
+    /// whole problem k_serial exists to solve.
+    pub fn nudge_serial_if_pending(&mut self) {
+        if crate::drivers::k_serial::SERIAL_RING.is_empty() {
+            return;
+        }
+        let Some(tid) = self.serial_thread_tid
         else {
             return;
         };

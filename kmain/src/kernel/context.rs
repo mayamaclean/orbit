@@ -5,7 +5,7 @@ use core::sync::atomic::Ordering;
 use device::{HartContext, TRAP_STACK_SIZE};
 use process::{FaultInfo, Thread, ThreadState};
 use riscv::register::sstatus::SPP;
-use tracing::error;
+use tracing::{error};
 
 use crate::kernel::user_trap_frame_vaddr;
 
@@ -106,7 +106,7 @@ pub unsafe fn load_thread_into_hart_context_and_jump(
 
         riscv::register::sepc::write(pc);
 
-        //serial::println!("cpu{} marking thread{} as running", context.hart_id, thread.tid);
+        //trace!("cpu{} marking thread{} as running", context.hart_id, thread.tid);
         thread
             .state
             .store(ThreadState::Running as usize, Ordering::Release);

@@ -4,6 +4,7 @@ extern crate alloc;
 
 use crate::kernel::{shared_user_ptr::SharedUserPtr, shootdown::CPU_COUNT};
 use alloc::{collections::btree_map::BTreeMap, vec::Vec};
+use tracing::trace;
 use core::{
     arch::asm,
     ptr::null_mut,
@@ -135,7 +136,7 @@ pub fn kick_machine_harts(hart_count: usize) {
 }
 
 pub fn supervisor_wake_hart(hart: usize) {
-    //serial::println!("hart{} sending wake ipi to hart{hart}", get_hart_context().hart_id);
+    trace!("hart{} sending wake ipi to hart{hart}", get_hart_context().hart_id);
     write_sswi(hart, 1);
 }
 
@@ -310,6 +311,10 @@ pub extern "C" fn k_hart_loop() -> ! {
             // is dispatched this same pass — no extra manager-pass of
             // latency. See `Orbit::nudge_gpu_if_pending` for rationale.
             orbit.nudge_gpu_if_pending();
+            // Same shape as the gpu nudge — fold every SERIAL_RING
+            // push that landed during this pass (trace from any hart
+            // in any context) into one Ready transition for k_serial.
+            orbit.nudge_serial_if_pending();
             orbit.assign_threads(hart_context);
 
             // Read the next sleep deadline while still holding the
@@ -1949,4 +1954,48 @@ pub fn handle_fb_present(epc: usize, hart_context: &'static HartContext, frame: 
 
         orbit_core::SyscallOutcome::Return { ret: 0 }
     });
+}
+
+pub struct SerialWriter {
+    buf: [u8; crate::drivers::k_serial::CHUNK_BYTES],
+    len: usize,
+}
+
+impl SerialWriter {
+    pub const fn new() -> Self {
+        Self {
+            buf: [0u8; crate::drivers::k_serial::CHUNK_BYTES],
+            len: 0,
+        }
+    }
+    pub fn flush(&mut self) {
+        if self.len == 0 {
+            return;
+        }
+        crate::drivers::k_serial::push_chunk(&self.buf[..self.len]);
+        self.len = 0;
+    }
+}
+
+impl core::fmt::Write for SerialWriter {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        for &b in s.as_bytes() {
+            if self.len >= self.buf.len() {
+                self.flush();
+            }
+            self.buf[self.len] = b;
+            self.len += 1;
+        }
+        Ok(())
+    }
+}
+
+#[macro_export]
+macro_rules! serialln {
+    ($($arg:tt)*) => {{
+        use core::fmt::Write;
+        let mut w = $crate::SerialWriter::new();
+        let _ = writeln!(w, $($arg)*);
+        w.flush();
+    }};
 }

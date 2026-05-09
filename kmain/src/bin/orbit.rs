@@ -25,7 +25,6 @@ use riscv::register::{
     satp::Mode,
     stvec::{Stvec, TrapMode},
 };
-use serial::println;
 
 use tracing::{Level, debug, error, info};
 
@@ -1188,7 +1187,7 @@ extern "C" fn rust_main(_hartid: usize, dtb: usize, serial: usize, load_addr: u6
 
         serial::init_serial(serial_addr as usize);
 
-        println!("boot! dtb @ {dtb_addr:016X?}");
+        serial::println!("boot! dtb @ {dtb_addr:016X?}");
 
         let (ram_base, ram_size) =
             find_ram(dtb_addr as *const u8).expect("failed to find RAM node in DTB");
@@ -1414,7 +1413,7 @@ extern "C" fn rust_main(_hartid: usize, dtb: usize, serial: usize, load_addr: u6
 
 #[panic_handler]
 fn panic_time(p: &PanicInfo) -> ! {
-    println!("{p:?}");
+    error!("{p:?}");
     loop {
         riscv::asm::wfi();
     }

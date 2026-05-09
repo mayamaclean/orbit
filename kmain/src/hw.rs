@@ -46,13 +46,14 @@ impl Hardware for RiscvHardware {
     fn serial_write_user(&mut self, pid: u16, tid: u32, text: &str) -> Result<(), ()> {
         // `{t}t USER[pid.tid]: {text}` matches the tracing-subscriber
         // layout used by kernel info!/debug! lines — keeps user output
-        // visually aligned with kernel logs in the smoke/debug streams.
-        serial::print!(
+        // visually aligned with kernel logs in the smoke/debug streams.        
+        crate::serialln!(
             "{}t USER[{}.{}]: {text}",
             riscv::register::time::read64(),
             pid,
             tid
         );
+
         Ok(())
     }
 
@@ -66,7 +67,7 @@ impl Hardware for RiscvHardware {
             // Framebuffer path not live — fall back to the serial
             // back-channel so the bytes aren't silently dropped.
             if let Ok(s) = core::str::from_utf8(bytes) {
-                serial::print!(
+                crate::serialln!(
                     "{}t USER[{}]: {}",
                     riscv::register::time::read64(),
                     dest_pid,

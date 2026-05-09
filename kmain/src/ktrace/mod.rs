@@ -111,19 +111,26 @@ impl Write for LineBuf {
 }
 
 /// Format `args` once into a stack buffer, then emit to both the UART
-/// (as-is) and — once `k_gpu` is live — the kernel scrollback. Done
-/// this way so we don't double-format and so the scrollback sees
-/// exactly the bytes the user would see on UART.
+/// (via k_serial's ring once it's live, else the spinlock'd
+/// `serial::print!` fallback) and — once `k_gpu` is live — the kernel
+/// scrollback. Done this way so we don't double-format and so the
+/// scrollback sees exactly the bytes the user would see on UART.
 fn emit(args: fmt::Arguments<'_>) {
     let mut buf = LineBuf::new();
     let _ = buf.write_fmt(args);
     let bytes = buf.as_slice();
 
-    // Serial is the always-available path. Uses the spinlock'd
-    // println-style API; safe from any context that itself isn't
-    // already holding the serial lock.
-    if let Ok(s) = core::str::from_utf8(bytes) {
-        serial::print!("{}", s);
+    // UART path. Once k_serial is up, push the chunk lock-free into
+    // SERIAL_RING; the kthread drains under one lock acquire per pass
+    // so concurrent harts don't serialize on the UART. Pre-spawn (early
+    // boot) and on ring-full we fall back to the synchronous spinlock
+    // path so the line still gets out.
+    let pushed = crate::drivers::k_serial::is_ready()
+        && crate::drivers::k_serial::push_chunk(bytes);
+    if !pushed {
+        if let Ok(s) = core::str::from_utf8(bytes) {
+            serial::print!("{}", s);
+        }
     }
 
     // Push to the k_gpu ring if it's initialized. Runs lock-free;

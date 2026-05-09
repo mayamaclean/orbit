@@ -4,6 +4,7 @@ pub mod fb;
 pub mod fonts;
 pub mod goldfish_rtc;
 pub mod k_gpu;
+pub mod k_serial;
 pub mod plic;
 pub mod virtio_blk_dev;
 pub mod virtio_gpu_dev;
