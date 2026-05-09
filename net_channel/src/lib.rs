@@ -1324,10 +1324,10 @@ impl NetChannel {
     {
         let cur = self.current();
 
-        //let channel_state = cur.state.load(Ordering::Acquire);
-        //if channel_state < 2 {
-        //    return Err(channel_state as isize);
-        //}
+        let channel_state = cur.state.load(Ordering::Acquire);
+        if channel_state < channel_state::ACTIVE {
+            return Err(channel_state as isize);
+        }
 
         let rx = self.rx();
 
