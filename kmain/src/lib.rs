@@ -167,12 +167,31 @@ pub fn wait_for(target: u64) {
 
 pub static MANAGER_LOCK: AtomicBool = AtomicBool::new(false);
 
+/// Non-blocking try-acquire of the global manager lock. **Only one
+/// caller**: the `if try_acquire_manager()` arm at the top of
+/// [`k_hart_loop`] (this file). Every other path that needs to mutate
+/// or read manager-owned state pushes a [`orbit_core::PendingWork`]
+/// entry onto [`kernel::MANAGER_WORK`] and (if a result is needed)
+/// parks the caller; whichever hart next holds the lock through
+/// `k_hart_loop` drains the queue and resumes the parked thread via
+/// [`kernel::Orbit::publish_pending_for_tid`].
+///
+/// Why no spin: a spin on this lock from trap context runs with
+/// `sstatus.SIE = 0`, which masks the SSWI that
+/// [`crate::kernel::shootdown::broadcast`] relies on for cross-hart
+/// ack. A `dealloc_process` running on hart B holds the lock, fires
+/// a TLB-shootdown to hart A, and waits on hart A's drain — which
+/// never happens if hart A is itself spinning here. Both harts wedge
+/// forever. (This is the deadlock that the eza_stress reproducer
+/// hit; see commit history.)
 pub fn try_acquire_manager() -> bool {
     MANAGER_LOCK
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
         .is_ok()
 }
 
+/// Drop the global manager lock. Pair with [`try_acquire_manager`];
+/// only [`k_hart_loop`] should ever be calling either.
 pub fn release_manager() {
     MANAGER_LOCK.store(false, Ordering::Release);
 }
@@ -888,15 +907,30 @@ pub unsafe fn handle_exit(
         let t = unsafe { (cur as *const Thread).as_ref_unchecked() };
         let pid = t.pid;
         let leader_tid = t.tid;
-        let orbit = unsafe { (hart_context.cscratch as *mut kernel::Orbit).as_mut_unchecked() };
-        // Brief manager spin — exit is not a hot path. Holding the
-        // lock here keeps `assign_threads` from picking up a sibling
-        // we haven't marked Exited yet.
-        while !try_acquire_manager() {
-            core::hint::spin_loop();
+        // Hand the sibling-fanout to the manager via MANAGER_WORK
+        // rather than spinning on MANAGER_LOCK from trap context with
+        // SIE off — that path would deadlock against any concurrent
+        // `shootdown::broadcast` running under the manager (the
+        // broadcast spins on an SSWI ack we'd never deliver). Retry on
+        // a full ring with `shootdown::drain_local` interleaved so we
+        // don't block other harts' broadcasts in the meantime.
+        let work = orbit_core::PendingWork::ExitGroup {
+            pid,
+            leader_tid,
+            exit_code,
+        };
+        loop {
+            match kernel::MANAGER_WORK.push_ref() {
+                Ok(mut slot) => {
+                    *slot = work;
+                    break;
+                }
+                Err(_) => {
+                    crate::kernel::shootdown::drain_local();
+                    core::hint::spin_loop();
+                }
+            }
         }
-        orbit.request_exit_group(pid, leader_tid, exit_code);
-        release_manager();
     }
 
     unsafe {
@@ -1148,26 +1182,31 @@ pub fn handle_create_process_v2(
     });
 }
 
-/// `query_denial_log(buf_ptr, buf_len) → bytes | -errno`. Synchronous
-/// read of the kernel-wide denial event ring into a user buffer.
-/// Acquires `MANAGER_LOCK` briefly for the snapshot — events are
-/// otherwise mutated by `drain_denial_events` under the same lock.
-/// Wired into `s_trap` at syscall number `4106`.
+/// `query_denial_log(buf_ptr, buf_len) → bytes | -errno`. Park the
+/// caller on the on-thread completion slot and queue a
+/// [`PendingWork::QueryDenials`]; the manager drains the producer
+/// queue, snapshots the kernel-wide ring, and copies the result
+/// into the caller's buffer through `UserPageWindow`. Wired into
+/// `s_trap` at syscall number `4106`.
 ///
 /// Lives in kmain (not orbit-core) for the same reason as
 /// `query_stats`: the ring is owned by `Orbit`, which `Hardware`
 /// deliberately doesn't expose.
+///
+/// Single-page constraint (matches `fs_stat` / `fs_readdir`): the
+/// destination buffer must fit in one 4 KiB page so the manager arm
+/// is one `UserPageWindow::map`. Existing callers that pass a
+/// page-aligned 4 KiB slot are unaffected (`50 events × 48 bytes` =
+/// 2400 B fits).
 #[unsafe(no_mangle)]
 pub fn handle_query_denial_log(
     epc: usize,
     hart_context: &'static HartContext,
     frame: &mut TrapFrame,
 ) {
-    use orbit_abi::denial::{DENIAL_RING_CAPACITY, DenialEvent};
-    use orbit_abi::errno::{EFAULT, EINVAL};
+    use orbit_abi::denial::DenialEvent;
+    use orbit_abi::errno::{EAGAIN, EFAULT, EINVAL};
     use orbit_abi::layout::user_range_ok;
-
-    let orbit = unsafe { (hart_context.cscratch as *mut kernel::Orbit).as_mut_unchecked() };
 
     dispatch_syscall(epc, hart_context, frame, |t, f| {
         let Ok(buf_va) = UserVa::new(f.regs[11] as u64)
@@ -1189,6 +1228,16 @@ pub fn handle_query_denial_log(
                 ret: -(EFAULT as isize),
             };
         }
+        // Single-page constraint enforced at the boundary so the
+        // manager arm is one `UserPageWindow`. Buffers that straddle
+        // a 4 KiB page get EINVAL.
+        if (buf_va.raw() & (mmu::PAGE_SIZE as u64 - 1)) + buf_len as u64
+            > mmu::PAGE_SIZE as u64
+        {
+            return orbit_core::SyscallOutcome::Return {
+                ret: -(EINVAL as isize),
+            };
+        }
         use orbit_core::Hardware;
         if !crate::hw::RiscvHardware.user_va_translates(t.root_table_addr(), buf_va) {
             return orbit_core::SyscallOutcome::Return {
@@ -1196,47 +1245,21 @@ pub fn handle_query_denial_log(
             };
         }
 
-        // Snapshot under the manager lock — short critical section,
-        // bounded by DENIAL_RING_CAPACITY events. Drain the producer
-        // queue first so any PermDeny the dispatch gate has pushed
-        // since the last manager pass lands in the ring before we
-        // snapshot. Without this drain, a caller racing the manager
-        // can read the ring before its own gate-induced PermDeny
-        // gets folded in — the lock-free queue lets the gate-side
-        // push race the read. Doesn't eliminate the race (a new
-        // event from another hart between drain and snapshot still
-        // beats us) but makes "any denial I caused is visible" hold
-        // for the calling thread.
-        let mut tmp = [DenialEvent::PermDeny {
-            required_class: 0,
-            perms: 0,
-            time_ticks: 0,
-            tid: 0,
-            sysno: 0,
-            source_role: 0,
-            pid: 0,
-        }; DENIAL_RING_CAPACITY];
-        while !try_acquire_manager() {
-            core::hint::spin_loop();
+        let work = orbit_core::PendingWork::QueryDenials {
+            buf_vaddr: buf_va,
+            buf_len,
+            pid: t.pid,
+            root_pa: t.root_table_addr(),
+            tid: t.tid,
+        };
+        if crate::hw::RiscvHardware.push_pending_work(work).is_err() {
+            return orbit_core::SyscallOutcome::Return {
+                ret: -(EAGAIN as isize),
+            };
         }
-        orbit.drain_denial_events();
-        let n = orbit.denial_ring_snapshot(&mut tmp);
-        release_manager();
-
-        let max_events = buf_len / event_size;
-        let to_emit = core::cmp::min(n, max_events);
-        let to_write = to_emit * event_size;
-
-        let guard = UserAccess::enter();
-        unsafe {
-            let dst = guard.slice_mut(buf_va, to_write);
-            let src = core::slice::from_raw_parts(tmp.as_ptr() as *const u8, to_write);
-            dst.copy_from_slice(src);
-        }
-        drop(guard);
-
-        orbit_core::SyscallOutcome::Return {
-            ret: to_write as isize,
+        orbit_core::SyscallOutcome::Yield {
+            state: process::ThreadState::Blocking,
+            ret: None,
         }
     });
 }
@@ -1621,17 +1644,21 @@ pub fn handle_get_realtime(epc: usize, hart_context: &'static HartContext, frame
 /// Lives in kmain for the same reason as `get_hart_id`: the data
 /// source is the kernel-side [`Orbit`] struct (process table, frame
 /// allocator stats), which `Hardware` deliberately doesn't surface.
-/// Synchronous — no manager round-trip; we acquire `MANAGER_LOCK`
-/// inline for the duration of the snapshot walk.
+/// Park the caller on the on-thread completion slot and queue a
+/// [`PendingWork::QueryStats`]; the manager runs the per-process
+/// snapshot under `MANAGER_LOCK` and copies the result into the
+/// caller's buffer through `UserPageWindow`.
+///
+/// Single-page constraint: the destination buffer must fit in one
+/// 4 KiB page (matches `fs_stat`). [`ProcessStats`] is well under one
+/// page so this never matters in practice.
 ///
 /// [`ProcessStats`]: orbit_abi::stats::ProcessStats
 #[unsafe(no_mangle)]
 pub fn handle_query_stats(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
-    use orbit_abi::errno::{EFAULT, EINVAL, ESRCH};
+    use orbit_abi::errno::{EAGAIN, EFAULT, EINVAL};
     use orbit_abi::layout::user_range_ok;
-    use orbit_abi::stats::{ProcessStats, STATS_MIN_LEN};
-
-    let orbit = unsafe { (hart_context.cscratch as *mut kernel::Orbit).as_mut_unchecked() };
+    use orbit_abi::stats::STATS_MIN_LEN;
 
     dispatch_syscall(epc, hart_context, frame, |t, f| {
         let Ok(buf_va) = UserVa::new(f.regs[11] as u64)
@@ -1654,9 +1681,16 @@ pub fn handle_query_stats(epc: usize, hart_context: &'static HartContext, frame:
                 ret: -(EFAULT as isize),
             };
         }
-        // ProcessStats fits in a page; walk only the start (matches
-        // serial_print/console_write convention). user_range_ok
-        // already excluded the kernel half and overflow.
+        // Single-page constraint enforced at the boundary so the
+        // manager arm is one `UserPageWindow`. `ProcessStats` (~128 B)
+        // fits in any 4 KiB slot.
+        if (buf_va.raw() & (mmu::PAGE_SIZE as u64 - 1)) + buf_len as u64
+            > mmu::PAGE_SIZE as u64
+        {
+            return orbit_core::SyscallOutcome::Return {
+                ret: -(EINVAL as isize),
+            };
+        }
         use orbit_core::Hardware;
         if !crate::hw::RiscvHardware.user_va_translates(t.root_table_addr(), buf_va) {
             return orbit_core::SyscallOutcome::Return {
@@ -1664,42 +1698,21 @@ pub fn handle_query_stats(epc: usize, hart_context: &'static HartContext, frame:
             };
         }
 
-        // Spin on MANAGER_LOCK so the heap_pages / maps walk doesn't
-        // race the manager mutating them. Brief — manager passes are
-        // <1 ms.
-        while !try_acquire_manager() {
-            core::hint::spin_loop();
-        }
-        let snapshot = orbit.snapshot_process_stats(t.pid);
-        release_manager();
-
-        let stats = match snapshot {
-            Some(s) => s,
-            None => {
-                return orbit_core::SyscallOutcome::Return {
-                    ret: -(ESRCH as isize),
-                };
-            }
+        let work = orbit_core::PendingWork::QueryStats {
+            target_pid: t.pid,
+            buf_vaddr: buf_va,
+            buf_len,
+            root_pa: t.root_table_addr(),
+            tid: t.tid,
         };
-
-        let native = core::mem::size_of::<ProcessStats>();
-        let to_write = core::cmp::min(native, buf_len);
-
-        // SUM gate the write. `user_va_translates` confirmed the start
-        // page; if `buf_len` straddles a page boundary into an
-        // unmapped follow-on the store faults — same convention as
-        // serial_print's PAGE_SIZE-bounded copy.
-        let guard = UserAccess::enter();
-        unsafe {
-            let dst = guard.slice_mut(buf_va, to_write);
-            let src =
-                core::slice::from_raw_parts(&stats as *const ProcessStats as *const u8, to_write);
-            dst.copy_from_slice(src);
+        if crate::hw::RiscvHardware.push_pending_work(work).is_err() {
+            return orbit_core::SyscallOutcome::Return {
+                ret: -(EAGAIN as isize),
+            };
         }
-        drop(guard);
-
-        orbit_core::SyscallOutcome::Return {
-            ret: to_write as isize,
+        orbit_core::SyscallOutcome::Yield {
+            state: ThreadState::Blocking,
+            ret: None,
         }
     });
 }

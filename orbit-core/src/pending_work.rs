@@ -430,6 +430,56 @@ pub enum PendingWork {
     /// kmain-internal. `status` carries the virtio status byte
     /// (0 = OK, non-zero = device error).
     CacheFill { packed_key: u64, status: u8 },
+
+    /// `_exit(2)` / `exit_group(2)` from the calling thread. Pushed by
+    /// `handle_exit` immediately before the leader descends into
+    /// `exit_thread_with_state(Exited)`. The manager runs
+    /// `request_exit_group` under `MANAGER_LOCK`, marking every sibling
+    /// thread `Exited` and IPI'ing any hart currently running one.
+    ///
+    /// No `tid` field — the leader is dying, so there is no resume
+    /// target. Sync ordering with the leader's own state transition is
+    /// loose: the leader is marked `Exited` by `exit_thread_with_state`
+    /// regardless of whether the manager has processed this entry yet,
+    /// and `request_exit_group` only writes sibling state, so the two
+    /// can race freely.
+    ExitGroup {
+        pid: u16,
+        leader_tid: u32,
+        exit_code: i32,
+    },
+
+    /// `query_denial_log(buf, len) → bytes | -errno` request. Manager
+    /// drains the producer queue, snapshots the kernel-wide ring,
+    /// copies up to `buf_len` bytes into the caller's buffer via
+    /// `UserPageWindow` against `root_pa`, and resumes via
+    /// `publish_pending_for_tid(tid, &[bytes_written])`.
+    ///
+    /// Single-page constraint: the syscall boundary rejects buffers
+    /// that straddle a 4 KiB page (matches `fs_stat` / `fs_readdir`),
+    /// so the manager arm is one `UserPageWindow::map`.
+    QueryDenials {
+        buf_vaddr: UserVa,
+        buf_len: usize,
+        pid: u16,
+        root_pa: PhysAddr,
+        tid: u32,
+    },
+
+    /// `query_stats(buf, len) → bytes | -errno` request. Manager
+    /// snapshots `Process` accounting for the calling thread's pid
+    /// and copies the resulting [`orbit_abi::stats::ProcessStats`]
+    /// into the caller's buffer; resumes via `publish_pending_for_tid`.
+    ///
+    /// Single-page constraint: same as `QueryDenials`. `ProcessStats`
+    /// is well under one page so this never matters in practice.
+    QueryStats {
+        target_pid: u16,
+        buf_vaddr: UserVa,
+        buf_len: usize,
+        root_pa: PhysAddr,
+        tid: u32,
+    },
 }
 
 /// Validated spawn context shared between bytes-mode (which uses it

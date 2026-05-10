@@ -2161,6 +2161,113 @@ impl Orbit {
         written as isize
     }
 
+    /// Manager arm for [`PendingWork::QueryDenials`]. Drains any
+    /// PermDeny / RoleDeny events the dispatch gate has pushed since
+    /// the last manager pass (so a caller racing the manager observes
+    /// its own gate-induced denial), snapshots the kernel-wide ring,
+    /// and writes up to `buf_len` bytes — capped at `DENIAL_RING_CAPACITY *
+    /// size_of::<DenialEvent>()` and to whole events — into the user
+    /// buffer via a single `UserPageWindow` against `root_pa`. Returns
+    /// `bytes_written` or a negative errno.
+    ///
+    /// Single-page constraint enforced by `handle_query_denial_log`
+    /// (matches `fs_stat` / `fs_readdir`); `50 events × 48 bytes` =
+    /// 2400 B fits in any page-aligned 4 KiB slot.
+    fn run_query_denials(
+        &mut self,
+        buf_vaddr: orbit_abi::layout::UserVa,
+        buf_len: usize,
+        _pid: u16,
+        root_pa: PhysAddr,
+    ) -> isize {
+        use orbit_abi::denial::{DENIAL_RING_CAPACITY, DenialEvent};
+
+        self.drain_denial_events();
+
+        let mut tmp = [DenialEvent::PermDeny {
+            required_class: 0,
+            perms: 0,
+            time_ticks: 0,
+            tid: 0,
+            sysno: 0,
+            source_role: 0,
+            pid: 0,
+        }; DENIAL_RING_CAPACITY];
+        let n = self.denial_ring_snapshot(&mut tmp);
+
+        let event_size = core::mem::size_of::<DenialEvent>();
+        let max_events = buf_len / event_size;
+        let to_emit = core::cmp::min(n, max_events);
+        let to_write = to_emit * event_size;
+        if to_write == 0 {
+            return 0;
+        }
+
+        let buf_va = buf_vaddr.raw();
+        let root_table = unsafe { memmap::kernel_root_from_pa(root_pa) };
+        let page_base = buf_va & !(PAGE_SIZE as u64 - 1);
+        let page_off = (buf_va - page_base) as usize;
+        let page_pa =
+            match unsafe { mmu::mmap::virt_to_phys(&root_table, VirtAddr::new(page_base)) } {
+                Some(p) => p as u64,
+                None => return Errno::new(EFAULT).to_ret(),
+            };
+        unsafe {
+            let mut w = user_page::UserPageWindow::map(page_pa, PAGE_SIZE);
+            let page = w.as_mut_slice();
+            let src = core::slice::from_raw_parts(tmp.as_ptr() as *const u8, to_write);
+            page[page_off..page_off + to_write].copy_from_slice(src);
+        }
+        to_write as isize
+    }
+
+    /// Manager arm for [`PendingWork::QueryStats`]. Snapshots
+    /// per-process accounting for `target_pid` (today: the caller's
+    /// own pid) under `MANAGER_LOCK` and copies the resulting
+    /// [`orbit_abi::stats::ProcessStats`] into the user buffer via
+    /// a single `UserPageWindow`. Returns `bytes_written`, `-ESRCH`
+    /// if the pid is no longer live, or `-EFAULT` on PT lookup
+    /// failure.
+    fn run_query_stats(
+        &mut self,
+        target_pid: u16,
+        buf_vaddr: orbit_abi::layout::UserVa,
+        buf_len: usize,
+        root_pa: PhysAddr,
+    ) -> isize {
+        use orbit_abi::errno::ESRCH;
+        use orbit_abi::stats::ProcessStats;
+
+        let stats = match self.snapshot_process_stats(target_pid) {
+            Some(s) => s,
+            None => return Errno::new(ESRCH).to_ret(),
+        };
+
+        let native = core::mem::size_of::<ProcessStats>();
+        let to_write = core::cmp::min(native, buf_len);
+        if to_write == 0 {
+            return 0;
+        }
+
+        let buf_va = buf_vaddr.raw();
+        let root_table = unsafe { memmap::kernel_root_from_pa(root_pa) };
+        let page_base = buf_va & !(PAGE_SIZE as u64 - 1);
+        let page_off = (buf_va - page_base) as usize;
+        let page_pa =
+            match unsafe { mmu::mmap::virt_to_phys(&root_table, VirtAddr::new(page_base)) } {
+                Some(p) => p as u64,
+                None => return Errno::new(EFAULT).to_ret(),
+            };
+        unsafe {
+            let mut w = user_page::UserPageWindow::map(page_pa, PAGE_SIZE);
+            let page = w.as_mut_slice();
+            let src =
+                core::slice::from_raw_parts(&stats as *const ProcessStats as *const u8, to_write);
+            page[page_off..page_off + to_write].copy_from_slice(src);
+        }
+        to_write as isize
+    }
+
     /// §13a.3 — `create_process_ex`. Same shape as
     /// `run_create_process_req` plus the argv blob copy + map step.
     /// The blob is one page at most (cap enforced at the syscall
@@ -3338,7 +3445,7 @@ impl Orbit {
             // Diagnostic for the eza-stress heap-corruption hypothesis:
             // log every EAGAIN with full context so we can correlate
             // with user-side mutex state when something goes wrong.
-            info!(
+            trace!(
                 "futex_wait: tid={tid} pid={pid} pa={pa:#x} expected={} observed={} \
                  action=EAGAIN",
                 req.expected, observed,
@@ -3359,7 +3466,7 @@ impl Orbit {
             q.push(waiter);
             q.len()
         };
-        info!(
+        trace!(
             "futex_wait: tid={tid} pid={pid} pa={pa:#x} expected={} observed={} \
              action=install waiters_after={n_after}",
             req.expected, observed,
@@ -3414,7 +3521,7 @@ impl Orbit {
             }
             None => 0,
         };
-        info!(
+        trace!(
             "futex_wake: caller_pid={caller_pid} pa={pa:#x} observed={observed} \
              requested={} drained={drained_tids:?} n_woken={n_woken}",
             req.n,
@@ -4015,6 +4122,33 @@ impl Orbit {
                 }
                 PendingWork::CacheFill { packed_key, status } => {
                     self.run_cache_fill(packed_key, status);
+                }
+                PendingWork::ExitGroup {
+                    pid,
+                    leader_tid,
+                    exit_code,
+                } => {
+                    self.request_exit_group(pid, leader_tid, exit_code);
+                }
+                PendingWork::QueryDenials {
+                    buf_vaddr,
+                    buf_len,
+                    pid,
+                    root_pa,
+                    tid,
+                } => {
+                    let result = self.run_query_denials(buf_vaddr, buf_len, pid, root_pa);
+                    self.publish_pending_for_tid(tid, &[result]);
+                }
+                PendingWork::QueryStats {
+                    target_pid,
+                    buf_vaddr,
+                    buf_len,
+                    root_pa,
+                    tid,
+                } => {
+                    let result = self.run_query_stats(target_pid, buf_vaddr, buf_len, root_pa);
+                    self.publish_pending_for_tid(tid, &[result]);
                 }
             }
         }

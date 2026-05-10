@@ -270,7 +270,7 @@ def main() -> int:
         tee.stop()
 
     try:
-        time.sleep(5.0)
+        time.sleep(8.0)
         if not wait_for_port(METRIC_HOST, LOADER_PORT, args.boot_timeout,
                              label="orbit-loader"):
             print("orbit-loader never came up; aborting", file=sys.stderr)
