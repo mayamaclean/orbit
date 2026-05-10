@@ -5,7 +5,6 @@ edition = "2024"
 
 [dependencies]
 riscv = { version = "0.16.0", features = ["rt"] }
-mmu = { path = "../mmu" }
 device = { path = "../device" }
 serial = { path = "../serial" }
 elf = { version = "0.8.0", default-features = false }

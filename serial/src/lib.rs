@@ -4,55 +4,71 @@ use core::{
     cell::UnsafeCell,
     fmt::{Arguments, Write},
     mem::MaybeUninit,
-    sync::atomic::{AtomicU64, Ordering},
 };
 
 use ns16550a::Uart;
-
-#[repr(align(128))]
-pub struct CriticalVal {
-    pub inner: AtomicU64,
-}
-
-impl CriticalVal {
-    pub fn acquire(&self) {
-        while let Err(_) = self
-            .inner
-            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
-        {}
-    }
-
-    pub fn release(&self) {
-        self.inner.store(0, Ordering::Release);
-    }
-}
+use spin::{MutexGuard, mutex::Mutex};
 
 #[repr(align(4096))]
 pub struct MpUart {
-    pub crit: CriticalVal,
-    pub uart: UnsafeCell<MaybeUninit<Uart>>,
+    pub(crate) uart: UnsafeCell<spin::Mutex<MaybeUninit<Uart>>>,
 }
 
 impl MpUart {
     pub fn print(&self, s: Arguments) {
-        self.crit.acquire();
         unsafe {
-            self.print_no_crit(s);
+            let _ = self
+                .uart
+                .get()
+                .as_ref_unchecked()
+                .lock()
+                .assume_init_mut()
+                .write_fmt(s);
         }
-        self.crit.release();
     }
 
-    pub unsafe fn print_no_crit(&self, s: Arguments) {
-        let uart = unsafe { self.uart.get().as_mut_unchecked().assume_init_mut() };
-        let _ = uart.write_fmt(s);
+    /// **Panic-handler-only.** Bypass the UART mutex entirely and write
+    /// straight to the hardware. Forms a `&mut Mutex<...>` while the
+    /// lock may be held by another hart (notably k_serial, which holds
+    /// it for life), so concurrent calls + concurrent ring-drains can
+    /// produce aliasing `&mut`s — UB at the language level. We accept
+    /// that for the panic path because the alternative is the panic
+    /// being silently swallowed when k_serial owns the lock; everything
+    /// else (`ktrace::emit`, the `serial_print` syscall, direct
+    /// `println!`) MUST go through the locked `print` / `acquire_serial`
+    /// path or the ring instead.
+    ///
+    /// Output may interleave with k_serial's drain bytes — cosmetic
+    /// only; the panic message still reaches the UART.
+    pub unsafe fn print_lock_bypass(&self, s: Arguments) {
+        let _ = unsafe {
+            self.uart
+                .get()
+                .as_mut_unchecked()
+                .get_mut()
+                .assume_init_mut()
+                .write_fmt(s)
+        };
     }
 
     pub unsafe fn print_str(&self, s: &str) -> core::fmt::Result {
-        self.crit.acquire();
-        let uart = unsafe { self.uart.get().as_mut_unchecked().assume_init_mut() };
-        let r = uart.write_str(s);
-        self.crit.release();
-
+        let int_on = riscv::register::sstatus::read().sie();
+        unsafe {
+            riscv::register::sstatus::clear_sie();
+        }
+        let r = unsafe {
+            self.uart
+                .get()
+                .as_ref_unchecked()
+                .lock()
+                .assume_init_mut()
+                .write_str(s)
+        };
+        if int_on {
+            unsafe {
+                riscv::register::sstatus::set_sie();
+            }
+        }
         r
     }
 }
@@ -60,32 +76,31 @@ impl MpUart {
 unsafe impl Sync for MpUart {}
 
 pub static SERIAL: MpUart = MpUart {
-    crit: CriticalVal {
-        inner: AtomicU64::new(0),
-    },
-    uart: UnsafeCell::new(MaybeUninit::zeroed()),
+    uart: UnsafeCell::new(Mutex::new(MaybeUninit::zeroed())),
 };
 
 pub fn print(s: Arguments) {
     SERIAL.print(s);
 }
 
-pub unsafe fn print_no_crit(s: Arguments) {
+/// Panic-handler-only free-function shim around
+/// [`MpUart::print_lock_bypass`]. See that method's doc for the safety
+/// rationale and why this isn't a general fallback.
+pub unsafe fn print_lock_bypass(s: Arguments) {
     unsafe {
-        SERIAL.print_no_crit(s);
+        SERIAL.print_lock_bypass(s);
     }
 }
 
-pub unsafe fn acquire_serial() {
-    SERIAL.crit.acquire();
-}
-
-pub unsafe fn release_serial() {
-    SERIAL.crit.release();
-}
-
 pub unsafe fn init_serial(addr: usize) {
-    let _ = unsafe { *SERIAL.uart.get().as_mut_unchecked().write(Uart::new(addr)) };
+    let _ = unsafe {
+        *SERIAL
+            .uart
+            .get()
+            .as_mut_unchecked()
+            .get_mut()
+            .write(Uart::new(addr))
+    };
 }
 
 pub fn print_loc() -> usize {
@@ -103,15 +118,43 @@ macro_rules! print {
     }};
 }
 
+pub unsafe fn acquire_serial() -> MutexGuard<'static, MaybeUninit<Uart>> {
+    unsafe {
+        let int_on = riscv::register::sstatus::read().sie();
+        riscv::register::sstatus::clear_sie();
+        let g = SERIAL.uart.get().as_ref_unchecked().lock();
+        if int_on {
+            riscv::register::sstatus::set_sie();
+        }
+        g
+    }
+}
+
 #[macro_export]
 macro_rules! println {
     // The pattern to match: accepts a format string and any number of arguments
     ($($arg:tt)*) => {{
         unsafe {
-            serial::acquire_serial();
-            serial::print_no_crit(format_args!($($arg)*));
-            serial::print_no_crit(format_args!("\n"));
-            serial::release_serial();
+            use core::fmt::Write;
+            let mut g = serial::acquire_serial();
+            let _ = g.assume_init_mut().write_fmt(format_args!($($arg)*));
+            let _ = g.assume_init_mut().write_str("\n");
+            core::mem::drop(g);
+        }
+    }};
+}
+
+#[macro_export]
+/// **Panic-handler-only.** Writes directly to the UART without taking
+/// the spin::Mutex — the only way to get bytes out when k_serial owns
+/// the lock for life. See [`MpUart::print_lock_bypass`] for the safety
+/// caveats. Don't use this from non-panic code; it's UB-adjacent on
+/// concurrent calls.
+macro_rules! panic_println {
+    ($($arg:tt)*) => {{
+        unsafe {
+            serial::print_lock_bypass(format_args!($($arg)*));
+            serial::print_lock_bypass(format_args!("\n"));
         }
     }};
 }

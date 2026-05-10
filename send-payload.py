@@ -137,6 +137,7 @@ def main() -> int:
         s.shutdown(socket.SHUT_WR)
         resp = s.recv(1, socket.MSG_WAITALL)
         print(f"resp={resp}")
+        #s.shutdown(socket.SHUT_RD)
 
     print("send-payload: done", file=sys.stderr)
     return 0

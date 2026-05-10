@@ -1,9 +1,11 @@
 #![no_std]
 #![no_main]
+#![feature(fmt_arguments_from_str)]
 
 extern crate alloc;
 
 use core::arch::{asm, global_asm, naked_asm};
+use core::fmt::Arguments;
 use core::ptr::null_mut;
 use core::sync::atomic::Ordering;
 use core::{alloc::Layout, panic::PanicInfo};
@@ -1169,7 +1171,7 @@ unsafe fn apply_relocations(slide: u64, dynamic_section: *const Elf64Dyn) {
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn rust_main(_hartid: usize, dtb: usize, serial: usize, load_addr: u64) -> ! {
+extern "C" fn rust_main(hartid: usize, dtb: usize, serial: usize, load_addr: u64) -> ! {
     unsafe {
         // 1. Sync data across cores
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
@@ -1187,7 +1189,7 @@ extern "C" fn rust_main(_hartid: usize, dtb: usize, serial: usize, load_addr: u6
 
         serial::init_serial(serial_addr as usize);
 
-        serial::println!("boot! dtb @ {dtb_addr:016X?}");
+        serial::println!("boot{hartid}! dtb @ {dtb_addr:016X?}");
 
         let (ram_base, ram_size) =
             find_ram(dtb_addr as *const u8).expect("failed to find RAM node in DTB");
@@ -1413,7 +1415,11 @@ extern "C" fn rust_main(_hartid: usize, dtb: usize, serial: usize, load_addr: u6
 
 #[panic_handler]
 fn panic_time(p: &PanicInfo) -> ! {
-    error!("{p:?}");
+    // this is unsafe
+    #[allow(unused_unsafe)]
+    unsafe {
+        serial::panic_println!("ERROR: {p:?}");
+    }
     loop {
         riscv::asm::wfi();
     }

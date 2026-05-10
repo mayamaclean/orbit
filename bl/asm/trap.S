@@ -16,11 +16,21 @@
 .set TRAPFRAME_MEPC_SAVE, 512
 
 # Per-hart M-mode trap stack slot. The 512 KiB stack region in memory.x
-# is split into one slot per hart so concurrent traps don't share sp.
-# Slot size = 128 KiB → shift 17. Hart_n's sp = _stack_end - n*128 KiB,
-# so hart 0 has the top slot; hart MAX-1 has the bottom slot adjacent
-# to .rodata (overflow there hits PMP-locked rodata once PR5 lands).
-.set HART_TRAP_STACK_SHIFT, 17
+# is split into two halves:
+#   top 256 KiB  — boot stacks  (set up by boot.S part2/part3)
+#   bottom 256 KiB — M-mode trap stacks (this layout)
+# Each hart gets a 64 KiB slot in each half; trap and boot slots for
+# the *same* hart are in different halves so an MSI taken inside
+# kinit_hart's WFI doesn't have m_trap's register-save area land on
+# top of kinit_hart's saved hartid (which used to corrupt the post-
+# mret a0 to 0 and made the secondary fall through to the primary
+# boot path in kmain `_start`).
+#
+# Hart N's trap sp = _stack_end - 0x40000 - N * 64 KiB.
+# 64 KiB → shift 16; the explicit 0x40000 sub places the trap region
+# below the boot region.
+.set HART_TRAP_STACK_SHIFT, 16
+.set HART_TRAP_STACK_BASE_OFFSET, 0x40000
 
 # Use macros for saving and restoring multiple registers
 .macro save_gp i, basereg=t6
@@ -96,14 +106,18 @@ m_trap_vector:
 	csrr	a4, mstatus
 	csrr	a5, mscratch
 
-	# Per-hart M-mode trap stack. KERNEL_STACK_END holds `_stack_end`,
-	# the top of bl's stack region. Each hart gets a 128 KiB slot
-	# (HART_TRAP_STACK_SHIFT) carved from the top down — hart 0 at
-	# _stack_end, hart 1 at _stack_end - 128 KiB, etc. Without this
-	# every hart loaded the same sp and concurrent M-mode traps raced
-	# on the shared stack frames inside Rust's m_trap.
+	# Per-hart M-mode trap stack. Trap stacks occupy the bottom half
+	# of bl's 512 KiB stack region; boot stacks live in the top half
+	# (see boot.S part3). For hart N:
+	#   sp = _stack_end - HART_TRAP_STACK_BASE_OFFSET - N * 64 KiB
+	# The base offset places the trap region 256 KiB below stack_end
+	# so it never overlaps any hart's boot stack — fixing the prior
+	# corruption where m_trap's saved s1 landed on kinit_hart's saved
+	# hartid and made the post-mret a0=0.
 	la		t0, KERNEL_STACK_END
 	ld		t0, 0(t0)
+	li		t2, HART_TRAP_STACK_BASE_OFFSET
+	sub		t0, t0, t2                        # t0 = _stack_end - 256 KiB
 	csrr	t1, mhartid
 	slli	t1, t1, HART_TRAP_STACK_SHIFT
 	sub		sp, t0, t1

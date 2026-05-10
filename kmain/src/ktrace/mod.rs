@@ -1,4 +1,7 @@
-use core::fmt::{self, Write};
+use core::{
+    fmt::{self, Write},
+    time::Duration,
+};
 
 use tracing::{Event, Id, Level, Metadata, Subscriber, field::Visit};
 
@@ -36,9 +39,10 @@ struct OrbitVisitor(pub(super) &'static str);
 impl Visit for OrbitVisitor {
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn core::fmt::Debug) {
         if field.name() == "message" {
+            let nanos = riscv::register::time::read64() * 100;
             emit(format_args!(
-                "{}t {}: {:?}\n",
-                riscv::register::time::read64(),
+                "{:.08}s {}: {:?}\n",
+                Duration::from_nanos(nanos).as_secs_f64(),
                 self.0,
                 value,
             ));
@@ -63,9 +67,10 @@ impl log::Log for OrbitLogger {
 
     fn log(&self, record: &log::Record) {
         if self.enabled(record.metadata()) {
+            let nanos = riscv::register::time::read64() * 100;
             emit(format_args!(
-                "{}t {}: {}\n",
-                riscv::register::time::read64(),
+                "{:.08}s {}: {}\n",
+                Duration::from_nanos(nanos).as_secs_f64(),
                 record.level(),
                 record.args(),
             ));
@@ -111,23 +116,28 @@ impl Write for LineBuf {
 }
 
 /// Format `args` once into a stack buffer, then emit to both the UART
-/// (via k_serial's ring once it's live, else the spinlock'd
-/// `serial::print!` fallback) and — once `k_gpu` is live — the kernel
+/// (via k_serial's ring once it's live, else the synchronous
+/// `serial::print!` path) and — once `k_gpu` is live — the kernel
 /// scrollback. Done this way so we don't double-format and so the
 /// scrollback sees exactly the bytes the user would see on UART.
+///
+/// **Post-spawn lock invariant:** once k_serial is ready it owns the
+/// UART spinlock for its lifetime — every other producer must go
+/// through the ring or it will deadlock. On ring-full we therefore
+/// drop the line rather than falling back to `serial::print!`.
 fn emit(args: fmt::Arguments<'_>) {
     let mut buf = LineBuf::new();
     let _ = buf.write_fmt(args);
     let bytes = buf.as_slice();
 
-    // UART path. Once k_serial is up, push the chunk lock-free into
-    // SERIAL_RING; the kthread drains under one lock acquire per pass
-    // so concurrent harts don't serialize on the UART. Pre-spawn (early
-    // boot) and on ring-full we fall back to the synchronous spinlock
-    // path so the line still gets out.
-    let pushed = crate::drivers::k_serial::is_ready()
-        && crate::drivers::k_serial::push_chunk(bytes);
-    if !pushed {
+    if crate::drivers::k_serial::is_ready() {
+        // Steady-state path: push to ring or drop (k_serial holds the
+        // UART lock; serial::print! would deadlock).
+        let _ = crate::drivers::k_serial::push_chunk(bytes);
+    }
+    else {
+        // Pre-spawn: lock is free, take it directly so early-boot
+        // tracing still reaches the UART.
         if let Ok(s) = core::str::from_utf8(bytes) {
             serial::print!("{}", s);
         }

@@ -19,7 +19,9 @@
 
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use orbit_core::tlb_shootdown::{ShootdownRing, drain_shootdown_ring, tlb_shootdown};
+use orbit_core::tlb_shootdown::{ShootdownEntry, ShootdownRing, drain_shootdown_ring};
+use process::AckCounter;
+use tracing::warn;
 
 use crate::kernel::context::get_hart_context;
 
@@ -116,19 +118,79 @@ pub fn broadcast(va: u64, len: u64) {
         return;
     }
     let self_id = get_hart_context().hart_id as usize;
-    let n_targets = n - 1;
-    let targets = (0..n)
-        .filter(move |&h| h != self_id)
-        .map(|h| (h, &SHOOTDOWN_RINGS[h]));
 
-    let mut hw = crate::hw::RiscvHardware;
-    // Errors are RingFull only — drop them. The orchestrator already
-    // ack-decrements failed targets so we don't deadlock; missing
-    // shootdowns mean a target hart will see a stale TLB entry until
-    // its next natural eviction. TODO: fall back to a coarser local
-    // policy (e.g., kick the receiver into a forced full-flush) once
-    // we have data showing the ring saturates in practice.
-    let _ = tlb_shootdown(n_targets, targets, va, len, &mut hw);
+    // Inlined `tlb_shootdown` orchestrator so we can spin on the ack
+    // counter ourselves and surface a warn! when the wait exceeds a
+    // threshold — diagnostics for the silent-hang scenario where a
+    // remote hart never delivers our SSWI and the manager wedges
+    // here forever (fans pegged, no logs).
+    let ack = AckCounter::new(n - 1);
+    let mut failed: u32 = 0;
+
+    for hart_id in 0..n {
+        if hart_id == self_id {
+            continue;
+        }
+        let ring: &'static ShootdownRing = &SHOOTDOWN_RINGS[hart_id];
+        match ring.push_ref() {
+            Ok(mut slot) => {
+                *slot = ShootdownEntry::Req {
+                    va,
+                    len,
+                    ack: ack.clone(),
+                };
+                drop(slot);
+                crate::supervisor_wake_hart(hart_id);
+            }
+            Err(_) => {
+                ack.decrement();
+                failed = failed.saturating_add(1);
+            }
+        }
+    }
+
+    // Spin with a stuck-detection threshold. ~1M iterations of the
+    // tight load+spin_loop on QEMU is roughly 10–50 ms of wall time —
+    // a real shootdown completes in microseconds, so anything above
+    // this is a genuine wedge worth telling about. After the first
+    // warn we keep spinning (the wedge may be transient and we can
+    // still recover) but bump the threshold geometrically so the log
+    // doesn't flood.
+    const FIRST_WARN_AT: u64 = 1_000_000;
+    let mut spins: u64 = 0;
+    let mut next_warn: u64 = FIRST_WARN_AT;
+    while ack.load() != 0 {
+        core::hint::spin_loop();
+        spins = spins.wrapping_add(1);
+        if spins == next_warn {
+            warn!(
+                "shootdown::broadcast wedged on hart {} after {} spins: \
+                 va={:#x} len={:#x} pending_acks={} failed={}",
+                self_id,
+                spins,
+                va,
+                len,
+                ack.load(),
+                failed,
+            );
+            next_warn = next_warn.saturating_mul(4);
+        }
+    }
+    if spins >= FIRST_WARN_AT {
+        warn!(
+            "shootdown::broadcast on hart {} unblocked after {} spins \
+             (va={:#x} len={:#x} failed={})",
+            self_id, spins, va, len, failed,
+        );
+    }
+
+    // Errors are RingFull only — failed targets already ack-
+    // decremented above so we don't deadlock; missing shootdowns
+    // mean a target hart will see a stale TLB entry until its next
+    // natural eviction. TODO: fall back to a coarser local policy
+    // (forced full-flush) once we have data showing the ring
+    // saturates in practice.
+    let _ = failed;
 }
 
 /// Drain the local hart's shootdown ring, executing one `sfence.vma`

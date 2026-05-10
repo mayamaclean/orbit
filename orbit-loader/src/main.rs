@@ -276,7 +276,9 @@ fn spawn_init_from_argv() {
         allowed_affinity: 0,
         affinity: 0,
         target_role: role::INHERIT,
-        _pad: 0,
+        // Init is the one process we *would* want to observe; keep it
+        // reapable.
+        flags: 0,
         request_perms: 0,
         request_allowed_perms: 0,
         cwd_vaddr: 0,
@@ -404,7 +406,7 @@ fn recv_payload(s: &Session<'_>) -> Result<(Vec<u8>, String), LoaderErr> {
 fn drain_some(s: &Session<'_>, out: &mut Vec<u8>) -> Result<(), LoaderErr> {
     let mut tmp = [0u8; 128 * 1024];
     let n = s
-        .read_some_with_poll_timeout(&mut tmp, 100)
+        .read_some_with_poll_timeout(&mut tmp, 25)
         .map_err(LoaderErr::NetCh)?;
     out.extend_from_slice(&tmp[..n]);
     Ok(())
@@ -463,7 +465,14 @@ fn spawn(body_only: &[u8]) -> Result<u16, LoaderErr> {
         // INHERIT keeps loader's role + perms verbatim. A future
         // signed-manifest path would name a concrete RoleId here.
         target_role: role::INHERIT,
-        _pad: 0,
+        // Detach: orbit-loader is fire-and-forget per network payload
+        // and never `wait_pid`s its children. Without this, every
+        // payload exit accumulates an entry in the loader's
+        // `dead_children` map (BTreeMap<u16, i32>), which under
+        // long-running stress (eza_stress.py) grows the kernel-heap
+        // allocations indefinitely and was the trigger for the
+        // jump-through-bad-fnptr fault inside the BTreeMap insert path.
+        flags: CreateProcessV2Args::DETACH,
         request_perms: 0,
         request_allowed_perms: 0,
         cwd_vaddr: 0,

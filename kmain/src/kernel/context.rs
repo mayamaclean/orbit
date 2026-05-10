@@ -5,7 +5,7 @@ use core::sync::atomic::Ordering;
 use device::{HartContext, TRAP_STACK_SIZE};
 use process::{FaultInfo, Thread, ThreadState};
 use riscv::register::sstatus::SPP;
-use tracing::{error};
+use tracing::error;
 
 use crate::kernel::user_trap_frame_vaddr;
 

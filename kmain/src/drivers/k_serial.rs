@@ -23,7 +23,10 @@
 //! `serial::print!` directly via the `is_ready` check — there's no
 //! kthread to drain the ring during that window.
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::{
+    fmt::Write,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use process::ThreadState;
 use thingbuf::StaticThingBuf;
@@ -54,7 +57,10 @@ pub struct SerialChunk {
 
 impl Default for SerialChunk {
     fn default() -> Self {
-        Self { len: 0, bytes: [0u8; CHUNK_BYTES] }
+        Self {
+            len: 0,
+            bytes: [0u8; CHUNK_BYTES],
+        }
     }
 }
 
@@ -112,7 +118,7 @@ pub extern "C" fn k_serial(_a0: usize) {
     info!("k_serial: ready");
     mark_ready();
 
-    unsafe { serial::acquire_serial() };
+    let mut uart = unsafe { serial::acquire_serial() };
     loop {
         unsafe {
             riscv::register::sstatus::clear_sie();
@@ -128,7 +134,9 @@ pub extern "C" fn k_serial(_a0: usize) {
             // On a non-UTF-8 chunk we drop the line — that's a bug
             // at the call site, not something to paper over here.
             if let Ok(s) = core::str::from_utf8(bytes) {
-                unsafe { serial::print_no_crit(format_args!("{s}")) };
+                unsafe {
+                    let _ = uart.assume_init_mut().write_str(s);
+                }
             }
         }
 
@@ -144,7 +152,6 @@ pub extern "C" fn k_serial(_a0: usize) {
     // fatal-error branch is added later.
     #[allow(unreachable_code)]
     unsafe {
-        serial::release_serial();
         exit_thread_with_state(ThreadState::Exited)
     };
 }

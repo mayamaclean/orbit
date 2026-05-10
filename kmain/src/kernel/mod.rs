@@ -1508,7 +1508,7 @@ impl Orbit {
     }
 
     fn run_close_req(&mut self, req: CloseHandleReq, pid: u16, root_pa: PhysAddr) -> isize {
-        info!("handling close req: {req:?}");
+        trace!("handling close req: {req:?}");
 
         // Look up the handle, revoke if Shared, then drop the Arc.
         // k_net may still hold a clone; the backing lives until it's
@@ -2154,7 +2154,7 @@ impl Orbit {
         {
             of.dir_cursor = next_cursor;
         }
-        info!(
+        trace!(
             "fs_readdir: pid={pid} fd={} ino={inode} cursor={cursor}->{next_cursor} bytes={written}",
             req.fd
         );
@@ -3080,6 +3080,11 @@ impl Orbit {
             proc.sgid = child_sgid;
             proc.login_name = child_login;
             proc.groups = child_groups;
+            // Detach: parent skips both exit_waiter signal and
+            // dead_children stash on this child's exit. Used by
+            // fire-and-forget spawners (orbit-loader) so a long-lived
+            // parent doesn't accumulate per-spawn exit-code entries.
+            proc.detached = (args.flags & orbit_abi::perms::CreateProcessV2Args::DETACH) != 0;
         }
         let perms_snapshot = child_perms.permissions();
         let tids: alloc::vec::Vec<u32> = self
@@ -3330,6 +3335,14 @@ impl Orbit {
             core::ptr::read_volatile(win.as_mut_ptr().add(page_off) as *const u32)
         };
         if observed != req.expected {
+            // Diagnostic for the eza-stress heap-corruption hypothesis:
+            // log every EAGAIN with full context so we can correlate
+            // with user-side mutex state when something goes wrong.
+            info!(
+                "futex_wait: tid={tid} pid={pid} pa={pa:#x} expected={} observed={} \
+                 action=EAGAIN",
+                req.expected, observed,
+            );
             self.publish_pending_for_tid(tid, &[Errno::new(EAGAIN).to_ret()]);
             return;
         }
@@ -3341,10 +3354,15 @@ impl Orbit {
             pid,
             deadline_ticks: 0,
         };
-        self.futex_waiters.entry(pa).or_default().push(waiter);
-        trace!(
-            "futex_wait: pid={pid} tid={tid} pa={pa:#x} expected={}",
-            req.expected
+        let n_after = {
+            let q = self.futex_waiters.entry(pa).or_default();
+            q.push(waiter);
+            q.len()
+        };
+        info!(
+            "futex_wait: tid={tid} pid={pid} pa={pa:#x} expected={} observed={} \
+             action=install waiters_after={n_after}",
+            req.expected, observed,
         );
     }
 
@@ -3354,31 +3372,53 @@ impl Orbit {
     /// of waiters woken (or a negative errno on translation failure).
     /// The caller arm in `drain_pending_work` then resumes the
     /// wake-caller's parked thread via the same helper with the count.
-    fn run_futex_wake_req(&mut self, req: FutexWakeReq, _pid: u16, root_pa: PhysAddr) -> isize {
+    fn run_futex_wake_req(
+        &mut self,
+        req: FutexWakeReq,
+        caller_pid: u16,
+        root_pa: PhysAddr,
+    ) -> isize {
         let root_table = unsafe { memmap::kernel_root_from_pa(root_pa) };
         let pa =
             match unsafe { mmu::mmap::virt_to_phys(&root_table, VirtAddr::new(req.uaddr.raw())) } {
                 Some(p) => p as u64,
                 None => return Errno::new(EFAULT).to_ret(),
             };
+        // Read *uaddr too — same diagnostic shape as futex_wait. If
+        // the user's mutex protocol is broken (e.g. unlock writes
+        // didn't reach the kernel before the wake), comparing the
+        // observed word against what the unlocker thought it wrote
+        // would catch it.
+        let page_pa = pa & !(PAGE_SIZE as u64 - 1);
+        let page_off = (pa - page_pa) as usize;
+        let observed = unsafe {
+            let mut win = crate::kernel::user_page::UserPageWindow::map(page_pa, PAGE_SIZE);
+            core::ptr::read_volatile(win.as_mut_ptr().add(page_off) as *const u32)
+        };
+        let mut drained_tids: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
         let n_woken = match self.futex_waiters.get_mut(&pa) {
             Some(waiters) => {
                 let take = core::cmp::min(req.n as usize, waiters.len());
                 // Drain from the front so wake order matches park
                 // order (FIFO). Since waiters are pushed at the tail
                 // in `run_futex_wait_req`, the oldest is at index 0.
-                let drained: Vec<FutexWaiter> = waiters.drain(..take).collect();
+                let drained: alloc::vec::Vec<FutexWaiter> = waiters.drain(..take).collect();
                 if waiters.is_empty() {
                     self.futex_waiters.remove(&pa);
                 }
                 for w in drained {
+                    drained_tids.push(w.tid);
                     self.publish_pending_for_tid(w.tid, &[0]);
                 }
                 take as isize
             }
             None => 0,
         };
-        trace!("futex_wake: pa={pa:#x} requested={} woke={n_woken}", req.n);
+        info!(
+            "futex_wake: caller_pid={caller_pid} pa={pa:#x} observed={observed} \
+             requested={} drained={drained_tids:?} n_woken={n_woken}",
+            req.n,
+        );
         n_woken
     }
 
@@ -3388,7 +3428,7 @@ impl Orbit {
         pid: u16,
         parent_allowed: u64,
     ) -> isize {
-        info!("handling create_thread req: {req:?} pid={pid} parent_allowed={parent_allowed:#x}");
+        trace!("handling create_thread req: {req:?} pid={pid} parent_allowed={parent_allowed:#x}");
 
         let all_harts = self.all_harts_mask();
         // Resolve sentinels exactly like create_process: 0 → "default."
@@ -3453,7 +3493,7 @@ impl Orbit {
                         return Errno::new(EAGAIN).to_ret();
                     }
                 };
-                info!(
+                trace!(
                     "create_thread: spawned tid={new_tid} in pid={pid} \
                     allowed={allowed:#x} affinity={affinity:#x}"
                 );
@@ -4703,7 +4743,21 @@ impl Orbit {
         //     parent can park.
         //  3. No parent (boot init) or parent already gone → drop
         //     the exit code on the floor.
-        if let Some(waiter_tid) = process.exit_waiter.take() {
+        //  4. Detached child (`Process.detached`) → behave like (3)
+        //     unconditionally. The parent opted out of observing this
+        //     child's exit at spawn time via `CREATE_PROCESS_V2`'s
+        //     `DETACH` flag, so we skip both the exit_waiter notify
+        //     and the dead_children insert. Without this opt-out, a
+        //     long-lived parent like orbit-loader accumulates one
+        //     dead_children entry per network payload spawn — under
+        //     stress (eza_stress.py) the BTreeMap insert path was the
+        //     trigger for the jump-through-bad-fnptr fault we chased.
+        if process.detached {
+            // Belt-and-suspenders: clear exit_waiter so a stale value
+            // doesn't get signaled later by some other path.
+            process.exit_waiter = None;
+        }
+        else if let Some(waiter_tid) = process.exit_waiter.take() {
             self.publish_pending_for_tid(waiter_tid, &[0, process.exit_code as isize]);
         }
         else if process.parent_pid != 0
@@ -4805,7 +4859,7 @@ impl Orbit {
         }
 
         while let Some(b) = process.heap_pages.pop() {
-            info!(
+            debug!(
                 "dealloc heap page pa@{:016X} {:08X?} pool={}",
                 b.pa().get_raw(),
                 b.layout(),
@@ -4904,9 +4958,69 @@ impl Orbit {
                                 Some(_) => "permission/range violation",
                                 None => "bad access",
                             };
+                            // Diagnostic context for the eza-lahR
+                            // cross-thread-stale-pointer hypothesis:
+                            // log own slot, sp + ra at fault, the slot
+                            // index that *would* contain stval if it
+                            // points into the per-thread stack region,
+                            // and the live sibling tids/slots in the
+                            // same process at the moment of fault.
+                            let own_slot = t.slot;
+                            let sp_at_fault = t.frame.regs[2];
+                            let ra_at_fault = t.frame.regs[1];
+                            let stval_slot = if (f.stval as u64) >= UPROC_STACK_BASE
+                                && (f.stval as u64) < UPROC_STACK_BASE + 256 * UPROC_STACK_STRIDE
+                            {
+                                Some(
+                                    ((f.stval as u64 - UPROC_STACK_BASE) / UPROC_STACK_STRIDE)
+                                        as u16,
+                                )
+                            }
+                            else {
+                                None
+                            };
+                            let mut siblings: alloc::string::String = alloc::string::String::new();
+                            {
+                                use core::fmt::Write as _;
+                                let _ = write!(&mut siblings, "[");
+                                let mut first = true;
+                                for &sib_tid in proc.threads.iter() {
+                                    if sib_tid == t.tid {
+                                        continue;
+                                    }
+                                    let sib_slot = self.threads.get(&sib_tid).and_then(|p| {
+                                        unsafe { (p.0 as *const Thread).as_ref() }
+                                            .and_then(|t| t.slot)
+                                    });
+                                    if !first {
+                                        let _ = write!(&mut siblings, ",");
+                                    }
+                                    first = false;
+                                    match sib_slot {
+                                        Some(s) => {
+                                            let _ =
+                                                write!(&mut siblings, "tid{}=slot{}", sib_tid, s);
+                                        }
+                                        None => {
+                                            let _ = write!(&mut siblings, "tid{}=?", sib_tid);
+                                        }
+                                    }
+                                }
+                                let _ = write!(&mut siblings, "]");
+                            }
                             warn!(
-                                "tid{} killed: {} cause={} epc={:#x} stval={:#x}",
-                                t.tid, label, f.cause, f.epc, f.stval
+                                "tid{} killed: {} cause={} epc={:#x} stval={:#x} \
+                                 own_slot={:?} sp={:#x} ra={:#x} stval_slot={:?} siblings={}",
+                                t.tid,
+                                label,
+                                f.cause,
+                                f.epc,
+                                f.stval,
+                                own_slot,
+                                sp_at_fault,
+                                ra_at_fault,
+                                stval_slot,
+                                siblings,
                             );
                             // Faulted threads carry no clean exit
                             // value; surface as -1 to wait_pid waiters.
@@ -4917,7 +5031,7 @@ impl Orbit {
                         }
                         None => {
                             let status = t.frame.regs[11] as isize;
-                            info!("tid{} dead, removing status={status}", t.tid);
+                            debug!("tid{} dead, removing status={status}", t.tid);
                             // exit-group: the EXIT-caller already
                             // stamped `exit_code` with the value it
                             // passed; sibling threads reaped after it
@@ -4936,7 +5050,7 @@ impl Orbit {
                 }
             }
 
-            info!("pid{} dead, removing", t.pid);
+            debug!("pid{} dead, removing", t.pid);
 
             pids_to_remove.push(t.pid);
         }
@@ -5602,7 +5716,7 @@ impl Orbit {
         // or move this to a pool
         let t = Box::new(thread);
         let tptr = Box::into_raw(t);
-        info!("created uthread@{tptr:016X?},pid={pid},tid={tid},table={rpt:016X?}");
+        debug!("created uthread@{tptr:016X?},pid={pid},tid={tid},table={rpt:016X?}");
 
         let owning_process = self.processes.get_mut(&pid).unwrap();
 
@@ -5862,7 +5976,7 @@ impl Orbit {
         frame.regs[10] = arg;
         frame.asid = pid as usize;
 
-        info!(
+        debug!(
             "ventry={:016X?},vsp=0x{:016X?},vtp=0x{:016X?},rpt_pa={:016X?}",
             entrypoint,
             frame.regs[2],
@@ -6211,7 +6325,7 @@ impl Orbit {
                 continue;
             }
 
-            info!("loading {segment:08x?}");
+            trace!("loading {segment:08x?}");
 
             let segment_data = match elf.segment_data(&segment) {
                 Ok(seg) => seg,
@@ -6349,7 +6463,7 @@ impl Orbit {
                 memsz: segment.p_memsz as usize,
                 align: segment.p_align as usize,
             });
-            info!(
+            trace!(
                 "elf PT_TLS: filesz=0x{:X} memsz=0x{:X} align=0x{:X}",
                 segment.p_filesz, segment.p_memsz, segment.p_align,
             );

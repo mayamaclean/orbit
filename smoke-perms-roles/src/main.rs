@@ -178,7 +178,7 @@ pub extern "C" fn main() -> i32 {
         allowed_affinity: 0,
         affinity: 0,
         target_role: role::WORKER,
-        _pad: 0,
+        flags: 0,
         request_perms: class::raw::ALL,
         request_allowed_perms: class::raw::ALL,
         // No cwd / argv / envp override — child inherits parent's

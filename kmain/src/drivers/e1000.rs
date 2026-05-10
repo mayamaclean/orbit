@@ -49,12 +49,27 @@ fn kdmap_ptr_to_phys<T>(p: *const T) -> u64 {
 
 const SW_MTU: usize = 2048;
 
-pub const TX_RING_LEN: usize = 8;
+// Ring depths are load-bearing for TCP throughput on bursty senders. With
+// only 8 descriptors (~11 KiB queue at MSS=1446) Linux's initial cwnd of
+// 10 segments alone overflows the queue — frames get dropped at the
+// device, host's TCP enters loss recovery, and we hit multi-second stalls
+// that look like zero-window stalls but are actually downstream of packet
+// loss. See the smoltcp issue thread on "ideal buffer size" for the same
+// pathology in the upstream community. The fix is paired with
+// `caps.max_burst_size = Some(RX_RING_LEN)` below: smoltcp clamps the
+// advertised TCP window to `max_burst_size * MSS`, which means the peer
+// can never have more in-flight than our device queue can absorb.
+//
+// 256 descriptors → ~370 KiB queueable + ~370 KiB advertised window. Plenty
+// for Linux's slow-start + steady-state burst sizes on loopback. Memory
+// cost is `SW_MTU * RX_RING_LEN` per direction = 512 KiB rx + 512 KiB tx
+// of DMA-mapped buffer space.
+pub const TX_RING_LEN: usize = 256;
 pub const TX_RING_BYTES: usize = round_usize_up(TX_RING_LEN * size_of::<TxDesc>(), PAGE_SIZE);
 pub const TX_RING_PAGES: usize = TX_RING_BYTES / PAGE_SIZE;
 pub const TX_RING_BUFS_BYTES: usize = round_usize_up(SW_MTU * TX_RING_LEN, PAGE_SIZE);
 
-pub const RX_RING_LEN: usize = 8;
+pub const RX_RING_LEN: usize = 256;
 pub const RX_RING_BYTES: usize = round_usize_up(RX_RING_LEN * size_of::<RxDesc>(), PAGE_SIZE);
 pub const RX_RING_PAGES: usize = RX_RING_BYTES / PAGE_SIZE;
 pub const RX_RING_BUFS_BYTES: usize = round_usize_up(SW_MTU * RX_RING_LEN, PAGE_SIZE);
@@ -499,6 +514,14 @@ impl smoltcp::phy::Device for E1000 {
         let mut caps = DeviceCapabilities::default();
         caps.medium = Medium::Ethernet;
         caps.max_transmission_unit = 1500;
+        // Cap smoltcp's advertised TCP window at `max_burst_size * MSS`
+        // bytes, matching what our RX descriptor ring can actually absorb
+        // before dropping frames. Without this, a large rx_buffer makes
+        // smoltcp advertise a window much bigger than the device queue,
+        // and the peer's burst overflows it — the exact pathology the
+        // smoltcp maintainer flagged in the "ideal buffer size" issue.
+        // Sized to RX_RING_LEN so peer's in-flight bytes ≤ device queue.
+        caps.max_burst_size = Some(RX_RING_LEN);
         caps.checksum.icmpv4 = Checksum::Both;
         caps.checksum.ipv4 = Checksum::Both;
         caps.checksum.tcp = Checksum::Both;

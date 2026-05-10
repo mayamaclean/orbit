@@ -4,6 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-net_channel = {path = "../net_channel" }
+net_channel = {path = "../net_channel", default-features = false }
 orbit-abi   = {path = "../orbit-abi" }
 orbit-rt    = {path = "../orbit-rt" }

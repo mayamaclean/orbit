@@ -38,9 +38,9 @@ full-runtime = ["dep:mem"]
 # Same crate std-on-orbit's PAL allocator uses (see
 # rust/library/std/src/sys/alloc/orbit.rs), so the runtime story is
 # consistent across no_std and std user code.
-dlmalloc = { version = "0.2.10", default-features = false }
+dlmalloc = { version = "0.2.10", default-features = false, features = [] }
 orbit-abi = { path = "../orbit-abi" }
-net_channel = { path = "../net_channel" }
+net_channel = { path = "../net_channel", default-features = false, features = [] }
 # `alloc` feature pulls in the buddy `FrameAllocator` we use to track
 # user-controlled VAs in the kernel-shared range. Optional + gated
 # behind `full-runtime` so std-on-orbit's build (which sets

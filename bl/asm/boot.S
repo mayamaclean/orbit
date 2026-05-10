@@ -92,13 +92,22 @@ part3:
 	# We only use additional harts to run user-space programs, although this may
 	# change.
 
-	# We divide up the stack so the harts aren't clobbering one another.
-	# 128 KiB per hart matches the M-mode trap stack slot size in trap.S
-	# (HART_TRAP_STACK_SHIFT = 17). Keeping boot and trap stack slots
-	# the same size means the boot stack a hart uses in part3/kinit_hart
-	# can't drift into a different hart's trap-stack slot.
+	# 512 KiB stack region split: top 256 KiB = boot stacks (64 KiB ×
+	# 4 harts), bottom 256 KiB = M-mode trap stacks (mirror layout in
+	# trap.S). Pre-split, both used `_stack_end - mhartid * 128 KiB` —
+	# kinit_hart's frame and m_trap's register-save area landed at the
+	# *same* address, so an MSI taken inside kinit_hart's WFI clobbered
+	# kinit_hart's saved `hartid` (offset 0x18 from frame top) with
+	# m_trap's saved s1, leaving the post-mret `ld a0, 0x8(sp)` to load
+	# 0 instead of mhartid. The kernel's `_start` then mistreated the
+	# secondary as hart 0.
+	#
+	# Layout for hart N (N=0..3):
+	#   boot sp = _stack_end - N * 64 KiB        (top-down in upper half)
+	#   trap sp = _stack_end - 0x40000 - N * 64 KiB  (top-down in lower half)
+	# 64 KiB matches HART_TRAP_STACK_SHIFT = 16 in trap.S.
 	la		sp, _stack_end
-	li		t0, 0x20000
+	li		t0, 0x10000           # 64 KiB
 	csrr	a0, mhartid
 	mul		t0, t0, a0
 	sub		sp, sp, t0

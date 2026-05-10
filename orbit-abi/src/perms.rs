@@ -422,9 +422,13 @@ pub struct CreateProcessV2Args {
     /// `role_denials` counter, and the syscall returns `-EPERM` —
     /// no child is created.
     pub target_role: role::RoleId,
-    /// Reserved — must be zero. Pinning the alignment without an
-    /// implicit padding slot keeps the wire shape grep-able.
-    pub _pad: u32,
+    /// Bitfield of behavioral flags for the spawn. Currently only
+    /// [`Self::DETACH`] is defined; remaining bits MUST be zero.
+    /// Repurposed from a former `_pad: u32` slot — same offset, same
+    /// natural-alignment role, just now carrying meaning. Wire-compat
+    /// with old callers that zeroed `_pad` is preserved (zero flags ==
+    /// today's behavior).
+    pub flags: u32,
     /// Caller-requested narrowing of the child's effective perms.
     /// Intersected with the role default + parent's allowed_perms.
     pub request_perms: u64,
@@ -543,6 +547,21 @@ impl CreateProcessV2Args {
     /// callers MUST use this (the kernel rejects any non-inherit value
     /// from a non-LOADER caller with `-EPERM`).
     pub const INHERIT_ID: i64 = -1;
+
+    /// [`Self::flags`] bit: spawn the child detached. The kernel skips
+    /// stashing this child's exit code in the parent's `dead_children`
+    /// map and skips signaling any `exit_waiter` the parent might
+    /// install — the child fully self-reaps and the parent has no way
+    /// to observe its exit. Used by orbit-loader (and any other
+    /// fire-and-forget spawner) so a long-lived parent doesn't
+    /// accumulate per-iteration exit-code state across thousands of
+    /// child spawns.
+    ///
+    /// `wait_pid` from the parent on a detached child's pid is a no-op
+    /// (returns `ECHILD` once the child has exited); callers that need
+    /// to observe completion must use a different mechanism (futex on
+    /// shared memory, NetCh, etc.) or omit the flag.
+    pub const DETACH: u32 = 1 << 0;
 
     /// Typed view of the request masks, for the kernel-side
     /// `derive_child_perms` clamp.

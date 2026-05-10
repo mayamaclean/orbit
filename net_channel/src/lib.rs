@@ -29,7 +29,7 @@ use smoltcp::socket::tcp::State as TcpState;
 use smoltcp::{iface::Interface, wire::IpAddress};
 
 #[cfg(feature = "kernel")]
-use tracing::{error, info};
+use tracing::{error, info, trace};
 
 /// Mutable view into a region of shared memory handed to `send_tcp`'s
 /// closure. Writes go through [`core::ptr::write_volatile`], which
@@ -274,10 +274,10 @@ pub const NC_TX_OFF: usize = 384;
 /// (roughly ~1.7 KiB).
 pub const NC_MIN_REGION_SIZE: usize = 4096;
 
-/// Maximum region size. Cap at 256 KiB so misbehaving umode can't demand an
+/// Maximum region size. Cap at 8 MiB so misbehaving umode can't demand an
 /// arbitrarily large kernel-side Shared allocation. Per-ring usable payload
-/// at the cap is ~127 KiB.
-pub const NC_MAX_REGION_SIZE: usize = 256 * 1024;
+/// at the cap is ~4 MiB.
+pub const NC_MAX_REGION_SIZE: usize = 8 * 1024 * 1024;
 
 // Compile-time checks so layout invariants fail the build, not the boot.
 // If these fire, `NC_TX_OFF` / `NetChannelQueue` layout / min-region math
@@ -1221,7 +1221,7 @@ impl NetChannel {
                     ctx.pending_rx_ack = false;
                 }
 
-                if rx.slices_is_empty() && !ctx.pending_rx_ack {
+                if !ctx.pending_rx_ack {
                     let next_rx = socket.get_next_rx();
                     if next_rx.1 > 0 {
                         // SAFETY: kernel is the sole producer of rx.slices.

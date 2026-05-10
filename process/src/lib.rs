@@ -590,6 +590,15 @@ pub struct Process {
     /// parent itself exits. Closes the wait_pid race when the child
     /// exits before the parent has a chance to park.
     pub dead_children: BTreeMap<u16, i32>,
+    /// `true` when this process was spawned with the
+    /// [`CreateProcessV2Args::DETACH`] flag. The exit path for a
+    /// detached process skips both the `exit_waiter` notify and the
+    /// parent-side `dead_children` insert, so a long-lived parent
+    /// (orbit-loader) doesn't accumulate per-spawn exit-code entries
+    /// across thousands of fire-and-forget children. Once the process
+    /// is reaped its identity is forgotten; a parent-side `wait_pid`
+    /// will see `ECHILD` and not block.
+    pub detached: bool,
     /// §13a.3 argv blob backing — `Some` when the process was
     /// spawned via `CREATE_PROCESS_EX` with non-empty argv. The
     /// kernel maps this single page R+U+S at
@@ -742,6 +751,7 @@ impl Process {
             exit_finalized: false,
             exit_waiter: None,
             dead_children: BTreeMap::new(),
+            detached: false,
             argv_blob: None,
             envp_blob: None,
             state: ProcessState::Running,

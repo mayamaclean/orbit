@@ -12,3 +12,5 @@ orbit-loader/tools/__pycache__/
 rootfs/bin/console
 rootfs/bin/smoke
 rootfs/bin/hello-std
+
+runs/

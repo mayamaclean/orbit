@@ -406,7 +406,7 @@ fn exec_path(line: &str) {
         // the fork-shaped semantic shells expect. Role-aware spawn
         // surfaces would name a concrete RoleId here.
         target_role: role::INHERIT,
-        _pad: 0,
+        flags: 0,
         request_perms: 0,
         request_allowed_perms: 0,
         cwd_vaddr: 0,

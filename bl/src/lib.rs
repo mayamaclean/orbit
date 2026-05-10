@@ -4,7 +4,6 @@ use core::arch::asm;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use device::{SysInfo, TrapFrame, wake_hart};
-use mmu::MB;
 use serial::println;
 
 use elf::endian::LittleEndian;
@@ -87,6 +86,7 @@ pub fn setup_interrupts() {
         medeleg::set_load_misaligned();
         medeleg::set_store_fault();
         medeleg::set_store_misaligned();
+        medeleg::set_load_fault()
     }
 }
 
@@ -188,7 +188,7 @@ pub extern "C" fn kmain_enter(serial_addr: usize, dtb_addr: usize) {
         }
     };
 
-    const VBASE: u64 = 0x8000_0000 + (64 * MB);
+    const VBASE: u64 = 0x8000_0000 + (64 * 1024 * 1024);
 
     let segments = elf.segments().unwrap();
     for segment in segments.iter() {

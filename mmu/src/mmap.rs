@@ -170,8 +170,7 @@ pub unsafe fn walk_to_table_materialize<'a, 'p>(
     pages: &mut PageAlloc<'p>,
     vaddr: VirtAddr,
     target_level: Level,
-    #[allow(unused_variables)]
-    log: bool,
+    #[allow(unused_variables)] log: bool,
 ) -> Result<&'a PageTable, ()> {
     let mut table = root.table;
     for lvl in ((target_level + 1)..=3).rev() {
@@ -248,7 +247,7 @@ pub unsafe fn map_address_page<'a>(
 
     let idx = config.vaddr.vpn_n(target_level as usize) as usize;
     let pte = &table.entries[idx];
-    
+
     if pte.is_valid() {
         #[cfg(feature = "alloc")]
         if config.log {
@@ -347,9 +346,7 @@ pub unsafe fn map_address_range<'a>(
 
     #[cfg(feature = "alloc")]
     if config.log {
-        trace!(
-            "map range: p0x{pstart:016X?}..p0x{pend:016X?}, v0x{vstart:016X?}..v0x{vend:016X?}"
-        );
+        trace!("map range: p0x{pstart:016X?}..p0x{pend:016X?}, v0x{vstart:016X?}..v0x{vend:016X?}");
     }
 
     let vlen = vend - vstart;

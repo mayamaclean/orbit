@@ -5,3 +5,5 @@ edition = "2024"
 
 [dependencies]
 ns16550a = "0.5.0"
+riscv = { version = "0.16.0" }
+spin = { version = "0.10", default-features = false, features = ["spin_mutex", "once"] }

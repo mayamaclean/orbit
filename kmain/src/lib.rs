@@ -4,7 +4,6 @@ extern crate alloc;
 
 use crate::kernel::{shared_user_ptr::SharedUserPtr, shootdown::CPU_COUNT};
 use alloc::{collections::btree_map::BTreeMap, vec::Vec};
-use tracing::trace;
 use core::{
     arch::asm,
     ptr::null_mut,
@@ -16,9 +15,10 @@ use orbit_abi::{layout::UserVa, perms::Permissions};
 use process::{Thread, ThreadState};
 use smoltcp::{
     iface::{PollResult, SocketHandle, SocketSet},
-    socket::dhcpv4,
+    socket::{dhcpv4, tcp::CongestionControl},
     storage::RingBuffer,
 };
+use tracing::trace;
 
 use crate::{
     drivers::e1000::E1000,
@@ -136,7 +136,7 @@ pub fn kick_machine_harts(hart_count: usize) {
 }
 
 pub fn supervisor_wake_hart(hart: usize) {
-    trace!("hart{} sending wake ipi to hart{hart}", get_hart_context().hart_id);
+    //trace!("hart{} sending wake ipi to hart{hart}", get_hart_context().hart_id);
     write_sswi(hart, 1);
 }
 
@@ -546,8 +546,25 @@ pub extern "C" fn k_net(device: *mut NetPackage) {
             if let Some(nc) = req.netchan.try_as_ref() {
                 if req.nc_type == 0 {
                     let socket = sockets.get_mut::<smoltcp::socket::tcp::Socket>(*sock_handle);
+                    let pre_recv_queue = socket.recv_queue();
                     let (iface_back, outcome) = nc.update_tcp(iface, socket, &mut req.ctx, now_us);
                     iface = iface_back;
+
+                    // Re-poll if any data is in flight OR if update_tcp advanced
+                    // smoltcp's read pointer (drained any increment). The drain
+                    // case is the one that bites: socket.recv() inside update_tcp
+                    // frees window space internally, but smoltcp won't emit the
+                    // window-update segment until iface.poll runs again. Without
+                    // this, drain-but-no-new-data cycles wait the full ~100ms
+                    // heartbeat for the window-update to go on the wire, gating
+                    // every round-trip on the heartbeat instead of the wake chain.
+                    if socket.recv_queue() > 0
+                        || socket.send_queue() > 0
+                        || socket.recv_queue() != pre_recv_queue
+                    {
+                        do_second_poll = true;
+                    }
+
                     // If the user-visible state of the channel just
                     // changed (state byte moved, fresh rx slice staged,
                     // tx slice freed), push a WakeEvent so the manager
@@ -650,7 +667,11 @@ pub extern "C" fn k_net(device: *mut NetPackage) {
                     // before its RTO doubles to noticeable territory,
                     // long enough to not flood normal traffic with
                     // probes (steady-state ACKs reset the timer anyway).
-                    sock.set_keep_alive(Some(smoltcp::time::Duration::from_millis(1000)));
+                    sock.set_keep_alive(Some(smoltcp::time::Duration::from_millis(5000)));
+                    sock.set_ack_delay(None);
+                    sock.set_nagle_enabled(true);
+                    sock.set_congestion_control(CongestionControl::Cubic);
+
                     let handle = sockets.add(sock);
 
                     info!("net: created tcp socket: {handle:?}");
