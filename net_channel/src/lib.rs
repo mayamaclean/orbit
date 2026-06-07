@@ -677,7 +677,7 @@ fn schedule_retry(ctx: &mut ChannelCtx, now_us: u64) {
 ///
 /// Sized to match the e1000 RX ring (8 descriptors): a PLIC IRQ batch
 /// can land 8 frames into smoltcp at once, and we want the staging path
-/// to absorb that without forcing a `nc_yield` round-trip per frame.
+/// to absorb that without forcing a `ch_yield` round-trip per frame.
 /// N=16 → capacity 15 (one slot reserved for the empty/full sentinel),
 /// so up to 15 staged slices in flight before the user has to wait on
 /// the kernel to drain.
@@ -723,6 +723,15 @@ impl NetChannelQueue {
 
     pub fn slices_is_empty(&self) -> bool {
         self.slices.is_empty()
+    }
+
+    /// `true` when the slice ring is full and a producer would block
+    /// on the next `enqueue_slice`. Used by selector-style readiness
+    /// scans to determine if the queue is currently writable without
+    /// issuing a syscall — pure shared-memory load against the SPSC
+    /// head/tail indices.
+    pub fn slices_is_full(&self) -> bool {
+        self.slices.is_full()
     }
     pub fn slices_len(&self) -> usize {
         self.slices.len()

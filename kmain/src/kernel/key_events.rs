@@ -7,7 +7,7 @@
 //! handler.
 //!
 //! Wake mechanism is the wake_override-via-`WAKE_QUEUE` shape, same as
-//! `nc_yield` and `update_tcp` use for net I/O. See
+//! `ch_yield` and `update_tcp` use for net I/O. See
 //! [`process::ProcessKeyEvents`] for the producer/consumer ordering
 //! contract.
 

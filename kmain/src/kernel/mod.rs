@@ -23,19 +23,20 @@ use process::{
 };
 
 use orbit_abi::errno::{
-    EAGAIN, EBADF, EFAULT, EINVAL, EIO, ENOEXEC, ENOMEM, ENOTDIR, EPERM, ESRCH, Errno,
+    EAGAIN, EBADF, EFAULT, EINVAL, EIO, EMFILE, ENOEXEC, ENOMEM, ENOTDIR, EPERM, ESRCH, Errno,
 };
 use orbit_core::ready_queue::ReadyQueue;
 use orbit_core::sleep_heap::SleepHeap;
 use orbit_core::{
-    CloseHandleReq, CreateProcessExReq, CreateProcessReq, CreateThreadReq, FbSurfaceCreateReq,
-    FbSurfaceDestroyReq, FsOpenReq, FsReadReq, FsReaddirReq, FsStatReq, FutexWaitReq, FutexWakeReq,
-    MAX_FS_PATH_LEN, MemMapReq, NetChannelCreationReq, PendingWork, WaitPidReq,
+    CloseHandleReq, CreateProcessExReq, CreateProcessReq, CreateThreadReq, EventFdCreateReq,
+    FbSurfaceCreateReq, FbSurfaceDestroyReq, FsOpenReq, FsReadReq, FsReaddirReq, FsStatReq,
+    FutexWaitReq, FutexWakeReq, MAX_FS_PATH_LEN, MemMapReq, NetChannelCreationReq, PendingWork,
+    WaitPidReq, WakeTidReq,
 };
 use thingbuf::StaticThingBuf;
 
 use crate::kernel::fs::FsErr;
-use crate::kernel::handle::{Handle, OpenFile, ProcessHandles};
+use crate::kernel::handle::{EventFdSlot, Handle, OpenFile, ProcessHandles};
 use crate::kernel::memmap::FrameToKdmap;
 use crate::kernel::shared_user_ptr::SharedUserPtr;
 use riscv::register::satp::{Mode, Satp};
@@ -1437,6 +1438,18 @@ impl Orbit {
         let vend = VirtAddr::new(req.nc_vaddr.raw() + region_size as u64);
         let pend = PhysAddr::new(frame.get_raw() + region_size as u64);
 
+        // Existence check *before* the mapping: the manager holds
+        // MANAGER_LOCK for this whole handler, so a process that's alive
+        // here stays alive through the install below. Mapping first would
+        // leave a recycled frame mapped R/W/U in a dead process's PT on
+        // this early return (SharedInner::drop only enqueues the frame,
+        // it never revokes the PTEs).
+        if !self.processes.contains_key(&pid) {
+            warn!("nc create: no owning process {req:?}");
+            self.kernel_pages.free(frame, layout);
+            return (Errno::new(ESRCH).to_ret(), 0);
+        }
+
         unsafe {
             let root_table = memmap::kernel_root_from_pa(root_pa);
             let mut pages = PageAlloc::FA(self.table_pages.frames_mut());
@@ -1446,12 +1459,6 @@ impl Orbit {
                 self.kernel_pages.free(frame, layout);
                 return (Errno::new(ENOMEM).to_ret(), 0);
             }
-        }
-
-        if !self.processes.contains_key(&pid) {
-            warn!("nc create: no owning process {req:?}");
-            self.kernel_pages.free(frame, layout);
-            return (Errno::new(ESRCH).to_ret(), 0);
         }
 
         // Frame ownership moves into the SharedUserPtr's Arc — not into
@@ -1466,11 +1473,23 @@ impl Orbit {
         // user out-pointer, which would have to resolve through KDMAP
         // (Shared-pool only) or a transient UserPageWindow, neither of
         // which is worth the machinery for 4 bytes.
-        let fd = self
+        let Some(fd) = self
             .process_handles
             .entry(pid)
             .or_insert_with(ProcessHandles::new)
-            .insert(Handle::NetChannel(shared.clone()));
+            .insert(Handle::NetChannel(shared.clone()))
+        else {
+            warn!("nc create: pid{pid} handle table exhausted (fd > i32::MAX)");
+            // The PTEs are already installed; the dropped NetChannel handle
+            // only enqueues the frame to pending_frees, so without this
+            // revoke the recycled frame would stay mapped R/W/U in the user
+            // PT. `shared` is still live here — `.insert` took a clone.
+            let root_table = unsafe { memmap::kernel_root_from_pa(root_pa) };
+            if let Err(e) = shared.revoke(&root_table) {
+                warn!("nc create: revoke after EMFILE failed: {e:?}");
+            }
+            return (Errno::new(EMFILE).to_ret(), 0);
+        };
 
         core::sync::atomic::fence(Ordering::SeqCst);
 
@@ -1549,6 +1568,181 @@ impl Orbit {
                 // pending_frees.
                 drop(of);
             }
+            Handle::Stdin | Handle::Stdout | Handle::Stderr => {
+                // Stdio handles are zero-sized markers — the actual
+                // sinks (console scrollback, key-event ring) live
+                // outside the handle table and don't need per-slot
+                // teardown. Closing 0/1/2 just removes the slot.
+            }
+            Handle::EventFd(slot) => {
+                // Wake-on-close cleanup is wired against the
+                // kernel-side parked-tid shadow but no kernel path
+                // currently parks a reader (no `read(fd)` dispatch
+                // exists for EventFd yet), so `kernel_parked_tid` is
+                // always zero here today and the wake branch is a
+                // dormant scaffold for the eventual POSIX read(fd)
+                // path. Leaving the load + check in place so the
+                // path lights up the moment the read-syscall arm
+                // starts stamping the shadow.
+                let parked = slot
+                    .kernel_parked_tid
+                    .load(core::sync::atomic::Ordering::Acquire);
+                if parked != 0 {
+                    let _ = wake_queue_push(WakeEvent::Tid(parked));
+                }
+                if let Err(e) = slot.region.revoke(&root_table) {
+                    warn!(
+                        "close_handle: eventfd revoke failed for fd={}: {e:?}",
+                        req.fd
+                    );
+                    return Errno::new(EIO).to_ret();
+                }
+                drop(slot);
+            }
+        }
+        0
+    }
+
+    /// `eventfd(vaddr_hint, initval, flags)` — manager path. Mirrors
+    /// `run_nc_create_req` shape: validate, allocate one
+    /// `kernel_pages` frame, initialize the [`EventFd`](orbit_abi::event_fd::EventFd)
+    /// header in-place via KDMAP, map the page user-RW SharedRevocable
+    /// at `vaddr_hint`, build a `SharedUserPtr<EventFdRegion>`, and
+    /// install a `Handle::EventFd` slot with the `cloexec`/`nonblock`
+    /// bits derived from `flags`.
+    fn run_eventfd_create_req(
+        &mut self,
+        req: EventFdCreateReq,
+        pid: u16,
+        root_pa: PhysAddr,
+    ) -> (isize, isize) {
+        use orbit_abi::event_fd::{
+            EFD_CLOEXEC, EFD_NONBLOCK, EVENTFD_REGION_SIZE, EventFd as EventFdRegion,
+        };
+
+        info!("handling eventfd req: {req:08X?}");
+
+        let region_size = EVENTFD_REGION_SIZE;
+        let layout = match Layout::from_size_align(region_size, PAGE_SIZE) {
+            Ok(l) => l,
+            Err(e) => {
+                warn!("eventfd: bad layout {e:?}");
+                return (Errno::new(EINVAL).to_ret(), 0);
+            }
+        };
+
+        let Some((frame, kva)) = self.kernel_pages.alloc_kdmap(layout)
+        else {
+            warn!("eventfd: alloc failed for {} bytes", region_size);
+            return (Errno::new(ENOMEM).to_ret(), 0);
+        };
+
+        // Zero then init the header — user observes a fully-init region
+        // before the PTE ever lands.
+        unsafe {
+            core::ptr::write_bytes(kva.as_mut_ptr::<u8>(), 0, region_size);
+            EventFdRegion::init(kva.as_mut_ptr::<u8>(), req.initval, req.flags);
+        }
+
+        let config = MappingConfig {
+            permissions: (PagePermissions::R as u64)
+                | (PagePermissions::W as u64)
+                | (PagePermissions::U as u64),
+            levels: 4,
+            page_size: PAGE_SIZE as u64,
+            vaddr: VirtAddr::new(req.vaddr_hint.raw()),
+            paddr: frame.raw(),
+            log: false,
+            supervisor_tag: SupervisorTag::SharedRevocable,
+        };
+        let vend = VirtAddr::new(req.vaddr_hint.raw() + region_size as u64);
+        let pend = PhysAddr::new(frame.get_raw() + region_size as u64);
+
+        // Existence check *before* the mapping: the manager holds
+        // MANAGER_LOCK for this whole handler, so a process that's alive
+        // here stays alive through the install below. Mapping first would
+        // leave a recycled frame mapped R/W/U in a dead process's PT on
+        // this early return (SharedInner::drop only enqueues the frame,
+        // it never revokes the PTEs).
+        if !self.processes.contains_key(&pid) {
+            warn!("eventfd: no owning process pid{pid}");
+            self.kernel_pages.free(frame, layout);
+            return (Errno::new(ESRCH).to_ret(), 0);
+        }
+
+        unsafe {
+            let root_table = memmap::kernel_root_from_pa(root_pa);
+            let mut pages = PageAlloc::FA(self.table_pages.frames_mut());
+
+            if map_address_range(&root_table, &mut pages, &config, vend, pend).is_err() {
+                warn!("eventfd: map failed {req:?}");
+                self.kernel_pages.free(frame, layout);
+                return (Errno::new(ENOMEM).to_ret(), 0);
+            }
+        }
+
+        let region: SharedUserPtr<EventFdRegion> =
+            SharedUserPtr::new(frame, layout, req.vaddr_hint, region_size, pid);
+
+        let efd_slot = EventFdSlot {
+            region: region.clone(),
+            kernel_parked_tid: core::sync::atomic::AtomicU32::new(0),
+        };
+
+        let cloexec = req.flags & EFD_CLOEXEC != 0;
+        let nonblock = req.flags & EFD_NONBLOCK != 0;
+
+        let Some(fd) = self
+            .process_handles
+            .entry(pid)
+            .or_insert_with(ProcessHandles::new)
+            .insert_with_flags(Handle::EventFd(efd_slot), cloexec, nonblock)
+        else {
+            warn!("eventfd: pid{pid} handle table exhausted (fd > i32::MAX)");
+            // The PTEs are already installed; the dropped EventFdSlot only
+            // enqueues the frame to pending_frees, so without this revoke
+            // the recycled frame would stay mapped R/W/U in the user PT.
+            // `region` is a retained clone — `efd_slot`'s went into the
+            // dropped handle.
+            let root_table = unsafe { memmap::kernel_root_from_pa(root_pa) };
+            if let Err(e) = region.revoke(&root_table) {
+                warn!("eventfd: revoke after EMFILE failed: {e:?}");
+            }
+            return (Errno::new(EMFILE).to_ret(), 0);
+        };
+
+        core::sync::atomic::fence(Ordering::SeqCst);
+        riscv::asm::sfence_vma(pid as usize, 0);
+        crate::kernel::shootdown::broadcast(0, 0);
+
+        info!(
+            "eventfd created user_va=0x{:08X} kva=0x{:016X} fd={fd}",
+            req.vaddr_hint.raw(),
+            kva.raw(),
+        );
+        (req.vaddr_hint.raw() as isize, fd as isize)
+    }
+
+    /// `wake_tid(target_tid)` — manager path. Validates that
+    /// `target_tid` belongs to `caller_pid` by walking the per-process
+    /// thread set, then pushes `WakeEvent::Tid(target_tid)`.
+    ///
+    /// Returns:
+    /// - `0` on success.
+    /// - `-ESRCH` if `target_tid` isn't a live thread anywhere.
+    /// - `-EPERM` if `target_tid` exists but belongs to a different pid.
+    /// - `-EAGAIN` if the wake queue is full (transient).
+    fn run_wake_tid_req(&mut self, req: WakeTidReq, caller_pid: u16) -> isize {
+        let Some(pt) = self.threads.get(&req.target_tid)
+        else {
+            return Errno::new(ESRCH).to_ret();
+        };
+        let target_pid = unsafe { (pt.0 as *const process::Thread).as_ref_unchecked().pid };
+        if target_pid != caller_pid {
+            return Errno::new(EPERM).to_ret();
+        }
+        if wake_queue_push(WakeEvent::Tid(req.target_tid)).is_err() {
+            return Errno::new(EAGAIN).to_ret();
         }
         0
     }
@@ -1685,7 +1879,7 @@ impl Orbit {
         // Lazy-create the handle table — same pattern create_netch
         // uses, since a process that opens a file before ever creating
         // a NetChannel won't have an entry yet.
-        let fd = self
+        let Some(fd) = self
             .process_handles
             .entry(pid)
             .or_insert_with(ProcessHandles::new)
@@ -1695,7 +1889,11 @@ impl Orbit {
                 offset: 0,
                 dir_cursor: 0,
                 is_regular,
-            }));
+            }))
+        else {
+            warn!("fs_open: pid{pid} handle table exhausted (fd > i32::MAX)");
+            return Errno::new(EMFILE).to_ret();
+        };
         debug!("fs_open: pid={pid} path={path} → fd={fd} ino={inode}");
         fd as isize
     }
@@ -3752,7 +3950,7 @@ impl Orbit {
                     // latched its tid. Before then (boot window), fall
                     // back to a coarse pid=0 scan — by the time
                     // anything pushes `WakeEvent::Net` for real (PLIC
-                    // IRQ, user nc_yield) the latch has fired, so the
+                    // IRQ, user ch_yield) the latch has fired, so the
                     // fallback is just a safety net for self-pushes
                     // during k_net's own bringup.
                     match self.net_thread_tid {
@@ -4118,6 +4316,19 @@ impl Orbit {
                     tid,
                 } => {
                     let result = self.run_fb_surface_destroy_req(req, pid, root_pa);
+                    self.publish_pending_for_tid(tid, &[result]);
+                }
+                PendingWork::EventFdCreate {
+                    req,
+                    pid,
+                    root_pa,
+                    tid,
+                } => {
+                    let (vaddr, fd) = self.run_eventfd_create_req(req, pid, root_pa);
+                    self.publish_pending_for_tid(tid, &[vaddr, fd]);
+                }
+                PendingWork::WakeTid { req, pid, tid } => {
+                    let result = self.run_wake_tid_req(req, pid);
                     self.publish_pending_for_tid(tid, &[result]);
                 }
                 PendingWork::CacheFill { packed_key, status } => {
@@ -4987,6 +5198,18 @@ impl Orbit {
                     }
                     Handle::File(of) => {
                         drop(of);
+                    }
+                    Handle::Stdin | Handle::Stdout | Handle::Stderr => {
+                        // No backing to release — sinks are global.
+                    }
+                    Handle::EventFd(slot) => {
+                        if let Err(e) = slot.region.revoke(&root_table) {
+                            warn!(
+                                "dealloc_process: eventfd revoke failed for pid{}: {e:?}",
+                                process.pid,
+                            );
+                        }
+                        drop(slot);
                     }
                 }
             }
@@ -6277,6 +6500,22 @@ impl Orbit {
         // into proc.maps via self.processes.get_mut.
         self.processes.insert(pid, proc);
 
+        // Seed slots 0 / 1 / 2 with the Stdin / Stdout / Stderr stdio
+        // markers so every new process has the POSIX-shaped fds
+        // available before its first `read(0)` / `write(1)` /
+        // `write(2)`. Pre-seeding (rather than lazy at first I/O) is
+        // what makes the fd numbers stable: `dup(0)` from the entry
+        // point now lands at slot 3 regardless of whether anything's
+        // touched stdio yet. Inheritance from the parent's stdio
+        // configuration lands later via `CreateProcessV2Args.inherit_fds`.
+        let ph = self
+            .process_handles
+            .entry(pid)
+            .or_insert_with(ProcessHandles::new);
+        if ph.is_empty() {
+            ph.seed_stdio();
+        }
+
         // Initial process thread: arg=0. There's no parent closure to
         // pass through — the binary's `_start` ignores a0. (argv is
         // installed at a fixed VA via `install_argv_blob`, not via
@@ -6766,6 +7005,104 @@ impl Orbit {
             let mut w = user_page::UserPageWindow::map(page_pa, PAGE_SIZE);
             let page = w.as_mut_slice();
             page[page_off..page_off + stat_bytes.len()].copy_from_slice(stat_bytes);
+        }
+        0
+    }
+
+    /// `ch_inspect(fd, *mut ChInfo) → 0 | -errno`. Sync. Resolves the
+    /// fd in the calling process's handle table, populates a
+    /// `ChInfo` based on the slot's variant (NetChannel / EventFd /
+    /// File / Stdin / Stdout / Stderr), and copies it into the user
+    /// buffer via `UserPageWindow`.
+    pub fn run_ch_inspect_req(
+        &mut self,
+        pid: u16,
+        root_pa: PhysAddr,
+        fd: u32,
+        info_vaddr: u64,
+    ) -> isize {
+        use orbit_abi::handle::{ChInfo, HandleKind};
+
+        let info_size = core::mem::size_of::<ChInfo>() as u64;
+        if !orbit_abi::layout::user_range_ok(info_vaddr, info_size) {
+            return Errno::new(EFAULT).to_ret();
+        }
+        if (info_vaddr & (PAGE_SIZE as u64 - 1)) + info_size > PAGE_SIZE as u64 {
+            return Errno::new(EINVAL).to_ret();
+        }
+
+        let mut info = ChInfo::default();
+
+        // Snapshot kind + region details under the handle borrow; we
+        // drop the borrow before touching user memory so the page
+        // window mapping doesn't observe a process_handles mutation
+        // mid-copy.
+        {
+            let Some(ph) = self.process_handles.get(&pid)
+            else {
+                return Errno::new(EBADF).to_ret();
+            };
+            let Some(handle_ref) = ph.get(fd)
+            else {
+                return Errno::new(EBADF).to_ret();
+            };
+            match handle_ref {
+                Handle::NetChannel(sup) => {
+                    info.kind = HandleKind::NetChannel as u8;
+                    info.region_va = sup.user_va().raw();
+                    info.region_size = sup.len() as u32;
+                    // Snapshot the kernel-published peer / state via
+                    // the shared header — cheap atomic loads, no
+                    // syscall on the caller's side. The shared region
+                    // is mapped via KDMAP so `try_as_ref` is the safe
+                    // accessor; on a revoked channel we report the
+                    // zeroed state which is what userspace would
+                    // observe anyway after `close_handle`.
+                    if let Some(nc) = sup.try_as_ref() {
+                        let cur = nc.current();
+                        info.peer_addr = cur.peer_addr.load(Ordering::Acquire);
+                        info.peer_port = cur.peer_port.load(Ordering::Acquire);
+                        info.state = cur.state.load(Ordering::Acquire);
+                    }
+                }
+                Handle::File(_) => {
+                    info.kind = HandleKind::File as u8;
+                    // Region fields stay zero — fs reads bounce
+                    // through per-fd scratch; userspace doesn't peek
+                    // directly at any shared region.
+                }
+                Handle::Stdin => info.kind = HandleKind::Stdin as u8,
+                Handle::Stdout => info.kind = HandleKind::Stdout as u8,
+                Handle::Stderr => info.kind = HandleKind::Stderr as u8,
+                Handle::EventFd(slot) => {
+                    info.kind = HandleKind::EventFd as u8;
+                    info.region_va = slot.region.user_va().raw();
+                    info.region_size = slot.region.len() as u32;
+                    // Read the flags field directly off the shared
+                    // header — it's plain-write (no atomic) and we
+                    // only need the create-time snapshot.
+                    if let Some(efd) = slot.region.try_as_ref() {
+                        info.flags = efd.flags;
+                    }
+                }
+            }
+        }
+
+        let info_bytes = unsafe {
+            core::slice::from_raw_parts(&info as *const _ as *const u8, info_size as usize)
+        };
+        let root_table = unsafe { memmap::kernel_root_from_pa(root_pa) };
+        let page_base = info_vaddr & !(PAGE_SIZE as u64 - 1);
+        let page_off = (info_vaddr - page_base) as usize;
+        let page_pa =
+            match unsafe { mmu::mmap::virt_to_phys(&root_table, VirtAddr::new(page_base)) } {
+                Some(p) => p as u64,
+                None => return Errno::new(EFAULT).to_ret(),
+            };
+        unsafe {
+            let mut w = user_page::UserPageWindow::map(page_pa, PAGE_SIZE);
+            let page = w.as_mut_slice();
+            page[page_off..page_off + info_bytes.len()].copy_from_slice(info_bytes);
         }
         0
     }

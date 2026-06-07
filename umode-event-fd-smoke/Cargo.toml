@@ -1,0 +1,16 @@
+[package]
+name = "umode-event-fd-smoke"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "umode-event-fd-smoke"
+path = "src/main.rs"
+
+# `[package.metadata.disk]` — picked up by `tools/build-disk.sh` so
+# the binary lands on the tarfs as `/bin/umode-event-fd-smoke`.
+[package.metadata.disk]
+
+[dependencies]
+orbit-abi = { path = "../orbit-abi" }
+orbit-rt = { path = "../orbit-rt" }

@@ -40,9 +40,9 @@ pub use orbit_abi::roles;
 
 pub use pending_work::{
     CloseHandleReq, CreateProcessExReq, CreateProcessReq, CreateProcessV2Req, CreateThreadReq,
-    FbSurfaceCreateReq, FbSurfaceDestroyReq, FsOpenReq, FsReadReq, FsReaddirReq, FsStatReq,
-    FutexWaitReq, FutexWakeReq, MAX_FS_PATH_LEN, MemMapReq, NetChannelCreationReq, PendingWork,
-    PledgeReq, SpawnContext, WaitPidReq,
+    EventFdCreateReq, FbSurfaceCreateReq, FbSurfaceDestroyReq, FsOpenReq, FsReadReq, FsReaddirReq,
+    FsStatReq, FutexWaitReq, FutexWakeReq, MAX_FS_PATH_LEN, MemMapReq, NetChannelCreationReq,
+    PendingWork, PledgeReq, SpawnContext, WaitPidReq, WakeTidReq,
 };
 
 /// Page size assumed by pure logic when bounding user-memory ranges. Must
@@ -216,7 +216,7 @@ pub enum ShimAction {
 /// [`trap::update_trap_frame`] — if the hart's `current` was retargeted
 /// between trap entry and the apply call, we must not stamp a user epc
 /// onto the wrong thread (the QEMU repro is knet ending up with
-/// `pc=0x22000339c` from an orbit-loader `nc_yield`, then sret-ing into
+/// `pc=0x22000339c` from an orbit-loader `ch_yield`, then sret-ing into
 /// user text in S-mode).
 pub fn apply_syscall_outcome(
     outcome: SyscallOutcome,

@@ -409,8 +409,8 @@ pub fn sleep_ms(ms: usize) -> Result<(), Errno> {
 /// syscall that can return as soon as the channel state changes,
 /// avoiding the 10 ms timer-tick floor for request/response workloads.
 #[inline]
-pub fn nc_yield(timeout_ms: usize) -> Result<(), Errno> {
-    Errno::from_ret(unsafe { ecall1(syscall::NC_YIELD, timeout_ms) }).map(|_| ())
+pub fn ch_yield(timeout_ms: usize) -> Result<(), Errno> {
+    Errno::from_ret(unsafe { ecall1(syscall::CH_YIELD, timeout_ms) }).map(|_| ())
 }
 
 /// Ask the kernel for a user-accessible region at `hint_va` of `len`
@@ -472,6 +472,61 @@ pub fn create_netch(
 #[inline]
 pub fn close_handle(fd: u32) -> Result<(), Errno> {
     Errno::from_ret(unsafe { ecall1(syscall::CLOSE_HANDLE, fd as usize) }).map(|_| ())
+}
+
+/// `ch_inspect(fd, &mut info)` — kind-aware per-fd metadata. Used by
+/// mio's `Selector::register` to translate a `RawFd` into the shared
+/// region pointer the scan loop reads from, and by future
+/// `FromRawFd`-shaped consumers to rehydrate user-side handle state
+/// without round-tripping through an `Arc<...>` cache.
+///
+/// The kernel writes exactly `size_of::<ChInfo>()` bytes into `info`.
+/// Caller must place `info` so the struct fits inside a single
+/// 4 KiB page (`(info as usize) % 64 == 0 && fits-in-page`) — same
+/// constraint as the other small-struct syscalls.
+#[inline]
+pub fn ch_inspect(fd: u32, info: &mut crate::handle::ChInfo) -> Result<(), Errno> {
+    Errno::from_ret(unsafe {
+        ecall2(
+            syscall::CH_INSPECT,
+            fd as usize,
+            info as *mut crate::handle::ChInfo as usize,
+        )
+    })
+    .map(|_| ())
+}
+
+/// Allocate an EventFd backing page, map it shared at `vaddr_hint` in
+/// the caller's shared range, and install a `Handle::EventFd` slot.
+///
+/// `initval` seeds the counter; `flags` is the bitwise OR of
+/// [`event_fd::EFD_NONBLOCK`](crate::event_fd::EFD_NONBLOCK),
+/// [`event_fd::EFD_SEMAPHORE`](crate::event_fd::EFD_SEMAPHORE), and
+/// [`event_fd::EFD_CLOEXEC`](crate::event_fd::EFD_CLOEXEC).
+///
+/// `vaddr_hint` must be page-aligned and inside
+/// `UPROC_SHARED_BASE..UPROC_SHARED_END`. Returns the mapped VA (which
+/// equals `vaddr_hint` on success) plus the kernel-assigned fd.
+#[inline]
+pub fn eventfd(vaddr_hint: usize, initval: u64, flags: u32) -> Result<(usize, u32), Errno> {
+    let (r0, r1) = unsafe {
+        ecall3_ret2(
+            syscall::EVENTFD,
+            vaddr_hint,
+            initval as usize,
+            flags as usize,
+        )
+    };
+    Errno::from_ret(r0).map(|va| (va, r1 as u32))
+}
+
+/// Push a `WakeEvent::Tid(tid)` onto the kernel wake queue. The kernel
+/// validates that `tid` belongs to the calling process; cross-process
+/// targets return `EPERM`. Best-effort — if the target isn't parked
+/// when the manager drains the queue the wake is a no-op.
+#[inline]
+pub fn wake_tid(tid: u32) -> Result<(), Errno> {
+    Errno::from_ret(unsafe { ecall1(syscall::WAKE_TID, tid as usize) }).map(|_| ())
 }
 
 /// Spawn a sibling thread in the calling process. `entry` is a function

@@ -26,12 +26,35 @@ rustc-dep-of-std = [
     "net_channel/rustc-dep-of-std",
 ]
 
+# `mem-alloc` gates the runtime modules that need the `mem` crate's
+# buddy `FrameAllocator` — `shared_va` (UPROC_SHARED range tracking),
+# `event_fd` (depends on shared_va to reserve its region), `netch`
+# (also reserves shared regions), and `env`. Pulled in by both
+# `full-runtime` (no_std consumers like umode) and by std-on-orbit
+# consumers that want EventFd / NetCh through the safe wrappers
+# without the `_start` symbol (`mio` is the canonical example —
+# its Selector uses orbit-rt's EventFd but the binary's `_start`
+# comes from std-on-orbit's PAL, not from orbit-rt).
+#
+# `mem` and its transitive deps (`heapless` / `byteorder`) aren't
+# `rustc-dep-of-std`-friendly, so this feature stays off when
+# orbit-rt is pulled into the std build's dep graph.
+mem-alloc = ["dep:mem"]
+
+# `start` provides `_start`: the no_std user-binary entrypoint that
+# resolves argv, calls `main()`, and handles process exit. Standalone
+# from `mem-alloc` so std-on-orbit consumers (which get `_start` from
+# std's PAL) can opt into the rest of the runtime without colliding.
+# Internally `_start` calls into the heap and shared-region paths, so
+# it implies `mem-alloc`.
+start = ["mem-alloc"]
+
 # Default for no_std user binaries (umode, console, hello, orbit-loader,
-# benches). Pulls in the runtime modules std-on-orbit doesn't need:
-# `_start`, the NetCh wrapper, and the SharedVa shared-range allocator
-# (which depends on `mem` → `heapless` → `byteorder`, none of which are
-# rustc-dep-of-std-friendly).
-full-runtime = ["dep:mem"]
+# benches). Aggregate that includes both `mem-alloc` (the runtime
+# modules) and `start` (the `_start` symbol). Existing consumers with
+# `default = ["full-runtime"]` keep working; std-on-orbit + mio set
+# `default-features = false` and pick just `mem-alloc`.
+full-runtime = ["mem-alloc", "start"]
 
 [dependencies]
 # dlmalloc backs the `#[global_allocator]` for no_std orbit binaries.

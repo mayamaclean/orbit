@@ -351,7 +351,7 @@ extern "C" fn s_trap(
                             kmain::handle_create_process_req(epc, hart_context, frame);
                         }
                         4100 => {
-                            kmain::handle_nc_yield(epc, hart_context, frame);
+                            kmain::handle_ch_yield(epc, hart_context, frame);
                         }
                         4101 => {
                             kmain::handle_query_stats(epc, hart_context, frame);
@@ -409,6 +409,9 @@ extern "C" fn s_trap(
                         4118 => {
                             kmain::handle_setlogin(epc, hart_context, frame);
                         }
+                        4119 => {
+                            kmain::handle_ch_inspect(epc, hart_context, frame);
+                        }
                         5000 => {
                             debug!("orbit handling u mode ecall({syscall})");
                             kmain::handle_create_thread(epc, hart_context, frame);
@@ -428,6 +431,9 @@ extern "C" fn s_trap(
                         }
                         5005 => {
                             kmain::handle_futex_wake(epc, hart_context, frame);
+                        }
+                        5006 => {
+                            kmain::handle_wake_tid(epc, hart_context, frame);
                         }
                         6000 => {
                             debug!("orbit handling u mode ecall({syscall})");
@@ -462,6 +468,9 @@ extern "C" fn s_trap(
                         }
                         7003 => {
                             kmain::handle_fb_present(epc, hart_context, frame);
+                        }
+                        8004 => {
+                            kmain::handle_eventfd(epc, hart_context, frame);
                         }
                         _ => {
                             debug!("orbit handling u mode ecall({syscall})");

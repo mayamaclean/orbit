@@ -14,11 +14,13 @@ use tracing::error;
 
 use crate::{
     CloseHandleReq, CreateProcessExReq, CreateProcessReq, CreateProcessV2Req, CreateThreadReq,
-    FbSurfaceCreateReq, FbSurfaceDestroyReq, FsOpenReq, FsReadReq, FsReaddirReq, FsStatReq,
-    FutexWaitReq, FutexWakeReq, Hardware, MAX_FS_PATH_LEN, MemMapReq, NetChannelCreationReq,
-    PAGE_SIZE, PendingWork, PledgeReq, SyscallOutcome, WaitPidReq,
+    EventFdCreateReq, FbSurfaceCreateReq, FbSurfaceDestroyReq, FsOpenReq, FsReadReq, FsReaddirReq,
+    FsStatReq, FutexWaitReq, FutexWakeReq, Hardware, MAX_FS_PATH_LEN, MemMapReq,
+    NetChannelCreationReq, PAGE_SIZE, PendingWork, PledgeReq, SyscallOutcome, WaitPidReq,
+    WakeTidReq,
 };
 use net_channel::BindSpec;
+use orbit_abi::event_fd::{EFD_ALL_FLAGS, EVENTFD_REGION_SIZE};
 use orbit_abi::fb::FbFormat;
 
 /// Cap on `sleep_ms(ms)` arguments. Anything at or above this returns
@@ -189,6 +191,100 @@ pub fn fb_surface_create_req<H: Hardware>(
         req,
         pid: thread.pid,
         root_pa: thread.root_table_addr(),
+        tid: thread.tid,
+    };
+    if hw.push_pending_work(work).is_err() {
+        return SyscallOutcome::Return {
+            ret: Errno::new(EAGAIN).to_ret(),
+        };
+    }
+    SyscallOutcome::Yield {
+        state: ThreadState::Blocking,
+        ret: None,
+    }
+}
+
+/// `eventfd(vaddr_hint, initval, flags)` — park the caller and queue
+/// a [`PendingWork::EventFdCreate`]. Manager allocates a `kernel_pages`
+/// frame, initializes the [`EventFd`](orbit_abi::event_fd::EventFd)
+/// header in-place, maps it user-RW + SharedRevocable at `vaddr_hint`,
+/// and inserts a `Handle::EventFd` slot. Resumes via `signal_pair`
+/// → `(vaddr, fd)`.
+pub fn eventfd_req<H: Hardware>(
+    thread: &mut Thread,
+    frame: &TrapFrame,
+    hw: &mut H,
+) -> SyscallOutcome {
+    let vaddr_hint_raw = frame.regs[11] as u64;
+    let initval = frame.regs[12] as u64;
+    let flags = frame.regs[13] as u32;
+
+    // EventFd regions are always one page; reject anything outside the
+    // shared range. Same shape as the NetChannel boundary check.
+    if !user_shared_range_ok(vaddr_hint_raw, EVENTFD_REGION_SIZE as u64) {
+        return SyscallOutcome::Return {
+            ret: Errno::new(EINVAL).to_ret(),
+        };
+    }
+    if vaddr_hint_raw & (PAGE_SIZE as u64 - 1) != 0 {
+        return SyscallOutcome::Return {
+            ret: Errno::new(EINVAL).to_ret(),
+        };
+    }
+    if flags & !EFD_ALL_FLAGS != 0 {
+        return SyscallOutcome::Return {
+            ret: Errno::new(EINVAL).to_ret(),
+        };
+    }
+    let Ok(vaddr_hint) = UserVa::new(vaddr_hint_raw)
+    else {
+        return SyscallOutcome::Return {
+            ret: Errno::new(EFAULT).to_ret(),
+        };
+    };
+
+    let req = EventFdCreateReq {
+        vaddr_hint,
+        initval,
+        flags,
+    };
+    let work = PendingWork::EventFdCreate {
+        req,
+        pid: thread.pid,
+        root_pa: thread.root_table_addr(),
+        tid: thread.tid,
+    };
+    if hw.push_pending_work(work).is_err() {
+        return SyscallOutcome::Return {
+            ret: Errno::new(EAGAIN).to_ret(),
+        };
+    }
+    SyscallOutcome::Yield {
+        state: ThreadState::Blocking,
+        ret: None,
+    }
+}
+
+/// `wake_tid(target_tid)` — push a `WakeEvent::Tid(target_tid)` once
+/// the manager validates the target belongs to the calling process.
+/// The doorbell primitive: lets a sibling thread nudge a reactor
+/// parked in `ch_yield` / `eventfd`'s blocking read.
+///
+/// `target_tid == 0` (the sentinel "no reader parked") is a no-op
+/// returning `0` synchronously without traversing the manager queue,
+/// since EventFd writers use it as a fast-path skip.
+pub fn wake_tid_req<H: Hardware>(
+    thread: &mut Thread,
+    frame: &TrapFrame,
+    hw: &mut H,
+) -> SyscallOutcome {
+    let target_tid = frame.regs[11] as u32;
+    if target_tid == 0 {
+        return SyscallOutcome::Return { ret: 0 };
+    }
+    let work = PendingWork::WakeTid {
+        req: WakeTidReq { target_tid },
+        pid: thread.pid,
         tid: thread.tid,
     };
     if hw.push_pending_work(work).is_err() {
@@ -1020,7 +1116,7 @@ pub const READ_KEY_EVENT_INDEFINITE: usize = usize::MAX;
 /// `count` 16-byte `KeyEvent`s from the caller's structured-event
 /// ring into `buf`.
 ///
-/// Park shape (same as `nc_yield`'s ms_sleep + wake_override):
+/// Park shape (same as `ch_yield`'s ms_sleep + wake_override):
 /// - `flags & READ_KEY_EVENT_NONBLOCK` — never park; return
 ///   immediately with the events drained or `EAGAIN`.
 /// - `timeout_ms == 0` (no NONBLOCK) — drain available; if empty,
@@ -1071,7 +1167,7 @@ pub fn read_key_event<H: Hardware>(
     if !hw.user_va_translates(thread.root_table_addr(), user_va) {
         return ready(Errno::new(EFAULT).to_ret());
     }
-    // Reject finite timeouts that match nc_yield's sleep cap. Anything
+    // Reject finite timeouts that match ch_yield's sleep cap. Anything
     // larger than the cap and *not* the sentinel is almost certainly a
     // caller treating ms_t as ns_t or similar — fail loud.
     if timeout_ms != READ_KEY_EVENT_INDEFINITE && timeout_ms >= READ_KEY_EVENT_MAX_TIMEOUT_MS {

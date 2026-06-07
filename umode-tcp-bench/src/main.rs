@@ -15,7 +15,7 @@
 //!
 //! Send pattern: a fixed-size buffer (`BUF_SIZE`) of zeros, written
 //! repeatedly via [`Session::write_all`]. write_all is the right
-//! primitive here — it loops on partial writes and `nc_yield`s when
+//! primitive here — it loops on partial writes and `ch_yield`s when
 //! the netch tx ring is full, which exercises the parker → knet
 //! signal path that Phase A+B+C+D restructured.
 
@@ -102,7 +102,7 @@ fn run_round(round: usize) -> bool {
             Ok(()) => sent += take,
             Err(Errno(e)) if e == EAGAIN => {
                 // write_all already loops on EAGAIN internally via
-                // nc_yield, but defensively handle a surfaced one.
+                // ch_yield, but defensively handle a surfaced one.
                 continue;
             }
             Err(Errno(e)) => {

@@ -4,8 +4,10 @@ pub mod argv;
 pub mod denial;
 pub mod envp;
 pub mod errno;
+pub mod event_fd;
 pub mod fb;
 pub mod fs;
+pub mod handle;
 pub mod input;
 pub mod layout;
 pub mod mmap;
@@ -19,6 +21,7 @@ pub mod syscall_stats;
 pub mod user;
 
 pub use errno::Errno;
+pub use handle::HandleKind;
 pub use stats::ProcessStats;
 pub use syscall::Sysno;
 pub use syscall_stats::{SyscallEntry, SyscallStatsHeader};

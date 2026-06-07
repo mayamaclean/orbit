@@ -285,7 +285,7 @@ fn yield_retry_preserves_a_regs_for_re_execute() {
 // These pin down the defense-in-depth gate that prevents a U-mode-ecall
 // commit from landing on the wrong thread when `hart.current` was
 // retargeted between trap entry and `apply_syscall_outcome`. The QEMU
-// repro: orbit-loader's `nc_yield(4100)` ecall lands on cpu2, but
+// repro: orbit-loader's `ch_yield(4100)` ecall lands on cpu2, but
 // `cpu2.current` has been swapped to knet (a Supervisor kthread). Without
 // the gate, `apply_syscall_outcome` would stamp `epc + 4 = 0x22000339c`
 // (a user VA) into `knet.pc`, and the next dispatch sret-s to a user

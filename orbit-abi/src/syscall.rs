@@ -81,7 +81,7 @@ pub const MMAP: usize = 4096;
 pub const CREATE_NETCH: usize = 4097;
 pub const CLOSE_HANDLE: usize = 4098;
 pub const CREATE_PROCESS: usize = 4099;
-pub const NC_YIELD: usize = 4100;
+pub const CH_YIELD: usize = 4100;
 pub const QUERY_STATS: usize = 4101;
 pub const QUERY_SYSCALL_STATS: usize = 4102;
 pub const CREATE_PROCESS_EX: usize = 4103;
@@ -248,6 +248,27 @@ pub const SETGROUPS: usize = 4117;
 /// - `EFAULT` — `name_ptr` doesn't translate.
 pub const SETLOGIN: usize = 4118;
 
+/// `ch_inspect(fd: i32, out: *mut ChInfo) -> 0 | -errno` — kind-aware
+/// per-fd metadata for `FromRawFd`-style rehydration. Reads the
+/// calling process's handle table, fills the [`ChInfo`](crate::handle::ChInfo)
+/// at `out` with kind tag + shared region (VA, size) + kind-specific
+/// state (NetChannel peer + session state; EventFd flags).
+///
+/// Used by mio's orbit `Selector::register` to translate the upstream
+/// `RawFd` argument into the shared-memory region pointer it scans on
+/// each `select()` pass — without this, the readiness check would
+/// require either a process-wide side-table or an extra fd → pointer
+/// translation per source per scan.
+///
+/// Sync, no manager round-trip — read-only against `process_handles`.
+///
+/// Errnos:
+/// - `EBADF` — `fd` not open in the calling process.
+/// - `EFAULT` — `out` doesn't translate under the caller's satp.
+/// - `EINVAL` — `out` straddles a page (single `UserPageWindow`
+///   constraint, same as `fs_stat`).
+pub const CH_INSPECT: usize = 4119;
+
 // 5000+ — multi-thread / SMP control plane. Numbered out of the 4096
 // block so the categorical split is obvious in dispatch tables and so
 // future single-process-spanning syscalls (futex wake/wait, etc.)
@@ -258,6 +279,23 @@ pub const GETTID: usize = 5002;
 pub const WAIT_PID: usize = 5003;
 pub const FUTEX_WAIT: usize = 5004;
 pub const FUTEX_WAKE: usize = 5005;
+
+/// `wake_tid(tid: u32) -> 0 | -errno` — push a `WakeEvent::Tid(tid)`
+/// onto the kernel wake queue. Validates that `tid` belongs to the
+/// calling process before queueing — cross-process wakes return
+/// `EPERM`. Used as the doorbell primitive that lets one user thread
+/// nudge another out of `ch_yield`-shaped parks (EventFd signal path,
+/// future mio-style cross-thread reactor wakes).
+///
+/// The wake is best-effort: if `tid` isn't currently parked when the
+/// manager drains the queue, the wake is a no-op. Callers that need
+/// stronger guarantees should pair the call with a shared-memory
+/// readiness flag the target re-checks after waking.
+///
+/// Errnos:
+/// - `ESRCH` — `tid` is not a live thread of the calling process.
+/// - `EAGAIN` — wake queue full (transient; caller may retry).
+pub const WAKE_TID: usize = 5006;
 
 // 6000+ — filesystem. v1 is read-only tarfs; close re-uses
 // `CLOSE_HANDLE = 4098` (handle table is shared across NetCh / file
@@ -342,6 +380,106 @@ pub const FB_SURFACE_DESTROY: usize = 7002;
 /// - `EAGAIN` — k_gpu ring full (caller should retry after a yield).
 pub const FB_PRESENT: usize = 7003;
 
+// 8000+ — unified handle operations. These dispatch on the kind of
+// the fd's `Handle` table entry (NetChannel / File / Stdin / Stdout /
+// Stderr / EventFd / Pipe / Pidfd / ...) so a single syscall surface
+// covers every fd-shaped resource. Mirrors POSIX `dup`/`fcntl`/`fstat`
+// shapes so the libc shim and `std::os::fd::*` plumbing can compile
+// against orbit without a per-kind detour.
+
+/// `dup(fd: i32) -> newfd | -errno` — POSIX `dup(2)`. Clone the slot's
+/// `Handle` (Arc-clone for shareable variants; fresh `OpenFile` for
+/// files sharing the inode but with an independent offset) into the
+/// next free slot in the calling process's handle table. The new slot
+/// has `cloexec = false` regardless of the source's flag — matches
+/// Linux `dup(2)` (use `fcntl(F_DUPFD_CLOEXEC)` if you need otherwise).
+///
+/// Errnos:
+/// - `EBADF` — `fd` not open in the calling process.
+/// - `EMFILE` — handle table at `i32::MAX` (effectively impossible).
+pub const DUP: usize = 8000;
+
+/// `dup2(oldfd: i32, newfd: i32) -> newfd | -errno` — POSIX `dup2(2)`.
+/// Same as [`DUP`] but targets `newfd` specifically. If `newfd` is
+/// already open, it's closed first (atomic from the caller's POV).
+/// `oldfd == newfd` is a no-op that returns `newfd` without closing.
+///
+/// Errnos:
+/// - `EBADF` — `oldfd` not open, or `newfd` is negative / out of range.
+pub const DUP2: usize = 8001;
+
+/// `fcntl(fd: i32, cmd: i32, arg: usize) -> ret | -errno` — POSIX
+/// `fcntl(2)`. v1 supports:
+/// - `F_GETFD` — return the `FD_CLOEXEC` bit.
+/// - `F_SETFD` — set the `FD_CLOEXEC` bit from `arg`.
+/// - `F_GETFL` — return the `O_NONBLOCK` bit and any cached open flags.
+/// - `F_SETFL` — set the `O_NONBLOCK` bit from `arg`.
+///
+/// Other `cmd` values return `EINVAL` so unsupported uses surface
+/// cleanly rather than silently no-op.
+///
+/// Errnos:
+/// - `EBADF` — `fd` not open.
+/// - `EINVAL` — unsupported `cmd`.
+pub const FCNTL: usize = 8002;
+
+/// `fstat(fd: i32, *mut StatX) -> 0 | -errno` — kind-aware metadata
+/// for any fd. For `Handle::File`, fills the POSIX-shaped fields the
+/// same way [`FS_FSTAT`] does; for `Handle::NetChannel` and
+/// `Handle::EventFd`, fills the POSIX fields with kind-appropriate
+/// stubs (`S_IFSOCK` / `S_IFCHR`) plus the kind tail used by
+/// `FromRawFd`-shaped consumers to rehydrate user-side state without
+/// a separate `nc_inspect`.
+///
+/// Errnos:
+/// - `EBADF` — `fd` not open.
+/// - `EFAULT` — buffer doesn't translate.
+/// - `EINVAL` — buffer straddles a page.
+pub const FSTAT: usize = 8003;
+
+/// `eventfd(vaddr_hint: usize, initval: u64, flags: u32) -> (user_va, fd) | -errno` —
+/// allocate a shared-memory EventFd region (one `kernel_pages` frame),
+/// initialize `count = initval` and `parked_tid = 0`, map shared into
+/// the calling process's `UPROC_SHARED_BASE..UPROC_SHARED_END` range,
+/// and install a `Handle::EventFd` slot. Two-register return: `a0 =
+/// user_va`, `a1 = fd`. `a0` carries the VA (always a large
+/// shared-range address) so a `-errno` in `a0` stays distinguishable
+/// from success — same convention as [`CREATE_NETCH`].
+///
+/// `flags` accepts `EFD_NONBLOCK` (slot's `nonblock` bit on creation)
+/// and `EFD_SEMAPHORE` (read decrements by 1 instead of swapping to 0).
+/// `EFD_CLOEXEC` is honored by setting `Slot.cloexec = true`.
+///
+/// Errnos:
+/// - `EINVAL` — unknown `flags`.
+/// - `ENOMEM` — `kernel_pages` exhausted or shared VA range full.
+pub const EVENTFD: usize = 8004;
+
+/// `poll(*PollFd, n, timeout_ms) -> n_ready | -errno` — **reserved**.
+/// Not implemented in v1 — the userspace selector (mio) does
+/// shared-memory readiness scans + parks on `ch_yield` / EventFd read,
+/// so no kernel-side multiplexer is needed. The libc `poll(3)` shim
+/// can ship as a userspace loop over the same primitives. The number
+/// is reserved to keep future tooling that greps `/proc/*/syscalls`
+/// shape-stable.
+pub const POLL: usize = 8005;
+
+/// `pipe(*[i32; 2], flags: u32) -> 0 | -errno` — **reserved**. Will
+/// allocate a shared-memory ring (SPSC, NetChannel-shaped at smaller
+/// region size) plus two `Handle::PipeRead` / `Handle::PipeWrite`
+/// slots in the calling process's table. Needed for
+/// `Stdio::MakePipe`-shaped `Command` flows and shell `|` pipelines.
+/// Lands with the tokio::process milestone.
+pub const PIPE: usize = 8006;
+
+/// `pidfd_open(pid: u16) -> fd | -errno` — **reserved**. Will install
+/// a `Handle::Pidfd` slot referencing the child process, usable with
+/// blocking and non-blocking `read(fd, &mut exit_status)` to retrieve
+/// exit info plus `wake_tid`-shaped delivery of kill signals once
+/// signals exist. Spawn syscalls will return this alongside the bare
+/// pid.
+pub const PIDFD_OPEN: usize = 8007;
+
 /// `fs_seek(fd, offset, whence) -> new_offset | -errno` — reposition
 /// the byte cursor on a regular-file fd. `whence` follows POSIX:
 /// `SEEK_SET = 0` (absolute), `SEEK_CUR = 1` (relative to current
@@ -377,7 +515,7 @@ pub enum Sysno {
     CreateNetch = CREATE_NETCH,
     CloseHandle = CLOSE_HANDLE,
     CreateProcess = CREATE_PROCESS,
-    NcYield = NC_YIELD,
+    ChYield = CH_YIELD,
     QueryStats = QUERY_STATS,
     QuerySyscallStats = QUERY_SYSCALL_STATS,
     CreateProcessEx = CREATE_PROCESS_EX,
@@ -396,6 +534,7 @@ pub enum Sysno {
     SetGid = SETGID,
     SetGroups = SETGROUPS,
     SetLogin = SETLOGIN,
+    ChInspect = CH_INSPECT,
     CreateThread = CREATE_THREAD,
     GetPid = GETPID,
     GetTid = GETTID,
@@ -412,6 +551,12 @@ pub enum Sysno {
     FbSurfaceCreate = FB_SURFACE_CREATE,
     FbSurfaceDestroy = FB_SURFACE_DESTROY,
     FbPresent = FB_PRESENT,
+    WakeTid = WAKE_TID,
+    Dup = DUP,
+    Dup2 = DUP2,
+    Fcntl = FCNTL,
+    Fstat = FSTAT,
+    Eventfd = EVENTFD,
 }
 
 impl Sysno {
@@ -434,7 +579,7 @@ impl Sysno {
             CREATE_NETCH => Self::CreateNetch,
             CLOSE_HANDLE => Self::CloseHandle,
             CREATE_PROCESS => Self::CreateProcess,
-            NC_YIELD => Self::NcYield,
+            CH_YIELD => Self::ChYield,
             QUERY_STATS => Self::QueryStats,
             QUERY_SYSCALL_STATS => Self::QuerySyscallStats,
             CREATE_PROCESS_EX => Self::CreateProcessEx,
@@ -453,6 +598,7 @@ impl Sysno {
             SETGID => Self::SetGid,
             SETGROUPS => Self::SetGroups,
             SETLOGIN => Self::SetLogin,
+            CH_INSPECT => Self::ChInspect,
             CREATE_THREAD => Self::CreateThread,
             GETPID => Self::GetPid,
             GETTID => Self::GetTid,
@@ -469,6 +615,12 @@ impl Sysno {
             FB_SURFACE_CREATE => Self::FbSurfaceCreate,
             FB_SURFACE_DESTROY => Self::FbSurfaceDestroy,
             FB_PRESENT => Self::FbPresent,
+            WAKE_TID => Self::WakeTid,
+            DUP => Self::Dup,
+            DUP2 => Self::Dup2,
+            FCNTL => Self::Fcntl,
+            FSTAT => Self::Fstat,
+            EVENTFD => Self::Eventfd,
             _ => return None,
         })
     }
@@ -491,7 +643,7 @@ impl Sysno {
             Self::CreateNetch => 9,
             Self::CloseHandle => 10,
             Self::CreateProcess => 11,
-            Self::NcYield => 12,
+            Self::ChYield => 12,
             Self::QueryStats => 13,
             Self::QuerySyscallStats => 14,
             Self::CreateThread => 15,
@@ -531,6 +683,13 @@ impl Sysno {
             Self::FbSurfaceDestroy => 49,
             Self::FbPresent => 50,
             Self::ReadKeyEvent => 51,
+            Self::WakeTid => 52,
+            Self::Dup => 53,
+            Self::Dup2 => 54,
+            Self::Fcntl => 55,
+            Self::Fstat => 56,
+            Self::Eventfd => 57,
+            Self::ChInspect => 58,
         }
     }
 
@@ -539,7 +698,7 @@ impl Sysno {
     /// when adding a `Sysno` variant. Older userland with a smaller
     /// COUNT reads a prefix of the kernel's table; newer userland with
     /// a larger COUNT treats the kernel's missing slots as zero.
-    pub const COUNT: usize = 52;
+    pub const COUNT: usize = 59;
 }
 
 #[cfg(test)]
@@ -566,7 +725,7 @@ mod tests {
             Sysno::from_usize(CREATE_PROCESS),
             Some(Sysno::CreateProcess)
         );
-        assert_eq!(Sysno::from_usize(NC_YIELD), Some(Sysno::NcYield));
+        assert_eq!(Sysno::from_usize(CH_YIELD), Some(Sysno::ChYield));
         assert_eq!(Sysno::from_usize(QUERY_STATS), Some(Sysno::QueryStats));
         assert_eq!(
             Sysno::from_usize(QUERY_SYSCALL_STATS),
@@ -621,6 +780,13 @@ mod tests {
         );
         assert_eq!(Sysno::from_usize(FB_PRESENT), Some(Sysno::FbPresent));
         assert_eq!(Sysno::from_usize(READ_KEY_EVENT), Some(Sysno::ReadKeyEvent));
+        assert_eq!(Sysno::from_usize(WAKE_TID), Some(Sysno::WakeTid));
+        assert_eq!(Sysno::from_usize(DUP), Some(Sysno::Dup));
+        assert_eq!(Sysno::from_usize(DUP2), Some(Sysno::Dup2));
+        assert_eq!(Sysno::from_usize(FCNTL), Some(Sysno::Fcntl));
+        assert_eq!(Sysno::from_usize(FSTAT), Some(Sysno::Fstat));
+        assert_eq!(Sysno::from_usize(EVENTFD), Some(Sysno::Eventfd));
+        assert_eq!(Sysno::from_usize(CH_INSPECT), Some(Sysno::ChInspect));
     }
 
     #[test]
@@ -629,12 +795,14 @@ mod tests {
         // READ_KEY_EVENT — used to be holes below 4096.
         assert_eq!(Sysno::from_usize(13), None);
         assert_eq!(Sysno::from_usize(4095), None);
-        // 4105..=4118 are now CREATE_PROCESS_V2 / QUERY_DENIAL_LOG /
+        // 4105..=4119 are now CREATE_PROCESS_V2 / QUERY_DENIAL_LOG /
         // CHDIR / GETCWD / GETUID / GETEUID / GETGID / GETEGID /
-        // GETGROUPS / GETLOGIN / SETUID / SETGID / SETGROUPS / SETLOGIN.
-        assert_eq!(Sysno::from_usize(4119), None);
+        // GETGROUPS / GETLOGIN / SETUID / SETGID / SETGROUPS / SETLOGIN /
+        // CH_INSPECT.
+        assert_eq!(Sysno::from_usize(4120), None);
         assert_eq!(Sysno::from_usize(4999), None);
-        assert_eq!(Sysno::from_usize(5006), None);
+        // 5006 is now WAKE_TID.
+        assert_eq!(Sysno::from_usize(5007), None);
         assert_eq!(Sysno::from_usize(5999), None);
         // 6004 / 6005 are now FS_SEEK / FS_FSTAT.
         assert_eq!(Sysno::from_usize(6006), None);
@@ -642,6 +810,10 @@ mod tests {
         // FB_SURFACE_DESTROY / FB_PRESENT.
         assert_eq!(Sysno::from_usize(6999), None);
         assert_eq!(Sysno::from_usize(7004), None);
+        // 8000..=8004 are DUP / DUP2 / FCNTL / FSTAT / EVENTFD; 8005..=8007
+        // are POLL / PIPE / PIDFD_OPEN, reserved (no Sysno variant yet).
+        assert_eq!(Sysno::from_usize(8005), None);
+        assert_eq!(Sysno::from_usize(8008), None);
         assert_eq!(Sysno::from_usize(usize::MAX), None);
     }
 
@@ -662,7 +834,7 @@ mod tests {
         assert_eq!(Sysno::CreateNetch as usize, CREATE_NETCH);
         assert_eq!(Sysno::CloseHandle as usize, CLOSE_HANDLE);
         assert_eq!(Sysno::CreateProcess as usize, CREATE_PROCESS);
-        assert_eq!(Sysno::NcYield as usize, NC_YIELD);
+        assert_eq!(Sysno::ChYield as usize, CH_YIELD);
         assert_eq!(Sysno::QueryStats as usize, QUERY_STATS);
         assert_eq!(Sysno::QuerySyscallStats as usize, QUERY_SYSCALL_STATS);
         assert_eq!(Sysno::CreateThread as usize, CREATE_THREAD);
@@ -699,6 +871,13 @@ mod tests {
         assert_eq!(Sysno::FbSurfaceDestroy as usize, FB_SURFACE_DESTROY);
         assert_eq!(Sysno::FbPresent as usize, FB_PRESENT);
         assert_eq!(Sysno::ReadKeyEvent as usize, READ_KEY_EVENT);
+        assert_eq!(Sysno::WakeTid as usize, WAKE_TID);
+        assert_eq!(Sysno::Dup as usize, DUP);
+        assert_eq!(Sysno::Dup2 as usize, DUP2);
+        assert_eq!(Sysno::Fcntl as usize, FCNTL);
+        assert_eq!(Sysno::Fstat as usize, FSTAT);
+        assert_eq!(Sysno::Eventfd as usize, EVENTFD);
+        assert_eq!(Sysno::ChInspect as usize, CH_INSPECT);
     }
 
     #[test]
@@ -720,7 +899,7 @@ mod tests {
         assert_eq!(CREATE_NETCH, 4097);
         assert_eq!(CLOSE_HANDLE, 4098);
         assert_eq!(CREATE_PROCESS, 4099);
-        assert_eq!(NC_YIELD, 4100);
+        assert_eq!(CH_YIELD, 4100);
         assert_eq!(QUERY_STATS, 4101);
         assert_eq!(QUERY_SYSCALL_STATS, 4102);
         assert_eq!(CREATE_THREAD, 5000);
@@ -752,11 +931,21 @@ mod tests {
         assert_eq!(SETGID, 4116);
         assert_eq!(SETGROUPS, 4117);
         assert_eq!(SETLOGIN, 4118);
+        assert_eq!(CH_INSPECT, 4119);
         assert_eq!(FB_QUERY, 7000);
         assert_eq!(FB_SURFACE_CREATE, 7001);
         assert_eq!(FB_SURFACE_DESTROY, 7002);
         assert_eq!(FB_PRESENT, 7003);
         assert_eq!(READ_KEY_EVENT, 12);
+        assert_eq!(WAKE_TID, 5006);
+        assert_eq!(DUP, 8000);
+        assert_eq!(DUP2, 8001);
+        assert_eq!(FCNTL, 8002);
+        assert_eq!(FSTAT, 8003);
+        assert_eq!(EVENTFD, 8004);
+        assert_eq!(POLL, 8005);
+        assert_eq!(PIPE, 8006);
+        assert_eq!(PIDFD_OPEN, 8007);
     }
 
     #[test]
@@ -776,7 +965,7 @@ mod tests {
             Sysno::CreateNetch,
             Sysno::CloseHandle,
             Sysno::CreateProcess,
-            Sysno::NcYield,
+            Sysno::ChYield,
             Sysno::QueryStats,
             Sysno::QuerySyscallStats,
             Sysno::CreateThread,
@@ -816,6 +1005,13 @@ mod tests {
             Sysno::FbSurfaceDestroy,
             Sysno::FbPresent,
             Sysno::ReadKeyEvent,
+            Sysno::WakeTid,
+            Sysno::Dup,
+            Sysno::Dup2,
+            Sysno::Fcntl,
+            Sysno::Fstat,
+            Sysno::Eventfd,
+            Sysno::ChInspect,
         ];
         assert_eq!(all.len(), Sysno::COUNT);
         let mut seen = [false; Sysno::COUNT];

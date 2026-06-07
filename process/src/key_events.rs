@@ -15,7 +15,7 @@
 //!   `wake_time = now + timeout_ms` and rely on the same wake_override
 //!   bit for early wake. The handle path can't combine cleanly with a
 //!   sleep_heap entry; this one does.
-//! - **Same primitive as `nc_yield`.** That syscall already
+//! - **Same primitive as `ch_yield`.** That syscall already
 //!   demonstrates the "ms_sleep + producer-side wake_override"
 //!   pattern. Reusing it avoids accumulating wake mechanisms.
 //! - **No allocation on the producer.** The handle path needs an Arc

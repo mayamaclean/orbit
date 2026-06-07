@@ -735,7 +735,7 @@ pub extern "C" fn k_net(device: *mut NetPackage) {
         }
 
         // Park until either `wake_time` ticks elapse or a producer
-        // (e1000 PLIC handler, update_tcp ring-progress, nc_yield
+        // (e1000 PLIC handler, update_tcp ring-progress, ch_yield
         // syscall) ORs a wake reason into our wake_override. Resumes
         // at the next iteration of this loop with all locals intact.
         //
@@ -1112,7 +1112,7 @@ pub fn handle_nc_create_req(epc: usize, hart_context: &'static HartContext, fram
     });
 }
 
-/// `nc_yield(timeout_ms)` — push a kernel `WakeEvent::Net` so k_net
+/// `ch_yield(timeout_ms)` — push a kernel `WakeEvent::Net` so k_net
 /// processes whatever the caller just queued in a NetCh ring, then
 /// optionally park the caller for up to `timeout_ms` (capped via
 /// `ms_sleep`'s existing one-hour ceiling). The park returns early
@@ -1128,7 +1128,7 @@ pub fn handle_nc_create_req(epc: usize, hart_context: &'static HartContext, fram
 /// immediately. Useful as a "fire and forget" wake from a path that
 /// doesn't itself want to sleep.
 #[unsafe(no_mangle)]
-pub fn handle_nc_yield(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
+pub fn handle_ch_yield(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
     dispatch_syscall(epc, hart_context, frame, |t, f| {
         let _ = crate::kernel::wake_queue_push(crate::kernel::WakeEvent::Net);
         let timeout_ms = f.regs[11];
@@ -1231,9 +1231,7 @@ pub fn handle_query_denial_log(
         // Single-page constraint enforced at the boundary so the
         // manager arm is one `UserPageWindow`. Buffers that straddle
         // a 4 KiB page get EINVAL.
-        if (buf_va.raw() & (mmu::PAGE_SIZE as u64 - 1)) + buf_len as u64
-            > mmu::PAGE_SIZE as u64
-        {
+        if (buf_va.raw() & (mmu::PAGE_SIZE as u64 - 1)) + buf_len as u64 > mmu::PAGE_SIZE as u64 {
             return orbit_core::SyscallOutcome::Return {
                 ret: -(EINVAL as isize),
             };
@@ -1384,6 +1382,26 @@ pub fn handle_futex_wake(epc: usize, hart_context: &'static HartContext, frame: 
     });
 }
 
+/// `wake_tid(target_tid) → 0 | -errno`. Cross-thread doorbell:
+/// validates same-process membership and pushes `WakeEvent::Tid`. See
+/// [`orbit_abi::syscall::WAKE_TID`] for the contract.
+#[unsafe(no_mangle)]
+pub fn handle_wake_tid(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
+    dispatch_syscall(epc, hart_context, frame, |t, f| {
+        orbit_core::syscall::wake_tid_req(t, f, &mut crate::hw::RiscvHardware)
+    });
+}
+
+/// `eventfd(vaddr_hint, initval, flags) → (vaddr, fd) | -errno`.
+/// Allocates a one-page shared region, maps it user-RW, and installs
+/// a `Handle::EventFd` slot. See [`orbit_abi::syscall::EVENTFD`].
+#[unsafe(no_mangle)]
+pub fn handle_eventfd(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
+    dispatch_syscall(epc, hart_context, frame, |t, f| {
+        orbit_core::syscall::eventfd_req(t, f, &mut crate::hw::RiscvHardware)
+    });
+}
+
 /// `fs_fstat(fd, &mut Stat) → 0 | -errno`. Sync — looks up the
 /// process's `OpenFile`, runs `Filesystem::stat`, copies into the
 /// user buffer.
@@ -1394,6 +1412,20 @@ pub fn handle_fs_fstat(epc: usize, hart_context: &'static HartContext, frame: &m
         let fd = f.regs[11] as u32;
         let stat_va = f.regs[12] as u64;
         let ret = orbit.run_fs_fstat(t.pid, t.root_table_addr(), fd, stat_va);
+        orbit_core::SyscallOutcome::Return { ret }
+    });
+}
+
+/// `ch_inspect(fd, *mut ChInfo) → 0 | -errno`. Sync — reads
+/// `process_handles` and copies the kind + region details into the
+/// caller's buffer.
+#[unsafe(no_mangle)]
+pub fn handle_ch_inspect(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
+    let orbit = unsafe { (hart_context.cscratch as *mut kernel::Orbit).as_mut_unchecked() };
+    dispatch_syscall(epc, hart_context, frame, |t, f| {
+        let fd = f.regs[11] as u32;
+        let info_va = f.regs[12] as u64;
+        let ret = orbit.run_ch_inspect_req(t.pid, t.root_table_addr(), fd, info_va);
         orbit_core::SyscallOutcome::Return { ret }
     });
 }
@@ -1684,9 +1716,7 @@ pub fn handle_query_stats(epc: usize, hart_context: &'static HartContext, frame:
         // Single-page constraint enforced at the boundary so the
         // manager arm is one `UserPageWindow`. `ProcessStats` (~128 B)
         // fits in any 4 KiB slot.
-        if (buf_va.raw() & (mmu::PAGE_SIZE as u64 - 1)) + buf_len as u64
-            > mmu::PAGE_SIZE as u64
-        {
+        if (buf_va.raw() & (mmu::PAGE_SIZE as u64 - 1)) + buf_len as u64 > mmu::PAGE_SIZE as u64 {
             return orbit_core::SyscallOutcome::Return {
                 ret: -(EINVAL as isize),
             };

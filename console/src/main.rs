@@ -209,7 +209,7 @@ fn syscall_name(ordinal: usize) -> &'static str {
         9 => "create_netch",
         10 => "close_handle",
         11 => "create_process",
-        12 => "nc_yield",
+        12 => "ch_yield",
         13 => "query_stats",
         14 => "query_syscall_stats",
         15 => "create_thread",
@@ -520,7 +520,7 @@ pub extern "C" fn main() -> i32 {
             // errors (EFAULT/EINVAL/EBUSY) shouldn't happen with a
             // stable stack-resident buffer. Yield briefly and retry.
             Err(_) => {
-                let _ = sleep_ms(10);
+                let _ = sleep_ms(16);
                 continue;
             }
         };

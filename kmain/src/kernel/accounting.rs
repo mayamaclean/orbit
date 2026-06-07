@@ -106,10 +106,20 @@ pub static SYSCALL_STATS: [SyscallSlot; Sysno::COUNT] = [
     SyscallSlot::new(),
     // ReadKeyEvent — ordinal 51, structured key-event ring drain.
     SyscallSlot::new(),
+    // WakeTid, Dup, Dup2, Fcntl, Fstat, Eventfd — ordinals 52..=57,
+    // appended for the unified handle / cross-thread doorbell ops.
+    SyscallSlot::new(),
+    SyscallSlot::new(),
+    SyscallSlot::new(),
+    SyscallSlot::new(),
+    SyscallSlot::new(),
+    SyscallSlot::new(),
+    // ChInspect — ordinal 58, kind-aware per-fd metadata.
+    SyscallSlot::new(),
 ];
 
 const _: () = assert!(
-    Sysno::COUNT == 52,
+    Sysno::COUNT == 59,
     "SYSCALL_STATS literal must be resized when Sysno::COUNT changes"
 );
 

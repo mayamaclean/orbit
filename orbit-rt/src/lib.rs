@@ -79,22 +79,27 @@
 // which pulls orbit-rt with `default-features = false` and provides
 // its own `alloc` workspace crate — doesn't end up with two `alloc`
 // names colliding.
-#[cfg(feature = "full-runtime")]
+#[cfg(feature = "mem-alloc")]
 extern crate alloc;
 
 pub mod argv;
 
-// Modules that rely on the `mem` crate (FrameAllocator), the `alloc`
-// crate (BTreeMap / Vec / String), or a `_start` symbol that would
-// clash with std-on-orbit's PAL `_start`. Gated behind `full-runtime`
-// so the std build (which sets `default-features = false`) sees a
-// smaller orbit-rt surface and avoids the alloc / mem dep chain that
-// isn't `rustc-dep-of-std`-friendly.
-#[cfg(feature = "full-runtime")]
+// Modules that rely on the `mem` crate (FrameAllocator) or the
+// `alloc` crate (BTreeMap / Vec / String). Gated on `mem-alloc` so
+// std-on-orbit + mio (which want the EventFd / NetCh wrappers but
+// not the `_start` symbol) can opt in independently of `full-runtime`.
+#[cfg(feature = "mem-alloc")]
 pub mod env;
-#[cfg(feature = "full-runtime")]
+#[cfg(feature = "mem-alloc")]
+pub mod event_fd;
+#[cfg(feature = "mem-alloc")]
 pub mod netch;
-#[cfg(feature = "full-runtime")]
+
+// `_start` is its own opt-in: std-on-orbit's PAL provides a `_start`
+// of its own, so any std consumer that imports orbit-rt must NOT
+// pull this module. no_std user binaries (umode, console, hello,
+// benches) inherit it via `full-runtime`'s default-features chain.
+#[cfg(feature = "start")]
 pub mod start;
 
 use core::alloc::{GlobalAlloc, Layout};
@@ -282,11 +287,18 @@ unsafe impl GlobalAlloc for OrbitHeap {
 }
 
 // `#[global_allocator]` only registered when orbit-rt is the runtime
-// for a no_std user binary. When orbit-rt is pulled in as a
-// `rustc-dep-of-std` dep, std provides its own #[global_allocator]
-// (see `rust/library/std/src/sys/alloc/orbit.rs`); registering ours
-// would be a duplicate and fail to link.
-#[cfg(not(feature = "rustc-dep-of-std"))]
+// for a no_std user binary — i.e. when the `start` feature is on
+// (the canonical "we own this binary's entrypoint" marker). std-on-
+// orbit + mio pull orbit-rt with `mem-alloc` only (for `event_fd` /
+// `shared_va`) and never want our allocator: std provides its own
+// `#[global_allocator]` at `rust/library/std/src/sys/alloc/orbit.rs`,
+// and registering ours would either fail to link (two allocators) or
+// silently override std's heap path.
+//
+// The previous gate (`not(feature = "rustc-dep-of-std")`) was looser
+// — it caught the std-internal build but not std-on-orbit *consumers*
+// like mio that pull orbit-rt as a normal dep.
+#[cfg(all(not(feature = "rustc-dep-of-std"), feature = "start"))]
 #[global_allocator]
 static ORBIT_HEAP: OrbitHeap = OrbitHeap;
 
@@ -294,15 +306,16 @@ static ORBIT_HEAP: OrbitHeap = OrbitHeap;
 // Shared VA allocator (unchanged in shape; just swaps lock_api Mutex
 // for the same SpinFlag pattern).
 //
-// Wrapped in `mod shared_va` and gated behind `full-runtime` because
+// Wrapped in `mod shared_va` and gated behind `mem-alloc` because
 // the buddy `FrameAllocator` lives in the `mem` crate, whose
 // transitive deps (heapless, byteorder, ...) don't ship
 // `rustc-dep-of-std` features and therefore can't be pulled into the
-// std build. std-on-orbit doesn't use SharedVa today — its NetCh impl
-// in [`rust/library/std/src/sys/net/connection/orbit.rs`] reserves
-// shared VAs through its own path.
+// std build. std-on-orbit's NetCh impl in
+// [`rust/library/std/src/sys/net/connection/orbit.rs`] reserves
+// shared VAs through its own bump cursor; mio's orbit Selector uses
+// this allocator through `EventFd::create`.
 // =====================================================================
-#[cfg(feature = "full-runtime")]
+#[cfg(feature = "mem-alloc")]
 mod shared_va {
     use super::{PAGE_SIZE_USIZE, PERMS_RW_U, SpinFlag};
     use core::alloc::Layout;
@@ -404,6 +417,7 @@ mod shared_va {
     /// `close_handle`). Drop releases only the VA, not whatever mapping
     /// was installed at it; if the caller forgets to tear down its
     /// mapping, the orphaned PTEs persist until process exit.
+    #[derive(Debug)]
     pub struct SharedRegion {
         va: usize,
         /// Layout passed to `alloc_aligned`. Stored verbatim because
@@ -506,5 +520,5 @@ mod shared_va {
     }
 }
 
-#[cfg(feature = "full-runtime")]
+#[cfg(feature = "mem-alloc")]
 pub use shared_va::{SHARED_VA, SharedRegion, SharedVa, shared_mmap};

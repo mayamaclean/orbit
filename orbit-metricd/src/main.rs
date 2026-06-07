@@ -287,7 +287,7 @@ fn syscall_name(ordinal: usize) -> &'static str {
         9 => "create_netch",
         10 => "close_handle",
         11 => "create_process",
-        12 => "nc_yield",
+        12 => "ch_yield",
         13 => "query_stats",
         14 => "query_syscall_stats",
         15 => "create_thread",
@@ -327,11 +327,18 @@ fn syscall_name(ordinal: usize) -> &'static str {
         49 => "fb_surface_destroy",
         50 => "fb_present",
         51 => "read_key_event",
+        52 => "wake_tid",
+        53 => "dup",
+        54 => "dup2",
+        55 => "fcntl",
+        56 => "fstat",
+        57 => "eventfd",
+        58 => "ch_inspect",
         _ => "?",
     }
 }
 
 const _: () = assert!(
-    Sysno::COUNT == 52,
+    Sysno::COUNT == 59,
     "syscall_name table must be resized when Sysno::COUNT changes"
 );

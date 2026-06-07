@@ -558,6 +558,434 @@ fn main() {
         Err(e) => println!("tcp connect failed: {e}"),
     }
 
+    // §13f — `os::fd` lift smoke. Validates the std PAL changes from
+    // Milestone C: File / TcpStream / TcpListener carry RawFd-shaped
+    // handles, expose `AsRawFd` / `AsFd` through the orbit-side
+    // `os::fd` plumbing, and `set_nonblocking(true)` is a real
+    // userspace operation (no kernel syscall, just an atomic flag).
+    {
+        use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener};
+        use std::os::fd::{AsFd, AsRawFd};
+
+        // File: open, check fd > 2 (stdio occupies 0/1/2), check
+        // AsFd returns the same raw value.
+        match std::fs::File::open("/bin/hello.txt") {
+            Ok(f) => {
+                let raw = f.as_raw_fd();
+                let borrowed = f.as_fd().as_raw_fd();
+                if raw > 2 && borrowed == raw {
+                    println!("PASS: os::fd File::as_raw_fd={raw} matches AsFd");
+                }
+                else {
+                    println!("FAIL: os::fd File raw={raw} borrowed={borrowed} (stdio is 0/1/2)");
+                }
+            }
+            Err(e) => println!("FAIL: os::fd File::open /bin/hello.txt: {e}"),
+        }
+
+        // TcpListener: bind on a separate port, validate as_raw_fd
+        // returns a positive non-stdio fd, then flip set_nonblocking
+        // and observe `accept()` returns WouldBlock without parking.
+        match TcpListener::bind(SocketAddr::V4(SocketAddrV4::new(
+            Ipv4Addr::new(0, 0, 0, 0),
+            7779,
+        ))) {
+            Ok(listener) => {
+                let raw = listener.as_raw_fd();
+                if raw > 2 {
+                    println!("PASS: os::fd TcpListener::as_raw_fd={raw}");
+                }
+                else {
+                    println!("FAIL: os::fd TcpListener raw={raw}");
+                }
+
+                match listener.set_nonblocking(true) {
+                    Ok(()) => println!("PASS: TcpListener::set_nonblocking(true)"),
+                    Err(e) => println!("FAIL: set_nonblocking(true): {e}"),
+                }
+
+                // Non-blocking accept on a freshly bound listener
+                // should return WouldBlock immediately — no peer has
+                // connected, and the kernel-side channel state is
+                // `IDLE` / `IN_FLIGHT`, not `ACTIVE`.
+                match listener.accept() {
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        println!("PASS: nonblocking accept returns WouldBlock");
+                    }
+                    Err(e) => println!("FAIL: nonblocking accept error: {e}"),
+                    Ok(_) => println!("FAIL: nonblocking accept somehow returned a peer"),
+                }
+            }
+            Err(e) => println!("FAIL: os::fd TcpListener::bind :7779: {e}"),
+        }
+    }
+
+    // §13g — mio compile + minimal API smoke. Validates the orbit
+    // mio fork actually links (the major scaffolding payoff for
+    // Milestone E) and that `Poll::new` + `Waker::new` + `Registry`
+    // operations resolve at runtime against the orbit sys backend.
+    // The selector scan loop is still a stub at this point, so we
+    // don't exercise `poll()` for real events — just the
+    // construction + register/deregister surface that tokio leans
+    // on at startup.
+    //
+    // Markers go through `orbit_abi::serialln!` so they land on the
+    // QEMU `-serial` channel (the only place we can read them
+    // headlessly); plain `println!` routes to the framebuffer.
+    {
+        use mio::{Events, Poll, Token, Waker};
+        use orbit_abi::serialln;
+        use std::sync::Arc;
+
+        let Ok(mut poll) = Poll::new()
+        else {
+            serialln!("FAIL: mio::Poll::new");
+            return;
+        };
+        serialln!("PASS: mio::Poll::new");
+
+        let Ok(waker) = Waker::new(poll.registry(), Token(42))
+        else {
+            serialln!("FAIL: mio::Waker::new");
+            return;
+        };
+        serialln!("PASS: mio::Waker::new");
+
+        // Zero-timeout poll before any wake: count is 0, no events.
+        let mut events = Events::with_capacity(8);
+        match poll.poll(&mut events, Some(core::time::Duration::ZERO)) {
+            Ok(()) if events.is_empty() => {
+                serialln!("PASS: mio::Poll::poll zero-timeout pre-wake returns empty");
+            }
+            Ok(()) => serialln!(
+                "FAIL: mio::Poll::poll pre-wake returned {} events",
+                events.iter().count()
+            ),
+            Err(e) => serialln!("FAIL: mio::Poll::poll pre-wake: {e}"),
+        }
+
+        // Fire wake(): bumps the EventFd's count in shared memory.
+        // The reactor isn't parked so no `wake_tid` syscall fires.
+        let _ = Arc::new(()); // keep `Arc` import used
+        match waker.wake() {
+            Ok(()) => serialln!("PASS: mio::Waker::wake"),
+            Err(e) => serialln!("FAIL: Waker::wake: {e}"),
+        }
+
+        // Poll after wake: the scan should observe count > 0 and
+        // emit an event with Token(42)/readable.
+        events.clear();
+        match poll.poll(&mut events, Some(core::time::Duration::from_millis(100))) {
+            Ok(()) => {
+                let mut saw = false;
+                for ev in events.iter() {
+                    if ev.token() == Token(42) && ev.is_readable() {
+                        saw = true;
+                    }
+                }
+                if saw {
+                    serialln!("PASS: mio scan observed Waker event after wake()");
+                }
+                else {
+                    serialln!(
+                        "FAIL: mio scan returned {} events but no Token(42)/readable",
+                        events.iter().count(),
+                    );
+                }
+            }
+            Err(e) => serialln!("FAIL: poll after wake: {e}"),
+        }
+
+        // Explicit deregister + drop ordering: mio's contract is
+        // that consumers deregister sources before close. The Waker
+        // owns its EventFd so dropping the Waker while it's still
+        // registered would leave a stale region pointer in the
+        // Selector. Drop Poll first (which drops Registry → drops
+        // Selector → invalidates the source set) before the Waker.
+        drop(poll);
+        drop(waker);
+    }
+
+    // §13h — ch_inspect smoke. Validates kind tags + region metadata
+    // for every Handle variant the kernel can serve today.
+    {
+        use orbit_abi::handle::{ChInfo, HandleKind};
+        use orbit_abi::layout::UPROC_SHARED_BASE;
+        use orbit_abi::serialln;
+        use orbit_abi::user::{ch_inspect, close_handle, eventfd};
+        use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener};
+        use std::os::fd::AsRawFd;
+
+        let mut info = ChInfo::default();
+
+        // Stdio kinds — fds 0/1/2 always present after process spawn.
+        for (fd, want, label) in [
+            (0u32, HandleKind::Stdin as u8, "Stdin"),
+            (1u32, HandleKind::Stdout as u8, "Stdout"),
+            (2u32, HandleKind::Stderr as u8, "Stderr"),
+        ] {
+            info = ChInfo::default();
+            match ch_inspect(fd, &mut info) {
+                Ok(()) if info.kind == want && info.region_va == 0 && info.region_size == 0 => {
+                    serialln!("PASS: ch_inspect fd={fd} kind={label}");
+                }
+                Ok(()) => serialln!(
+                    "FAIL: ch_inspect fd={fd} kind={} (wanted {label}={want}) va=0x{:X} size={}",
+                    info.kind,
+                    info.region_va,
+                    info.region_size,
+                ),
+                Err(e) => serialln!("FAIL: ch_inspect fd={fd} errno={}", e.0),
+            }
+        }
+
+        // EventFd kind + region echo. The returned va should match
+        // both what eventfd() handed us *and* what's mapped into
+        // shared memory at that VA.
+        let hint = (UPROC_SHARED_BASE as usize) + 0x10_0000;
+        match eventfd(hint, 7, orbit_abi::event_fd::EFD_NONBLOCK) {
+            Ok((va, fd)) => {
+                info = ChInfo::default();
+                match ch_inspect(fd, &mut info) {
+                    Ok(())
+                        if info.kind == HandleKind::EventFd as u8
+                            && info.region_va as usize == va
+                            && info.region_size == 4096
+                            && (info.flags & orbit_abi::event_fd::EFD_NONBLOCK) != 0 =>
+                    {
+                        serialln!(
+                            "PASS: ch_inspect EventFd fd={fd} va=0x{:X} size={} flags=0x{:X}",
+                            info.region_va,
+                            info.region_size,
+                            info.flags,
+                        );
+                    }
+                    Ok(()) => serialln!(
+                        "FAIL: ch_inspect EventFd fd={fd} kind={} va=0x{:X}/0x{:X} size={} flags=0x{:X}",
+                        info.kind,
+                        info.region_va,
+                        va as u64,
+                        info.region_size,
+                        info.flags,
+                    ),
+                    Err(e) => serialln!("FAIL: ch_inspect EventFd errno={}", e.0),
+                }
+                let _ = close_handle(fd);
+            }
+            Err(e) => serialln!("FAIL: eventfd setup for ch_inspect errno={}", e.0),
+        }
+
+        // NetChannel kind. Bind a listener on a free port; the
+        // resulting NetChannel handle should ch_inspect to kind
+        // = NetChannel with a non-zero region_va in the shared range.
+        match TcpListener::bind(SocketAddr::V4(SocketAddrV4::new(
+            Ipv4Addr::new(0, 0, 0, 0),
+            7791,
+        ))) {
+            Ok(listener) => {
+                let fd = listener.as_raw_fd() as u32;
+                info = ChInfo::default();
+                match ch_inspect(fd, &mut info) {
+                    Ok(())
+                        if info.kind == HandleKind::NetChannel as u8
+                            && info.region_va != 0
+                            && info.region_size > 0 =>
+                    {
+                        serialln!(
+                            "PASS: ch_inspect NetChannel fd={fd} va=0x{:X} size={} state={}",
+                            info.region_va,
+                            info.region_size,
+                            info.state,
+                        );
+                    }
+                    Ok(()) => serialln!(
+                        "FAIL: ch_inspect NetChannel fd={fd} kind={} va=0x{:X} size={}",
+                        info.kind,
+                        info.region_va,
+                        info.region_size,
+                    ),
+                    Err(e) => serialln!("FAIL: ch_inspect NetChannel errno={}", e.0),
+                }
+            }
+            Err(e) => serialln!("FAIL: TcpListener bind for ch_inspect: {e}"),
+        }
+
+        // EBADF on a fd that was never allocated. 100_000 is way past
+        // any plausible slot in a fresh process.
+        info = ChInfo::default();
+        match ch_inspect(100_000, &mut info) {
+            Err(e) if e.0 == orbit_abi::errno::EBADF => {
+                serialln!("PASS: ch_inspect bogus fd returns EBADF");
+            }
+            Ok(()) => serialln!("FAIL: ch_inspect bogus fd unexpectedly succeeded"),
+            Err(e) => serialln!("FAIL: ch_inspect bogus fd errno={} (wanted EBADF)", e.0),
+        }
+    }
+
+    // §13i — Raw-fd round-trip smoke. Exercises the new orbit
+    // `FromRawFd` / `IntoRawFd` impls on std::net::TcpListener: a
+    // bound listener's fd is extracted, then reconstituted into a
+    // fresh wrapper, and the resulting object is asserted to share
+    // the same kernel handle / region as the original.
+    {
+        use orbit_abi::handle::ChInfo;
+        use orbit_abi::serialln;
+        use orbit_abi::user::ch_inspect;
+        use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener};
+        use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
+
+        match TcpListener::bind(SocketAddr::V4(SocketAddrV4::new(
+            Ipv4Addr::new(0, 0, 0, 0),
+            7792,
+        ))) {
+            Ok(listener) => {
+                let original_fd = listener.as_raw_fd();
+                let mut info_before = ChInfo::default();
+                let _ = ch_inspect(original_fd as u32, &mut info_before);
+
+                // IntoRawFd → mem::forget the wrapper, keep the kernel
+                // handle alive.
+                let raw = listener.into_raw_fd();
+                if raw == original_fd {
+                    serialln!("PASS: TcpListener::into_raw_fd preserves fd value");
+                }
+                else {
+                    serialln!("FAIL: TcpListener::into_raw_fd raw={raw} vs original={original_fd}",);
+                }
+
+                // FromRawFd → rebuilds the wrapper via ch_inspect.
+                let rebuilt = unsafe { TcpListener::from_raw_fd(raw) };
+                let rebuilt_fd = rebuilt.as_raw_fd();
+                let mut info_after = ChInfo::default();
+                let _ = ch_inspect(rebuilt_fd as u32, &mut info_after);
+
+                if rebuilt_fd == original_fd
+                    && info_after.region_va == info_before.region_va
+                    && info_after.region_size == info_before.region_size
+                {
+                    serialln!(
+                        "PASS: TcpListener::from_raw_fd rehydrated va=0x{:X} size={}",
+                        info_after.region_va,
+                        info_after.region_size,
+                    );
+                }
+                else {
+                    serialln!(
+                        "FAIL: rehydration drift fd={}/{} va=0x{:X}/0x{:X} size={}/{}",
+                        rebuilt_fd,
+                        original_fd,
+                        info_after.region_va,
+                        info_before.region_va,
+                        info_after.region_size,
+                        info_before.region_size,
+                    );
+                }
+
+                // OwnedFd round-trip. Going OwnedFd → TcpListener →
+                // OwnedFd should preserve the fd through both
+                // conversions.
+                let owned: OwnedFd = rebuilt.into();
+                let owned_fd = owned.as_raw_fd();
+                let again: TcpListener = owned.into();
+                if again.as_raw_fd() == owned_fd {
+                    serialln!("PASS: OwnedFd ↔ TcpListener round-trip preserves fd");
+                }
+                else {
+                    serialln!(
+                        "FAIL: OwnedFd round-trip drift {} → {}",
+                        owned_fd,
+                        again.as_raw_fd(),
+                    );
+                }
+                drop(again);
+            }
+            Err(e) => serialln!("FAIL: TcpListener bind for raw-fd smoke: {e}"),
+        }
+    }
+
+    // §13j — Cross-thread wake_tid doorbell. §13g exercises the
+    // shared-mem `count.fetch_add` path with a single thread (wake
+    // fires before park), so it never engages the `wake_tid` →
+    // `WakeEvent::Tid` → manager-driven unpark chain. Here the
+    // parent parks in `poll.poll(events, 5s)` and a child thread
+    // delivers `waker.wake()` 50ms later. Pass criteria:
+    //  - the parent unparks (Token(99)/readable event observed)
+    //  - elapsed wall-clock < 500ms (anything close to 5s means
+    //    the doorbell didn't fire and we sat through the timeout)
+    {
+        use mio::{Events, Poll, Token, Waker};
+        use orbit_abi::serialln;
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        let Ok(mut poll) = Poll::new()
+        else {
+            serialln!("FAIL: §13j Poll::new");
+            return;
+        };
+        let Ok(waker) = Waker::new(poll.registry(), Token(99))
+        else {
+            serialln!("FAIL: §13j Waker::new");
+            return;
+        };
+        let waker = Arc::new(waker);
+
+        let waker_for_child = Arc::clone(&waker);
+        let child = std::thread::spawn(move || {
+            // Park budget = 50ms; the parent's poll timeout is
+            // 5s so any latency over ~100ms means doorbell missed.
+            std::thread::sleep(Duration::from_millis(50));
+            waker_for_child.wake()
+        });
+
+        let mut events = Events::with_capacity(8);
+        let started = Instant::now();
+        let result = poll.poll(&mut events, Some(Duration::from_secs(5)));
+        let elapsed = started.elapsed();
+
+        match result {
+            Ok(()) => {
+                let mut saw = false;
+                for ev in events.iter() {
+                    if ev.token() == Token(99) && ev.is_readable() {
+                        saw = true;
+                    }
+                }
+                if saw && elapsed < Duration::from_millis(500) {
+                    serialln!(
+                        "PASS: cross-thread wake_tid unparked reactor in {}ms",
+                        elapsed.as_millis(),
+                    );
+                }
+                else if saw {
+                    serialln!(
+                        "FAIL: reactor unparked but took {}ms (timeout fire, not doorbell)",
+                        elapsed.as_millis(),
+                    );
+                }
+                else {
+                    serialln!(
+                        "FAIL: §13j poll returned {} events but no Token(99)/readable",
+                        events.iter().count(),
+                    );
+                }
+            }
+            Err(e) => serialln!("FAIL: §13j poll: {e}"),
+        }
+
+        // Child returns Result<(), io::Error> — surface a failed
+        // wake call so it can't be silently swallowed.
+        match child.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => serialln!("FAIL: §13j child waker.wake() returned {e}"),
+            Err(_) => serialln!("FAIL: §13j child thread panicked"),
+        }
+
+        drop(poll);
+        // `waker` is the last Arc clone now; drops the EventFd.
+        drop(waker);
+    }
+
     // §13e — TcpListener round-trip. Bind to port 7778, accept one
     // peer, echo what they send. The host driver sends a single
     // line and disconnects.

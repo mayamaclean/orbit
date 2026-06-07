@@ -173,7 +173,7 @@ pub mod class {
     pub const PROC_SPAWN: ClassMask = ClassMask::from_raw(raw::PROC_SPAWN);
 
     /// `sleep_ms`, `set_affinity`, `get_affinity`, `get_hart_id`,
-    /// `nc_yield`. Anything that hands the scheduler a parking
+    /// `ch_yield`. Anything that hands the scheduler a parking
     /// or migration request.
     pub const SCHED: ClassMask = ClassMask::from_raw(raw::SCHED);
 
@@ -694,7 +694,7 @@ impl Permissions {
             syscall::CREATE_NETCH => class::NETCH,
             syscall::CLOSE_HANDLE => class::STDIO,
             syscall::CREATE_PROCESS => class::PROC_SPAWN,
-            syscall::NC_YIELD => class::SCHED,
+            syscall::CH_YIELD => class::SCHED,
             syscall::QUERY_STATS => class::STATS,
             syscall::QUERY_SYSCALL_STATS => class::STATS,
             syscall::CREATE_PROCESS_EX => class::PROC_SPAWN,
@@ -707,6 +707,18 @@ impl Permissions {
             syscall::WAIT_PID => class::PROC_LIFE,
             syscall::FUTEX_WAIT => class::FUTEX,
             syscall::FUTEX_WAKE => class::FUTEX,
+            // Cross-thread doorbell + EventFd: both are
+            // synchronization primitives in the same family as futex.
+            // Same FUTEX class so a pledge of "we use std mutex/cond"
+            // covers them implicitly.
+            syscall::WAKE_TID => class::FUTEX,
+            syscall::EVENTFD => class::FUTEX,
+            // `ch_inspect` is the read-side companion to `eventfd` /
+            // `create_netch` — mio's Selector calls it to translate a
+            // RawFd into the shared region pointer at registration
+            // time. Same class as those primitives so a single pledge
+            // keeps the group composable.
+            syscall::CH_INSPECT => class::FUTEX,
             syscall::FS_OPEN => class::FS_RO,
             syscall::FS_READ => class::FS_RO,
             syscall::FS_STAT => class::FS_RO,
@@ -1006,7 +1018,7 @@ mod tests {
             CREATE_NETCH,
             CLOSE_HANDLE,
             CREATE_PROCESS,
-            NC_YIELD,
+            CH_YIELD,
             QUERY_STATS,
             QUERY_SYSCALL_STATS,
             CREATE_PROCESS_EX,
@@ -1019,6 +1031,9 @@ mod tests {
             WAIT_PID,
             FUTEX_WAIT,
             FUTEX_WAKE,
+            WAKE_TID,
+            EVENTFD,
+            CH_INSPECT,
             FS_OPEN,
             FS_READ,
             FS_STAT,
@@ -1558,7 +1573,7 @@ mod tests {
             CREATE_NETCH,
             CLOSE_HANDLE,
             CREATE_PROCESS,
-            NC_YIELD,
+            CH_YIELD,
             QUERY_STATS,
             QUERY_SYSCALL_STATS,
             CREATE_PROCESS_EX,
@@ -1571,6 +1586,9 @@ mod tests {
             WAIT_PID,
             FUTEX_WAIT,
             FUTEX_WAKE,
+            WAKE_TID,
+            EVENTFD,
+            CH_INSPECT,
             FS_OPEN,
             FS_READ,
             FS_STAT,

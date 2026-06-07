@@ -247,6 +247,27 @@ pub struct FbSurfaceDestroyReq {
     pub handle: u32,
 }
 
+/// `eventfd(vaddr_hint, initval, flags)` request — manager allocates
+/// a `kernel_pages` frame, initializes the [`EventFd`](orbit_abi::event_fd::EventFd)
+/// header, maps it shared-revocable into the caller's shared range,
+/// installs a `Handle::EventFd` slot, and signals
+/// `(vaddr, fd)` on the result tid.
+#[derive(Debug, Clone, Copy)]
+pub struct EventFdCreateReq {
+    pub vaddr_hint: UserVa,
+    pub initval: u64,
+    pub flags: u32,
+}
+
+/// `wake_tid(target_tid)` request — manager validates that
+/// `target_tid` belongs to the calling process and pushes a
+/// `WakeEvent::Tid(target_tid)`. Signals `0` on success or `-ESRCH` /
+/// `-EPERM`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WakeTidReq {
+    pub target_tid: u32,
+}
+
 /// One slot in the manager's MPSC work ring. Fixed-size by virtue of
 /// the variants — the largest payload (`CreateProcessReq`) is two
 /// words; the handle is one Arc.
@@ -418,6 +439,20 @@ pub enum PendingWork {
         root_pa: PhysAddr,
         tid: u32,
     },
+    /// `eventfd(vaddr_hint, initval, flags)` — manager allocates the
+    /// backing frame, initializes the EventFd layout, maps it into the
+    /// caller's shared range, and installs a `Handle::EventFd` slot.
+    /// Resumes via `publish_pending_for_tid(tid, &[vaddr, fd])`.
+    EventFdCreate {
+        req: EventFdCreateReq,
+        pid: u16,
+        root_pa: PhysAddr,
+        tid: u32,
+    },
+    /// `wake_tid(target_tid)` — manager validates same-process
+    /// membership and pushes `WakeEvent::Tid(target_tid)`. Resumes via
+    /// `publish_pending_for_tid(tid, &[result])`.
+    WakeTid { req: WakeTidReq, pid: u16, tid: u32 },
     /// Page-cache DMA completion. Posted by the virtio-blk IRQ when a
     /// chain submitted via the cached path (`submit_blk_read_cached`)
     /// finishes. Carries the packed `CacheKey` the manager uses to
