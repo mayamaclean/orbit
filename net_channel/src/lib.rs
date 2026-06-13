@@ -532,6 +532,19 @@ pub enum Phase {
 pub struct ChannelCtx {
     pub bind: BindSpec,
     pub phase: Phase,
+    /// Trusted copy of the region's queue subregion length, computed
+    /// kernel-side from the (kernel-validated) region size at channel
+    /// creation. The `queue_len` stamped into the shared header by
+    /// [`NetChannel::init`] is the *user's* copy — the header page is
+    /// mapped user-RW, so a process can scribble it; the kernel must
+    /// never derive a pointer from it. All kernel-side sub-region
+    /// access goes through this field instead.
+    pub queue_len: usize,
+    /// Trusted per-ring payload capacity; same rationale as
+    /// [`queue_len`](Self::queue_len) — `NetChannelQueue::capacity`
+    /// in the shared header is user-writable and must not size a
+    /// kernel-side slice.
+    pub capacity: usize,
     /// "A slice is enqueued on rx.slices and we haven't yet drained the
     /// matching increment." Mirror of the user-side ack flag — gates
     /// re-enqueue so we don't deposit a duplicate slice while smoltcp
@@ -539,6 +552,15 @@ pub struct ChannelCtx {
     pub pending_rx_ack: bool,
     /// Same invariant on the tx side.
     pub pending_tx_ack: bool,
+    /// Length of the rx slice currently staged (valid while
+    /// `pending_rx_ack`). Bounds the increment the user may ack with:
+    /// increments are user-controlled shared-memory values, and an
+    /// unchecked one would flow straight into `socket.recv(n)` —
+    /// smoltcp asserts `n <= buffer`, so a hostile value is at minimum
+    /// a kernel panic. Zeroed on drain and on recycle.
+    pub staged_rx_len: usize,
+    /// Same bound on the tx side (flows into `socket.send(n)`).
+    pub staged_tx_len: usize,
     /// Last engaged value observed. We recycle on the `1 → 0` edge
     /// rather than on every poll where engaged is `0`, otherwise a
     /// fresh-but-unclaimed session would get torn down before the user
@@ -554,12 +576,19 @@ pub struct ChannelCtx {
 
 #[cfg(feature = "kernel")]
 impl ChannelCtx {
-    pub fn new(bind: BindSpec) -> Self {
+    /// `region_size` must be the kernel-validated value returned by
+    /// [`NetChannel::normalize_region_size`] for this channel — it is
+    /// the root of trust for the layout fields above.
+    pub fn new(bind: BindSpec, region_size: usize) -> Self {
         Self {
             bind,
             phase: Phase::FreshIdle,
+            queue_len: NetChannel::queue_len_for(region_size),
+            capacity: NetChannel::capacity_for(region_size),
             pending_rx_ack: false,
             pending_tx_ack: false,
+            staged_rx_len: 0,
+            staged_tx_len: 0,
             last_engaged: false,
             backoff_ms: 0,
             next_attempt_at_us: 0,
@@ -838,6 +867,10 @@ impl NetChannel {
         }
     }
 
+    /// User-side only: reads the layout field out of the shared header,
+    /// which the kernel must never trust (user-RW page). Kernel code
+    /// carries the trusted copy in [`ChannelCtx::queue_len`].
+    #[cfg(not(feature = "kernel"))]
     pub fn queue_len(&self) -> usize {
         self.queue_len
     }
@@ -854,12 +887,28 @@ impl NetChannel {
         unsafe { &*(self.anchor().add(NC_CURRENT_OFF) as *const NetChannelCurrent) }
     }
 
+    /// Safe under both satps: `NC_TX_OFF` is a compile-time constant,
+    /// so unlike [`rx`](Self::rx) this derives no pointer from shared
+    /// mutable state.
     pub fn tx(&self) -> &NetChannelQueue {
         unsafe { &*(self.anchor().add(NC_TX_OFF) as *const NetChannelQueue) }
     }
 
+    /// User-side only — offsets by the header's `queue_len`, which the
+    /// user may freely corrupt (self-harm). Kernel code must use
+    /// [`rx_trusted`](Self::rx_trusted) with the `ChannelCtx` copy.
+    #[cfg(not(feature = "kernel"))]
     pub fn rx(&self) -> &NetChannelQueue {
         unsafe { &*(self.anchor().add(NC_TX_OFF + self.queue_len) as *const NetChannelQueue) }
+    }
+
+    /// Kernel-side rx accessor. `queue_len` must come from
+    /// [`ChannelCtx::queue_len`] (kernel-derived at creation), never
+    /// from the shared header — a scribbled header value would walk
+    /// this pointer to an attacker-chosen KDMAP offset.
+    #[cfg(feature = "kernel")]
+    pub fn rx_trusted(&self, queue_len: usize) -> &NetChannelQueue {
+        unsafe { &*(self.anchor().add(NC_TX_OFF + queue_len) as *const NetChannelQueue) }
     }
 
     /// Reset the kernel-owned halves of both rings so the next connection
@@ -875,9 +924,9 @@ impl NetChannel {
     /// the kernel releases `current.state = 0` — otherwise userspace may
     /// observe stale-then-zero indices out of order.
     #[cfg(feature = "kernel")]
-    pub unsafe fn reset_kernel_side(&self) {
+    pub unsafe fn reset_kernel_side(&self, queue_len: usize) {
         let tx = self.tx();
-        let rx = self.rx();
+        let rx = self.rx_trusted(queue_len);
         unsafe {
             tx.slices.reset_producer();
             tx.increments.reset_consumer();
@@ -973,8 +1022,27 @@ impl NetChannel {
                 let tx = self.tx();
                 // SAFETY: kernel is the sole consumer of tx.increments.
                 while let Some(user_tx_count) = unsafe { tx.dequeue_increment() } {
+                    // Same bound as the Active-phase drain: increments
+                    // are user-controlled; an out-of-protocol value on
+                    // the final flush fails the channel rather than
+                    // flowing into socket.send.
+                    if !ctx.pending_tx_ack
+                        || user_tx_count == 0
+                        || user_tx_count > ctx.staged_tx_len
+                    {
+                        error!(
+                            "tcp: bogus tx increment {user_tx_count} at disengage (staged={}, pending={}), failing channel",
+                            ctx.staged_tx_len, ctx.pending_tx_ack,
+                        );
+                        cur.fail_cause.store(EBIND_IO as i32, Ordering::Release);
+                        cur.state.store(channel_state::FAILED, Ordering::Release);
+                        outcome.session_state_changed = true;
+                        ctx.phase = Phase::Failed;
+                        return (iface, outcome);
+                    }
                     let _ = socket.send(|_b| (user_tx_count, user_tx_count));
                     ctx.pending_tx_ack = false;
+                    ctx.staged_tx_len = 0;
                 }
             }
 
@@ -1024,10 +1092,12 @@ impl NetChannel {
             // session.
             socket.abort();
             unsafe {
-                self.reset_kernel_side();
+                self.reset_kernel_side(ctx.queue_len);
             }
             ctx.pending_rx_ack = false;
             ctx.pending_tx_ack = false;
+            ctx.staged_rx_len = 0;
+            ctx.staged_tx_len = 0;
             // peer_addr/port are advisory; clear so the next session's
             // peer info doesn't leak through.
             cur.peer_addr.store(0, Ordering::Relaxed);
@@ -1206,7 +1276,7 @@ impl NetChannel {
         // ── Drain rings only when the session is active ────────────────
         if matches!(ctx.phase, Phase::Active) {
             let tx = self.tx();
-            let rx = self.rx();
+            let rx = self.rx_trusted(ctx.queue_len);
 
             // `may_recv()` is true while the *transport* allows new data
             // (Established / FIN-WAIT-1/2) OR when the rx_buffer still has
@@ -1219,6 +1289,28 @@ impl NetChannel {
             if socket.may_recv() || socket.recv_queue() > 0 {
                 // SAFETY: kernel is the sole consumer of rx.increments.
                 while let Some(user_rx_count) = unsafe { rx.dequeue_increment() } {
+                    // The increment is a user-controlled shared-memory
+                    // value. The protocol allows exactly one increment
+                    // per staged slice, in `1..=staged_len` — anything
+                    // else (stale ring entry, scribbled slot, hostile
+                    // count) would flow into `socket.recv(n)`, where
+                    // smoltcp asserts `n <= buffer` (kernel panic) or,
+                    // worse, desyncs the lockstep ring pointers. Fail
+                    // the channel instead.
+                    if !ctx.pending_rx_ack
+                        || user_rx_count == 0
+                        || user_rx_count > ctx.staged_rx_len
+                    {
+                        error!(
+                            "tcp: bogus rx increment {user_rx_count} (staged={}, pending={}), failing channel",
+                            ctx.staged_rx_len, ctx.pending_rx_ack,
+                        );
+                        cur.fail_cause.store(EBIND_IO as i32, Ordering::Release);
+                        cur.state.store(channel_state::FAILED, Ordering::Release);
+                        outcome.session_state_changed = true;
+                        ctx.phase = Phase::Failed;
+                        return (iface, outcome);
+                    }
                     if let Err(e) = socket.recv(|_b| (user_rx_count, user_rx_count)) {
                         error!("tcp: failed recv: {e:?}");
                         cur.fail_cause.store(EBIND_IO as i32, Ordering::Release);
@@ -1228,6 +1320,7 @@ impl NetChannel {
                         return (iface, outcome);
                     }
                     ctx.pending_rx_ack = false;
+                    ctx.staged_rx_len = 0;
                 }
 
                 if !ctx.pending_rx_ack {
@@ -1238,6 +1331,7 @@ impl NetChannel {
                         core::sync::atomic::fence(Ordering::SeqCst);
                         rx.avail.store(next_rx.1, Ordering::Release);
                         ctx.pending_rx_ack = true;
+                        ctx.staged_rx_len = next_rx.1;
                         // New rx slice is visible to the user — anyone
                         // parked in `read_some` should run.
                         outcome.ring_progress = true;
@@ -1248,6 +1342,22 @@ impl NetChannel {
             if socket.may_send() {
                 // SAFETY: kernel is the sole consumer of tx.increments.
                 while let Some(user_tx_count) = unsafe { tx.dequeue_increment() } {
+                    // Same bound as the rx drain above — see that
+                    // comment for the rationale.
+                    if !ctx.pending_tx_ack
+                        || user_tx_count == 0
+                        || user_tx_count > ctx.staged_tx_len
+                    {
+                        error!(
+                            "tcp: bogus tx increment {user_tx_count} (staged={}, pending={}), failing channel",
+                            ctx.staged_tx_len, ctx.pending_tx_ack,
+                        );
+                        cur.fail_cause.store(EBIND_IO as i32, Ordering::Release);
+                        cur.state.store(channel_state::FAILED, Ordering::Release);
+                        outcome.session_state_changed = true;
+                        ctx.phase = Phase::Failed;
+                        return (iface, outcome);
+                    }
                     if let Err(e) = socket.send(|_b| (user_tx_count, user_tx_count)) {
                         error!("tcp: failed send: {e:?}");
                         cur.fail_cause.store(EBIND_IO as i32, Ordering::Release);
@@ -1257,6 +1367,7 @@ impl NetChannel {
                         return (iface, outcome);
                     }
                     ctx.pending_tx_ack = false;
+                    ctx.staged_tx_len = 0;
                 }
 
                 if tx.slices_is_empty() && !ctx.pending_tx_ack {
@@ -1267,6 +1378,7 @@ impl NetChannel {
                         core::sync::atomic::fence(Ordering::SeqCst);
                         tx.avail.store(next_tx.1, Ordering::Release);
                         ctx.pending_tx_ack = true;
+                        ctx.staged_tx_len = next_tx.1;
                         // Fresh tx slice = user has writeable space —
                         // anyone parked in `write_all` should run.
                         outcome.ring_progress = true;
@@ -1394,14 +1506,23 @@ impl NetChannel {
         self.desired().engaged.store(0, Ordering::Release);
     }
 
+    /// Build the smoltcp socket-buffer slices over the shared payload
+    /// rings. `queue_len` / `capacity` must be the trusted
+    /// [`ChannelCtx`] copies — the header's `capacity` field is
+    /// user-writable, and sizing a `&'static mut [u8]` from it would
+    /// hand smoltcp a kernel slice extending past the region.
     #[cfg(feature = "kernel")]
-    pub fn rings(&self) -> (&'static mut [u8], &'static mut [u8]) {
+    pub fn rings(
+        &self,
+        queue_len: usize,
+        capacity: usize,
+    ) -> (&'static mut [u8], &'static mut [u8]) {
         let tx = self.tx();
-        let rx = self.rx();
+        let rx = self.rx_trusted(queue_len);
         unsafe {
             (
-                core::slice::from_raw_parts_mut(tx.buf_ptr(), tx.capacity),
-                core::slice::from_raw_parts_mut(rx.buf_ptr(), rx.capacity),
+                core::slice::from_raw_parts_mut(tx.buf_ptr(), capacity),
+                core::slice::from_raw_parts_mut(rx.buf_ptr(), capacity),
             )
         }
     }

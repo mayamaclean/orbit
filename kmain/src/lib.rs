@@ -651,7 +651,12 @@ pub extern "C" fn k_net(device: *mut NetPackage) {
 
                 if req.nc_type == 0 {
                     let req_pid = req.pid;
-                    let (txr, rxr) = req.netchan.as_ref().rings();
+                    // Layout from the trusted ChannelCtx copy, not the
+                    // user-writable shared header.
+                    let (txr, rxr) = req
+                        .netchan
+                        .as_ref()
+                        .rings(req.ctx.queue_len, req.ctx.capacity);
 
                     info!(
                         "net: tcp socket ring lens: rx={},tx={}",
@@ -1276,30 +1281,17 @@ pub fn handle_create_process_ex(
     });
 }
 
-/// §13a.3 / §13e — `argv_envp() → (argv_va, envp_va)`. Synchronous
-/// read off the caller's `Process.argv_blob` / `envp_blob` slots; a
-/// `0` in either slot means "not installed" — orbit-rt treats those
-/// as empty `argv` / `envp`.
+/// §13a.3 / §13e — `argv_envp() → (argv_va, envp_va)`. Manager
+/// round-trip: reads the caller's `Process.argv_blob` / `envp_blob`
+/// presence flags and resumes with the fixed blob VAs (or `0` for
+/// "not installed" — orbit-rt treats those as empty `argv` / `envp`).
+/// The blobs are install-once-immutable, but the `processes` map
+/// lookup itself raced manager-side inserts when this was a sync
+/// handler.
 #[unsafe(no_mangle)]
 pub fn handle_argv_envp(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
-    let orbit = unsafe { (hart_context.cscratch as *mut kernel::Orbit).as_mut_unchecked() };
-    dispatch_syscall(epc, hart_context, frame, |t, _f| {
-        let argv_va = if orbit.process_has_argv(t.pid) {
-            orbit_abi::layout::USER_ARGV_BASE as isize
-        }
-        else {
-            0
-        };
-        let envp_va = if orbit.process_has_envp(t.pid) {
-            orbit_abi::layout::USER_ENVP_BASE as isize
-        }
-        else {
-            0
-        };
-        orbit_core::SyscallOutcome::Return2 {
-            ret0: argv_va,
-            ret1: envp_va,
-        }
+    dispatch_syscall(epc, hart_context, frame, |t, f| {
+        orbit_core::syscall::argv_envp_req(t, f, &mut crate::hw::RiscvHardware)
     });
 }
 
@@ -1402,71 +1394,53 @@ pub fn handle_eventfd(epc: usize, hart_context: &'static HartContext, frame: &mu
     });
 }
 
-/// `fs_fstat(fd, &mut Stat) → 0 | -errno`. Sync — looks up the
-/// process's `OpenFile`, runs `Filesystem::stat`, copies into the
-/// user buffer.
+/// `fs_fstat(fd, &mut Stat) → 0 | -errno`. Manager round-trip — the
+/// manager looks up the process's `OpenFile`, runs `Filesystem::stat`,
+/// and copies into the user buffer.
 #[unsafe(no_mangle)]
 pub fn handle_fs_fstat(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
-    let orbit = unsafe { (hart_context.cscratch as *mut kernel::Orbit).as_mut_unchecked() };
     dispatch_syscall(epc, hart_context, frame, |t, f| {
-        let fd = f.regs[11] as u32;
-        let stat_va = f.regs[12] as u64;
-        let ret = orbit.run_fs_fstat(t.pid, t.root_table_addr(), fd, stat_va);
-        orbit_core::SyscallOutcome::Return { ret }
+        orbit_core::syscall::fs_fstat_req(t, f, &mut crate::hw::RiscvHardware)
     });
 }
 
-/// `ch_inspect(fd, *mut ChInfo) → 0 | -errno`. Sync — reads
-/// `process_handles` and copies the kind + region details into the
-/// caller's buffer.
+/// `ch_inspect(fd, *mut ChInfo) → 0 | -errno`. Manager round-trip —
+/// the manager reads `process_handles` and copies the kind + region
+/// details into the caller's buffer.
 #[unsafe(no_mangle)]
 pub fn handle_ch_inspect(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
-    let orbit = unsafe { (hart_context.cscratch as *mut kernel::Orbit).as_mut_unchecked() };
     dispatch_syscall(epc, hart_context, frame, |t, f| {
-        let fd = f.regs[11] as u32;
-        let info_va = f.regs[12] as u64;
-        let ret = orbit.run_ch_inspect_req(t.pid, t.root_table_addr(), fd, info_va);
-        orbit_core::SyscallOutcome::Return { ret }
+        orbit_core::syscall::ch_inspect_req(t, f, &mut crate::hw::RiscvHardware)
     });
 }
 
-/// `fs_seek(fd, offset, whence) → new_offset | -errno`. Sync — only
-/// touches the per-fd `OpenFile.offset`, no DMA / manager work.
+/// `fs_seek(fd, offset, whence) → new_offset | -errno`. Manager
+/// round-trip — the per-fd `OpenFile.offset` is manager-owned state
+/// (`fs_read` / `fs_readdir`, its only consumers, run there too).
 #[unsafe(no_mangle)]
 pub fn handle_fs_seek(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
-    let orbit = unsafe { (hart_context.cscratch as *mut kernel::Orbit).as_mut_unchecked() };
     dispatch_syscall(epc, hart_context, frame, |t, f| {
-        let fd = f.regs[11] as u32;
-        let offset = f.regs[12] as i64;
-        let whence = f.regs[13] as u32;
-        let ret = orbit.run_fs_seek(t.pid, fd, offset, whence);
-        orbit_core::SyscallOutcome::Return { ret }
+        orbit_core::syscall::fs_seek_req(t, f, &mut crate::hw::RiscvHardware)
     });
 }
 
-/// `chdir(path_ptr, path_len) → 0 | -errno`. Sync handler — mutates
-/// the calling process's cwd in place after the kernel-side fs lookup
-/// confirms the target dir exists. Body lives on `Orbit` so it can
-/// reach into `self.processes`.
+/// `chdir(path_ptr, path_len) → 0 | -errno`. Manager round-trip —
+/// the manager confirms the target dir exists in the active fs, then
+/// mutates the calling process's cwd.
 #[unsafe(no_mangle)]
 pub fn handle_chdir(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
-    let orbit = unsafe { (hart_context.cscratch as *mut kernel::Orbit).as_mut_unchecked() };
     dispatch_syscall(epc, hart_context, frame, |t, f| {
-        let ret = orbit.run_chdir(t.pid, t.root_table_addr(), f.regs[11] as u64, f.regs[12]);
-        orbit_core::SyscallOutcome::Return { ret }
+        orbit_core::syscall::chdir_req(t, f, &mut crate::hw::RiscvHardware)
     });
 }
 
-/// `getcwd(buf_ptr, buf_len) → bytes | -errno`. Sync handler — copies
-/// the calling process's cwd into the user buffer. Caller passes a
-/// page-resident buffer at least `cwd.len()` bytes long; ERANGE if the
-/// buffer is too short.
+/// `getcwd(buf_ptr, buf_len) → bytes | -errno`. Manager round-trip —
+/// copies the calling process's cwd into the user buffer; ERANGE if
+/// the buffer is too short.
 #[unsafe(no_mangle)]
 pub fn handle_getcwd(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
-    let orbit = unsafe { (hart_context.cscratch as *mut kernel::Orbit).as_mut_unchecked() };
     dispatch_syscall(epc, hart_context, frame, |t, f| {
-        let ret = orbit.run_getcwd(t.pid, t.root_table_addr(), f.regs[11] as u64, f.regs[12]);
-        orbit_core::SyscallOutcome::Return { ret }
+        orbit_core::syscall::getcwd_req(t, f, &mut crate::hw::RiscvHardware)
     });
 }
 
@@ -1539,75 +1513,63 @@ pub fn handle_getegid(epc: usize, hart_context: &'static HartContext, frame: &mu
 /// `getgroups(buf_ptr, count) → count | -errno` — POSIX
 /// `getgroups(2)`. `count` is in `u32` slots, not bytes. POSIX
 /// special case: `count == 0` returns the current group count
-/// without writing.
+/// without writing. Manager round-trip.
 #[unsafe(no_mangle)]
 pub fn handle_getgroups(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
-    let orbit = unsafe { (hart_context.cscratch as *mut kernel::Orbit).as_mut_unchecked() };
     dispatch_syscall(epc, hart_context, frame, |t, f| {
-        let ret = orbit.run_getgroups(t.pid, t.root_table_addr(), f.regs[11] as u64, f.regs[12]);
-        orbit_core::SyscallOutcome::Return { ret }
+        orbit_core::syscall::getgroups_req(t, f, &mut crate::hw::RiscvHardware)
     });
 }
 
 /// `getlogin(buf_ptr, buf_len) → bytes | -errno` — POSIX
 /// `getlogin_r(3)`. Copies the calling process's session login name
-/// (no NUL terminator) into the user buffer.
+/// (no NUL terminator) into the user buffer. Manager round-trip.
 #[unsafe(no_mangle)]
 pub fn handle_getlogin(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
-    let orbit = unsafe { (hart_context.cscratch as *mut kernel::Orbit).as_mut_unchecked() };
     dispatch_syscall(epc, hart_context, frame, |t, f| {
-        let ret = orbit.run_getlogin(t.pid, t.root_table_addr(), f.regs[11] as u64, f.regs[12]);
-        orbit_core::SyscallOutcome::Return { ret }
+        orbit_core::syscall::getlogin_req(t, f, &mut crate::hw::RiscvHardware)
     });
 }
 
-/// `setuid(uid) → 0 | -errno` — POSIX `setuid(2)`. Sync handler:
-/// mutates the calling process's uid triplet under POSIX rules and
-/// refreshes per-thread credential snapshots so subsequent
-/// `getuid`/`geteuid` from sibling threads see the new identity.
+/// `setuid(uid) → 0 | -errno` — POSIX `setuid(2)`. Manager
+/// round-trip: mutates the calling process's uid triplet under POSIX
+/// rules and refreshes per-thread credential snapshots so subsequent
+/// `getuid`/`geteuid` from sibling threads see the new identity. The
+/// snapshot walk is exactly why this runs on the manager — it writes
+/// `Thread` fields the getuid fast path reads lock-free.
 #[unsafe(no_mangle)]
 pub fn handle_setuid(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
-    let orbit = unsafe { (hart_context.cscratch as *mut kernel::Orbit).as_mut_unchecked() };
     dispatch_syscall(epc, hart_context, frame, |t, f| {
-        let uid = f.regs[11] as u32;
-        let ret = orbit.run_setuid(t.pid, uid);
-        orbit_core::SyscallOutcome::Return { ret }
+        orbit_core::syscall::setuid_req(t, f, &mut crate::hw::RiscvHardware)
     });
 }
 
-/// `setgid(gid) → 0 | -errno` — POSIX `setgid(2)`. Sync gid mirror
-/// of [`handle_setuid`].
+/// `setgid(gid) → 0 | -errno` — POSIX `setgid(2)`. Gid mirror of
+/// [`handle_setuid`].
 #[unsafe(no_mangle)]
 pub fn handle_setgid(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
-    let orbit = unsafe { (hart_context.cscratch as *mut kernel::Orbit).as_mut_unchecked() };
     dispatch_syscall(epc, hart_context, frame, |t, f| {
-        let gid = f.regs[11] as u32;
-        let ret = orbit.run_setgid(t.pid, gid);
-        orbit_core::SyscallOutcome::Return { ret }
+        orbit_core::syscall::setgid_req(t, f, &mut crate::hw::RiscvHardware)
     });
 }
 
 /// `setgroups(buf_ptr, count) → 0 | -errno` — POSIX `setgroups(2)`.
 /// Replace the caller's supplementary group list. Requires
-/// `euid == 0`.
+/// `euid == 0`. Manager round-trip.
 #[unsafe(no_mangle)]
 pub fn handle_setgroups(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
-    let orbit = unsafe { (hart_context.cscratch as *mut kernel::Orbit).as_mut_unchecked() };
     dispatch_syscall(epc, hart_context, frame, |t, f| {
-        let ret = orbit.run_setgroups(t.pid, t.root_table_addr(), f.regs[11] as u64, f.regs[12]);
-        orbit_core::SyscallOutcome::Return { ret }
+        orbit_core::syscall::setgroups_req(t, f, &mut crate::hw::RiscvHardware)
     });
 }
 
 /// `setlogin(name_ptr, name_len) → 0 | -errno` — POSIX `setlogin(2)`.
 /// Stamp the calling process's session login name. Requires
-/// `euid == 0`.
+/// `euid == 0`. Manager round-trip.
 #[unsafe(no_mangle)]
 pub fn handle_setlogin(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
-    let orbit = unsafe { (hart_context.cscratch as *mut kernel::Orbit).as_mut_unchecked() };
     dispatch_syscall(epc, hart_context, frame, |t, f| {
-        let ret = orbit.run_setlogin(t.pid, t.root_table_addr(), f.regs[11] as u64, f.regs[12]);
-        orbit_core::SyscallOutcome::Return { ret }
+        orbit_core::syscall::setlogin_req(t, f, &mut crate::hw::RiscvHardware)
     });
 }
 

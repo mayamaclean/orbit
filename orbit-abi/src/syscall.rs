@@ -260,7 +260,11 @@ pub const SETLOGIN: usize = 4118;
 /// require either a process-wide side-table or an extra fd → pointer
 /// translation per source per scan.
 ///
-/// Sync, no manager round-trip — read-only against `process_handles`.
+/// Manager round-trip (blocking-syscall shape): `process_handles` is
+/// manager-owned state, so the caller parks and the manager fills the
+/// buffer. Registration-time cost only — the per-`select()` readiness
+/// scan reads the shared region pointer this call returns, not the
+/// syscall itself.
 ///
 /// Errnos:
 /// - `EBADF` — `fd` not open in the calling process.

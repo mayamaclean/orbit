@@ -94,10 +94,42 @@ pub use orbit_abi::layout::*;
 
 /// MPSC ring of `PendingWork` entries pushed by blocking-syscall paths
 /// on any hart and drained by whichever hart next holds `MANAGER_LOCK`.
-/// Cap chosen at ~8x current hart count so a steady-state burst of
-/// concurrent blocking syscalls doesn't EAGAIN until something is
-/// genuinely wedged. Default slot is `PendingWork::Empty`.
-pub static MANAGER_WORK: StaticThingBuf<PendingWork, 32> = StaticThingBuf::new();
+/// Default slot is `PendingWork::Empty`.
+///
+/// Cap bumped 32 → 128 with the sync-handler → PendingWork migration:
+/// twelve more syscalls now ride this ring (fs_seek / fs_fstat /
+/// ch_inspect / chdir / getcwd / cred get+set / argv_envp), and the
+/// per-process startup burst (argv_envp per spawn) made 32 reachable
+/// under the wait_any_child smoke's 3-concurrent-spawn workload. A
+/// full ring EAGAINs the syscall (caller-visible!), so headroom is
+/// correctness-adjacent, not just throughput.
+pub static MANAGER_WORK: StaticThingBuf<PendingWork, 128> = StaticThingBuf::new();
+
+/// One completed virtio-blk chain: the packed
+/// [`page_cache::CacheKey`] stashed at submit time plus the device
+/// status byte. `packed_key == 0` is the empty/Default sentinel
+/// (`page_cache::unpack` rejects it).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CacheFillEvent {
+    pub packed_key: u64,
+    pub status: u8,
+}
+
+/// Dedicated SPSC-ish ring for virtio-blk completion events
+/// (producer: the blk PLIC handler; consumer: the manager via
+/// [`Orbit::drain_cache_fills`]).
+///
+/// CacheFill used to ride `MANAGER_WORK`; under syscall pressure the
+/// shared ring filled and the IRQ handler *dropped* the completion —
+/// leaving the page-cache slot `Loading` forever and every fs_read
+/// waiter on it parked permanently (June 2026 wait_any_child smoke:
+/// two hello children dead-parked mid `do_fs_read_test` on a cold
+/// cache). Completions are not shed-able work: a dedicated ring sized
+/// at 2× the virtio queue depth (`QUEUE_SIZE = 64` bounds in-flight
+/// chains) cannot overflow as long as the manager drains once per
+/// refill cycle, so the push in the IRQ handler is infallible in
+/// practice and a failure there is a hard `error!`.
+pub static CACHE_FILLS: StaticThingBuf<CacheFillEvent, 128> = StaticThingBuf::new();
 
 /// Targeted "tickle a parked thread" events. Producers: PLIC IRQ
 /// handlers (e.g. e1000 RX → wake k_net), `update_tcp` (slice staged
@@ -1502,7 +1534,10 @@ impl Orbit {
             netchan: shared,
             nc_type: req.nc_type,
             pid,
-            ctx: net_channel::ChannelCtx::new(req.bind),
+            // region_size is the kernel-normalized value — it seeds the
+            // ChannelCtx's trusted queue_len/capacity so k_net never
+            // derives layout from the user-writable shared header.
+            ctx: net_channel::ChannelCtx::new(req.bind, region_size),
         };
 
         if let Some(np) = self
@@ -2833,7 +2868,7 @@ impl Orbit {
         // copy reuses `copy_user_path`, which insists on a
         // `MAX_FS_PATH_LEN`-sized scratch — we cap the meaningful
         // payload at MAX_LOGIN_NAME but use the larger fixed buffer.
-        const MAX_LOGIN_NAME: usize = 32;
+        const MAX_LOGIN_NAME: usize = orbit_core::MAX_LOGIN_NAME;
         let mut login_buf = [0u8; MAX_FS_PATH_LEN];
         let login_override: Option<&str> = if args.setlogin_vaddr != 0 && args.setlogin_len != 0 {
             if args.setlogin_len > MAX_LOGIN_NAME {
@@ -3555,25 +3590,45 @@ impl Orbit {
         Ok(backing)
     }
 
-    /// Owns the signaling end-to-end. Sync errors signal
-    /// `(errno, 0)` here; async success installs the handle on the
-    /// target's `exit_waiter` slot and `dealloc_process` later signals
-    /// `(0, exit_code)`. The pair shape (a0 = success/errno, a1 =
-    /// exit_code) keeps the negative-as-errno convention orthogonal
-    /// to negative exit codes — see `orbit-abi/src/user.rs::wait_pid`.
+    /// Owns the signaling end-to-end. Two dispatch paths based on
+    /// `req.target_pid`:
+    ///
+    /// - **`> 0` (specific)** — find the target child, validate
+    ///   parent-of, install caller on `target.exit_waiter`.
+    ///   `dealloc_process` later signals `(0, exit_code)`.
+    /// - **`-1` (any)** — drain `parent.dead_children.pop_first()`
+    ///   for a sync return of `(child_pid, exit_code)`; on empty,
+    ///   install caller on `parent.any_child_waiter` after an
+    ///   ECHILD probe.
+    ///
+    /// Sync errors signal `(-errno, 0)`; sentinel encodings (`0`,
+    /// `< -1`) are already rejected sync in `wait_pid_req` before
+    /// the work-queue push, so we don't see them here. Self-wait
+    /// (specific-pid == caller_pid) is also pre-filtered.
+    ///
+    /// The pair-shape return (r0 = pid-or-errno, r1 = exit_code)
+    /// matches POSIX `waitpid(2)` — see [`orbit_abi::user::wait_pid`]
+    /// and [`orbit_abi::user::wait_any_child`].
     fn run_wait_pid_req(&mut self, req: WaitPidReq, caller_pid: u16, caller_tid: u32) {
+        if req.target_pid == -1 {
+            return self.run_wait_any_child(caller_pid, caller_tid);
+        }
+
+        // `target_pid > 0` from here on — the syscall-entry helper
+        // already rejected `0` and `< -1`. Narrow to `u16` for the
+        // process-map key; orbit pids never exceed `u16::MAX`.
+        let target_pid = req.target_pid as u16;
+
         // First check the caller's `dead_children` — covers the race
         // where the target exited before this wait_pid syscall ran.
-        // dealloc_process stashed (target_pid → exit_code) on the
-        // parent's process struct; drain it here for sync return.
         if let Some(parent) = self.processes.get_mut(&caller_pid)
-            && let Some(code) = parent.dead_children.remove(&req.target_pid)
+            && let Some(code) = parent.dead_children.remove(&target_pid)
         {
             self.publish_pending_for_tid(caller_tid, &[0, code as isize]);
             return;
         }
 
-        let Some(target) = self.processes.get_mut(&req.target_pid)
+        let Some(target) = self.processes.get_mut(&target_pid)
         else {
             // Never existed (or exited and the parent's already gone
             // / wasn't tracked) — POSIX surfaces this as ECHILD.
@@ -3602,8 +3657,64 @@ impl Orbit {
         target.exit_waiter = Some(caller_tid);
         info!(
             "wait_pid: pid={caller_pid} tid={caller_tid} parked on target={} exit",
-            req.target_pid
+            target_pid
         );
+    }
+
+    /// `waitpid(-1)` arm. Drains `dead_children` first (race-with-
+    /// already-exited fast path); otherwise probes for live children
+    /// + parks the caller on `parent.any_child_waiter`. ECHILD if
+    /// the caller has zero live (non-detached) children AND
+    /// `dead_children` is empty — same shape as POSIX.
+    fn run_wait_any_child(&mut self, caller_pid: u16, caller_tid: u32) {
+        let Some(parent) = self.processes.get_mut(&caller_pid)
+        else {
+            // Caller's own process struct missing — shouldn't happen
+            // (the calling thread is in this pid), but surface ECHILD
+            // rather than panic.
+            self.publish_pending_for_tid(
+                caller_tid,
+                &[Errno::new(orbit_abi::errno::ECHILD).to_ret(), 0],
+            );
+            return;
+        };
+
+        // Fast path: already-reaped child waiting in dead_children.
+        // `pop_first` gives lowest-pid wins; POSIX doesn't specify
+        // ordering, so we pick a deterministic one.
+        if let Some((pid, code)) = parent.dead_children.pop_first() {
+            self.publish_pending_for_tid(caller_tid, &[pid as isize, code as isize]);
+            return;
+        }
+
+        if parent.any_child_waiter.is_some() {
+            // Single-waiter v1.
+            self.publish_pending_for_tid(
+                caller_tid,
+                &[Errno::new(orbit_abi::errno::EBUSY).to_ret(), 0],
+            );
+            return;
+        }
+
+        // No cached exit — probe for live, non-detached children
+        // before parking. ECHILD if none exist.
+        let has_live_child = self
+            .processes
+            .values()
+            .any(|p| p.parent_pid == caller_pid && !p.detached);
+        if !has_live_child {
+            self.publish_pending_for_tid(
+                caller_tid,
+                &[Errno::new(orbit_abi::errno::ECHILD).to_ret(), 0],
+            );
+            return;
+        }
+
+        // Park on the parent's any-child slot. dealloc_process drains
+        // it for any non-detached child of ours.
+        let parent = self.processes.get_mut(&caller_pid).expect("parent alive");
+        parent.any_child_waiter = Some(caller_tid);
+        info!("wait_any_child: pid={caller_pid} tid={caller_tid} parked on any-child exit");
     }
 
     /// §13a.5 — futex wait. Owns the signaling: sync errors signal
@@ -4047,10 +4158,37 @@ impl Orbit {
             // trips. Other states (Ready / Running / Assigned /
             // Exited) bail out — the wake_override OR above already
             // recorded the reason for the next dispatch to consume.
+            //
+            // Blocking promotion is additionally gated on a SIGNALED
+            // completion slot. A Blocking park is a manager-resolved
+            // syscall whose canonical wake is always publish-then-
+            // push (`publish_pending_for_tid`), so a Tid wake that
+            // finds Blocking + NONE is by construction *stale*: the
+            // parker's post-park re-check already won the take-CAS
+            // for an earlier syscall and this is the leftover queue
+            // entry — or it's a `wake_tid` doorbell misaimed at a
+            // blocking-syscall park. Promoting in either case resumes
+            // the thread with `frame.regs` untouched, so the syscall
+            // "returns" whatever was in a0 (the QEMU repro: hello's
+            // fs_read loop reporting 6001 — FS_READ's own sysno — as
+            // bytes read, after a stale wake from the preceding
+            // argv_envp publish broke its park). Suspended parks are
+            // wake-tolerant (ms_sleep / read_key_event re-check their
+            // condition) and keep the ungated behavior.
+            //
+            // The SIGNALED probe is race-free against publishers (the
+            // manager is the only SIGNALED-setter and we hold
+            // MANAGER_LOCK); a parker concurrently *consuming* makes
+            // our later take lose its CAS, which the promoted branch
+            // already handles.
+            let has_rets =
+                thread.pending_state.load(Ordering::Acquire) == process::PENDING_STATE_SIGNALED;
             let promoted = thread
                 .state
                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |s| {
-                    if s == ThreadState::Blocking as usize || s == ThreadState::Suspended as usize {
+                    if s == ThreadState::Suspended as usize
+                        || (s == ThreadState::Blocking as usize && has_rets)
+                    {
                         Some(ThreadState::Ready as usize)
                     }
                     else {
@@ -4146,7 +4284,24 @@ impl Orbit {
     /// with its [`CompletionHandle`]; we run the handler, signal the
     /// handle with the result, and let the next scheduler scan resume
     /// the parked thread off `thread.handle.is_signaled()`.
+    /// Drain [`CACHE_FILLS`] — virtio-blk completion events. Runs at
+    /// the top of every [`Self::drain_pending_work`] pass so fills
+    /// resolve (and their parked fs_read waiters unblock) before new
+    /// work generates more reads. Separate ring from `MANAGER_WORK`
+    /// so syscall pressure can never force the blk IRQ to drop a
+    /// completion — see the [`CACHE_FILLS`] doc for the failure mode.
+    pub(crate) fn drain_cache_fills(&mut self) {
+        while let Some(mut slot) = CACHE_FILLS.pop_ref() {
+            let ev = core::mem::take(&mut *slot);
+            drop(slot);
+            if ev.packed_key != 0 {
+                self.run_cache_fill(ev.packed_key, ev.status);
+            }
+        }
+    }
+
     pub(crate) fn drain_pending_work(&mut self) {
+        self.drain_cache_fills();
         while let Some(mut slot) = MANAGER_WORK.pop_ref() {
             let work = core::mem::take(&mut *slot);
             drop(slot);
@@ -4330,6 +4485,113 @@ impl Orbit {
                 PendingWork::WakeTid { req, pid, tid } => {
                     let result = self.run_wake_tid_req(req, pid);
                     self.publish_pending_for_tid(tid, &[result]);
+                }
+                // The next twelve arms are the converted-from-sync
+                // handlers (docs/dev/fd-unix-io-scope.md item 0): the
+                // run_* bodies predate the conversion unchanged; only
+                // the call site moved from the trap path to here, so
+                // `process_handles` / `Process` cwd + creds are now
+                // touched exclusively under the manager.
+                PendingWork::FsSeek { req, pid, tid } => {
+                    let result = self.run_fs_seek(pid, req.fd, req.offset, req.whence);
+                    self.publish_pending_for_tid(tid, &[result]);
+                }
+                PendingWork::FsFstat {
+                    req,
+                    pid,
+                    root_pa,
+                    tid,
+                } => {
+                    let result = self.run_fs_fstat(pid, root_pa, req.fd, req.stat_vaddr.raw());
+                    self.publish_pending_for_tid(tid, &[result]);
+                }
+                PendingWork::ChInspect {
+                    req,
+                    pid,
+                    root_pa,
+                    tid,
+                } => {
+                    let result =
+                        self.run_ch_inspect_req(pid, root_pa, req.fd, req.info_vaddr.raw());
+                    self.publish_pending_for_tid(tid, &[result]);
+                }
+                PendingWork::Chdir {
+                    req,
+                    pid,
+                    root_pa,
+                    tid,
+                } => {
+                    let result = self.run_chdir(pid, root_pa, req.path_vaddr.raw(), req.path_len);
+                    self.publish_pending_for_tid(tid, &[result]);
+                }
+                PendingWork::GetCwd {
+                    req,
+                    pid,
+                    root_pa,
+                    tid,
+                } => {
+                    let result = self.run_getcwd(pid, root_pa, req.buf_vaddr.raw(), req.buf_len);
+                    self.publish_pending_for_tid(tid, &[result]);
+                }
+                PendingWork::GetGroups {
+                    req,
+                    pid,
+                    root_pa,
+                    tid,
+                } => {
+                    let result = self.run_getgroups(pid, root_pa, req.buf_vaddr, req.count);
+                    self.publish_pending_for_tid(tid, &[result]);
+                }
+                PendingWork::GetLogin {
+                    req,
+                    pid,
+                    root_pa,
+                    tid,
+                } => {
+                    let result = self.run_getlogin(pid, root_pa, req.buf_vaddr.raw(), req.buf_len);
+                    self.publish_pending_for_tid(tid, &[result]);
+                }
+                PendingWork::SetUid { req, pid, tid } => {
+                    let result = self.run_setuid(pid, req.uid);
+                    self.publish_pending_for_tid(tid, &[result]);
+                }
+                PendingWork::SetGid { req, pid, tid } => {
+                    let result = self.run_setgid(pid, req.gid);
+                    self.publish_pending_for_tid(tid, &[result]);
+                }
+                PendingWork::SetGroups {
+                    req,
+                    pid,
+                    root_pa,
+                    tid,
+                } => {
+                    let result = self.run_setgroups(pid, root_pa, req.buf_vaddr, req.count);
+                    self.publish_pending_for_tid(tid, &[result]);
+                }
+                PendingWork::SetLogin {
+                    req,
+                    pid,
+                    root_pa,
+                    tid,
+                } => {
+                    let result =
+                        self.run_setlogin(pid, root_pa, req.name_vaddr.raw(), req.name_len);
+                    self.publish_pending_for_tid(tid, &[result]);
+                }
+                PendingWork::ArgvEnvp { pid, tid } => {
+                    let argv_va = if self.process_has_argv(pid) {
+                        orbit_abi::layout::USER_ARGV_BASE as isize
+                    }
+                    else {
+                        0
+                    };
+                    let envp_va = if self.process_has_envp(pid) {
+                        orbit_abi::layout::USER_ENVP_BASE as isize
+                    }
+                    else {
+                        0
+                    };
+                    self.publish_pending_for_tid(tid, &[argv_va, envp_va]);
                 }
                 PendingWork::CacheFill { packed_key, status } => {
                     self.run_cache_fill(packed_key, status);
@@ -4618,9 +4880,26 @@ impl Orbit {
         let t = unsafe { (pt.0 as *mut Thread).as_mut_unchecked() };
         let prior = t.state.load(Ordering::Acquire);
         if prior != ThreadState::Blocking as usize && prior != ThreadState::Suspended as usize {
+            // The thread isn't parked. Dominant cause: we drained the
+            // work item inside the caller's push-to-park window, so
+            // the parker is Running on its way to `state = Blocking`.
+            // Writing `frame.regs` directly here scribbles over a
+            // live frame, and the unconditional `state = Ready` below
+            // demotes a Running thread — the double-dispatch
+            // corruption the apply-path guard ("scheduler retargeted
+            // current mid-trap?") catches. Route through the
+            // on-thread completion slot instead: the parker's
+            // post-park re-check (`try_wake_pending_inline`) delivers
+            // the rets the moment it commits the park, and the
+            // companion `WakeEvent::Tid` covers the already-parked
+            // interleave. This is exactly the race
+            // `publish_pending_for_tid` was built for — the direct
+            // path just predates it.
             warn!(
-                "resume_thread_with_values: tid={tid} not Blocking/Suspended (state={prior}); writing regs anyway"
+                "resume_thread_with_values: tid={tid} not Blocking/Suspended (state={prior}); routing via completion slot"
             );
+            self.publish_pending_for_tid(tid, vals);
+            return;
         }
         let n = vals.len().min(4);
         for (i, &v) in vals.iter().enumerate().take(n) {
@@ -5103,12 +5382,28 @@ impl Orbit {
             process.exit_waiter = None;
         }
         else if let Some(waiter_tid) = process.exit_waiter.take() {
+            // Per-child `wait_pid(this.pid > 0)` waiter — priority over
+            // the parent's any-child slot, since this caller asked
+            // specifically.
             self.publish_pending_for_tid(waiter_tid, &[0, process.exit_code as isize]);
         }
         else if process.parent_pid != 0
             && let Some(parent) = self.processes.get_mut(&process.parent_pid)
         {
-            parent.dead_children.insert(process.pid, process.exit_code);
+            // No per-child waiter — check the parent's any-child slot
+            // before falling through to the `dead_children` stash.
+            // Either path resolves a waiting `waitpid(-1)`; the
+            // any-waiter path skips the BTreeMap insert because the
+            // parker is about to consume the value directly.
+            if let Some(waiter_tid) = parent.any_child_waiter.take() {
+                self.publish_pending_for_tid(
+                    waiter_tid,
+                    &[process.pid as isize, process.exit_code as isize],
+                );
+            }
+            else {
+                parent.dead_children.insert(process.pid, process.exit_code);
+            }
         }
 
         // §13a.3 / §13e — return the argv / envp blob pages to kernel_pages.
@@ -7457,7 +7752,7 @@ impl Orbit {
         name_vaddr: u64,
         name_len: usize,
     ) -> isize {
-        const MAX_LOGIN_NAME: usize = 32;
+        const MAX_LOGIN_NAME: usize = orbit_core::MAX_LOGIN_NAME;
         if name_len == 0 || name_len > MAX_LOGIN_NAME {
             return Errno::new(orbit_abi::errno::ENAMETOOLONG).to_ret();
         }

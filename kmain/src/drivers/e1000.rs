@@ -7,7 +7,7 @@ use core::{
 use mem::round_usize_up;
 use mmu::PAGE_SIZE;
 use smoltcp::phy::{Checksum, DeviceCapabilities, Medium};
-use tracing::{error, info, trace, warn};
+use tracing::{error, info, warn};
 
 use crate::kernel::memmap::KdmapVa;
 
@@ -243,7 +243,11 @@ impl E1000 {
         Ok(mac)
     }
 
-    pub fn set_interrupts_enabled(&mut self, mask: u16) {
+    /// Enable the interrupt causes in `mask`. IMS is a *set-only*
+    /// register — writing 0 bits masks nothing, so this function can
+    /// only ever widen the enabled set. Disabling causes requires a
+    /// write to IMC (0xD8), which nothing needs yet.
+    pub fn enable_interrupts(&mut self, mask: u16) {
         unsafe {
             self.bar.add(IMS_REG_ADDR).write_volatile(mask as u32);
             if mask > 0 {
@@ -258,7 +262,7 @@ impl E1000 {
 
     pub fn init_hw(&mut self, mac: [u8; 6]) -> Result<(), ()> {
         unsafe {
-            let svid = 0x8086; //self.read_subsystem_vendor_id()?;
+            let svid = self.read_subsystem_vendor_id()?;
 
             info!("e1000: svid: {svid:04X?}");
 
@@ -320,13 +324,19 @@ impl E1000 {
             const TX_INT_MASK: u16 = 0x0001;
 
             // set interrupts
-            self.set_interrupts_enabled(RX_INT_MASK | TX_INT_MASK);
+            self.enable_interrupts(RX_INT_MASK | TX_INT_MASK);
 
             let interrupts = self.read_interrupt_status();
 
             core::arch::asm!("fence iorw, iorw");
 
-            const RX_CTL: u32 = 0x8002;
+            // EN | BAM | BSIZE=2048, plus SECRC (bit 26) so the device
+            // strips the 4-byte FCS instead of appending it to the
+            // frame and including it in desc.length — without SECRC
+            // every frame handed to smoltcp carried 4 trailing CRC
+            // bytes (harmless for IP, which is bounded by its own
+            // total-length field, but garbage all the same).
+            const RX_CTL: u32 = 0x8002 | (1 << 26);
             self.bar.add(RCTL_REG_ADDR).write_volatile(RX_CTL);
 
             const TX_CTL: u32 = 0b0110000000000111111000011111010; //0x100000A | (0xF << 4) | (0x40 << 12);
@@ -343,13 +353,32 @@ impl E1000 {
         unsafe {
             let rindex = self.rx_next;
 
-            if (self.rx_ring[rindex].status & 0x1u8) == 0 {
+            if (core::ptr::addr_of!(self.rx_ring[rindex].status).read_volatile() & 0x1u8) == 0 {
                 return None;
             }
+
+            // Order the DD observation before the length/payload loads
+            // below. The device writes the frame data, then sets DD;
+            // RVWMO lets the CPU hoist the data loads above the status
+            // load, so without this fence a DD=1 read can pair with
+            // stale buffer bytes. QEMU's TCG never reorders — this is
+            // for real hardware. The TX DD checks need no fence: the
+            // buffer *stores* in TxToken::consume sit behind a branch
+            // on the DD load, and RVWMO orders load→store through the
+            // control dependency.
+            core::arch::asm!("fence r, r");
 
             let tindex = self.bar.add(TDT_REG_ADDR).read_volatile() as usize;
 
             if (self.tx_ring[tindex].status & 0x1u8) == 0 {
+                // No reply descriptor → decline the receive. Latency
+                // interplay worth knowing: the pending rx packet raised
+                // its interrupt when it *arrived*, so no new IRQ will
+                // fire for it — if k_net's poll loop ends before a TX
+                // DD frees up, the packet waits for the heartbeat.
+                // Mostly self-healing within one wake (TX completions
+                // land fast), but this warn doubles as an ingress-
+                // latency marker.
                 warn!("previous transmission request still in progress");
                 return None;
             }
@@ -410,10 +439,13 @@ impl E1000 {
         unsafe {
             let rindex = self.rx_next;
 
-            if (self.rx_ring[rindex].status & 0x1u8) == 0 {
+            if (core::ptr::addr_of!(self.rx_ring[rindex].status).read_volatile() & 0x1u8) == 0 {
                 warn!("previous receive request still in progress");
                 return None;
             }
+
+            // DD-before-payload ordering — see get_next_rxtx.
+            core::arch::asm!("fence r, r");
 
             self.rx_next = (rindex + 1) % RX_RING_LEN;
 
@@ -450,24 +482,16 @@ impl<'e> smoltcp::phy::TxToken for E1000TxToken<'e> {
         self.desc.status = 0;
         self.desc.cmd = 0x0B;
 
+        // No debug MMIO here: this used to read ICR (twice), STATUS,
+        // RDT, and RDH per frame to feed a trace!. Reading ICR *clears*
+        // it — those reads raced ack_irq_static's view of the interrupt
+        // causes — and five MMIO round-trips per transmitted frame is
+        // real throughput cost. Keep this path at exactly one MMIO
+        // write.
         unsafe {
-            let icr0 = self.bar.add(ICR_REG_ADDR).read_volatile();
-
             core::arch::asm!("fence iorw, iorw");
 
             self.bar.add(TDT_REG_ADDR).write_volatile(self.next_tdt);
-
-            let icr1 = self.bar.add(ICR_REG_ADDR).read_volatile();
-
-            let status = self.bar.add(STATUS_REG_ADDR).read_volatile();
-
-            let rdt = self.bar.add(RDT_REG_ADDR).read_volatile();
-            let rdh = self.bar.add(RDH_REG_ADDR).read_volatile();
-
-            trace!(
-                "e1000: status={:08X?}, icr0={:08X?}, icr1={:08X?}, rdt={rdt:08X?}, rdh={rdh:08X?}",
-                status, icr0, icr1
-            );
         }
         r
     }
@@ -493,8 +517,6 @@ impl<'e> smoltcp::phy::RxToken for E1000RxToken<'e> {
             core::arch::asm!("fence iorw, iorw");
 
             self.bar.add(RDT_REG_ADDR).write_volatile(self.next_rdt);
-
-            self.bar.add(STATUS_REG_ADDR).read_volatile();
         }
         r
     }
@@ -513,7 +535,13 @@ impl smoltcp::phy::Device for E1000 {
     fn capabilities<'e>(&'e self) -> DeviceCapabilities {
         let mut caps = DeviceCapabilities::default();
         caps.medium = Medium::Ethernet;
-        caps.max_transmission_unit = 1500;
+        // smoltcp's MTU for Medium::Ethernet is *frame-inclusive* (it
+        // counts the 14-byte Ethernet header). 1514 yields the standard
+        // 1500-byte IP MTU / 1460-byte MSS; the old value of 1500 was
+        // silently giving up 14 bytes per segment (IP MTU 1486, MSS
+        // 1446). SW_MTU (2048) bounds the DMA buffers, so 1514 fits
+        // with room to spare.
+        caps.max_transmission_unit = 1514;
         // Cap smoltcp's advertised TCP window at `max_burst_size * MSS`
         // bytes, matching what our RX descriptor ring can actually absorb
         // before dropping frames. Without this, a large rx_buffer makes

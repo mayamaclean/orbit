@@ -8,16 +8,17 @@ use mmu::PagePermissions;
 use orbit_abi::layout::UserVa;
 use process::{Thread, ThreadState};
 
-use orbit_abi::errno::{EAGAIN, EBUSY, EFAULT, EINVAL, EIO, EPERM, Errno};
+use orbit_abi::errno::{EAGAIN, EBUSY, EFAULT, EINVAL, EIO, ENAMETOOLONG, EPERM, Errno};
 use orbit_abi::layout::{user_priv_range_ok, user_range_ok, user_shared_range_ok};
 use tracing::error;
 
 use crate::{
-    CloseHandleReq, CreateProcessExReq, CreateProcessReq, CreateProcessV2Req, CreateThreadReq,
-    EventFdCreateReq, FbSurfaceCreateReq, FbSurfaceDestroyReq, FsOpenReq, FsReadReq, FsReaddirReq,
-    FsStatReq, FutexWaitReq, FutexWakeReq, Hardware, MAX_FS_PATH_LEN, MemMapReq,
-    NetChannelCreationReq, PAGE_SIZE, PendingWork, PledgeReq, SyscallOutcome, WaitPidReq,
-    WakeTidReq,
+    ChInspectReq, ChdirReq, CloseHandleReq, CreateProcessExReq, CreateProcessReq,
+    CreateProcessV2Req, CreateThreadReq, EventFdCreateReq, FbSurfaceCreateReq, FbSurfaceDestroyReq,
+    FsFstatReq, FsOpenReq, FsReadReq, FsReaddirReq, FsSeekReq, FsStatReq, FutexWaitReq,
+    FutexWakeReq, GetCwdReq, GetGroupsReq, GetLoginReq, Hardware, MAX_FS_PATH_LEN, MAX_LOGIN_NAME,
+    MemMapReq, NetChannelCreationReq, PAGE_SIZE, PendingWork, PledgeReq, SetGidReq, SetGroupsReq,
+    SetLoginReq, SetUidReq, SyscallOutcome, WaitPidReq, WakeTidReq,
 };
 use net_channel::BindSpec;
 use orbit_abi::event_fd::{EFD_ALL_FLAGS, EVENTFD_REGION_SIZE};
@@ -298,6 +299,399 @@ pub fn wake_tid_req<H: Hardware>(
     }
 }
 
+/// Push `work` and park the caller `Blocking`, or return `-EAGAIN`
+/// sync when the manager ring is full. The shared tail of every
+/// converted-from-sync request below — see
+/// `docs/dev/fd-unix-io-scope.md` item 0 for why these round-trip
+/// instead of touching manager state from the trap path.
+fn park_on_manager<H: Hardware>(hw: &mut H, work: PendingWork) -> SyscallOutcome {
+    if hw.push_pending_work(work).is_err() {
+        return SyscallOutcome::Return {
+            ret: Errno::new(EAGAIN).to_ret(),
+        };
+    }
+    SyscallOutcome::Yield {
+        state: ThreadState::Blocking,
+        ret: None,
+    }
+}
+
+/// `fs_seek(fd, offset, whence) → new_offset | -errno`. Queues
+/// [`PendingWork::FsSeek`]; the manager owns `OpenFile.offset`.
+/// Bad `whence` fails sync — no point round-tripping it.
+pub fn fs_seek_req<H: Hardware>(
+    thread: &mut Thread,
+    frame: &TrapFrame,
+    hw: &mut H,
+) -> SyscallOutcome {
+    let whence = frame.regs[13] as u32;
+    if whence > 2 {
+        return SyscallOutcome::Return {
+            ret: Errno::new(EINVAL).to_ret(),
+        };
+    }
+    let req = FsSeekReq {
+        fd: frame.regs[11] as u32,
+        offset: frame.regs[12] as i64,
+        whence,
+    };
+    park_on_manager(
+        hw,
+        PendingWork::FsSeek {
+            req,
+            pid: thread.pid,
+            tid: thread.tid,
+        },
+    )
+}
+
+/// `fs_fstat(fd, &mut Stat) → 0 | -errno`. Queues
+/// [`PendingWork::FsFstat`] after bounding the out-buffer.
+pub fn fs_fstat_req<H: Hardware>(
+    thread: &mut Thread,
+    frame: &TrapFrame,
+    hw: &mut H,
+) -> SyscallOutcome {
+    let Ok(stat_vaddr) = UserVa::new(frame.regs[12] as u64)
+    else {
+        return SyscallOutcome::Return {
+            ret: Errno::new(EFAULT).to_ret(),
+        };
+    };
+    let stat_size = core::mem::size_of::<orbit_abi::fs::Stat>() as u64;
+    if !user_range_ok(stat_vaddr.raw(), stat_size) {
+        return SyscallOutcome::Return {
+            ret: Errno::new(EFAULT).to_ret(),
+        };
+    }
+    let req = FsFstatReq {
+        fd: frame.regs[11] as u32,
+        stat_vaddr,
+    };
+    park_on_manager(
+        hw,
+        PendingWork::FsFstat {
+            req,
+            pid: thread.pid,
+            root_pa: thread.root_table_addr(),
+            tid: thread.tid,
+        },
+    )
+}
+
+/// `ch_inspect(fd, *mut ChInfo) → 0 | -errno`. Queues
+/// [`PendingWork::ChInspect`]. The out-buffer must fit in one page
+/// (single-`UserPageWindow` constraint) — rejected sync with EINVAL,
+/// same contract as before the conversion.
+pub fn ch_inspect_req<H: Hardware>(
+    thread: &mut Thread,
+    frame: &TrapFrame,
+    hw: &mut H,
+) -> SyscallOutcome {
+    let Ok(info_vaddr) = UserVa::new(frame.regs[12] as u64)
+    else {
+        return SyscallOutcome::Return {
+            ret: Errno::new(EFAULT).to_ret(),
+        };
+    };
+    let info_size = core::mem::size_of::<orbit_abi::handle::ChInfo>();
+    if !user_range_ok(info_vaddr.raw(), info_size as u64) {
+        return SyscallOutcome::Return {
+            ret: Errno::new(EFAULT).to_ret(),
+        };
+    }
+    if !struct_fits_in_one_page(info_vaddr.raw() as usize, info_size) {
+        return SyscallOutcome::Return {
+            ret: Errno::new(EINVAL).to_ret(),
+        };
+    }
+    let req = ChInspectReq {
+        fd: frame.regs[11] as u32,
+        info_vaddr,
+    };
+    park_on_manager(
+        hw,
+        PendingWork::ChInspect {
+            req,
+            pid: thread.pid,
+            root_pa: thread.root_table_addr(),
+            tid: thread.tid,
+        },
+    )
+}
+
+/// `chdir(path_ptr, path_len) → 0 | -errno`. Queues
+/// [`PendingWork::Chdir`]; manager validates the dir exists before
+/// mutating `Process.cwd`.
+pub fn chdir_req<H: Hardware>(
+    thread: &mut Thread,
+    frame: &TrapFrame,
+    hw: &mut H,
+) -> SyscallOutcome {
+    let path_len = frame.regs[12];
+    if path_len == 0 {
+        return SyscallOutcome::Return {
+            ret: Errno::new(EINVAL).to_ret(),
+        };
+    }
+    if path_len > MAX_FS_PATH_LEN {
+        return SyscallOutcome::Return {
+            ret: Errno::new(ENAMETOOLONG).to_ret(),
+        };
+    }
+    let Ok(path_vaddr) = UserVa::new(frame.regs[11] as u64)
+    else {
+        return SyscallOutcome::Return {
+            ret: Errno::new(EFAULT).to_ret(),
+        };
+    };
+    if !user_range_ok(path_vaddr.raw(), path_len as u64) {
+        return SyscallOutcome::Return {
+            ret: Errno::new(EFAULT).to_ret(),
+        };
+    }
+    park_on_manager(
+        hw,
+        PendingWork::Chdir {
+            req: ChdirReq {
+                path_vaddr,
+                path_len,
+            },
+            pid: thread.pid,
+            root_pa: thread.root_table_addr(),
+            tid: thread.tid,
+        },
+    )
+}
+
+/// `getcwd(buf_ptr, buf_len) → bytes | -errno`. Queues
+/// [`PendingWork::GetCwd`].
+pub fn getcwd_req<H: Hardware>(
+    thread: &mut Thread,
+    frame: &TrapFrame,
+    hw: &mut H,
+) -> SyscallOutcome {
+    let buf_len = frame.regs[12];
+    if buf_len == 0 || buf_len > PAGE_SIZE {
+        return SyscallOutcome::Return {
+            ret: Errno::new(EINVAL).to_ret(),
+        };
+    }
+    let Ok(buf_vaddr) = UserVa::new(frame.regs[11] as u64)
+    else {
+        return SyscallOutcome::Return {
+            ret: Errno::new(EFAULT).to_ret(),
+        };
+    };
+    if !user_range_ok(buf_vaddr.raw(), buf_len as u64) {
+        return SyscallOutcome::Return {
+            ret: Errno::new(EFAULT).to_ret(),
+        };
+    }
+    park_on_manager(
+        hw,
+        PendingWork::GetCwd {
+            req: GetCwdReq { buf_vaddr, buf_len },
+            pid: thread.pid,
+            root_pa: thread.root_table_addr(),
+            tid: thread.tid,
+        },
+    )
+}
+
+/// `getgroups(buf_ptr, count) → count | -errno`. Queues
+/// [`PendingWork::GetGroups`]. `count == 0` is the POSIX sizing call
+/// — the buffer is ignored, so it's only validated for `count > 0`.
+pub fn getgroups_req<H: Hardware>(
+    thread: &mut Thread,
+    frame: &TrapFrame,
+    hw: &mut H,
+) -> SyscallOutcome {
+    let buf_vaddr = frame.regs[11] as u64;
+    let count = frame.regs[12];
+    if count > process::NGROUPS_MAX {
+        return SyscallOutcome::Return {
+            ret: Errno::new(EINVAL).to_ret(),
+        };
+    }
+    if count > 0 && !user_range_ok(buf_vaddr, (count * core::mem::size_of::<u32>()) as u64) {
+        return SyscallOutcome::Return {
+            ret: Errno::new(EFAULT).to_ret(),
+        };
+    }
+    park_on_manager(
+        hw,
+        PendingWork::GetGroups {
+            req: GetGroupsReq { buf_vaddr, count },
+            pid: thread.pid,
+            root_pa: thread.root_table_addr(),
+            tid: thread.tid,
+        },
+    )
+}
+
+/// `getlogin(buf_ptr, buf_len) → bytes | -errno`. Queues
+/// [`PendingWork::GetLogin`].
+pub fn getlogin_req<H: Hardware>(
+    thread: &mut Thread,
+    frame: &TrapFrame,
+    hw: &mut H,
+) -> SyscallOutcome {
+    let buf_len = frame.regs[12];
+    if buf_len == 0 || buf_len > PAGE_SIZE {
+        return SyscallOutcome::Return {
+            ret: Errno::new(EINVAL).to_ret(),
+        };
+    }
+    let Ok(buf_vaddr) = UserVa::new(frame.regs[11] as u64)
+    else {
+        return SyscallOutcome::Return {
+            ret: Errno::new(EFAULT).to_ret(),
+        };
+    };
+    if !user_range_ok(buf_vaddr.raw(), buf_len as u64) {
+        return SyscallOutcome::Return {
+            ret: Errno::new(EFAULT).to_ret(),
+        };
+    }
+    park_on_manager(
+        hw,
+        PendingWork::GetLogin {
+            req: GetLoginReq { buf_vaddr, buf_len },
+            pid: thread.pid,
+            root_pa: thread.root_table_addr(),
+            tid: thread.tid,
+        },
+    )
+}
+
+/// `setuid(uid) → 0 | -EPERM`. Queues [`PendingWork::SetUid`] —
+/// the manager applies POSIX triplet rules and refreshes sibling
+/// threads' credential snapshots.
+pub fn setuid_req<H: Hardware>(
+    thread: &mut Thread,
+    frame: &TrapFrame,
+    hw: &mut H,
+) -> SyscallOutcome {
+    park_on_manager(
+        hw,
+        PendingWork::SetUid {
+            req: SetUidReq {
+                uid: frame.regs[11] as u32,
+            },
+            pid: thread.pid,
+            tid: thread.tid,
+        },
+    )
+}
+
+/// `setgid(gid) → 0 | -EPERM`. Gid mirror of [`setuid_req`].
+pub fn setgid_req<H: Hardware>(
+    thread: &mut Thread,
+    frame: &TrapFrame,
+    hw: &mut H,
+) -> SyscallOutcome {
+    park_on_manager(
+        hw,
+        PendingWork::SetGid {
+            req: SetGidReq {
+                gid: frame.regs[11] as u32,
+            },
+            pid: thread.pid,
+            tid: thread.tid,
+        },
+    )
+}
+
+/// `setgroups(buf_ptr, count) → 0 | -errno`. Queues
+/// [`PendingWork::SetGroups`]. `count == 0` legally empties the list
+/// with a (possibly null) ignored buffer.
+pub fn setgroups_req<H: Hardware>(
+    thread: &mut Thread,
+    frame: &TrapFrame,
+    hw: &mut H,
+) -> SyscallOutcome {
+    let buf_vaddr = frame.regs[11] as u64;
+    let count = frame.regs[12];
+    if count > process::NGROUPS_MAX {
+        return SyscallOutcome::Return {
+            ret: Errno::new(EINVAL).to_ret(),
+        };
+    }
+    if count > 0 && !user_range_ok(buf_vaddr, (count * core::mem::size_of::<u32>()) as u64) {
+        return SyscallOutcome::Return {
+            ret: Errno::new(EFAULT).to_ret(),
+        };
+    }
+    park_on_manager(
+        hw,
+        PendingWork::SetGroups {
+            req: SetGroupsReq { buf_vaddr, count },
+            pid: thread.pid,
+            root_pa: thread.root_table_addr(),
+            tid: thread.tid,
+        },
+    )
+}
+
+/// `setlogin(name_ptr, name_len) → 0 | -errno`. Queues
+/// [`PendingWork::SetLogin`].
+pub fn setlogin_req<H: Hardware>(
+    thread: &mut Thread,
+    frame: &TrapFrame,
+    hw: &mut H,
+) -> SyscallOutcome {
+    let name_len = frame.regs[12];
+    if name_len == 0 || name_len > MAX_LOGIN_NAME {
+        return SyscallOutcome::Return {
+            ret: Errno::new(ENAMETOOLONG).to_ret(),
+        };
+    }
+    let Ok(name_vaddr) = UserVa::new(frame.regs[11] as u64)
+    else {
+        return SyscallOutcome::Return {
+            ret: Errno::new(EFAULT).to_ret(),
+        };
+    };
+    if !user_range_ok(name_vaddr.raw(), name_len as u64) {
+        return SyscallOutcome::Return {
+            ret: Errno::new(EFAULT).to_ret(),
+        };
+    }
+    park_on_manager(
+        hw,
+        PendingWork::SetLogin {
+            req: SetLoginReq {
+                name_vaddr,
+                name_len,
+            },
+            pid: thread.pid,
+            root_pa: thread.root_table_addr(),
+            tid: thread.tid,
+        },
+    )
+}
+
+/// `argv_envp() → (argv_va | 0, envp_va | 0)`. Queues
+/// [`PendingWork::ArgvEnvp`]. The blob VAs are fixed constants; the
+/// round-trip exists only to read the install-presence flags off
+/// `Process` safely (the sync version's `processes` map lookup raced
+/// manager-side inserts of unrelated pids). Called once per process
+/// startup by orbit-rt, so the park cost is invisible.
+pub fn argv_envp_req<H: Hardware>(
+    thread: &mut Thread,
+    _frame: &TrapFrame,
+    hw: &mut H,
+) -> SyscallOutcome {
+    park_on_manager(
+        hw,
+        PendingWork::ArgvEnvp {
+            pid: thread.pid,
+            tid: thread.tid,
+        },
+    )
+}
+
 /// `fb_surface_destroy(handle)` — park the caller on a completion
 /// handle and queue a [`PendingWork::FbSurfaceDestroy`]. Manager
 /// looks up the surface, unmaps its user VA, removes the per-process
@@ -469,20 +863,43 @@ pub fn create_process_req<H: Hardware>(
     }
 }
 
-/// `wait_pid(pid) → exit_code | -errno` (`-ECHILD` if the target
-/// doesn't exist or already reaped, `-EPERM` if the caller isn't its
-/// parent, `-EINVAL` for self-wait, `-EBUSY` if a sibling already
-/// parked on the target). Parks the caller on a fresh handle and
-/// queues `PendingWork::WaitPid`; the manager either installs the
-/// handle on the target's exit-waiter slot (alive case) or signals
-/// the error sync.
+/// `waitpid(pid)` — POSIX-shaped, polymorphic on pid:
+///
+/// - `pid >  0` — wait for that specific child. Returns `(0, exit_code)`
+///   on success; r0 carries `-errno` on the error legs (`-ECHILD` for
+///   never-existed / already-reaped, `-EPERM` if the caller isn't the
+///   parent, `-EBUSY` if a sibling already parked on this target).
+/// - `pid == -1` — wait for any child. Returns `(child_pid, exit_code)`
+///   on success (r0 is the resolved child's pid, positive — fits in
+///   `u16`); `-ECHILD` if the caller has no live children + empty
+///   `dead_children`, `-EBUSY` if another thread already parked on the
+///   parent's `any_child_waiter` slot.
+/// - `pid ==  0` or `pid < -1` — reserved for future process-group
+///   semantics; returns `-EINVAL` today.
+///
+/// Self-wait (caller passing its own pid as `> 0`) is rejected sync
+/// with `-EINVAL` — would deadlock the calling thread on its own
+/// `exit_waiter` slot.
+///
+/// Parks the caller and queues [`PendingWork::WaitPid`]; the manager
+/// either installs the parker tid on the appropriate waiter slot or
+/// signals the error / cached exit synchronously.
 pub fn wait_pid_req<H: Hardware>(
     thread: &mut Thread,
     frame: &TrapFrame,
     hw: &mut H,
 ) -> SyscallOutcome {
-    let target_pid = frame.regs[11] as u16;
-    if target_pid == 0 || target_pid == thread.pid {
+    // Sign-extend the syscall arg through `i32`; the kernel-side
+    // request struct carries the raw selector verbatim. Reject the
+    // pgrp-reserved encodings sync — manager would have to do it
+    // anyway and the work-queue round-trip is wasted.
+    let target_pid = frame.regs[11] as isize as i32;
+    if target_pid == 0 || target_pid < -1 {
+        return SyscallOutcome::Return {
+            ret: Errno::new(EINVAL).to_ret(),
+        };
+    }
+    if target_pid > 0 && (target_pid as u32) == (thread.pid as u32) {
         return SyscallOutcome::Return {
             ret: Errno::new(EINVAL).to_ret(),
         };
@@ -1092,8 +1509,24 @@ pub fn read_stdin<H: Hardware>(
         return ready(n2 as isize);
     }
 
+    // Park indefinitely. read_stdin has no timeout, so mirror
+    // read_key_event's `READ_KEY_EVENT_INDEFINITE` shape: `wake_time =
+    // usize::MAX` keeps the sleep-heap entry from ever popping on its
+    // deadline (`drain_woken`'s `wake_time > now` is always true for
+    // `u64::MAX`), so the only wake path is `wake_override`, set by
+    // `input::dispatch`'s `WakeEvent::InputTid(tid)` doorbell.
+    //
+    // Suspended, NOT Blocking: the doorbell publishes no results, and
+    // `set_wake_reason_where` promotes Suspended unconditionally but
+    // gates Blocking on a SIGNALED completion slot (the canonical
+    // publish-then-push shape every PendingWork syscall uses). A
+    // Blocking park here would have its keystroke wake silently
+    // dropped. YieldRetry's re-drain on resume makes a spurious or
+    // duplicate wake harmless — an empty re-drain just re-parks. This
+    // matches read_key_event, the only other YieldRetry parker.
+    thread.wake_time = usize::MAX;
     SyscallOutcome::YieldRetry {
-        state: ThreadState::Blocking,
+        state: ThreadState::Suspended,
     }
 }
 

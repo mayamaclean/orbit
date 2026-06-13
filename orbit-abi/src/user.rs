@@ -858,7 +858,7 @@ pub fn argv_envp() -> (usize, usize) {
 }
 
 /// Block the caller until child process `pid` exits, then return the
-/// child's exit code. Errnos:
+/// child's exit code. POSIX `waitpid(pid > 0, ...)`-shape. Errnos:
 /// - `ECHILD` — `pid` doesn't exist (never existed or already reaped).
 ///   v1 has no zombies; a child whose parent never waited is reaped
 ///   immediately on exit, so a late `wait_pid` always sees ECHILD.
@@ -874,8 +874,47 @@ pub fn argv_envp() -> (usize, usize) {
 /// negative convention.
 #[inline]
 pub fn wait_pid(pid: u16) -> Result<i32, Errno> {
+    // Specific-pid arm: the kernel returns `(0, exit_code)` on
+    // success, `(-errno, 0)` on error. Cast the `u16` through `i32`
+    // for the syscall arg — kernel reads it as i32 and dispatches
+    // on sign.
     let (r0, r1) = unsafe { ecall1_ret2(syscall::WAIT_PID, pid as usize) };
     Errno::from_ret(r0).map(|_| r1 as i32)
+}
+
+/// Block the caller until *any* child exits, then return
+/// `(child_pid, exit_code)`. POSIX `wait(&status)` / `waitpid(-1, ...)`
+/// shape. Errnos:
+/// - `ECHILD` — caller has no live children and an empty cache of
+///   already-exited children. Either you never spawned anything that
+///   could come back here, or every child you did spawn was
+///   `DETACH`-flagged at creation.
+/// - `EBUSY`  — another thread of this process already parked on
+///   `waitpid(-1)` (v1 single-waiter; futex lifts this).
+///
+/// On success, the resolved child's pid is `> 0` and its exit code
+/// lands in the second slot. The kernel drains the parent's
+/// `dead_children` cache (lowest-pid wins) before parking — so
+/// children that exited before you called still get reaped here.
+///
+/// Detached children (spawned with `CreateProcessV2Args::DETACH`)
+/// are invisible to this call: their exits don't satisfy a parked
+/// `wait_any_child` and they don't count toward the live-child probe
+/// that gates ECHILD. Mirror of how `dead_children` already skips
+/// detached spawns.
+#[inline]
+pub fn wait_any_child() -> Result<(u16, i32), Errno> {
+    // Any-child arm: kernel returns `(child_pid, exit_code)` on
+    // success (r0 positive = pid), `(-errno, 0)` on error. The `-1`
+    // selector goes through the same WAIT_PID sysno as the
+    // specific-pid path; the kernel dispatches on sign.
+    let (r0, r1) = unsafe { ecall1_ret2(syscall::WAIT_PID, (-1isize) as usize) };
+    if r0 < 0 {
+        Err(Errno::new(-r0 as i32))
+    }
+    else {
+        Ok((r0 as u16, r1 as i32))
+    }
 }
 
 /// Absolute monotonic microseconds since system boot.

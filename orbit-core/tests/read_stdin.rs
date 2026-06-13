@@ -78,9 +78,15 @@ fn block_empty_parks_then_yields_retry() {
     assert!(matches!(
         outcome,
         SyscallOutcome::YieldRetry {
-            state: ThreadState::Blocking
+            state: ThreadState::Suspended
         }
     ));
+    assert_eq!(
+        t.wake_time,
+        usize::MAX,
+        "indefinite park stamps wake_time = MAX so the sleep-heap deadline never fires; \
+         only the InputTid doorbell wakes it"
+    );
     assert!(
         t.handle.is_none(),
         "no Arc'd handle on the on-thread completion path"
@@ -228,7 +234,7 @@ fn yield_retry_keeps_pc_so_resume_re_executes_ecall() {
     let outcome = syscall::read_stdin(&mut t, &frame, &mut hw);
     let action = apply_syscall_outcome(outcome, &mut t, &mut frame, ECALL_EPC);
 
-    assert_eq!(action, ShimAction::Yield(ThreadState::Blocking));
+    assert_eq!(action, ShimAction::Yield(ThreadState::Suspended));
     assert_eq!(
         t.pc.load(Ordering::Acquire),
         ECALL_EPC,

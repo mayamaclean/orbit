@@ -17,13 +17,11 @@ use core::alloc::Layout;
 use core::ptr::null_mut;
 use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 
-use tracing::{error, info, warn};
+use tracing::{error, info};
 use virtio::queue::VirtqBacking;
 use virtio_blk::{
     ARENA_BYTES, Block, BlockBacking, BlockError, QUEUE_SIZE, SECTOR_SIZE, VIRTIO_BLK_DEVICE_ID,
 };
-
-use orbit_core::PendingWork;
 
 use crate::drivers::{plic, virtio_probe};
 use crate::kernel::memmap::{KernelPages, phys_to_kdmap};
@@ -344,16 +342,25 @@ fn virtio_blk_handler(_src: u32) {
                 error!("virtio-blk: completion for head={head} with no registered key");
                 return;
             }
-            let work = PendingWork::CacheFill {
+            // Dedicated completion ring — never MANAGER_WORK. Sharing
+            // the syscall ring meant a burst of blocking syscalls
+            // could fill it and force this handler to *drop* the
+            // completion, leaving the cache slot Loading forever and
+            // every fs_read waiter on it parked permanently. The ring
+            // is sized at 2× QUEUE_SIZE, so with ≤ QUEUE_SIZE chains
+            // in flight this push cannot fail unless the manager has
+            // stopped draining entirely — which is unrecoverable
+            // anyway, hence error-level and no fallback.
+            let ev = crate::kernel::CacheFillEvent {
                 packed_key: packed,
                 status,
             };
-            if crate::kernel::MANAGER_WORK
+            if crate::kernel::CACHE_FILLS
                 .push_ref()
-                .map(|mut s| *s = work)
+                .map(|mut s| *s = ev)
                 .is_err()
             {
-                warn!("virtio-blk: MANAGER_WORK full — dropping CacheFill for head={head}");
+                error!("virtio-blk: CACHE_FILLS full — dropping CacheFill for head={head} (manager stalled?)");
             }
         });
     }

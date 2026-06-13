@@ -66,7 +66,7 @@ grep -q 'orbit-loader: listening' "$QEMU_LOG" \
   || die "orbit-loader never reported listening — see $QEMU_LOG"
 
 note "shipping bench ELF via send-payload.py"
-python3 "$ROOT/orbit-loader/tools/send-payload.py" \
+python3 "$ROOT/send-payload.py" \
   "$BENCH_BIN" --name umode-sleep-bench \
   || die "send-payload failed"
 

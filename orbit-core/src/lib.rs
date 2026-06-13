@@ -39,10 +39,12 @@ pub mod trap;
 pub use orbit_abi::roles;
 
 pub use pending_work::{
-    CloseHandleReq, CreateProcessExReq, CreateProcessReq, CreateProcessV2Req, CreateThreadReq,
-    EventFdCreateReq, FbSurfaceCreateReq, FbSurfaceDestroyReq, FsOpenReq, FsReadReq, FsReaddirReq,
-    FsStatReq, FutexWaitReq, FutexWakeReq, MAX_FS_PATH_LEN, MemMapReq, NetChannelCreationReq,
-    PendingWork, PledgeReq, SpawnContext, WaitPidReq, WakeTidReq,
+    ChInspectReq, ChdirReq, CloseHandleReq, CreateProcessExReq, CreateProcessReq,
+    CreateProcessV2Req, CreateThreadReq, EventFdCreateReq, FbSurfaceCreateReq, FbSurfaceDestroyReq,
+    FsFstatReq, FsOpenReq, FsReadReq, FsReaddirReq, FsSeekReq, FsStatReq, FutexWaitReq,
+    FutexWakeReq, GetCwdReq, GetGroupsReq, GetLoginReq, MAX_FS_PATH_LEN, MAX_LOGIN_NAME, MemMapReq,
+    NetChannelCreationReq, PendingWork, PledgeReq, SetGidReq, SetGroupsReq, SetLoginReq, SetUidReq,
+    SpawnContext, WaitPidReq, WakeTidReq,
 };
 
 /// Page size assumed by pure logic when bounding user-memory ranges. Must

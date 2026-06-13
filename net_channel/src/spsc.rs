@@ -44,13 +44,32 @@ pub struct SpscQueue<T: Copy, const N: usize> {
 unsafe impl<T: Copy + Send, const N: usize> Sync for SpscQueue<T, N> {}
 
 impl<T: Copy, const N: usize> SpscQueue<T, N> {
+    /// Defensive masking on every index load. For the NetChannel use
+    /// these queues live in user-RW shared memory — *both* indices,
+    /// including the "kernel-owned" one, can be scribbled by the user.
+    /// In legitimate operation indices are always `< N` (stores go
+    /// through `% N`), so the mask is a no-op; on corruption it
+    /// confines the damage to garbage within this channel's own ring
+    /// instead of an out-of-bounds slot access panicking the kernel.
+    /// (Garbage *values* are the caller's problem — the kernel side
+    /// bounds-checks increments against its staged slices.)
+    #[inline]
+    fn load_head(&self, order: Ordering) -> usize {
+        self.head.load(order) % N
+    }
+
+    #[inline]
+    fn load_tail(&self, order: Ordering) -> usize {
+        self.tail.load(order) % N
+    }
+
     /// # Safety
     /// Caller must be the sole producer on this queue.
     #[inline]
     pub unsafe fn enqueue(&self, val: T) -> Result<(), T> {
-        let tail = self.tail.load(Ordering::Relaxed);
+        let tail = self.load_tail(Ordering::Relaxed);
         let next = (tail + 1) % N;
-        if next == self.head.load(Ordering::Acquire) {
+        if next == self.load_head(Ordering::Acquire) {
             return Err(val);
         }
         unsafe {
@@ -64,8 +83,8 @@ impl<T: Copy, const N: usize> SpscQueue<T, N> {
     /// Caller must be the sole consumer on this queue.
     #[inline]
     pub unsafe fn dequeue(&self) -> Option<T> {
-        let head = self.head.load(Ordering::Relaxed);
-        if head == self.tail.load(Ordering::Acquire) {
+        let head = self.load_head(Ordering::Relaxed);
+        if head == self.load_tail(Ordering::Acquire) {
             return None;
         }
         let val = unsafe { self.buffer[head].get().read_volatile() };
@@ -75,20 +94,20 @@ impl<T: Copy, const N: usize> SpscQueue<T, N> {
 
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.head.load(Ordering::Acquire) == self.tail.load(Ordering::Acquire)
+        self.load_head(Ordering::Acquire) == self.load_tail(Ordering::Acquire)
     }
 
     #[inline]
     pub fn is_full(&self) -> bool {
-        let tail = self.tail.load(Ordering::Acquire);
-        let head = self.head.load(Ordering::Acquire);
+        let tail = self.load_tail(Ordering::Acquire);
+        let head = self.load_head(Ordering::Acquire);
         (tail + 1) % N == head
     }
 
     #[inline]
     pub fn len(&self) -> usize {
-        let head = self.head.load(Ordering::Acquire);
-        let tail = self.tail.load(Ordering::Acquire);
+        let head = self.load_head(Ordering::Acquire);
+        let tail = self.load_tail(Ordering::Acquire);
         (tail + N - head) % N
     }
 

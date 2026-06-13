@@ -118,11 +118,27 @@ pub const MAX_FS_PATH_LEN: usize = 256;
 
 #[derive(Debug, Clone, Copy)]
 pub struct WaitPidReq {
-    /// Pid to wait on. Manager validates that the caller is the
-    /// parent (returns EPERM otherwise) and that the pid currently
-    /// exists (ECHILD if not — covers both never-existed and
-    /// already-reaped).
-    pub target_pid: u16,
+    /// POSIX-shaped pid selector — same encoding as `waitpid(2)`'s
+    /// first argument:
+    ///
+    /// - `>  0` — wait for that specific child. Manager validates the
+    ///   caller is the parent (EPERM otherwise) and the pid currently
+    ///   exists or is in the parent's `dead_children` (ECHILD covers
+    ///   never-existed + already-reaped). Resolved against the
+    ///   target's `exit_waiter` slot.
+    /// - `== -1` — wait for any child. Manager drains
+    ///   `parent.dead_children` first; on empty, parks the caller in
+    ///   `parent.any_child_waiter`. ECHILD if the parent has no live
+    ///   children and an empty `dead_children`.
+    /// - `==  0` — reserved for "any child in the caller's process
+    ///   group" once process groups land. EINVAL today.
+    /// - `<  -1` — reserved for "any child in process group `|pid|`".
+    ///   EINVAL today.
+    ///
+    /// Stored as `i32` (not `u16`) so the `-1` sentinel round-trips
+    /// cleanly through the syscall arg. Specific-pid values are
+    /// always in the `1..=u16::MAX` range, validated kernel-side.
+    pub target_pid: i32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -266,6 +282,129 @@ pub struct EventFdCreateReq {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WakeTidReq {
     pub target_tid: u32,
+}
+
+/// Cap on `setlogin(2)` name length, shared between the boundary
+/// check in `setlogin_req` and the manager body so the two can't
+/// drift. POSIX leaves the bound implementation-defined; 32 matches
+/// OpenBSD's `LOGIN_NAME_MAX`.
+pub const MAX_LOGIN_NAME: usize = 32;
+
+// The next eleven requests were converted from sync trap-path
+// handlers (see docs/dev/fd-unix-io-scope.md item 0): they read or
+// mutate manager-owned state (`process_handles`, `Process` cwd /
+// creds), and a lock-free trap-path access races the manager's
+// BTreeMap mutations on other harts. Routing them through the work
+// queue makes that state single-consumer by construction — no
+// trap-path locks (a trap/exception while holding one re-creates the
+// kptr-long-jump deadlock class documented on MANAGER_LOCK).
+
+/// `fs_seek(fd, offset, whence)` request. Manager repositions the
+/// per-fd `OpenFile.offset` and signals the new absolute offset.
+/// `fs_read`/`fs_readdir` (the offset's only consumers) already run
+/// on the manager, so this completes the single-consumer story for
+/// per-fd state.
+#[derive(Debug, Clone, Copy)]
+pub struct FsSeekReq {
+    pub fd: u32,
+    pub offset: i64,
+    /// POSIX whence: `SEEK_SET = 0`, `SEEK_CUR = 1`, `SEEK_END = 2`.
+    pub whence: u32,
+}
+
+/// `fs_fstat(fd, &mut Stat)` request. Manager resolves the fd's
+/// `OpenFile`, runs `Filesystem::stat`, and copies into the user
+/// buffer via `UserPageWindow`.
+#[derive(Debug, Clone, Copy)]
+pub struct FsFstatReq {
+    pub fd: u32,
+    /// User VA of the `Stat` out-buffer (`size_of::<Stat>` bytes).
+    pub stat_vaddr: UserVa,
+}
+
+/// `ch_inspect(fd, *mut ChInfo)` request. Manager reads the fd's
+/// handle-table slot and copies a populated
+/// [`ChInfo`](orbit_abi::handle::ChInfo) into the user buffer.
+#[derive(Debug, Clone, Copy)]
+pub struct ChInspectReq {
+    pub fd: u32,
+    /// User VA of the `ChInfo` out-buffer. Must sit inside a single
+    /// page (single-`UserPageWindow` constraint, same as `fs_stat`).
+    pub info_vaddr: UserVa,
+}
+
+/// `chdir(path_ptr, path_len)` request. Manager validates the dir
+/// exists in the active fs, then replaces the caller's `Process.cwd`.
+#[derive(Debug, Clone, Copy)]
+pub struct ChdirReq {
+    pub path_vaddr: UserVa,
+    /// `1..=MAX_FS_PATH_LEN`, enforced at the boundary.
+    pub path_len: usize,
+}
+
+/// `getcwd(buf_ptr, buf_len)` request. Manager copies the caller's
+/// cwd (no NUL) into the user buffer; signals bytes written or
+/// `-ERANGE`.
+#[derive(Debug, Clone, Copy)]
+pub struct GetCwdReq {
+    pub buf_vaddr: UserVa,
+    pub buf_len: usize,
+}
+
+/// `getgroups(buf_ptr, count)` request. `count == 0` is the POSIX
+/// sizing call (returns the group count without writing).
+#[derive(Debug, Clone, Copy)]
+pub struct GetGroupsReq {
+    /// Raw u64 (not `UserVa`): ignored — and legally null — when
+    /// `count == 0`. Boundary validates it only for `count > 0`.
+    pub buf_vaddr: u64,
+    /// Slot count (`u32`s, not bytes).
+    pub count: usize,
+}
+
+/// `getlogin(buf_ptr, buf_len)` request. Manager copies the session
+/// login name (no NUL); signals bytes written or `-ENOENT`.
+#[derive(Debug, Clone, Copy)]
+pub struct GetLoginReq {
+    pub buf_vaddr: UserVa,
+    pub buf_len: usize,
+}
+
+/// `setuid(uid)` request. Manager applies the POSIX triplet rules and
+/// refreshes every sibling thread's credential snapshot — which is
+/// exactly why this must run on the manager: the snapshot walk
+/// mutates `Thread` fields the trap path reads lock-free.
+#[derive(Debug, Clone, Copy)]
+pub struct SetUidReq {
+    pub uid: u32,
+}
+
+/// `setgid(gid)` request. Gid mirror of [`SetUidReq`].
+#[derive(Debug, Clone, Copy)]
+pub struct SetGidReq {
+    pub gid: u32,
+}
+
+/// `setgroups(buf_ptr, count)` request. Manager reads `count` `u32`s
+/// from user memory and replaces the supplementary group list
+/// (requires `euid == 0`; `count == 0` empties the list).
+#[derive(Debug, Clone, Copy)]
+pub struct SetGroupsReq {
+    /// Raw u64 (not `UserVa`): ignored — and legally null — when
+    /// `count == 0` (the POSIX empty-the-list call). Boundary
+    /// validates it only for `count > 0`.
+    pub buf_vaddr: u64,
+    /// Slot count, `0..=NGROUPS_MAX` (boundary-enforced).
+    pub count: usize,
+}
+
+/// `setlogin(name_ptr, name_len)` request. Manager stamps the session
+/// login name (UTF-8, `1..=MAX_LOGIN_NAME` bytes, requires
+/// `euid == 0`).
+#[derive(Debug, Clone, Copy)]
+pub struct SetLoginReq {
+    pub name_vaddr: UserVa,
+    pub name_len: usize,
 }
 
 /// One slot in the manager's MPSC work ring. Fixed-size by virtue of
@@ -453,6 +592,80 @@ pub enum PendingWork {
     /// membership and pushes `WakeEvent::Tid(target_tid)`. Resumes via
     /// `publish_pending_for_tid(tid, &[result])`.
     WakeTid { req: WakeTidReq, pid: u16, tid: u32 },
+    /// `fs_seek` — manager mutates the per-fd `OpenFile.offset`.
+    /// Resumes via `publish_pending_for_tid(tid, &[new_offset])`.
+    FsSeek { req: FsSeekReq, pid: u16, tid: u32 },
+    /// `fs_fstat` — manager stats the file backing the fd and copies
+    /// into the user buffer. Resumes with `&[result]`.
+    FsFstat {
+        req: FsFstatReq,
+        pid: u16,
+        root_pa: PhysAddr,
+        tid: u32,
+    },
+    /// `ch_inspect` — manager fills a `ChInfo` from the fd's slot and
+    /// copies into the user buffer. Resumes with `&[result]`.
+    ChInspect {
+        req: ChInspectReq,
+        pid: u16,
+        root_pa: PhysAddr,
+        tid: u32,
+    },
+    /// `chdir` — manager validates + replaces `Process.cwd`.
+    Chdir {
+        req: ChdirReq,
+        pid: u16,
+        root_pa: PhysAddr,
+        tid: u32,
+    },
+    /// `getcwd` — manager copies `Process.cwd` into the user buffer.
+    GetCwd {
+        req: GetCwdReq,
+        pid: u16,
+        root_pa: PhysAddr,
+        tid: u32,
+    },
+    /// `getgroups` — manager copies the supplementary group list.
+    GetGroups {
+        req: GetGroupsReq,
+        pid: u16,
+        root_pa: PhysAddr,
+        tid: u32,
+    },
+    /// `getlogin` — manager copies the session login name.
+    GetLogin {
+        req: GetLoginReq,
+        pid: u16,
+        root_pa: PhysAddr,
+        tid: u32,
+    },
+    /// `setuid` — manager mutates the uid triplet + thread snapshots.
+    SetUid { req: SetUidReq, pid: u16, tid: u32 },
+    /// `setgid` — gid mirror of [`PendingWork::SetUid`].
+    SetGid { req: SetGidReq, pid: u16, tid: u32 },
+    /// `setgroups` — manager reads the group list from user memory
+    /// and replaces `Process.groups`.
+    SetGroups {
+        req: SetGroupsReq,
+        pid: u16,
+        root_pa: PhysAddr,
+        tid: u32,
+    },
+    /// `setlogin` — manager reads the name from user memory and
+    /// stamps `Process.login_name`.
+    SetLogin {
+        req: SetLoginReq,
+        pid: u16,
+        root_pa: PhysAddr,
+        tid: u32,
+    },
+    /// `argv_envp` — manager reads the caller's `Process.argv_blob` /
+    /// `envp_blob` presence flags and resumes with
+    /// `&[argv_va_or_0, envp_va_or_0]`. Converted from a sync handler:
+    /// the blobs themselves are install-once-immutable, but the
+    /// `self.processes` BTreeMap lookup raced manager-side inserts of
+    /// unrelated pids.
+    ArgvEnvp { pid: u16, tid: u32 },
     /// Page-cache DMA completion. Posted by the virtio-blk IRQ when a
     /// chain submitted via the cached path (`submit_blk_read_cached`)
     /// finishes. Carries the packed `CacheKey` the manager uses to

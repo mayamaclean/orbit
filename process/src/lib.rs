@@ -573,10 +573,10 @@ pub struct Process {
     /// `exit_code` alone — the value the exit-caller passed wins,
     /// regardless of the order in which sibling threads are reaped.
     pub exit_finalized: bool,
-    /// Single-waiter slot for §13a.2 `wait_pid`. v1 contract: at most
-    /// one parent thread parks here at a time; a second `wait_pid`
-    /// call returns EBUSY. Multi-waiter wants a `Vec<u32>` and lands
-    /// with futex (§13a.5).
+    /// Single-waiter slot for §13a.2 `wait_pid(pid > 0)`. v1 contract:
+    /// at most one parent thread parks here at a time; a second
+    /// `wait_pid` call returns EBUSY. Multi-waiter wants a `Vec<u32>`
+    /// and lands with futex (§13a.5).
     ///
     /// Stores the parker's tid. `dealloc_process` resolves it via
     /// `Orbit::publish_pending_for_tid(tid, &[0, exit_code])` — the
@@ -584,11 +584,25 @@ pub struct Process {
     /// (parker exited mid-wait) are silently dropped by the resume
     /// helper.
     pub exit_waiter: Option<u32>,
+    /// Single-waiter slot for `waitpid(-1)` — POSIX `wait()`-shape.
+    /// Symmetric to [`exit_waiter`](Self::exit_waiter) but lives on
+    /// the *parent* (this process) instead of per-child, since the
+    /// caller hasn't named a specific child to track. Resolved by
+    /// `dealloc_process` for any non-detached child of ours: the
+    /// child's exit publishes `(child_pid, exit_code)` to the parker
+    /// instead of stashing in `dead_children`.
+    ///
+    /// Single-waiter v1: a second `waitpid(-1)` while one is already
+    /// parked returns EBUSY. Multi-waiter (Vec + broadcast) is a
+    /// future extension.
+    pub any_child_waiter: Option<u32>,
     /// Already-exited children whose parent (this process) hasn't
     /// called `wait_pid` yet. Keyed by child pid → child's exit code.
     /// Drained when the parent waits, or freed wholesale when the
     /// parent itself exits. Closes the wait_pid race when the child
-    /// exits before the parent has a chance to park.
+    /// exits before the parent has a chance to park. `waitpid(-1)`
+    /// drains via `pop_first` (lowest pid wins) before parking on
+    /// [`any_child_waiter`](Self::any_child_waiter).
     pub dead_children: BTreeMap<u16, i32>,
     /// `true` when this process was spawned with the
     /// [`CreateProcessV2Args::DETACH`] flag. The exit path for a
@@ -750,6 +764,7 @@ impl Process {
             exit_code: 0,
             exit_finalized: false,
             exit_waiter: None,
+            any_child_waiter: None,
             dead_children: BTreeMap::new(),
             detached: false,
             argv_blob: None,

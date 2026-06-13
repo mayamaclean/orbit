@@ -19,7 +19,8 @@ use orbit_abi::{
         ConsoleWriter, close_handle, console_write, create_process_with_argv, create_thread, exit,
         fs_open, fs_read, fs_readdir, fs_stat, futex_wait, futex_wake, get_affinity, get_hart_id,
         getegid, geteuid, getgid, getgroups, getlogin, getpid, gettid, getuid, serial_print,
-        set_affinity, setgid, setgroups, setlogin, setuid, sleep_ms, wait_pid,
+        set_affinity, setgid, setgroups, setlogin, setuid, sleep_ms, thread_exit, wait_any_child,
+        wait_pid,
     },
 };
 use orbit_rt::netch::NetCh;
@@ -62,7 +63,10 @@ extern "C" fn tls_worker_entry() -> ! {
     TLS_WORKER_FINAL_TICK.store(MY_TICK.get(), Ordering::Release);
 
     TLS_WORKER_DONE.store(1, Ordering::Release);
-    exit(0);
+    // Per-thread exit: `exit(0)` is exit-group since the
+    // whole-process-exit change and was racily killing main here —
+    // see docs/dev/fd-unix-io-scope.md addendum.
+    thread_exit();
 }
 
 fn run_tls_isolation_probe() {
@@ -146,7 +150,10 @@ static WORKER_HART: AtomicU32 = AtomicU32::new(u32::MAX);
 extern "C" fn worker_entry() -> ! {
     let hart = get_hart_id();
     WORKER_HART.store(hart, Ordering::Release);
-    exit(0);
+    // Per-thread exit: `exit(0)` is exit-group since the
+    // whole-process-exit change and was racily killing main here —
+    // see docs/dev/fd-unix-io-scope.md addendum.
+    thread_exit();
 }
 
 // =====================================================================
@@ -216,7 +223,10 @@ extern "C" fn shootdown_worker_entry() -> ! {
     // hart 1's TLB and we report the failure from main.
     let _stale = unsafe { core::ptr::read_volatile(va as *const u8) };
     SD_WORKER_SURVIVED.store(1, Ordering::Release);
-    exit(0);
+    // Per-thread exit: `exit(0)` is exit-group since the
+    // whole-process-exit change and was racily killing main here —
+    // see docs/dev/fd-unix-io-scope.md addendum.
+    thread_exit();
 }
 
 fn run_shootdown_probe() {
@@ -392,7 +402,10 @@ extern "C" fn futex_worker_entry() -> ! {
         Err(Errno(e)) => e as u32,
     };
     FUTEX_WORKER_RESULT.store(code, Ordering::Release);
-    exit(0);
+    // Per-thread exit: `exit(0)` is exit-group since the
+    // whole-process-exit change and was racily killing main here —
+    // see docs/dev/fd-unix-io-scope.md addendum.
+    thread_exit();
 }
 
 fn run_futex_probe() {
@@ -1279,6 +1292,154 @@ fn run_exec_smoke() {
     logln!("=== exec smoke done ===");
 }
 
+/// `waitpid(-1)` / `wait_any_child` smoke: validates the POSIX
+/// `wait(&status)`-shaped surface. Coverage:
+///
+/// 1. **Pre-spawn ECHILD** — `wait_any_child` with no live children
+///    returns ECHILD sync.
+/// 2. **Three-child reap** — spawn three copies of `/bin/hello` via
+///    path-mode `create_process_v2` (the non-LOADER-restricted spawn
+///    path), then `wait_any_child` three times. Each call returns a
+///    distinct pid from the spawned set; exit codes all == 42.
+/// 3. **Post-reap ECHILD** — fourth `wait_any_child` returns ECHILD.
+/// 4. **Race fast path** — spawn one child, sleep long enough for it
+///    to exit + land in `dead_children`, then `wait_any_child`
+///    resolves sync via the `pop_first` cache drain.
+fn run_wait_any_child_smoke() {
+    extern crate alloc;
+    use alloc::vec::Vec;
+    use orbit_abi::perms::{CreateProcessV2Args, role};
+    use orbit_abi::serialln;
+    use orbit_abi::user::create_process_v2;
+
+    // serialln! (not logln!) — the framebuffer compositor switches
+    // its active source to the child pid on spawn, so any logln!
+    // emitted by the parent after the first spawn is dropped from
+    // the screen + the kernel's USER[pid.tid] trace. Route to the
+    // kernel serial log instead, where the markers survive the
+    // source-switch.
+    serialln!("=== wait_any_child smoke begin ===");
+
+    // run_exec_smoke runs first and reaps its single child, so we're
+    // starting with zero live children. ECHILD expected.
+    match wait_any_child() {
+        Err(Errno(e)) if e == ECHILD => {
+            serialln!("PASS: wait_any_child empty got ECHILD");
+        }
+        other => serialln!("FAIL: wait_any_child empty got {other:?}"),
+    }
+
+    // Path-mode spawn: kernel reads `/bin/hello` off tarfs, no
+    // bytes-mode LOADER gate. `target_role: INHERIT` preserves
+    // umode's current role; identity is inherited (-1 sentinel).
+    let path = b"/bin/hello";
+    let mut argv_buf = [0u8; 64];
+    let argv_args: [&[u8]; 1] = [b"/bin/hello"];
+    let argv_len =
+        orbit_abi::argv::pack(&argv_args, &mut argv_buf).expect("argv blob fits in 64 bytes");
+    let argv_blob = &argv_buf[..argv_len];
+
+    let spawn_one = || -> Result<u16, Errno> {
+        let args = CreateProcessV2Args {
+            elf_vaddr: 0,
+            elf_len: 0,
+            allowed_affinity: 0,
+            affinity: 0,
+            target_role: role::INHERIT,
+            flags: 0,
+            request_perms: 0,
+            request_allowed_perms: 0,
+            cwd_vaddr: 0,
+            cwd_len: 0,
+            argv_vaddr: argv_blob.as_ptr() as usize,
+            argv_len: argv_blob.len(),
+            envp_vaddr: 0,
+            stdout_capture: 0,
+            _pad2: 0,
+            setuid_uid: -1,
+            setuid_gid: -1,
+            setlogin_vaddr: 0,
+            setlogin_len: 0,
+            groups_vaddr: 0,
+            groups_count: 0,
+            spawn_path_vaddr: path.as_ptr() as usize,
+            spawn_path_len: path.len(),
+        };
+        create_process_v2(&args)
+    };
+
+    let mut expected_pids: Vec<u16> = Vec::with_capacity(3);
+    for i in 0..3 {
+        match spawn_one() {
+            Ok(pid) => {
+                serialln!("PASS: wait_any_child spawn[{i}] pid={pid}");
+                expected_pids.push(pid);
+            }
+            Err(e) => {
+                serialln!("FAIL: wait_any_child spawn[{i}] failed: {e:?}");
+                return;
+            }
+        }
+    }
+
+    let mut observed_pids: Vec<u16> = Vec::with_capacity(3);
+    for i in 0..3 {
+        match wait_any_child() {
+            Ok((pid, 42)) => {
+                if expected_pids.contains(&pid) && !observed_pids.contains(&pid) {
+                    serialln!("PASS: wait_any_child[{i}] pid={pid} code=42");
+                    observed_pids.push(pid);
+                }
+                else if !expected_pids.contains(&pid) {
+                    serialln!(
+                        "FAIL: wait_any_child[{i}] pid={pid} not in expected {expected_pids:?}",
+                    );
+                }
+                else {
+                    serialln!("FAIL: wait_any_child[{i}] duplicated pid={pid}");
+                }
+            }
+            Ok((pid, code)) => {
+                serialln!("FAIL: wait_any_child[{i}] pid={pid} code={code} (want 42)");
+            }
+            Err(e) => serialln!("FAIL: wait_any_child[{i}] errored: {e:?}"),
+        }
+    }
+
+    // Post-reap: dead_children empty, no live children, ECHILD.
+    match wait_any_child() {
+        Err(Errno(e)) if e == ECHILD => {
+            serialln!("PASS: wait_any_child post-reap got ECHILD");
+        }
+        other => serialln!("FAIL: wait_any_child post-reap got {other:?}"),
+    }
+
+    // Race fast path: spawn one child, sleep long enough for it to
+    // exit and land in dead_children, then verify wait_any_child
+    // resolves sync via the pop_first cache drain rather than parking.
+    // /bin/hello prints + exits in well under 200ms.
+    match spawn_one() {
+        Ok(race_pid) => {
+            serialln!("PASS: wait_any_child race spawn pid={race_pid}");
+            let _ = sleep_ms(200);
+            match wait_any_child() {
+                Ok((pid, 42)) if pid == race_pid => {
+                    serialln!("PASS: wait_any_child race reaped pid={pid} via cache");
+                }
+                Ok((pid, code)) => {
+                    serialln!(
+                        "FAIL: wait_any_child race got pid={pid} code={code} (want {race_pid}/42)",
+                    );
+                }
+                Err(e) => serialln!("FAIL: wait_any_child race errored: {e:?}"),
+            }
+        }
+        Err(e) => serialln!("FAIL: wait_any_child race spawn failed: {e:?}"),
+    }
+
+    serialln!("=== wait_any_child smoke done ===");
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn main() -> i32 {
     // print to serial
@@ -1300,6 +1461,11 @@ pub extern "C" fn main() -> i32 {
     run_fs_smoke();
 
     run_exec_smoke();
+
+    // §13a.2 follow-up — POSIX `waitpid(-1)` shape. Runs after
+    // run_exec_smoke (which leaves no live children) so the pre-spawn
+    // ECHILD assertion holds.
+    run_wait_any_child_smoke();
 
     run_error_path_tests();
 
