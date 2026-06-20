@@ -3,7 +3,7 @@ use core::ptr::null_mut;
 use core::sync::atomic::Ordering;
 
 use device::{HartContext, TRAP_STACK_SIZE};
-use process::{FaultInfo, Thread, ThreadState};
+use process::{FaultInfo, RunningThread, Thread, ThreadState, ThreadView};
 use riscv::register::sstatus::SPP;
 use tracing::error;
 
@@ -66,7 +66,7 @@ pub unsafe fn load_thread_into_hart_context_and_jump(
         riscv::register::sstatus::clear_sie();
 
         riscv::register::sstatus::set_spp(thread.mode);
-        let pc = thread.pc.load(Ordering::Acquire);
+        let pc = thread.pc_load(Ordering::Acquire);
 
         // Sanity check: a kernel thread's pc must never be a user VA.
         // Kernel text lives in the high half (KTEXT_NOMINAL =
@@ -83,7 +83,7 @@ pub unsafe fn load_thread_into_hart_context_and_jump(
                 thread.tid,
                 thread.pid,
                 pc,
-                thread.state.load(Ordering::Acquire),
+                thread.state_load(Ordering::Acquire),
                 thread.last_wake_reason.load(Ordering::Acquire),
             );
             panic!(
@@ -107,9 +107,19 @@ pub unsafe fn load_thread_into_hart_context_and_jump(
         riscv::register::sepc::write(pc);
 
         //trace!("cpu{} marking thread{} as running", context.hart_id, thread.tid);
-        thread
-            .state
-            .store(ThreadState::Running as usize, Ordering::Release);
+        thread.mark_running();
+        // Kill race: a sibling exit-group can mark this thread `Exited`
+        // (the un-gated kill store) between assignment and now. `Exited` is
+        // terminal, so `mark_running` refused the `Running` store and left
+        // it `Exited`. Don't `sret` into a dead thread (its address space
+        // may be mid-teardown) — drop our claim and bail to idle; the
+        // reaper collects it. Without this the thread would run one
+        // pointless quantum before `check_context_and_switch` noticed.
+        if thread.state_load(Ordering::Acquire) == ThreadState::Exited as usize {
+            context.current.store(null_mut(), Ordering::Release);
+            let kidle = context.kptr.load(Ordering::Acquire);
+            jump(context, kidle as usize);
+        }
         // Per-thread context-switch tally: every Ready→Running dispatch
         // (user or kernel thread) is one switch from this thread's
         // perspective. Foreign-hart reads via `query_stats` go through
@@ -135,7 +145,7 @@ pub unsafe fn load_thread_into_hart_context_and_jump(
             enter_hart_context_asm(user_frame_vaddr, thread.satp.bits(), thread.satp.asid());
         }
         else {
-            let frame_ptr = thread.frame as *const _ as *const ();
+            let frame_ptr = thread.frame_ptr();
             enter_hart_kcontext_asm(frame_ptr);
         }
     }
@@ -200,30 +210,35 @@ pub fn kthread_park(state: ThreadState, wake_time: usize) {
     }
 
     let context = get_hart_context();
-    let cur = context.current.load(Ordering::Acquire);
-    if cur.is_null() {
+    // Own-hart current as a capability — never a raw `&mut Thread`
+    // (whole-struct retag racing the manager's atomic peeks; Phase-E).
+    let Some(mut rt) = current_running()
+    else {
         panic!(
             "kthread_park with no current thread on hart{} — caller \
              must be running as a kernel thread",
             context.hart_id,
         );
-    }
-    let thread = unsafe { (cur as *mut Thread).as_mut_unchecked() };
+    };
 
-    if thread.mode != SPP::Supervisor {
+    if rt.view().mode() != SPP::Supervisor {
         panic!(
             "kthread_park: tid={} is not a kernel thread (mode={:?}); \
              user threads must yield via the syscall path",
-            thread.tid, thread.mode,
+            rt.view().tid(),
+            rt.view().mode(),
         );
     }
 
-    let tstate = thread.state.load(Ordering::Acquire);
+    let tstate = rt.view().state();
     if tstate != ThreadState::Running as usize {
-        let tid = thread.tid;
-        let tlast_wake_reason = thread.last_wake_reason.load(Ordering::Acquire);
-        let twake_override = thread.wake_override.load(Ordering::Acquire);
-        error!("[ktpark] t{tid} s{tstate} lwr{tlast_wake_reason} two{twake_override}");
+        let v = rt.view();
+        error!(
+            "[ktpark] t{} s{tstate} lwr{} two{}",
+            v.tid(),
+            v.last_wake_reason(),
+            v.has_pending_wake(),
+        );
     }
 
     if state == ThreadState::Blocking {
@@ -231,7 +246,7 @@ pub fn kthread_park(state: ThreadState, wake_time: usize) {
             "kthread_park(Blocking) on tid={} — kthreads must use Suspended \
              + a WakeEvent push from the IRQ handler, then poll \
              `handle.is_signaled()` for the result.",
-            thread.tid
+            rt.view().tid(),
         );
     }
 
@@ -240,10 +255,11 @@ pub fn kthread_park(state: ThreadState, wake_time: usize) {
     // `exit_thread_with_state(Suspended)` finds it for the SLEEP_INBOX
     // push; an async preemption between this store and the ecall is
     // benign — we'd be redispatched, resume at the ecall, and park
-    // with the (already-consistent) value.
-    thread.ticks = 0;
+    // with the (already-consistent) value. Both writes field-project
+    // through the cap (no `&mut Thread`).
+    rt.set_ticks(0);
     if state == ThreadState::Suspended {
-        thread.wake_time = wake_time;
+        rt.set_wake_time(wake_time);
     }
 
     // ecall → cause=9 → s_trap_vector saves the trap frame in the
@@ -271,14 +287,14 @@ pub fn kthread_park(state: ThreadState, wake_time: usize) {
 /// handler when a user thread can't continue (page fault, bad ecall, etc.).
 /// Manager-side cleanup reads `fault_info` to classify and log.
 pub unsafe fn fault_thread(info: FaultInfo) -> ! {
-    unsafe {
-        let context = (riscv::register::sscratch::read() as *const HartContext).as_ref_unchecked();
-        let cur = context.current.load(Ordering::Acquire);
-        if !cur.is_null() {
-            (cur as *mut Thread).as_mut_unchecked().fault_info = Some(info);
-        }
-        exit_thread_with_state(ThreadState::Exited)
+    // Own-hart fault path: stamp `fault_info` (a sealed field) via the
+    // field-projecting cap verb — never `as_mut_unchecked().set_fault_info`,
+    // which formed a whole-struct `&mut Thread` to write one sealed field.
+    if let Some(mut rt) = current_running() {
+        rt.set_fault(info);
     }
+    // SAFETY: caller is in a thread context (documented contract).
+    unsafe { exit_thread_with_state(ThreadState::Exited) }
 }
 
 /// caller must actually be in a thread context!
@@ -301,102 +317,121 @@ pub unsafe fn fault_thread(info: FaultInfo) -> ! {
 /// repro.
 pub unsafe fn exit_thread_with_state(state: ThreadState) -> ! {
     unsafe {
-        let context = (riscv::register::sscratch::read() as *const HartContext).as_ref_unchecked();
+        let context = get_hart_context();
 
         let thread_addr = context.current.load(Ordering::Acquire);
-        if thread_addr != null_mut() {
-            let thread = (thread_addr as *const Thread).as_ref_unchecked();
-            // For a Suspended park, bump sleep_seq *before* publishing
-            // state so a manager observing state=Suspended via the
-            // Release store below also observes the new seq. Captured
-            // here for the SLEEP_INBOX push after the state release.
-            let mut sleep_notice: Option<crate::kernel::SleepNotice> = None;
-            if state == ThreadState::Suspended {
-                let seq = thread
-                    .sleep_seq
-                    .fetch_add(1, Ordering::Release)
-                    .wrapping_add(1);
-                sleep_notice = Some(crate::kernel::SleepNotice {
-                    wake_time: thread.wake_time as u64,
-                    sleep_seq: seq,
-                    thread: thread_addr as *mut Thread,
-                });
-            }
+        if thread_addr == null_mut() {
+            let target = context.kptr.load(Ordering::Acquire);
+            jump(context, target as usize)
+        }
+        
+        // Own-hart, `current` about to be nulled — exclusive access. This
+        // `&Thread` only touches atomic (`sleep_seq`, `state` via
+        // `transition_to`) and `pub`/immutable (`tid`, `handle`) fields, so
+        // it is sound even while a sibling propagates creds to this thread:
+        // the contended cred fields are atomics (UnsafeCell ⇒ not frozen by
+        // the shared retag) and are never read through this reference. The
+        // now-sealed `wake_time` is read via the field-projecting view.
+        let thread = (thread_addr as *const Thread).as_ref_unchecked();
+        // For a Suspended park, bump sleep_seq *before* publishing
+        // state so a manager observing state=Suspended via the
+        // Release store below also observes the new seq. Captured
+        // here for the SLEEP_INBOX push after the state release.
+        let mut sleep_notice: Option<crate::kernel::SleepNotice> = None;
+        if state == ThreadState::Suspended {
+            let seq = thread
+                .sleep_seq
+                .fetch_add(1, Ordering::Release)
+                .wrapping_add(1);
+            sleep_notice = Some(crate::kernel::SleepNotice {
+                wake_time: process::ThreadView::from_ptr(thread_addr as *const Thread)
+                    .wake_time() as u64,
+                sleep_seq: seq,
+                thread: thread_addr as *mut Thread,
+            });
+        }
 
-            context.current.store(null_mut(), Ordering::Release);
-            thread.state.store(state as usize, Ordering::Release);
-            if let Some(notice) = sleep_notice {
-                // Inbox-overflow: log and proceed. The thread still
-                // parks correctly (state is set), but won't be woken
-                // by the sleep-heap path until something else (e.g.
-                // a WAKE_QUEUE event) flips it Ready. At cap=64 this
-                // should not realistically fire; a hit means the
-                // manager is starved and the diagnostic is the
-                // important output.
-                if crate::kernel::SLEEP_INBOX.push(notice).is_err() {
-                    error!(
-                        "SLEEP_INBOX full on park: tid={} wake_time={}",
-                        thread.tid, notice.wake_time,
-                    );
-                }
+        context.current.store(null_mut(), Ordering::Release);
+        thread.transition_to(state);
+        if let Some(notice) = sleep_notice {
+            // Inbox-overflow: log and proceed. The thread still
+            // parks correctly (state is set), but won't be woken
+            // by the sleep-heap path until something else (e.g.
+            // a WAKE_QUEUE event) flips it Ready. At cap=64 this
+            // should not realistically fire; a hit means the
+            // manager is starved and the diagnostic is the
+            // important output.
+            if crate::kernel::SLEEP_INBOX.push(notice).is_err() {
+                error!(
+                    "SLEEP_INBOX full on park: tid={} wake_time={}",
+                    thread.tid, notice.wake_time,
+                );
             }
-            // Ready transition (preemption / yield-to-scheduler):
-            // publish through the per-hart inbox so the manager
-            // folds it into self.ready next pass. Push happens
-            // after state.store(Ready) so the manager observing
-            // the inbox entry also observes the consistent state.
-            if state == ThreadState::Ready {
-                if crate::kernel::push_ready_notice(thread_addr as *mut Thread).is_err() {
-                    error!(
-                        "READY_INBOX full on yield: tid={} — thread will sit \
-                         until another path requeues it",
-                        thread.tid,
-                    );
-                }
+        }
+        // Ready transition (preemption / yield-to-scheduler):
+        // publish through the per-hart inbox so the manager
+        // folds it into self.ready next pass. Push happens
+        // after state.store(Ready) so the manager observing
+        // the inbox entry also observes the consistent state.
+        if state == ThreadState::Ready {
+            // Own-hart yield: the thread is already `Ready` (stored
+            // above); mint the enqueue token from this hart's
+            // exclusive access — no marshal, the existing frame
+            // resumes as-is.
+            // SAFETY: own-hart, `current` just nulled — exclusive
+            // (this whole fn is `unsafe`).
+            let runnable =
+                process::RunningThread::from_ptr(thread_addr as *mut Thread).into_runnable();
+            if crate::kernel::push_ready_notice(runnable).is_err() {
+                error!(
+                    "READY_INBOX full on yield: tid={} — thread will sit \
+                        until another path requeues it",
+                    thread.tid,
+                );
             }
-            // Blocking transition: wire the back-ref between the
-            // handle and this thread *after* the state Release so a
-            // concurrent signaler that observes state=Blocking also
-            // observes the waiter slot. set_waiter must run here
-            // (not in the syscall handler) because apply_syscall_outcome
-            // already committed the frame snapshot above us — running
-            // the hook earlier could have its frame marshaling
-            // clobbered by the snapshot copy.
-            //
-            // After publishing the waiter, re-check is_signaled:
-            // catches the race where the signaler raced our
-            // set_waiter and returned null from take_waiter (no wake
-            // fired). If we got back our own ptr, un-park inline.
-            if state == ThreadState::Blocking {
-                if let Some(handle) = thread.handle.as_ref() {
-                    handle.set_waiter(thread_addr as *mut Thread);
-                    if handle.is_signaled() {
-                        let claimed = handle.take_waiter();
-                        if !claimed.is_null() {
-                            // We won the race. Marshal handle rets
-                            // into the saved frame, take the handle
-                            // out of the thread, mark Ready, queue.
-                            // Same shape as the wake hook (kmain
-                            // has the registered fn).
-                            crate::kernel::wake_blocked_inline(thread_addr as *mut Thread);
-                        }
+        }
+        // Blocking transition: wire the back-ref between the
+        // handle and this thread *after* the state Release so a
+        // concurrent signaler that observes state=Blocking also
+        // observes the waiter slot. set_waiter must run here
+        // (not in the syscall handler) because apply_syscall_outcome
+        // already committed the frame snapshot above us — running
+        // the hook earlier could have its frame marshaling
+        // clobbered by the snapshot copy.
+        //
+        // After publishing the waiter, re-check is_signaled:
+        // catches the race where the signaler raced our
+        // set_waiter and returned null from take_waiter (no wake
+        // fired). If we got back our own ptr, un-park inline.
+        if state == ThreadState::Blocking {
+            if let Some(handle) = thread.handle.as_ref() {
+                handle.set_waiter(thread_addr as *mut Thread);
+                if handle.is_signaled() {
+                    let claimed = handle.take_waiter();
+                    if !claimed.is_null() {
+                        // We won the race. Marshal handle rets
+                        // into the saved frame, take the handle
+                        // out of the thread, mark Ready, queue.
+                        // Same shape as the wake hook (kmain
+                        // has the registered fn).
+                        crate::kernel::wake_blocked_inline(thread_addr as *mut Thread);
                     }
                 }
-                // On-thread completion path: same race as the handle
-                // re-check above, but for manager-resolved syscalls
-                // that published rets via `Thread::publish_results`.
-                // The manager's `WakeEvent::Tid` push handles the
-                // Suspended branch (eager promote in `drain_wakes`),
-                // but a parker in `Blocking` is invisible to that
-                // path — the post-publish re-check here is what
-                // recovers a wake that landed before our `state.store`
-                // of Blocking made the parker observable.
-                //
-                // Helper takes `*mut Thread` so the brief `&mut`
-                // reborrow needed for the `frame.regs` write doesn't
-                // alias the outer `&Thread` binding above.
-                crate::kernel::try_wake_pending_inline(thread_addr as *mut Thread);
             }
+            // On-thread completion path: same race as the handle
+            // re-check above, but for manager-resolved syscalls
+            // that published rets via `Thread::publish_results`.
+            // The manager's `WakeEvent::Tid` push handles the
+            // Suspended branch (eager promote in `drain_wakes`),
+            // but a parker in `Blocking` is invisible to that
+            // path — the post-publish re-check here is what
+            // recovers a wake that landed before our `state.store`
+            // of Blocking made the parker observable.
+            //
+            // Helper takes `*mut Thread` so the brief `&mut`
+            // reborrow needed for the `frame.regs` write doesn't
+            // alias the outer `&Thread` binding above.
+            crate::kernel::try_wake_pending_inline(thread_addr as *mut Thread);
         }
 
         let target = context.kptr.load(Ordering::Acquire);
@@ -413,6 +448,65 @@ pub fn get_hart_context() -> &'static HartContext {
         let addr = riscv::register::sscratch::read();
         (addr as *const HartContext).as_ref_unchecked()
     }
+}
+
+/// This hart's currently-running thread as a [`RunningThread`] capability,
+/// or `None` when the hart is idle (`current == null`).
+///
+/// The own-hart exclusive-access seam: it mints the cap from this hart's
+/// `current` pointer so callers never hand-roll
+/// `current.load() as *mut Thread` + `as_mut_unchecked()` — a whole-struct
+/// `&mut Thread` retag that races the manager's concurrent atomic reads
+/// (the Phase-E finding). All sealed writes then flow through the cap's
+/// field-projecting verbs.
+#[inline]
+pub fn current_running() -> Option<RunningThread<'static>> {
+    let cur = get_hart_context().current.load(Ordering::Acquire);
+    if cur.is_null() {
+        None
+    }
+    else {
+        // SAFETY: own-hart `current` — this hart is executing it, so no
+        // other hart aliases it (the trap-entry seam; see
+        // `RunningThread::from_ptr`).
+        Some(unsafe { RunningThread::from_ptr(cur as *mut Thread) })
+    }
+}
+
+/// This hart's currently-running thread as a read-only [`ThreadView`], or
+/// `None` when idle. For sites that only need to read (diagnostics, state
+/// probes) and don't want the mutating capability.
+#[inline]
+pub fn current_view() -> Option<ThreadView<'static>> {
+    let cur = get_hart_context().current.load(Ordering::Acquire);
+    if cur.is_null() {
+        None
+    }
+    else {
+        // SAFETY: live registry thread; read-only snapshot (atomics + Copy
+        // scalars, never `&frame`).
+        Some(unsafe { ThreadView::from_ptr(cur as *const Thread) })
+    }
+}
+
+/// All harts' [`HartContext`]s as a slice. Derived from this hart's
+/// `sscratch` (which points at its own context) minus its `hart_id` — the
+/// contexts are a contiguous array allocated once at boot. Length is
+/// [`CPU_COUNT`](crate::kernel::shootdown::CPU_COUNT); an empty slice before
+/// that is published (early boot). Centralizes the unsafe array-walk the
+/// scheduler assign pass, the accounting sweep, and the diagnostic loops
+/// used to open-code.
+pub fn hart_contexts() -> &'static [HartContext] {
+    let count = crate::kernel::shootdown::CPU_COUNT.load(Ordering::Acquire);
+    if count == 0 {
+        return &[];
+    }
+    let here = get_hart_context();
+    let base = (here as *const HartContext as usize)
+        .wrapping_sub((here.hart_id as usize) * core::mem::size_of::<HartContext>());
+    // SAFETY: `base` is the boot-allocated array's start; `[base, base+count)`
+    // is exactly the `CPU_COUNT` contexts allocated in `rust_main`.
+    unsafe { core::slice::from_raw_parts(base as *const HartContext, count) }
 }
 
 #[unsafe(no_mangle)]

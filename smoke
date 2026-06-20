@@ -126,7 +126,7 @@ run_perms_roles_smoke() {
   done
 
   note "shipping smoke-perms-roles via send-payload.py"
-  python3 "$ROOT/orbit-loader/tools/send-payload.py" "$PR_ELF" \
+  python3 "$ROOT/orbit-loader/tools/send_payload.py" "$PR_ELF" \
     --name smoke-perms-roles >/tmp/orbit-pr-send.log 2>&1 \
     || die "send-payload failed (see /tmp/orbit-pr-send.log)"
 

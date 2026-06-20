@@ -108,7 +108,7 @@ fn fills_all_idle_harts_remotes_get_ipis_self_does_not() {
     // Every thread now Assigned with ticks bumped.
     for t in &sched.threads {
         assert_eq!(
-            t.state.load(Ordering::Acquire),
+            t.state_load(Ordering::Acquire),
             ThreadState::Assigned as usize
         );
         assert_eq!(t.ticks, 1);
@@ -370,7 +370,7 @@ fn distribution_preserves_per_thread_invariants() {
             expected_ticks[i], t.ticks
         );
         assert_eq!(
-            t.state.load(Ordering::Acquire),
+            t.state_load(Ordering::Acquire),
             ThreadState::Assigned as usize,
             "thread[{i}] should be Assigned"
         );
@@ -401,6 +401,6 @@ fn distribution_preserves_per_thread_invariants() {
         sched
             .threads
             .iter()
-            .all(|t| t.state.load(Ordering::Acquire) != ThreadState::Ready as usize)
+            .all(|t| t.state_load(Ordering::Acquire) != ThreadState::Ready as usize)
     );
 }

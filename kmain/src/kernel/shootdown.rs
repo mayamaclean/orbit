@@ -25,11 +25,12 @@ use tracing::warn;
 
 use crate::kernel::context::get_hart_context;
 
-/// Compile-time cap on hart count. The QEMU `virt` machine we target
-/// runs `-smp 4`; 8 leaves room for future `-smp 8` runs without
-/// re-jiggering the static array. Bump and re-verify the
-/// `RING_INITIALIZER` block below if a real platform pushes past it.
-pub const MAX_HARTS: usize = 8;
+/// Compile-time cap on hart count. Homed in orbit-core (the lowest crate
+/// the `manager` crate's `READY_INBOXES` can also reach); re-exported
+/// here so existing `shootdown::MAX_HARTS` references keep working.
+/// Bump there + re-verify the `RING_INITIALIZER` block below if a real
+/// platform pushes past it.
+pub use orbit_core::MAX_HARTS;
 
 /// Per-hart shootdown ring. Index by `hart_id`. Producers (any hart)
 /// push via the orchestrator; the consumer (target hart) drains in

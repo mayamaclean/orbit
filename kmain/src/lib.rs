@@ -2,23 +2,18 @@
 
 extern crate alloc;
 
-use crate::kernel::{shared_user_ptr::SharedUserPtr, shootdown::CPU_COUNT};
+use crate::kernel::shared_user_ptr::SharedUserPtr;
 use alloc::{collections::btree_map::BTreeMap, vec::Vec};
-use core::{
-    arch::asm,
-    ptr::null_mut,
-    sync::atomic::{AtomicBool, Ordering},
-};
+use core::{arch::asm, ptr::null_mut, sync::atomic::Ordering};
 use device::{HartContext, TrapFrame};
 use net_channel::NetChannel;
 use orbit_abi::{layout::UserVa, perms::Permissions};
-use process::{Thread, ThreadState};
+use process::{RunningThread, Thread, ThreadState};
 use smoltcp::{
     iface::{PollResult, SocketHandle, SocketSet},
     socket::{dhcpv4, tcp::CongestionControl},
     storage::RingBuffer,
 };
-use tracing::trace;
 
 use crate::{
     drivers::e1000::E1000,
@@ -165,36 +160,16 @@ pub fn wait_for(target: u64) {
     wait_until(riscv::register::time::read64().wrapping_add(target));
 }
 
-pub static MANAGER_LOCK: AtomicBool = AtomicBool::new(false);
-
-/// Non-blocking try-acquire of the global manager lock. **Only one
-/// caller**: the `if try_acquire_manager()` arm at the top of
-/// [`k_hart_loop`] (this file). Every other path that needs to mutate
-/// or read manager-owned state pushes a [`orbit_core::PendingWork`]
-/// entry onto [`kernel::MANAGER_WORK`] and (if a result is needed)
-/// parks the caller; whichever hart next holds the lock through
-/// `k_hart_loop` drains the queue and resumes the parked thread via
-/// [`kernel::Orbit::publish_pending_for_tid`].
-///
-/// Why no spin: a spin on this lock from trap context runs with
-/// `sstatus.SIE = 0`, which masks the SSWI that
-/// [`crate::kernel::shootdown::broadcast`] relies on for cross-hart
-/// ack. A `dealloc_process` running on hart B holds the lock, fires
-/// a TLB-shootdown to hart A, and waits on hart A's drain — which
-/// never happens if hart A is itself spinning here. Both harts wedge
-/// forever. (This is the deadlock that the eza_stress reproducer
-/// hit; see commit history.)
-pub fn try_acquire_manager() -> bool {
-    MANAGER_LOCK
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
-        .is_ok()
-}
-
-/// Drop the global manager lock. Pair with [`try_acquire_manager`];
-/// only [`k_hart_loop`] should ever be calling either.
-pub fn release_manager() {
-    MANAGER_LOCK.store(false, Ordering::Release);
-}
+// The global manager lock now lives in `process` as [`process::SchedGuard`]
+// (RAII: `SchedGuard::try_acquire()` wins the CAS, `Drop` releases). It's
+// forced low in the crate graph so the upcoming capability layer
+// (`ThreadHandle::as_manager(&SchedGuard)`, which touches sealed `Thread`
+// fields) can name the guard. **Only one caller** acquires it: the
+// `k_hart_loop` arm below; every other path that needs manager-owned
+// state pushes a [`orbit_core::PendingWork`] entry onto
+// [`kernel::MANAGER_WORK`] and parks. Never spin on it from trap context
+// (SIE=0 masks the shootdown SSWI ack — the eza_stress deadlock); the
+// `try_acquire`-or-back-off shape is the only correct use.
 
 /// Dispatch-site permission gate. Called by `s_trap`'s cause=8 arm
 /// (the U-mode ecall path) before the syscall dispatch match runs.
@@ -214,8 +189,12 @@ pub fn release_manager() {
 ///
 /// [`DenialEvent::PermDeny`]: orbit_abi::denial::DenialEvent::PermDeny
 /// [`Permissions`]: orbit_abi::perms::Permissions
-pub fn perm_gate_check(thread: &Thread, syscall: usize) -> bool {
-    let perms = thread.permissions;
+pub fn perm_gate_check(view: process::ThreadView<'_>, syscall: usize) -> bool {
+    // Field-projected `Acquire` reads of the atomic permission snapshot —
+    // never a whole-struct `&Thread`, which would freeze the snapshot
+    // while the pledge propagation path field-writes it on this
+    // (Running) thread from the manager hart.
+    let perms = view.permissions_snapshot();
     if perms.allows(syscall) {
         return true;
     }
@@ -228,13 +207,13 @@ pub fn perm_gate_check(thread: &Thread, syscall: usize) -> bool {
         required_class: orbit_abi::perms::Permissions::class_for(syscall).raw(),
         perms: perms.perms,
         time_ticks: now_ticks,
-        tid: thread.tid,
+        tid: view.tid(),
         sysno: syscall as u32,
         source_role: perms.role,
-        pid: thread.pid,
+        pid: view.pid(),
     };
 
-    tracing::warn!("[{}.{}] {event:?}", thread.pid, thread.tid);
+    tracing::warn!("[{}.{}] {event:?}", view.pid(), view.tid());
 
     if crate::kernel::DENIAL_EVENT_QUEUE.push(Some(event)).is_err() {
         crate::kernel::DENIAL_EVENTS_DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -258,8 +237,7 @@ pub fn enforce_eperm(epc: usize, hart_context: &'static HartContext, frame: &mut
 
 #[unsafe(no_mangle)]
 pub extern "C" fn k_hart_loop() -> ! {
-    let hart_context =
-        unsafe { (riscv::register::sscratch::read() as *const HartContext).as_ref_unchecked() };
+    let hart_context = kernel::context::get_hart_context();
 
     let orbit = unsafe { (hart_context.cscratch as *mut kernel::Orbit).as_mut_unchecked() };
 
@@ -300,16 +278,23 @@ pub extern "C" fn k_hart_loop() -> ! {
         // manager runs at least this often as a safety net for any
         // SLEEP_INBOX entry that landed between our read and the WFI.
         const WFI_HEARTBEAT_CYCLES: u64 = 100_000;
-        let mut wfi_cycles: u64 = WFI_HEARTBEAT_CYCLES;
-        if try_acquire_manager() {
+        // Run the manager pass under the scheduler lock via the scoped
+        // `try_with`: the `SchedGuard` is confined to the closure and
+        // released on return, so the `-> !` dispatch below can't be
+        // reached with a guard in scope (it lives *outside* the closure).
+        // The closure returns the next-sleep deadline; `None` ⇒ another
+        // hart holds the lock and we fall back to the heartbeat.
+        let wfi_cycles = if let Some(next_sleep) = process::SchedGuard::try_with(|sched_guard| {
             // Bucket hook 4: enter scheduler critical section.
             crate::kernel::accounting::switch_bucket(
                 hart_context,
                 crate::kernel::accounting::HartBucket::Scheduler,
             );
 
-            orbit.cleanup_threads_and_processes();
-            orbit.drain_pending_work();
+            // `sched_guard` threads the lock-held proof into the manager
+            // methods that mint thread capabilities (`as_manager`).
+            orbit.cleanup_threads_and_processes(sched_guard);
+            orbit.drain_pending_work(sched_guard);
             // Drain denial events queued by the dispatch-site gate —
             // best-effort audit logging into the kernel-wide ring +
             // per-process counters. Cheap (lock-free MPSC pop), runs
@@ -320,7 +305,7 @@ pub extern "C" fn k_hart_loop() -> ! {
             // Drain wake events *before* assign_threads so any thread
             // whose wake_time was just bumped to 0 is observed Ready
             // by the next scheduler scan in this same critical section.
-            orbit.drain_wakes();
+            orbit.manager.drain_wakes(sched_guard);
             orbit.check_net();
             // End-of-pass batched nudge: every CONSOLE_RING push that
             // landed during this pass (manager-side handlers + concurrent
@@ -329,36 +314,50 @@ pub extern "C" fn k_hart_loop() -> ! {
             // push. Runs *before* `assign_threads` so the readied k_gpu
             // is dispatched this same pass — no extra manager-pass of
             // latency. See `Orbit::nudge_gpu_if_pending` for rationale.
-            orbit.nudge_gpu_if_pending();
+            orbit.nudge_gpu_if_pending(sched_guard);
             // Same shape as the gpu nudge — fold every SERIAL_RING
             // push that landed during this pass (trace from any hart
             // in any context) into one Ready transition for k_serial.
-            orbit.nudge_serial_if_pending();
-            orbit.assign_threads(hart_context);
+            orbit.nudge_serial_if_pending(sched_guard);
+            orbit.assign_threads(sched_guard, hart_context);
 
             // Read the next sleep deadline while still holding the
             // lock. Out of the lock-guarded section the heap can be
             // mutated by the next manager pass; the value we cache
             // here is the snapshot at end-of-pass.
             let now = riscv::register::time::read64();
-            wfi_cycles = orbit.next_sleep_in_cycles(now, WFI_HEARTBEAT_CYCLES);
+            // Temporary diagnostic: flag a thread that's parked but should
+            // be runnable (lost wake) — see Orbit::check_stuck_threads.
+            orbit.manager.check_stuck_threads(now);
+            let next_sleep = orbit
+                .manager
+                .next_sleep_in_cycles(now, WFI_HEARTBEAT_CYCLES);
 
             // Bucket hook 5: leave scheduler critical section. Switch
-            // *before* release so the next acquirer's snapshot doesn't
-            // race a still-Scheduler bucket on this hart.
+            // *before* the guard releases (on closure return) so the next
+            // acquirer's snapshot doesn't race a still-Scheduler bucket.
             crate::kernel::accounting::switch_bucket(
                 hart_context,
                 crate::kernel::accounting::HartBucket::Kernel,
             );
-            release_manager();
-
+            next_sleep
+        }) {
+            // Lock was acquired and released (the closure returned, so the
+            // guard already dropped inside `try_with`). Dispatch whatever
+            // this pass assigned us — *outside* the locked closure, so the
+            // `-> !` `enter_hart_context` (sret into the thread, abandons
+            // this stack) can never run with a guard in scope.
             if hart_has_thread(hart_context) {
                 arm_hart_timer(1_000_000);
                 unsafe {
                     enter_hart_context(hart_context);
                 }
             }
+            next_sleep
         }
+        else {
+            WFI_HEARTBEAT_CYCLES
+        };
 
         // For the WFI path we *do* want SIE on so async traps fire and
         // wake us — WFI returns on any pending interrupt regardless of
@@ -795,11 +794,11 @@ pub fn arm_hart_timer(cycles: u64) {
 #[unsafe(no_mangle)]
 pub fn check_context_and_switch() -> ! {
     let c = get_hart_context();
-    let t = c.current.load(Ordering::Acquire);
 
-    if t != null_mut() {
-        let thread: &Thread = unsafe { (t as *mut Thread).as_ref_unchecked() };
-        let thread_state = thread.state.load(Ordering::Acquire);
+    // Read this hart's current thread through the read-only view (no bare
+    // `&Thread`). Own-hart, but the view keeps the access atomic-only.
+    if let Some(view) = kernel::context::current_view() {
+        let thread_state = view.state();
         if thread_state == ThreadState::Running as usize {
             unsafe {
                 exit_thread_with_state(ThreadState::Ready);
@@ -814,7 +813,7 @@ pub fn check_context_and_switch() -> ! {
             tracing::info!(
                 "DBG check_ctx_switch null-cur(Suspended): hart={} tid={}",
                 c.hart_id,
-                thread.tid,
+                view.tid(),
             );
             c.current.store(null_mut(), Ordering::Release);
         }
@@ -822,7 +821,7 @@ pub fn check_context_and_switch() -> ! {
             tracing::info!(
                 "DBG check_ctx_switch null-cur(Blocking): hart={} tid={}",
                 c.hart_id,
-                thread.tid,
+                view.tid(),
             );
             c.current.store(null_mut(), Ordering::Release);
         }
@@ -843,7 +842,9 @@ pub fn update_thread_and_trap_frame(
     if cptr == null_mut() {
         return;
     }
-    let thread: &mut Thread = unsafe { (cptr as *mut Thread).as_mut_unchecked() };
+    // SAFETY: own-hart `current` — this hart is saving its own trapped
+    // thread, so no other hart aliases it.
+    let mut running = unsafe { RunningThread::from_ptr(cptr as *mut Thread) };
 
     // Watchdog: if the trap's from_user disagrees with the current
     // thread's mode, the hart's `current` was retargeted between when
@@ -859,23 +860,23 @@ pub fn update_thread_and_trap_frame(
     // No actual bug — suppress to keep the watchdog signal
     // meaningful. Any other state with a mismatch is a real
     // scheduling anomaly worth logging.
-    let thread_in_user_mode = thread.mode == riscv::register::sstatus::SPP::User;
-    if thread_in_user_mode != from_user
-        && thread.state.load(Ordering::Acquire) != ThreadState::Assigned as usize
+    let thread_in_user_mode = running.view().mode() == riscv::register::sstatus::SPP::User;
+    if thread_in_user_mode != from_user && running.view().state() != ThreadState::Assigned as usize
     {
+        let v = running.view();
         tracing::warn!(
             "trap mode mismatch on cpu{}: tid={} mode={:?} state={} from_user={} epc={:#x} — \
              scheduler retargeted current mid-trap?",
             hart_context.hart_id,
-            thread.tid,
-            thread.mode,
-            thread.state.load(Ordering::Acquire),
+            v.tid(),
+            v.mode(),
+            v.state(),
             from_user,
             epc,
         );
     }
 
-    orbit_core::trap::update_trap_frame(thread, epc, frame, from_user);
+    orbit_core::trap::update_trap_frame(&mut running, epc, frame, from_user);
 }
 
 /// `exit(code)` (sysno 0) — POSIX `_exit(2)` / `exit_group(2)` shape.
@@ -909,9 +910,9 @@ pub unsafe fn handle_exit(
     let exit_code = frame.regs[11] as i32;
     let cur = hart_context.current.load(Ordering::Acquire);
     if !cur.is_null() {
-        let t = unsafe { (cur as *const Thread).as_ref_unchecked() };
-        let pid = t.pid;
-        let leader_tid = t.tid;
+        let view = unsafe { process::ThreadView::from_ptr(cur as *const Thread) };
+        let pid = view.pid();
+        let leader_tid = view.tid();
         // Hand the sibling-fanout to the manager via MANAGER_WORK
         // rather than spinning on MANAGER_LOCK from trap context with
         // SIE off — that path would deadlock against any concurrent
@@ -960,13 +961,13 @@ pub fn handle_console_write(epc: usize, hart_context: &'static HartContext, fram
 /// then delegates frame/pc commit to
 /// [`orbit_core::apply_syscall_outcome`] so kmain and the host tests
 /// share one implementation of the outcome contract.
-fn dispatch_syscall<F>(
+fn dispatch_syscall_rt<F>(
     epc: usize,
     hart_context: &'static HartContext,
     frame: &mut TrapFrame,
     body: F,
 ) where
-    F: FnOnce(&mut Thread, &mut TrapFrame) -> orbit_core::SyscallOutcome,
+    F: FnOnce(&mut RunningThread, &mut TrapFrame) -> orbit_core::SyscallOutcome,
 {
     // Snapshot the syscall number + start tick *before* `body` runs,
     // since the handler clobbers `regs[10]` with its return value.
@@ -985,7 +986,9 @@ fn dispatch_syscall<F>(
             frame.regs[10] = (-1 as isize) as usize;
             return;
         }
-        let thread = (current as *mut Thread).as_mut_unchecked();
+        // SAFETY: own-hart `current` — this hart trapped while running it,
+        // so no other hart aliases it. The one cross-crate trap-entry cap.
+        let mut running = RunningThread::from_ptr(current as *mut Thread);
 
         // U-mode-only path: cause=8 traps are by definition from U-mode,
         // so `current` should be a User thread. If it's a kthread,
@@ -998,15 +1001,11 @@ fn dispatch_syscall<F>(
         // `apply_syscall_outcome` gate is also a no-op on a kthread, so
         // even if we did reach it nothing would corrupt — we just want
         // the diagnostic out.
-        if thread.mode != riscv::register::sstatus::SPP::User {
-            // Walk the HartContext array so we can print every hart's
-            // current ptr alongside the offending one. This is the
-            // diagnostic that pins down where the racy User thread
-            // actually landed.
-            let hart_root = {
-                (riscv::register::sscratch::read() as *const HartContext)
-                    .sub(hart_context.hart_id as usize)
-            };
+        if running.view().mode() != riscv::register::sstatus::SPP::User {
+            // Read through a `ThreadView` (field-projected atomics + Copy
+            // scalars) — never a whole-struct `&Thread` over a thread the
+            // manager may be propagating creds to.
+            let v = running.view();
             tracing::error!(
                 "dispatch_syscall mode mismatch — cpu{} epc={:#x} a0={:#x} \
                  cur=tid={} pid={} mode={:?} state={} thread.pc={:#x} \
@@ -1014,31 +1013,33 @@ fn dispatch_syscall<F>(
                 hart_context.hart_id,
                 epc,
                 frame.regs[10],
-                thread.tid,
-                thread.pid,
-                thread.mode,
-                thread.state.load(Ordering::Acquire),
-                thread.pc.load(Ordering::Acquire),
-                thread.last_wake_reason.load(Ordering::Acquire),
+                v.tid(),
+                v.pid(),
+                v.mode(),
+                v.state(),
+                v.pc(),
+                v.last_wake_reason(),
             );
-            // Hart count isn't readily available here (Orbit owns it
-            // via cscratch); 4 covers the QEMU virt config we ship.
-            for i in 0..(CPU_COUNT.load(Ordering::Relaxed)) {
-                let hc = hart_root.add(i).as_ref_unchecked();
-                let cur = hc.current.load(Ordering::Acquire) as *mut Thread;
+            // Print every hart's current ptr alongside the offending one
+            // to pin down where the racy User thread actually landed. The
+            // boot-array walk is centralized in `hart_contexts()`; foreign
+            // harts' threads are read through `ThreadView` (atomics + Copy),
+            // never a bare `&Thread` over a thread another hart is writing.
+            for hc in kernel::context::hart_contexts() {
+                let cur = hc.current.load(Ordering::Acquire) as *const Thread;
                 if cur.is_null() {
-                    tracing::error!("  cpu{}: cur=<null>", i);
+                    tracing::error!("  cpu{}: cur=<null>", hc.hart_id);
                 }
                 else {
-                    let t = cur.as_ref_unchecked();
+                    let v = process::ThreadView::from_ptr(cur);
                     tracing::error!(
                         "  cpu{}: cur=tid={} pid={} mode={:?} state={} pc={:#x}",
-                        i,
-                        t.tid,
-                        t.pid,
-                        t.mode,
-                        t.state.load(Ordering::Acquire),
-                        t.pc.load(Ordering::Acquire),
+                        hc.hart_id,
+                        v.tid(),
+                        v.pid(),
+                        v.mode(),
+                        v.state(),
+                        v.pc(),
                     );
                 }
             }
@@ -1052,24 +1053,55 @@ fn dispatch_syscall<F>(
             panic!(
                 "dispatch_syscall on cpu{}: cur tid={} mode={:?} (expected User) — \
                  a kthread is current during a U-mode ecall (epc={:#x})",
-                hart_context.hart_id, thread.tid, thread.mode, epc,
+                hart_context.hart_id, v.tid(), v.mode(), epc,
             );
         }
 
-        let outcome = body(thread, frame);
-        let action = orbit_core::apply_syscall_outcome(outcome, thread, frame, epc);
+        // The body gets the own-hart `&mut RunningThread`; read-only
+        // handlers reach fields through `r.view()` (field-projected
+        // atomics + Copy scalars — never a whole-struct `&Thread`, which
+        // would freeze the cred fields a sibling may be propagating). The
+        // one writing handler (`set_affinity`) uses the cap's own-hart
+        // `&self` atomic store. The frame/state commit below goes through
+        // `apply_syscall_outcome`'s `&mut running` cap.
+        let outcome = body(&mut running, frame);
+        let action = orbit_core::apply_syscall_outcome(outcome, &mut running, frame, epc);
         // Bracket close: record on *both* arms before `Yield` long-
         // jumps. Service-time semantics still hold — `apply_syscall_
         // outcome` has finished its work (frame committed, state
         // transition decided) by this point, so `now() - start_ticks`
         // is the time the kernel spent before either resuming the
         // caller or parking it.
-        crate::kernel::accounting::record_syscall(syscall_no, thread, syscall_start_ticks);
+        crate::kernel::accounting::record_syscall(syscall_no, &running, syscall_start_ticks);
         match action {
             orbit_core::ShimAction::Resume => {}
             orbit_core::ShimAction::Yield(state) => exit_thread_with_state(state),
         }
     }
+}
+
+/// Read-only dispatch shim — **the default path for syscall handlers**.
+/// Wraps [`dispatch_syscall_rt`] and hands the body a
+/// [`process::ThreadView`] (the minimal capability — field-projected
+/// reads only).
+///
+/// Syscalls should use this `ThreadView` path unless there is a concrete
+/// justification for the `RunningThread` path: namely, the handler must
+/// *write* a thread field on the own-hart fast path (today only
+/// `set_affinity`, via `dispatch_syscall_rt`). Reaching for the wider
+/// `RunningThread` cap without that need hands a read-only handler the
+/// power to scribble the frame/state, which the view path forbids by
+/// construction — so prefer the view and document the exception at the
+/// call site when you take the `_rt` path.
+fn dispatch_syscall<F>(
+    epc: usize,
+    hart_context: &'static HartContext,
+    frame: &mut TrapFrame,
+    body: F,
+) where
+    F: FnOnce(process::ThreadView<'_>, &mut TrapFrame) -> orbit_core::SyscallOutcome,
+{
+    dispatch_syscall_rt(epc, hart_context, frame, |r, f| body(r.view(), f));
 }
 
 pub fn handle_ms_sleep(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
@@ -1201,8 +1233,8 @@ pub fn handle_create_process_v2(
 /// Single-page constraint (matches `fs_stat` / `fs_readdir`): the
 /// destination buffer must fit in one 4 KiB page so the manager arm
 /// is one `UserPageWindow::map`. Existing callers that pass a
-/// page-aligned 4 KiB slot are unaffected (`50 events × 48 bytes` =
-/// 2400 B fits).
+/// page-aligned 4 KiB slot are unaffected (`64 events × 48 bytes` =
+/// 3072 B fits).
 #[unsafe(no_mangle)]
 pub fn handle_query_denial_log(
     epc: usize,
@@ -1251,19 +1283,16 @@ pub fn handle_query_denial_log(
         let work = orbit_core::PendingWork::QueryDenials {
             buf_vaddr: buf_va,
             buf_len,
-            pid: t.pid,
+            pid: t.pid(),
             root_pa: t.root_table_addr(),
-            tid: t.tid,
+            tid: t.tid(),
         };
         if crate::hw::RiscvHardware.push_pending_work(work).is_err() {
             return orbit_core::SyscallOutcome::Return {
                 ret: -(EAGAIN as isize),
             };
         }
-        orbit_core::SyscallOutcome::Yield {
-            state: process::ThreadState::Blocking,
-            ret: None,
-        }
+        orbit_core::SyscallOutcome::ParkForPublish
     });
 }
 
@@ -1332,9 +1361,10 @@ pub fn handle_fs_readdir(epc: usize, hart_context: &'static HartContext, frame: 
 
 #[unsafe(no_mangle)]
 pub fn handle_set_affinity(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
-    dispatch_syscall(epc, hart_context, frame, |t, f| {
-        orbit_core::syscall::set_affinity(t, f)
-    });
+    // `set_affinity` re-pins the thread by writing its own `affinity`
+    // atom — uses the own-hart `RunningThread` cap (via the rt shim),
+    // not the read-only `ThreadView` the common shim hands out.
+    dispatch_syscall_rt(epc, hart_context, frame, |r, f| orbit_core::syscall::set_affinity(r, f));
 }
 
 #[unsafe(no_mangle)]
@@ -1451,7 +1481,7 @@ pub fn handle_getcwd(epc: usize, hart_context: &'static HartContext, frame: &mut
 pub fn handle_getpid(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
     dispatch_syscall(epc, hart_context, frame, |t, _f| {
         orbit_core::SyscallOutcome::Return {
-            ret: t.pid as isize,
+            ret: t.pid() as isize,
         }
     });
 }
@@ -1462,7 +1492,7 @@ pub fn handle_getpid(epc: usize, hart_context: &'static HartContext, frame: &mut
 pub fn handle_gettid(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
     dispatch_syscall(epc, hart_context, frame, |t, _f| {
         orbit_core::SyscallOutcome::Return {
-            ret: t.tid as isize,
+            ret: t.tid() as isize,
         }
     });
 }
@@ -1475,7 +1505,7 @@ pub fn handle_gettid(epc: usize, hart_context: &'static HartContext, frame: &mut
 pub fn handle_getuid(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
     dispatch_syscall(epc, hart_context, frame, |t, _f| {
         orbit_core::SyscallOutcome::Return {
-            ret: t.uid as isize,
+            ret: t.uid() as isize,
         }
     });
 }
@@ -1485,7 +1515,7 @@ pub fn handle_getuid(epc: usize, hart_context: &'static HartContext, frame: &mut
 pub fn handle_geteuid(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
     dispatch_syscall(epc, hart_context, frame, |t, _f| {
         orbit_core::SyscallOutcome::Return {
-            ret: t.euid as isize,
+            ret: t.euid() as isize,
         }
     });
 }
@@ -1495,7 +1525,7 @@ pub fn handle_geteuid(epc: usize, hart_context: &'static HartContext, frame: &mu
 pub fn handle_getgid(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
     dispatch_syscall(epc, hart_context, frame, |t, _f| {
         orbit_core::SyscallOutcome::Return {
-            ret: t.gid as isize,
+            ret: t.gid() as isize,
         }
     });
 }
@@ -1505,7 +1535,7 @@ pub fn handle_getgid(epc: usize, hart_context: &'static HartContext, frame: &mut
 pub fn handle_getegid(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {
     dispatch_syscall(epc, hart_context, frame, |t, _f| {
         orbit_core::SyscallOutcome::Return {
-            ret: t.egid as isize,
+            ret: t.egid() as isize,
         }
     });
 }
@@ -1691,21 +1721,18 @@ pub fn handle_query_stats(epc: usize, hart_context: &'static HartContext, frame:
         }
 
         let work = orbit_core::PendingWork::QueryStats {
-            target_pid: t.pid,
+            target_pid: t.pid(),
             buf_vaddr: buf_va,
             buf_len,
             root_pa: t.root_table_addr(),
-            tid: t.tid,
+            tid: t.tid(),
         };
         if crate::hw::RiscvHardware.push_pending_work(work).is_err() {
             return orbit_core::SyscallOutcome::Return {
                 ret: -(EAGAIN as isize),
             };
         }
-        orbit_core::SyscallOutcome::Yield {
-            state: ThreadState::Blocking,
-            ret: None,
-        }
+        orbit_core::SyscallOutcome::ParkForPublish
     });
 }
 
@@ -1935,7 +1962,7 @@ pub fn handle_fb_present(epc: usize, hart_context: &'static HartContext, frame: 
             };
         }
 
-        let Some(surfaces) = crate::kernel::surface::get(t.pid)
+        let Some(surfaces) = crate::kernel::surface::get(t.pid())
         else {
             // No surface table for this pid → certainly no handle.
             return orbit_core::SyscallOutcome::Return {
@@ -1972,7 +1999,7 @@ pub fn handle_fb_present(epc: usize, hart_context: &'static HartContext, frame: 
             format_raw: snapshot.format as u32,
         };
 
-        if !push_present(Source::Process(t.pid), args) {
+        if !push_present(Source::Process(t.pid()), args) {
             return orbit_core::SyscallOutcome::Return {
                 ret: -(EAGAIN as isize),
             };

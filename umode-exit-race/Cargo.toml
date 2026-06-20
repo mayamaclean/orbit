@@ -1,0 +1,13 @@
+[package]
+name = "umode-exit-race"
+version = "0.1.0"
+edition = "2024"
+
+# Repro payload for the exit-ordering / kill-protocol race ("Bug 5"): a
+# multi-threaded process whose workers tight-loop reading a shared mmap
+# region while main exits without joining them. Sent to a running guest
+# via orbit-loader/tools/send-payload.py — not a disk binary.
+
+[dependencies]
+orbit-abi = { path = "../orbit-abi" }
+orbit-rt  = { path = "../orbit-rt" }

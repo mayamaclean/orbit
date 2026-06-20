@@ -2,16 +2,14 @@
 //! integration test. Not a binary, not a test itself.
 #![allow(dead_code)]
 
-use std::alloc::{Layout, alloc_zeroed};
-use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicI64, AtomicU8, AtomicU64, AtomicUsize};
-
 use device::{HartContext, Stack, TrapFrame};
 use mmu::sv48::PhysAddr;
 use orbit_abi::layout::UserVa;
 use process::{Thread, ThreadState};
 use riscv::register::satp::Satp;
 use riscv::register::sstatus::SPP;
+use std::alloc::{Layout, alloc_zeroed};
+use std::collections::BTreeMap;
 
 use orbit_core::{Hardware, PendingWork};
 
@@ -43,13 +41,12 @@ pub fn make_thread(state: ThreadState, mode: SPP) -> Thread {
         register_root(stack_ptr as *const u8);
         let frame = &mut *frame_ptr;
         let stack = &mut *stack_ptr;
-        Thread {
-            pc: AtomicUsize::new(0),
-            state: AtomicUsize::new(state as usize),
-            wake_time: 0,
-            wake_override: AtomicU64::new(0),
-            last_wake_reason: AtomicU64::new(0),
-            sleep_seq: AtomicU64::new(0),
+        let t = Thread::new(process::ThreadInit {
+            entrypoint: 0,
+            satp: Satp::from_bits(0),
+            mode,
+            tid: 1,
+            pid: 1,
             frame,
             stack,
             // Test threads don't go through the kernel-thread allocator
@@ -57,46 +54,47 @@ pub fn make_thread(state: ThreadState, mode: SPP) -> Thread {
             // used in production for non-pid-0 threads.
             kernel_stack: None,
             kernel_trap_frame: None,
-            satp: Satp::from_bits(0),
-            mode,
-            handle: None,
-            pending_rets: [
-                AtomicI64::new(0),
-                AtomicI64::new(0),
-                AtomicI64::new(0),
-                AtomicI64::new(0),
-            ],
-            pending_state: AtomicU8::new(0),
-            pending_ret_count: AtomicU8::new(0),
-            tid: 1,
-            pid: 1,
-            ticks: 0,
             slot: None,
-            fault_info: None,
             // Test threads default to "any hart" — affinity-specific
             // behavior is asserted by tests that mutate the field
             // directly after construction.
             allowed_affinity: u64::MAX,
-            affinity: AtomicU64::new(u64::MAX),
-            context_switches: AtomicU64::new(0),
-            cpu_ticks_total: AtomicU64::new(0),
-            syscall_count: AtomicU64::new(0),
-            syscall_ticks: AtomicU64::new(0),
+            affinity: u64::MAX,
             permissions: orbit_abi::perms::Permissions::ZERO,
-            stdout_redirect: None,
-            egid: 0,
-            euid: 0,
-            gid: 0,
-            sgid: 0,
-            suid: 0,
             uid: 0,
-        }
+            euid: 0,
+            suid: 0,
+            gid: 0,
+            egid: 0,
+            sgid: 0,
+            stdout_redirect: None,
+        });
+        // `Thread::new` always starts in `Ready`; honor the caller's
+        // requested initial state for fixtures that need Running/etc.
+        t.transition_to_unchecked(state);
+        t
     }
 }
 
 /// A blank trap frame on the test heap. Callers mutate regs in place.
 pub fn make_frame() -> TrapFrame {
     TrapFrame::empty()
+}
+
+/// A read-only [`ThreadView`](process::ThreadView) over a fixture thread —
+/// the argument the syscall handlers now take. Own-test exclusive access,
+/// so the view's field-projected reads are uncontended.
+pub fn view(t: &Thread) -> process::ThreadView<'_> {
+    // SAFETY: `t` is a live fixture thread owned by the calling test.
+    unsafe { process::ThreadView::from_ptr(t as *const Thread) }
+}
+
+/// A [`RunningThread`](process::RunningThread) over a fixture thread, for
+/// the handlers that take the own-hart cap (`set_affinity`) or the
+/// accounting bump (`record_syscall`). Own-test exclusive access.
+pub fn running(t: &mut Thread) -> process::RunningThread<'_> {
+    // SAFETY: `t` is a live fixture thread the calling test owns exclusively.
+    unsafe { process::RunningThread::from_ptr(t as *mut Thread) }
 }
 
 /// Zero-initialized `HartContext` on the test heap, returned as a

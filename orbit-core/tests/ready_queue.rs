@@ -36,9 +36,9 @@ fn fifo_order_with_wide_affinity() {
     let tp2: *mut _ = &mut *t2;
     let tp3: *mut _ = &mut *t3;
     let mut q = ReadyQueue::new();
-    q.push(tp1);
-    q.push(tp2);
-    q.push(tp3);
+    q.push(unsafe { process::Runnable::from_raw(tp1) });
+    q.push(unsafe { process::Runnable::from_raw(tp2) });
+    q.push(unsafe { process::Runnable::from_raw(tp3) });
     assert_eq!(q.len(), 3);
     assert_eq!(q.pop_for(u64::MAX), Some(tp1));
     assert_eq!(q.pop_for(u64::MAX), Some(tp2));
@@ -61,8 +61,8 @@ fn affinity_skip_preserves_order_for_remaining() {
     let tp_open: *mut _ = &mut *t_open;
 
     let mut q = ReadyQueue::new();
-    q.push(tp_pinned);
-    q.push(tp_open);
+    q.push(unsafe { process::Runnable::from_raw(tp_pinned) });
+    q.push(unsafe { process::Runnable::from_raw(tp_open) });
 
     // hart 0 looks for work — pinned skipped, open returned.
     assert_eq!(q.pop_for(1 << 0), Some(tp_open));
@@ -79,7 +79,7 @@ fn no_match_returns_none_without_consuming() {
     set_affinity(&mut t, 1 << 2);
     let tp: *mut _ = &mut *t;
     let mut q = ReadyQueue::new();
-    q.push(tp);
+    q.push(unsafe { process::Runnable::from_raw(tp) });
 
     assert_eq!(q.pop_for(1 << 0), None);
     assert_eq!(q.len(), 1, "no matching hart must not consume");
@@ -109,11 +109,11 @@ fn multiple_pinned_pop_in_push_order_per_mask() {
     let p2b: *mut _ = &mut *t2b;
 
     let mut q = ReadyQueue::new();
-    q.push(p1a);
-    q.push(p1b);
-    q.push(p2a);
-    q.push(p1c);
-    q.push(p2b);
+    q.push(unsafe { process::Runnable::from_raw(p1a) });
+    q.push(unsafe { process::Runnable::from_raw(p1b) });
+    q.push(unsafe { process::Runnable::from_raw(p2a) });
+    q.push(unsafe { process::Runnable::from_raw(p1c) });
+    q.push(unsafe { process::Runnable::from_raw(p2b) });
 
     assert_eq!(q.pop_for(1 << 1), Some(p1a));
     assert_eq!(q.pop_for(1 << 2), Some(p2a));
@@ -131,7 +131,7 @@ fn pop_with_intersecting_mask() {
     set_affinity(&mut t, 1 << 5);
     let tp: *mut _ = &mut *t;
     let mut q = ReadyQueue::new();
-    q.push(tp);
+    q.push(unsafe { process::Runnable::from_raw(tp) });
 
     let mask = (1 << 1) | (1 << 5) | (1 << 7);
     assert_eq!(q.pop_for(mask), Some(tp));
@@ -146,12 +146,17 @@ fn affinity_changes_visible_to_subsequent_pop() {
     set_affinity(&mut t, 1 << 0);
     let tp: *mut _ = &mut *t;
     let mut q = ReadyQueue::new();
-    q.push(tp);
+    q.push(unsafe { process::Runnable::from_raw(tp) });
 
     // hart 1 doesn't match yet.
     assert_eq!(q.pop_for(1 << 1), None);
 
-    // Re-pin to hart 1.
-    t.affinity.store(1 << 1, Ordering::Release);
+    // Re-pin to hart 1. Mutate through `tp` — the same provenance the
+    // queued `Runnable` (and thus `pop_for`) reads affinity through.
+    // Writing via the original `t` binding would invalidate `tp`'s
+    // Stacked-Borrows tag and make the subsequent read UB; in the live
+    // kernel both the affinity write and the pop read go through
+    // manager-held registry pointers of one provenance.
+    unsafe { (*tp).affinity.store(1 << 1, Ordering::Release) };
     assert_eq!(q.pop_for(1 << 1), Some(tp));
 }

@@ -8,9 +8,8 @@
 
 mod common;
 
-use std::sync::atomic::Ordering;
 
-use process::ThreadState;
+use process::{RunningThread, ThreadState};
 use riscv::register::sstatus::SPP;
 
 use orbit_core::{ShimAction, SyscallOutcome, apply_syscall_outcome};
@@ -24,47 +23,50 @@ const ECALL_EPC: usize = 0x2_2000_0400;
 #[test]
 fn return_bumps_pc_past_ecall() {
     let mut t = make_thread(ThreadState::Running, SPP::User);
-    t.pc.store(ECALL_EPC, Ordering::Release);
+    let mut r = unsafe { RunningThread::from_ptr(&mut t) };
+    r.set_pc(ECALL_EPC);
     let mut f = make_frame();
 
     let action =
-        apply_syscall_outcome(SyscallOutcome::Return { ret: 0 }, &mut t, &mut f, ECALL_EPC);
+        apply_syscall_outcome(SyscallOutcome::Return { ret: 0 }, &mut r, &mut f, ECALL_EPC);
 
     assert_eq!(action, ShimAction::Resume);
-    assert_eq!(t.pc.load(Ordering::Acquire), ECALL_EPC + 4);
+    assert_eq!(r.view().pc(), ECALL_EPC + 4);
 }
 
 #[test]
 fn return_writes_ret_into_frame_reg10() {
     let mut t = make_thread(ThreadState::Running, SPP::User);
+    let mut r = unsafe { RunningThread::from_ptr(&mut t) };
     let mut f = make_frame();
 
     let _ = apply_syscall_outcome(
         SyscallOutcome::Return { ret: -2 },
-        &mut t,
+        &mut r,
         &mut f,
         ECALL_EPC,
     );
 
     // The thread resumes from its snapshotted frame, not the local one,
     // so thread.frame.regs[10] is what the user code will see.
-    assert_eq!(t.frame.regs[10], (-2isize) as usize);
+    assert_eq!(r.frame_reg(10), (-2isize) as usize);
 }
 
 #[test]
 fn return_snapshots_full_frame_into_thread_frame() {
     let mut t = make_thread(ThreadState::Running, SPP::User);
+    let mut r = unsafe { RunningThread::from_ptr(&mut t) };
     let mut f = make_frame();
     f.regs[11] = 0xAAAA;
     f.regs[12] = 0xBBBB;
     f.regs[15] = 0xCCCC;
 
-    let _ = apply_syscall_outcome(SyscallOutcome::Return { ret: 7 }, &mut t, &mut f, ECALL_EPC);
+    let _ = apply_syscall_outcome(SyscallOutcome::Return { ret: 7 }, &mut r, &mut f, ECALL_EPC);
 
-    assert_eq!(t.frame.regs[10], 7);
-    assert_eq!(t.frame.regs[11], 0xAAAA);
-    assert_eq!(t.frame.regs[12], 0xBBBB);
-    assert_eq!(t.frame.regs[15], 0xCCCC);
+    assert_eq!(r.frame_reg(10), 7);
+    assert_eq!(r.frame_reg(11), 0xAAAA);
+    assert_eq!(r.frame_reg(12), 0xBBBB);
+    assert_eq!(r.frame_reg(15), 0xCCCC);
 }
 
 #[test]
@@ -74,10 +76,11 @@ fn return_action_is_resume_not_yield() {
     // exit_thread_with_state (Yield). Getting this wrong sends the
     // thread to the wrong post-syscall path.
     let mut t = make_thread(ThreadState::Running, SPP::User);
+    let mut r = unsafe { RunningThread::from_ptr(&mut t) };
     let mut f = make_frame();
 
     let action =
-        apply_syscall_outcome(SyscallOutcome::Return { ret: 0 }, &mut t, &mut f, ECALL_EPC);
+        apply_syscall_outcome(SyscallOutcome::Return { ret: 0 }, &mut r, &mut f, ECALL_EPC);
 
     match action {
         ShimAction::Resume => {}
@@ -90,21 +93,19 @@ fn return_action_is_resume_not_yield() {
 #[test]
 fn yield_some_ret_writes_ret_before_snapshot() {
     let mut t = make_thread(ThreadState::Running, SPP::User);
+    let mut r = unsafe { RunningThread::from_ptr(&mut t) };
     let mut f = make_frame();
 
     let action = apply_syscall_outcome(
-        SyscallOutcome::Yield {
-            state: ThreadState::Suspended,
-            ret: Some(0),
-        },
-        &mut t,
+        SyscallOutcome::SleepUntil { deadline: 0 },
+        &mut r,
         &mut f,
         ECALL_EPC,
     );
 
     assert_eq!(action, ShimAction::Yield(ThreadState::Suspended));
-    assert_eq!(t.frame.regs[10], 0);
-    assert_eq!(t.pc.load(Ordering::Acquire), ECALL_EPC + 4);
+    assert_eq!(r.frame_reg(10), 0);
+    assert_eq!(r.view().pc(), ECALL_EPC + 4);
 }
 
 #[test]
@@ -112,20 +113,18 @@ fn yield_ready_state_propagates_to_action() {
     // serial_print yields Ready after committing the result — exercises
     // the "syscall completed, re-enter scheduler" path.
     let mut t = make_thread(ThreadState::Running, SPP::User);
+    let mut r = unsafe { RunningThread::from_ptr(&mut t) };
     let mut f = make_frame();
 
     let action = apply_syscall_outcome(
-        SyscallOutcome::Yield {
-            state: ThreadState::Ready,
-            ret: Some(-5),
-        },
-        &mut t,
+        SyscallOutcome::DoneReschedule { ret: -5 },
+        &mut r,
         &mut f,
         ECALL_EPC,
     );
 
     assert_eq!(action, ShimAction::Yield(ThreadState::Ready));
-    assert_eq!(t.frame.regs[10], (-5isize) as usize);
+    assert_eq!(r.frame_reg(10), (-5isize) as usize);
 }
 
 // ---- Yield with None (manager-completed syscalls) ----
@@ -137,15 +136,13 @@ fn yield_none_ret_preserves_frame_reg10() {
     // must leave regs[10] exactly as it was (typically the syscall
     // number, stale but soon overwritten).
     let mut t = make_thread(ThreadState::Running, SPP::User);
+    let mut r = unsafe { RunningThread::from_ptr(&mut t) };
     let mut f = make_frame();
     f.regs[10] = 4096; // MMAP syscall number
 
     let _ = apply_syscall_outcome(
-        SyscallOutcome::Yield {
-            state: ThreadState::Blocking,
-            ret: None,
-        },
-        &mut t,
+        SyscallOutcome::ParkForPublish,
+        &mut r,
         &mut f,
         ECALL_EPC,
     );
@@ -153,7 +150,7 @@ fn yield_none_ret_preserves_frame_reg10() {
     // frame.regs[10] stays the stale syscall number (manager overwrites
     // thread.frame.regs[10] directly when unblocking).
     assert_eq!(f.regs[10], 4096);
-    assert_eq!(t.frame.regs[10], 4096);
+    assert_eq!(r.frame_reg(10), 4096);
 }
 
 #[test]
@@ -163,20 +160,18 @@ fn yield_blocking_still_bumps_pc() {
     // manager unblocks them, execution resumes at epc+4, not the
     // original ecall.
     let mut t = make_thread(ThreadState::Running, SPP::User);
-    t.pc.store(ECALL_EPC, Ordering::Release);
+    let mut r = unsafe { RunningThread::from_ptr(&mut t) };
+    r.set_pc(ECALL_EPC);
     let mut f = make_frame();
 
     let _ = apply_syscall_outcome(
-        SyscallOutcome::Yield {
-            state: ThreadState::Blocking,
-            ret: None,
-        },
-        &mut t,
+        SyscallOutcome::ParkForPublish,
+        &mut r,
         &mut f,
         ECALL_EPC,
     );
 
-    assert_eq!(t.pc.load(Ordering::Acquire), ECALL_EPC + 4);
+    assert_eq!(r.view().pc(), ECALL_EPC + 4);
 }
 
 // ---- Regression pin: the Return-arm bug ----
@@ -188,18 +183,19 @@ fn return_must_bump_pc_past_ecall() {
     // bump. Documented here so a future refactor can't silently
     // reintroduce that behavior.
     let mut t = make_thread(ThreadState::Running, SPP::User);
-    t.pc.store(ECALL_EPC, Ordering::Release);
+    let mut r = unsafe { RunningThread::from_ptr(&mut t) };
+    r.set_pc(ECALL_EPC);
     let mut f = make_frame();
 
     let _ = apply_syscall_outcome(
         SyscallOutcome::Return { ret: -2 },
-        &mut t,
+        &mut r,
         &mut f,
         ECALL_EPC,
     );
 
     assert_ne!(
-        t.pc.load(Ordering::Acquire),
+        r.view().pc(),
         ECALL_EPC,
         "Return must bump pc past the ecall — without this, \
          the thread re-executes the same ecall on resume"
@@ -212,43 +208,45 @@ fn return_must_overwrite_thread_frame_with_ret() {
     // holds whatever was written before the trap, so the user code
     // sees a stale (non-ret) value in a0 on resume.
     let mut t = make_thread(ThreadState::Running, SPP::User);
-    t.frame.regs[10] = 0xDEAD_BEEF;
+    let mut r = unsafe { RunningThread::from_ptr(&mut t) };
+    r.set_frame_reg(10, 0xDEAD_BEEF);
     let mut f = make_frame();
 
     let _ = apply_syscall_outcome(
         SyscallOutcome::Return { ret: -2 },
-        &mut t,
+        &mut r,
         &mut f,
         ECALL_EPC,
     );
 
-    assert_eq!(t.frame.regs[10], (-2isize) as usize);
-    assert_ne!(t.frame.regs[10], 0xDEAD_BEEF);
+    assert_eq!(r.frame_reg(10), (-2isize) as usize);
+    assert_ne!(r.frame_reg(10), 0xDEAD_BEEF);
 }
 
 // ---- YieldRetry ----
 
 #[test]
-fn yield_retry_keeps_pc_at_ecall() {
-    // The whole point of YieldRetry is that the resumed thread re-runs
+fn retry_on_doorbell_keeps_pc_at_ecall_and_yields_suspended() {
+    // The whole point of a retry park is that the resumed thread re-runs
     // the ecall instead of stepping past it. Bumping pc here would
     // turn read_stdin's park-and-retry into a single-shot read that
-    // returns garbage on wake.
+    // returns garbage on wake. Phase-C closure: a retry park is *always*
+    // Suspended (the only state whose wake doesn't require a published
+    // completion slot) — there is no longer a Blocking-retry to express.
     let mut t = make_thread(ThreadState::Running, SPP::User);
-    t.pc.store(ECALL_EPC, Ordering::Release);
+    let mut r = unsafe { RunningThread::from_ptr(&mut t) };
+    r.set_pc(ECALL_EPC);
     let mut f = make_frame();
 
     let action = apply_syscall_outcome(
-        SyscallOutcome::YieldRetry {
-            state: ThreadState::Blocking,
-        },
-        &mut t,
+        SyscallOutcome::RetryOnDoorbell,
+        &mut r,
         &mut f,
         ECALL_EPC,
     );
 
-    assert_eq!(action, ShimAction::Yield(ThreadState::Blocking));
-    assert_eq!(t.pc.load(Ordering::Acquire), ECALL_EPC);
+    assert_eq!(action, ShimAction::Yield(ThreadState::Suspended));
+    assert_eq!(r.view().pc(), ECALL_EPC);
 }
 
 #[test]
@@ -257,6 +255,7 @@ fn yield_retry_preserves_a_regs_for_re_execute() {
     // Resume must restore them as-of the trap so the re-executed
     // syscall handler sees identical inputs.
     let mut t = make_thread(ThreadState::Running, SPP::User);
+    let mut r = unsafe { RunningThread::from_ptr(&mut t) };
     let mut f = make_frame();
     f.regs[10] = 0x42; // syscall number
     f.regs[11] = 0xAAAA; // arg0
@@ -265,19 +264,17 @@ fn yield_retry_preserves_a_regs_for_re_execute() {
     f.regs[14] = 0xDDDD; // arg3
 
     let _ = apply_syscall_outcome(
-        SyscallOutcome::YieldRetry {
-            state: ThreadState::Blocking,
-        },
-        &mut t,
+        SyscallOutcome::RetryOnDoorbell,
+        &mut r,
         &mut f,
         ECALL_EPC,
     );
 
-    assert_eq!(t.frame.regs[10], 0x42);
-    assert_eq!(t.frame.regs[11], 0xAAAA);
-    assert_eq!(t.frame.regs[12], 0xBBBB);
-    assert_eq!(t.frame.regs[13], 0xCCCC);
-    assert_eq!(t.frame.regs[14], 0xDDDD);
+    assert_eq!(r.frame_reg(10), 0x42);
+    assert_eq!(r.frame_reg(11), 0xAAAA);
+    assert_eq!(r.frame_reg(12), 0xBBBB);
+    assert_eq!(r.frame_reg(13), 0xCCCC);
+    assert_eq!(r.frame_reg(14), 0xDDDD);
 }
 
 // ---- Mode/state gate ----
@@ -297,33 +294,32 @@ const KTHREAD_PC: usize = 0xFFFF_FFC0_0001_0000;
 #[test]
 fn return_refuses_to_commit_to_kthread() {
     let mut t = make_thread(ThreadState::Running, SPP::Supervisor);
-    t.pc.store(KTHREAD_PC, Ordering::Release);
-    let original_frame = *t.frame;
+    let mut r = unsafe { RunningThread::from_ptr(&mut t) };
+    r.set_pc(KTHREAD_PC);
+    let orig_reg11 = r.frame_reg(11);
     let mut f = make_frame();
     f.regs[11] = 0xDEAD;
 
     let action =
-        apply_syscall_outcome(SyscallOutcome::Return { ret: 0 }, &mut t, &mut f, ECALL_EPC);
+        apply_syscall_outcome(SyscallOutcome::Return { ret: 0 }, &mut r, &mut f, ECALL_EPC);
 
     // No-op fallback so the trap dispatcher still unwinds, but no writes
     // to thread.pc/thread.frame.
     assert_eq!(action, ShimAction::Resume);
-    assert_eq!(t.pc.load(Ordering::Acquire), KTHREAD_PC);
-    assert_eq!(t.frame.regs[11], original_frame.regs[11]);
+    assert_eq!(r.view().pc(), KTHREAD_PC);
+    assert_eq!(r.frame_reg(11), orig_reg11);
 }
 
 #[test]
 fn yield_refuses_to_commit_to_kthread() {
     let mut t = make_thread(ThreadState::Running, SPP::Supervisor);
-    t.pc.store(KTHREAD_PC, Ordering::Release);
+    let mut r = unsafe { RunningThread::from_ptr(&mut t) };
+    r.set_pc(KTHREAD_PC);
     let mut f = make_frame();
 
     let action = apply_syscall_outcome(
-        SyscallOutcome::Yield {
-            state: ThreadState::Suspended,
-            ret: Some(0),
-        },
-        &mut t,
+        SyscallOutcome::SleepUntil { deadline: 0 },
+        &mut r,
         &mut f,
         ECALL_EPC,
     );
@@ -333,50 +329,47 @@ fn yield_refuses_to_commit_to_kthread() {
     // want the dispatcher to return normally so cleanup happens
     // elsewhere.
     assert_eq!(action, ShimAction::Resume);
-    assert_eq!(t.pc.load(Ordering::Acquire), KTHREAD_PC);
-    assert_eq!(
-        t.state.load(Ordering::Acquire),
-        ThreadState::Running as usize,
-    );
+    assert_eq!(r.view().pc(), KTHREAD_PC);
+    assert_eq!(r.view().state(), ThreadState::Running as usize);
 }
 
 #[test]
 fn yield_retry_refuses_to_commit_to_kthread() {
     let mut t = make_thread(ThreadState::Running, SPP::Supervisor);
-    t.pc.store(KTHREAD_PC, Ordering::Release);
+    let mut r = unsafe { RunningThread::from_ptr(&mut t) };
+    r.set_pc(KTHREAD_PC);
     let mut f = make_frame();
 
     let action = apply_syscall_outcome(
-        SyscallOutcome::YieldRetry {
-            state: ThreadState::Blocking,
-        },
-        &mut t,
+        SyscallOutcome::RetryOnDoorbell,
+        &mut r,
         &mut f,
         ECALL_EPC,
     );
 
     assert_eq!(action, ShimAction::Resume);
-    assert_eq!(t.pc.load(Ordering::Acquire), KTHREAD_PC);
+    assert_eq!(r.view().pc(), KTHREAD_PC);
 }
 
 #[test]
 fn return2_refuses_to_commit_to_kthread() {
     let mut t = make_thread(ThreadState::Running, SPP::Supervisor);
-    t.pc.store(KTHREAD_PC, Ordering::Release);
+    let mut r = unsafe { RunningThread::from_ptr(&mut t) };
+    r.set_pc(KTHREAD_PC);
     let mut f = make_frame();
 
     let action = apply_syscall_outcome(
         SyscallOutcome::Return2 { ret0: 1, ret1: 2 },
-        &mut t,
+        &mut r,
         &mut f,
         ECALL_EPC,
     );
 
     assert_eq!(action, ShimAction::Resume);
-    assert_eq!(t.pc.load(Ordering::Acquire), KTHREAD_PC);
+    assert_eq!(r.view().pc(), KTHREAD_PC);
     // Neither ret0 nor ret1 stamped into the kthread frame.
-    assert_ne!(t.frame.regs[10], 1);
-    assert_ne!(t.frame.regs[11], 2);
+    assert_ne!(r.frame_reg(10), 1);
+    assert_ne!(r.frame_reg(11), 2);
 }
 
 #[test]
@@ -386,25 +379,27 @@ fn assigned_user_thread_refuses_to_commit() {
     // Important specifically because `Assigned` was the state we saw
     // most often in the QEMU mode-mismatch warnings.
     let mut t = make_thread(ThreadState::Assigned, SPP::User);
+    let mut r = unsafe { RunningThread::from_ptr(&mut t) };
     let original_pc = 0x2200_0000;
-    t.pc.store(original_pc, Ordering::Release);
+    r.set_pc(original_pc);
     let mut f = make_frame();
 
-    let _ = apply_syscall_outcome(SyscallOutcome::Return { ret: 0 }, &mut t, &mut f, ECALL_EPC);
+    let _ = apply_syscall_outcome(SyscallOutcome::Return { ret: 0 }, &mut r, &mut f, ECALL_EPC);
 
-    assert_eq!(t.pc.load(Ordering::Acquire), original_pc);
+    assert_eq!(r.view().pc(), original_pc);
 }
 
 #[test]
 fn ready_user_thread_refuses_to_commit() {
     let mut t = make_thread(ThreadState::Ready, SPP::User);
+    let mut r = unsafe { RunningThread::from_ptr(&mut t) };
     let original_pc = 0x2200_0000;
-    t.pc.store(original_pc, Ordering::Release);
+    r.set_pc(original_pc);
     let mut f = make_frame();
 
-    let _ = apply_syscall_outcome(SyscallOutcome::Return { ret: 0 }, &mut t, &mut f, ECALL_EPC);
+    let _ = apply_syscall_outcome(SyscallOutcome::Return { ret: 0 }, &mut r, &mut f, ECALL_EPC);
 
-    assert_eq!(t.pc.load(Ordering::Acquire), original_pc);
+    assert_eq!(r.view().pc(), original_pc);
 }
 
 #[test]
@@ -416,21 +411,23 @@ fn suspended_user_thread_commits_normally() {
     // transitioned it during ms_sleep before `exit_thread_with_state`
     // ran).
     let mut t = make_thread(ThreadState::Suspended, SPP::User);
-    t.pc.store(ECALL_EPC, Ordering::Release);
+    let mut r = unsafe { RunningThread::from_ptr(&mut t) };
+    r.set_pc(ECALL_EPC);
     let mut f = make_frame();
 
-    let _ = apply_syscall_outcome(SyscallOutcome::Return { ret: 0 }, &mut t, &mut f, ECALL_EPC);
+    let _ = apply_syscall_outcome(SyscallOutcome::Return { ret: 0 }, &mut r, &mut f, ECALL_EPC);
 
-    assert_eq!(t.pc.load(Ordering::Acquire), ECALL_EPC + 4);
+    assert_eq!(r.view().pc(), ECALL_EPC + 4);
 }
 
 #[test]
 fn blocking_user_thread_commits_normally() {
     let mut t = make_thread(ThreadState::Blocking, SPP::User);
-    t.pc.store(ECALL_EPC, Ordering::Release);
+    let mut r = unsafe { RunningThread::from_ptr(&mut t) };
+    r.set_pc(ECALL_EPC);
     let mut f = make_frame();
 
-    let _ = apply_syscall_outcome(SyscallOutcome::Return { ret: 0 }, &mut t, &mut f, ECALL_EPC);
+    let _ = apply_syscall_outcome(SyscallOutcome::Return { ret: 0 }, &mut r, &mut f, ECALL_EPC);
 
-    assert_eq!(t.pc.load(Ordering::Acquire), ECALL_EPC + 4);
+    assert_eq!(r.view().pc(), ECALL_EPC + 4);
 }

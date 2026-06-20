@@ -29,7 +29,7 @@ use smoltcp::socket::tcp::State as TcpState;
 use smoltcp::{iface::Interface, wire::IpAddress};
 
 #[cfg(feature = "kernel")]
-use tracing::{error, info, trace};
+use tracing::{error, info};
 
 /// Mutable view into a region of shared memory handed to `send_tcp`'s
 /// closure. Writes go through [`core::ptr::write_volatile`], which
@@ -1787,6 +1787,17 @@ mod netchannel_layout_tests {
         fn nc(&self) -> &NetChannel {
             unsafe { &*(self.base as *const NetChannel) }
         }
+        /// Trusted `queue_len` / `capacity` for this region — the kernel
+        /// derives these from the region size at creation (stashed in
+        /// `ChannelCtx`), never from the user-writable header. Tests pass
+        /// them to the kernel-side accessors (`rings`, `rx_trusted`) the
+        /// same way the reconciler does.
+        fn qlen(&self) -> usize {
+            NetChannel::queue_len_for(self.layout.size())
+        }
+        fn cap(&self) -> usize {
+            NetChannel::capacity_for(self.layout.size())
+        }
     }
 
     impl Drop for OwnedRegion {
@@ -1800,16 +1811,14 @@ mod netchannel_layout_tests {
     fn init_stamps_queue_len_and_capacities() {
         let region = OwnedRegion::new(NC_MIN_REGION_SIZE);
         let nc = region.nc();
-        assert_eq!(
-            nc.queue_len(),
-            NetChannel::queue_len_for(NC_MIN_REGION_SIZE)
-        );
+        // `init` stamps the trusted queue_len into the header at offset 0.
+        assert_eq!(nc.queue_len, NetChannel::queue_len_for(NC_MIN_REGION_SIZE));
         assert_eq!(
             nc.tx().capacity(),
             NetChannel::capacity_for(NC_MIN_REGION_SIZE)
         );
         assert_eq!(
-            nc.rx().capacity(),
+            nc.rx_trusted(region.qlen()).capacity(),
             NetChannel::capacity_for(NC_MIN_REGION_SIZE)
         );
     }
@@ -1820,7 +1829,7 @@ mod netchannel_layout_tests {
         let region = OwnedRegion::new(NC_MIN_REGION_SIZE);
         let nc = region.nc();
         let cap = NetChannel::capacity_for(NC_MIN_REGION_SIZE);
-        let (tx, rx) = nc.rings();
+        let (tx, rx) = nc.rings(region.qlen(), region.cap());
         assert_eq!(tx.len(), cap);
         assert_eq!(rx.len(), cap);
     }
@@ -1830,7 +1839,7 @@ mod netchannel_layout_tests {
     fn rings_tx_and_rx_do_not_overlap() {
         let region = OwnedRegion::new(NC_MIN_REGION_SIZE);
         let nc = region.nc();
-        let (tx, rx) = nc.rings();
+        let (tx, rx) = nc.rings(region.qlen(), region.cap());
         let tx_start = tx.as_ptr() as usize;
         let tx_end = tx_start + tx.len();
         let rx_start = rx.as_ptr() as usize;
@@ -1848,7 +1857,7 @@ mod netchannel_layout_tests {
         let nc = region.nc();
         let base = region.base as usize;
         let end = base + NC_MIN_REGION_SIZE;
-        let (tx, rx) = nc.rings();
+        let (tx, rx) = nc.rings(region.qlen(), region.cap());
         let tx_start = tx.as_ptr() as usize;
         let rx_end = rx.as_ptr() as usize + rx.len();
         assert!(
@@ -1865,7 +1874,7 @@ mod netchannel_layout_tests {
         // provenance.
         let region = OwnedRegion::new(NC_MIN_REGION_SIZE);
         let nc = region.nc();
-        let (tx, rx) = nc.rings();
+        let (tx, rx) = nc.rings(region.qlen(), region.cap());
 
         tx[0] = 0xAA;
         tx[tx.len() - 1] = 0xBB;
@@ -1886,10 +1895,11 @@ mod netchannel_layout_tests {
         let region = OwnedRegion::new(NC_MIN_REGION_SIZE);
         let nc = region.nc();
         let base = region.base as usize;
+        let qlen = region.qlen();
         let tx = nc.tx() as *const _ as usize;
-        let rx = nc.rx() as *const _ as usize;
+        let rx = nc.rx_trusted(qlen) as *const _ as usize;
         assert_eq!(tx - base, NC_TX_OFF);
-        assert_eq!(rx - base, NC_TX_OFF + nc.queue_len());
+        assert_eq!(rx - base, NC_TX_OFF + qlen);
     }
 
     #[test]
@@ -1961,7 +1971,7 @@ mod netchannel_layout_tests {
         // Grid over several valid region sizes.
         for &sz in &[NC_MIN_REGION_SIZE, 8192, 16384, NC_MAX_REGION_SIZE] {
             let region = OwnedRegion::new(sz);
-            let (tx, rx) = region.nc().rings();
+            let (tx, rx) = region.nc().rings(region.qlen(), region.cap());
             let cap = NetChannel::capacity_for(sz);
             assert_eq!(tx.len(), cap);
             assert_eq!(rx.len(), cap);

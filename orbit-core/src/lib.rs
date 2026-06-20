@@ -25,6 +25,13 @@ pub mod syscall;
 pub mod tlb_shootdown;
 pub mod trap;
 
+/// Upper bound on hart count for static per-hart array sizing
+/// (TLB-shootdown rings, the manager's `READY_INBOXES`). The real CPU
+/// count is a runtime value (`SysInfo::cpu_count`, ≤ this). Homed here —
+/// the lowest crate both kmain (`shootdown`) and the `manager` crate
+/// (`READY_INBOXES`) can reach — so per-hart arrays size in either.
+pub const MAX_HARTS: usize = 8;
+
 /// Role registry, transition gates, and witness types.
 ///
 /// Moved into `orbit-abi` so the [`process`] crate can name
@@ -151,19 +158,18 @@ pub trait Hardware {
 /// The pure handler only mutates in-memory state and reports the intended
 /// outcome; [`apply_syscall_outcome`] translates that into the concrete
 /// frame / pc / state mutations a shim needs.
+/// **Park-shape closure (phase C).** The old open `state: ThreadState`
+/// field on `Yield`/`YieldRetry` let a body pick a park state that
+/// mismatched its wake mechanism — the read-stdin regression was a
+/// doorbell parker that chose `Blocking` (whose only wake is
+/// publish-then-push) instead of `Suspended`. Each variant below fixes
+/// the `(park state, pc/ret commit shape, wake_time policy)` triple as
+/// one atomic choice, so that class of bug is unrepresentable: there is
+/// no "Blocking + doorbell" variant to construct. `apply` is the sole
+/// place those three are realized, and it stamps `wake_time` itself so a
+/// body can't set a deadline inconsistent with its park state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyscallOutcome {
-    /// Commit side effects (snapshot frame, bump pc) and yield the current
-    /// thread into `state` via the asm switch. If `ret` is `Some`, the shim
-    /// writes it into `regs[10]` before the snapshot so the resumed thread
-    /// sees that value; `None` means "leave the frame alone" for
-    /// manager-completed syscalls (mmap, nc_create, close) whose return
-    /// value is written into `thread.frame.regs[10]` at unblock time.
-    Yield {
-        state: ThreadState,
-        ret: Option<isize>,
-    },
-
     /// Write `ret` into `regs[10]`, commit the frame snapshot + pc bump
     /// (so the thread resumes past the ecall with `ret` visible), and
     /// return to the trap dispatcher without yielding. Used for
@@ -174,17 +180,39 @@ pub enum SyscallOutcome {
     /// For synchronous syscalls returning two `isize`s — modelled on
     /// Windows's `GetProcessAffinityMask` shape (current + allowed in
     /// one trap). The async two-return path (`create_netch`) goes via
-    /// `Yield + signal_n`, not this variant.
+    /// a park + `signal_n`, not this variant.
     Return2 { ret0: isize, ret1: isize },
 
-    /// Snapshot frame, *retain* pc at the ecall, yield into `state`.
-    /// On wake the thread re-executes the ecall with its original
-    /// args — used for park-and-retry primitives like `read_stdin`,
-    /// where the signaler doesn't compute a return value (it just
-    /// wakes the reader to retry). a-regs preserved from the trap
-    /// snapshot, so the syscall handler re-enters with identical
-    /// inputs.
-    YieldRetry { state: ThreadState },
+    /// Syscall completed: write `ret`, advance pc, and yield `Ready`
+    /// (back through the scheduler so siblings get a turn). The
+    /// [`syscall::ready`]-shaped fast path — serial_print / console_write
+    /// / most non-blocking syscalls.
+    DoneReschedule { ret: isize },
+
+    /// Sleep until the absolute `deadline` tick. Resume returns 0 with pc
+    /// advanced past the ecall; `apply` stamps `wake_time = deadline`.
+    /// Park state `Suspended`. `ms_sleep`.
+    SleepUntil { deadline: usize },
+
+    /// Park `Blocking` awaiting a manager publish-then-push: the body has
+    /// already queued a `PendingWork`; the manager publishes return
+    /// values into the on-thread completion slot and the wake drain
+    /// marshals them on resume (pc advanced, `regs[10]` filled at unblock
+    /// time). No `wake_time`. Every converted-from-sync `*_req`.
+    ParkForPublish,
+
+    /// Doorbell park, no deadline: park `Suspended` and *retain* pc at the
+    /// ecall so the thread re-executes (a-regs preserved) on wake; the
+    /// only wake path is `wake_override` (an input doorbell). `apply`
+    /// stamps `wake_time = usize::MAX` so the sleep heap never fires.
+    /// `read_stdin`, `read_key_event` (indefinite).
+    RetryOnDoorbell,
+
+    /// Doorbell park with a deadline: like [`Self::RetryOnDoorbell`] but
+    /// `apply` stamps `wake_time = deadline`, so a timer wake re-executes
+    /// the ecall (which observes the elapsed timeout and returns).
+    /// `read_key_event` (timeout).
+    RetryUntilDeadline { deadline: usize },
 }
 
 /// What the shim should do after [`apply_syscall_outcome`] commits the
@@ -222,13 +250,11 @@ pub enum ShimAction {
 /// user text in S-mode).
 pub fn apply_syscall_outcome(
     outcome: SyscallOutcome,
-    thread: &mut process::Thread,
+    running: &mut process::RunningThread,
     frame: &mut device::TrapFrame,
     epc: usize,
 ) -> ShimAction {
-    use core::sync::atomic::Ordering;
-
-    if !commit_allowed(thread) {
+    if !commit_allowed(running.view()) {
         // Caller-side panics in kmain's dispatch_syscall already catch
         // mode mismatches; this is the no-op fallback so a test or any
         // future caller that doesn't pre-check can't corrupt the wrong
@@ -238,36 +264,48 @@ pub fn apply_syscall_outcome(
         return ShimAction::Resume;
     }
 
+    // The frame/pc writes are sealed to the own-hart capability — the
+    // hart owns the thread it's committing for, so the writes are
+    // uncontended (the bug-2 invariant, now by construction). `apply` is
+    // also the sole place each park variant's `(state, commit, wake_time)`
+    // triple is realized (the phase-C park-shape closure).
+    use process::ThreadState::{Blocking, Ready, Suspended};
     match outcome {
         SyscallOutcome::Return { ret } => {
-            frame.regs[10] = ret as usize;
-            *thread.frame = *frame;
-            thread.pc.store(epc + 4, Ordering::Release);
+            running.commit_return(ret, epc, frame);
             ShimAction::Resume
         }
         SyscallOutcome::Return2 { ret0, ret1 } => {
-            frame.regs[10] = ret0 as usize;
-            frame.regs[11] = ret1 as usize;
-            *thread.frame = *frame;
-            thread.pc.store(epc + 4, Ordering::Release);
+            running.commit_return2(ret0, ret1, epc, frame);
             ShimAction::Resume
         }
-        SyscallOutcome::YieldRetry { state } => {
-            // No reg writes — handler relies on a-reg snapshot
-            // matching trap entry so the re-execute sees the
-            // original args. pc stays at epc; the resumed thread
-            // re-enters the ecall and the handler re-runs.
-            *thread.frame = *frame;
-            thread.pc.store(epc, Ordering::Release);
-            ShimAction::Yield(state)
+        SyscallOutcome::DoneReschedule { ret } => {
+            running.commit_yield(Some(ret), epc, frame);
+            ShimAction::Yield(Ready)
         }
-        SyscallOutcome::Yield { state, ret } => {
-            if let Some(r) = ret {
-                frame.regs[10] = r as usize;
-            }
-            *thread.frame = *frame;
-            thread.pc.store(epc + 4, Ordering::Release);
-            ShimAction::Yield(state)
+        SyscallOutcome::SleepUntil { deadline } => {
+            running.commit_yield(Some(0), epc, frame);
+            running.set_wake_time(deadline);
+            ShimAction::Yield(Suspended)
+        }
+        SyscallOutcome::ParkForPublish => {
+            // No reg write — the manager fills `regs[10]` from the
+            // completion slot at unblock time. pc advances so the resumed
+            // thread continues past the ecall.
+            running.commit_yield(None, epc, frame);
+            ShimAction::Yield(Blocking)
+        }
+        SyscallOutcome::RetryOnDoorbell => {
+            // No reg writes — the a-reg snapshot matches trap entry so the
+            // re-executed ecall sees identical args. pc stays at epc.
+            running.commit_yield_retry(epc, frame);
+            running.set_wake_time(usize::MAX);
+            ShimAction::Yield(Suspended)
+        }
+        SyscallOutcome::RetryUntilDeadline { deadline } => {
+            running.commit_yield_retry(epc, frame);
+            running.set_wake_time(deadline);
+            ShimAction::Yield(Suspended)
         }
     }
 }
@@ -281,14 +319,13 @@ pub fn apply_syscall_outcome(
 ///   * state must be Running / Suspended / Blocking — a freshly-`Assigned`
 ///     thread hasn't actually run yet, and Ready/Exited shouldn't be
 ///     observed as `current` in a syscall path.
-fn commit_allowed(thread: &process::Thread) -> bool {
-    use core::sync::atomic::Ordering;
+fn commit_allowed(thread: process::ThreadView<'_>) -> bool {
     use riscv::register::sstatus::SPP;
 
-    if thread.mode != SPP::User {
+    if thread.mode() != SPP::User {
         return false;
     }
-    let state = thread.state.load(Ordering::Acquire);
+    let state = thread.state();
     state == process::ThreadState::Running as usize
         || state == process::ThreadState::Suspended as usize
         || state == process::ThreadState::Blocking as usize

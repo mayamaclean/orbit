@@ -2,7 +2,7 @@
 //!
 //! Wraps a `VecDeque<DenialEvent>` capped at
 //! [`DENIAL_RING_CAPACITY`](orbit_abi::denial::DENIAL_RING_CAPACITY)
-//! (50 entries today). On push when full, the oldest event is evicted
+//! (64 entries today). On push when full, the oldest event is evicted
 //! — best-effort retention; the diagnostic value is "what was the
 //! kernel denying in the last few hundred ms," not "every denial
 //! since boot."
@@ -136,7 +136,7 @@ mod tests {
         let r = DenialRing::new();
         assert_eq!(r.len(), 0);
         assert!(r.is_empty());
-        assert_eq!(DenialRing::capacity(), 50);
+        assert_eq!(DenialRing::capacity(), 64);
     }
 
     #[test]

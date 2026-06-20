@@ -38,7 +38,7 @@ impl Scheduler for StateAwareSched {
             if t.affinity.load(Ordering::Relaxed) & hart_mask == 0 {
                 continue;
             }
-            if t.state.load(Ordering::Acquire) == ThreadState::Ready as usize {
+            if t.state_load(Ordering::Acquire) == ThreadState::Ready as usize {
                 return Some(p);
             }
         }
@@ -76,7 +76,7 @@ fn second_pass_skips_already_assigned_thread() {
     assert_eq!(slot_b.load(Ordering::Acquire) as *mut Thread, t1);
     let t1_ref = unsafe { &*t1 };
     assert_eq!(
-        t1_ref.state.load(Ordering::Acquire),
+        t1_ref.state_load(Ordering::Acquire),
         ThreadState::Assigned as usize,
     );
 
@@ -158,7 +158,7 @@ fn busy_remote_protects_against_overwrite() {
     );
     let ready_ref = unsafe { &*ready_thread };
     assert_eq!(
-        ready_ref.state.load(Ordering::Acquire),
+        ready_ref.state_load(Ordering::Acquire),
         ThreadState::Assigned as usize,
     );
 
@@ -208,7 +208,7 @@ fn affinity_pin_blocks_unwanted_assignment() {
     );
     let pinned_ref = unsafe { &*pinned };
     assert_eq!(
-        pinned_ref.state.load(Ordering::Acquire),
+        pinned_ref.state_load(Ordering::Acquire),
         ThreadState::Ready as usize,
         "rejected thread stays Ready",
     );

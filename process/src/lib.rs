@@ -5,7 +5,7 @@ extern crate alloc;
 use core::alloc::Layout;
 use core::fmt;
 use core::marker::PhantomData;
-use core::sync::atomic::{AtomicI64, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicI64, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use alloc::collections::{btree_map::BTreeMap, btree_set::BTreeSet};
 use alloc::string::{String, ToString};
@@ -17,12 +17,16 @@ use orbit_abi::roles::ChildPerms;
 use riscv::register::{satp::Satp, sstatus::SPP};
 use smoltcp::iface::SocketHandle;
 
+pub mod cap;
 pub mod completion;
 pub mod key_events;
+pub mod sched_lock;
 pub mod spsc;
 pub mod stdin;
+pub use cap::{ExitedThread, ManagerThread, ParkedMut, Runnable, RunningThread, ThreadView};
 pub use completion::{AckCounter, CompletionHandle};
 pub use key_events::ProcessKeyEvents;
+pub use sched_lock::SchedGuard;
 pub use spsc::SpscQueue;
 pub use stdin::ProcessStdin;
 
@@ -293,16 +297,22 @@ impl UserMapping {
 #[derive(Debug)]
 #[repr(C, align(64))]
 pub struct Thread {
-    pub pc: AtomicUsize,
-    pub state: AtomicUsize,
-    /// Thread's own scheduled park time. The thread itself is the sole
-    /// writer (set on park; the kernel scheduler reads but never
-    /// writes here). Non-atomic because of that single-writer
-    /// invariant — concurrent reads of an aligned `usize` on RV64
-    /// are safe under the current ABI, and the field's value is
-    /// only consulted in the `Suspended → Ready` transition where
-    /// the `state` field's release-store fences any prior write.
-    pub wake_time: usize,
+    // Sealed (Phase B): the resume payload. Reachable only via the
+    // capability verbs / read accessors below — see `cap.rs`.
+    pub(crate) pc: AtomicUsize,
+    pub(crate) state: AtomicUsize,
+    /// Thread's own scheduled park time. The own-hart parker is the sole
+    /// *writer* (set on park via [`cap::RunningThread::set_wake_time`]).
+    ///
+    /// **Atomic** because the stuck-thread watchdog (`manager`) reads it
+    /// cross-hart in its census dump for *every* thread — including ones
+    /// Running on another hart that may be concurrently re-parking — with
+    /// no `state` handshake to order against. A non-atomic read there
+    /// would data-race the writer. The store/load are `Relaxed`: the
+    /// meaningful ordering for the sleep-heap path travels via the
+    /// captured `SleepNotice` copy + the `state` Release/Acquire, not this
+    /// field; the atomic only makes the watchdog's lock-free read defined.
+    pub(crate) wake_time: AtomicUsize,
     /// Pending wake reasons as a bitmask of [`wake_reason`] flags.
     ///
     /// `0` = no pending wake. Any non-zero bit-pattern is "wake this
@@ -332,7 +342,7 @@ pub struct Thread {
     /// entry was pushed). See [orbit-core/src/sleep_heap.rs] for the
     /// staleness contract.
     pub sleep_seq: AtomicU64,
-    pub frame: &'static mut TrapFrame,
+    pub(crate) frame: &'static mut TrapFrame,
     pub stack: &'static mut Stack,
     /// Owning handle on the kernel-thread stack and trap-frame allocations.
     /// `Some` only for kernel threads (pid==0); user threads track their
@@ -345,7 +355,7 @@ pub struct Thread {
     pub mode: SPP,
     /// Set by the trap handler when this thread is killed by a fault.
     /// `None` means the thread exited cleanly (e.g. via the exit syscall).
-    pub fault_info: Option<FaultInfo>,
+    pub(crate) fault_info: Option<FaultInfo>,
     /// Wait/signal handle this thread is parked on while
     /// `state == Blocking`. The manager scans for signaled handles each
     /// scheduler pass; on a hit it writes `result()` / `extra()` into
@@ -367,7 +377,7 @@ pub struct Thread {
     /// Trap-context signalers (read_stdin's `push_byte`, future IRQ
     /// paths) keep using [`Self::handle`] instead — the swap-of-waiter
     /// protocol is what makes that case safe without the lock.
-    pub pending_rets: [AtomicI64; 4],
+    pub(crate) pending_rets: [AtomicI64; 4],
     /// Snapshot of the owning process's [`Permissions`] at the time
     /// the thread was created. Refreshed when the process pledges
     /// (manager-side: walks every thread of the process under
@@ -378,7 +388,21 @@ pub struct Thread {
     /// kernel-wide `DenialRing` + bumps the owning process's
     /// `perm_denials` counter, then short-circuits the syscall with
     /// `-EPERM`.
-    pub permissions: Permissions,
+    ///
+    /// **Atomic snapshot (not the full wire [`Permissions`]).** Pledge
+    /// propagation field-writes this on *sibling* threads that may be
+    /// Running on another hart, concurrent with the lock-free perm-gate
+    /// read — so the two hot fields the gate needs (`perms` effective
+    /// mask + `role`) are split into atoms rather than a non-atomic
+    /// 40-byte struct, which would data-race that write. `allowed_perms`
+    /// / `_reserved` are *not* snapshotted here: they're read only off
+    /// the owning [`ProcessState`] under the lock at spawn, never off the
+    /// thread. Written only via [`cap::ManagerThread::set_permissions`]
+    /// (Release); read via [`cap::ThreadView::perms_mask`] / `role`
+    /// (Acquire).
+    pub(crate) perms: AtomicU64,
+    /// Role-id half of the permission snapshot (see [`Self::perms`]).
+    pub(crate) perm_role: AtomicU32,
     /// Immutable upper bound on which harts this thread can ever run on.
     /// Bit `i` set ⇔ hart `i` permitted. Set at construction; `set_affinity`
     /// rejects any mask that escapes this bound (Windows-style: a parent
@@ -414,12 +438,18 @@ pub struct Thread {
     /// the thread — they're variable-size and rarely-read; the
     /// `getgroups`/`getlogin` syscalls go through the manager-side
     /// [`Process`] lookup instead.
-    pub uid: u32,
-    pub euid: u32,
-    pub suid: u32,
-    pub gid: u32,
-    pub egid: u32,
-    pub sgid: u32,
+    /// POSIX credential triplet snapshot. Atomic for the same reason as
+    /// [`Self::perms`]: `setuid`/`setgid` propagation field-writes these
+    /// on sibling threads that may be Running on another hart, concurrent
+    /// with the lock-free `getuid`/`vaccess` reads. Written only via
+    /// [`cap::ManagerThread::set_uid_triplet`] / `set_gid_triplet`
+    /// (Release); read via [`cap::ThreadView`] accessors (Acquire).
+    pub(crate) uid: AtomicU32,
+    pub(crate) euid: AtomicU32,
+    pub(crate) suid: AtomicU32,
+    pub(crate) gid: AtomicU32,
+    pub(crate) egid: AtomicU32,
+    pub(crate) sgid: AtomicU32,
     pub tid: u32,
     pub pid: u16,
     /// Per-process slot index. `None` for kernel threads.
@@ -439,11 +469,11 @@ pub struct Thread {
     /// Ordering: the manager's Release-store of SIGNALED publishes the
     /// rets writes; the wake drain's Acquire-load synchronizes against
     /// it before reading rets.
-    pub pending_state: AtomicU8,
+    pub(crate) pending_state: AtomicU8,
     /// Number of valid slots in `pending_rets` (0..=4). Manager writes
     /// before the SIGNALED store; readers Acquire-load via [`Self::pending_state`]
     /// and then trust this count.
-    pub pending_ret_count: AtomicU8,
+    pub(crate) pending_ret_count: AtomicU8,
     pub ticks: u8,
 }
 
@@ -454,7 +484,88 @@ pub const PENDING_STATE_NONE: u8 = 0;
 /// `frame.regs[10..]` on resume.
 pub const PENDING_STATE_SIGNALED: u8 = 1;
 
+/// Caller-supplied fields for [`Thread::new`]. Holds every field the
+/// creator chooses; the *sealed* resume-payload fields
+/// (`state`/`pending_*`/`fault_info`) are stamped to their canonical
+/// fresh-thread defaults inside `new`, and `pc`/`frame` come from
+/// `entrypoint`/`frame` here. Construction is the only place a `Thread`
+/// is built from outside `process` now that the resume fields are
+/// `pub(crate)` — so it routes through this one constructor.
+pub struct ThreadInit {
+    /// Initial program counter (resume PC) for the thread.
+    pub entrypoint: usize,
+    pub satp: Satp,
+    pub mode: SPP,
+    pub tid: u32,
+    pub pid: u16,
+    pub frame: &'static mut TrapFrame,
+    pub stack: &'static mut Stack,
+    pub kernel_stack: Option<Frame<Shared>>,
+    pub kernel_trap_frame: Option<Frame<Shared>>,
+    pub slot: Option<u16>,
+    pub allowed_affinity: u64,
+    pub affinity: u64,
+    pub permissions: Permissions,
+    pub uid: u32,
+    pub euid: u32,
+    pub suid: u32,
+    pub gid: u32,
+    pub egid: u32,
+    pub sgid: u32,
+    pub stdout_redirect: Option<u16>,
+}
+
 impl Thread {
+    /// Build a fresh thread. `pc` is set to `init.entrypoint`, `frame`
+    /// to `init.frame`, `state` to `Ready`, and the on-thread completion
+    /// slot + `fault_info` to their empty defaults — the canonical
+    /// fresh-thread resume payload. All other fields come from `init`.
+    pub fn new(init: ThreadInit) -> Self {
+        Self {
+            pc: AtomicUsize::new(init.entrypoint),
+            state: AtomicUsize::new(ThreadState::Ready as usize),
+            wake_time: AtomicUsize::new(0),
+            wake_override: AtomicU64::new(0),
+            last_wake_reason: AtomicU64::new(0),
+            sleep_seq: AtomicU64::new(0),
+            frame: init.frame,
+            stack: init.stack,
+            kernel_stack: init.kernel_stack,
+            kernel_trap_frame: init.kernel_trap_frame,
+            satp: init.satp,
+            mode: init.mode,
+            fault_info: None,
+            handle: None,
+            pending_rets: [
+                AtomicI64::new(0),
+                AtomicI64::new(0),
+                AtomicI64::new(0),
+                AtomicI64::new(0),
+            ],
+            perms: AtomicU64::new(init.permissions.perms),
+            perm_role: AtomicU32::new(init.permissions.role),
+            allowed_affinity: init.allowed_affinity,
+            affinity: AtomicU64::new(init.affinity),
+            cpu_ticks_total: AtomicU64::new(0),
+            context_switches: AtomicU64::new(0),
+            syscall_count: AtomicU64::new(0),
+            syscall_ticks: AtomicU64::new(0),
+            uid: AtomicU32::new(init.uid),
+            euid: AtomicU32::new(init.euid),
+            suid: AtomicU32::new(init.suid),
+            gid: AtomicU32::new(init.gid),
+            egid: AtomicU32::new(init.egid),
+            sgid: AtomicU32::new(init.sgid),
+            tid: init.tid,
+            pid: init.pid,
+            slot: init.slot,
+            stdout_redirect: init.stdout_redirect,
+            pending_state: AtomicU8::new(PENDING_STATE_NONE),
+            pending_ret_count: AtomicU8::new(0),
+            ticks: 0,
+        }
+    }
+
     pub fn root_table_addr(&self) -> PhysAddr {
         PhysAddr::from(self.satp)
     }
@@ -533,11 +644,294 @@ impl Thread {
         }
         Some(n)
     }
+
+    // ─── Read accessors for the sealed (Phase B) fields ─────────────
+    // Reads are safe to expose crate-wide: a caller can observe the
+    // value but cannot *write* the sealed resume payload (that stays
+    // cap-verb-only). Writes of `state`/`pc`/`frame` flow exclusively
+    // through `cap::{RunningThread, ParkedMut}`.
+
+    #[inline]
+    pub fn state_load(&self, order: Ordering) -> usize {
+        self.state.load(order)
+    }
+
+    #[inline]
+    pub fn pc_load(&self, order: Ordering) -> usize {
+        self.pc.load(order)
+    }
+
+    #[inline]
+    pub fn pending_state_load(&self, order: Ordering) -> u8 {
+        self.pending_state.load(order)
+    }
+
+    /// Publish a scheduler-state transition (Release-ordered) for the
+    /// non-`Ready` mechanics that run outside the capabilities. Typed on
+    /// [`ThreadState`] so a bogus discriminant can't be stored, and the
+    /// `Ordering` is fixed to `Release` (the only correct choice — it
+    /// pairs with the `Acquire` loads in the scheduler dispatch and the
+    /// sleep-heap `classify`). Safe to expose: dispatch is gated by the
+    /// `Runnable` queue, not the `state` field, so this can't fabricate a
+    /// dispatchable thread on its own; `→ Ready` coupled with frame
+    /// marshaling still flows only through [`cap::ParkedMut`].
+    ///
+    /// Prefer the intent-named verbs [`Self::mark_running`] /
+    /// [`Self::mark_assigned`] at fixed-transition sites; this typed
+    /// setter is for the dynamic park/exit commit (where the target state
+    /// is chosen at runtime from the syscall outcome).
+    ///
+    /// **Edge validation (always on — release kernel included).** The
+    /// transition is checked against [`Self::transition_allowed`] and an
+    /// illegal edge **panics** rather than silently storing a corrupt
+    /// state. Two cases are deliberately *not* treated as illegal:
+    ///
+    /// - **`Exited` is terminal.** A redundant `Exited → Exited` (the
+    ///   reaper re-running on an already-dead thread) is a no-op, and an
+    ///   attempted `Exited → runnable` is the cross-hart kill race — a
+    ///   sibling was marked `Exited` (via the un-gated
+    ///   [`cap::ManagerThread::mark_exited`] kill store) between this
+    ///   hart's assign/dispatch and this store. Both are *refused without
+    ///   panicking*: the thread stays `Exited` for the reaper. Panicking
+    ///   there would crash the kernel on a legitimate concurrent exit; and
+    ///   refusing (rather than storing) also fixes the latent
+    ///   resurrection loop the old debug-only check let through in release.
+    ///
+    /// A genuine illegal edge (`Suspended → Running`, a skipped dispatch
+    /// step, or a `parked → Ready` that bypassed the [`Runnable`] mint —
+    /// that must go through [`Self::promote_ready_from_parked`]) is a real
+    /// bug and panics in every build. Fixtures that need to fabricate an
+    /// arbitrary state use the feature-gated
+    /// [`Self::transition_to_unchecked`].
+    #[inline]
+    pub fn transition_to(&self, state: ThreadState) {
+        let from = self.state.load(Ordering::Acquire);
+        // `Exited` is terminal — never resurrect, never panic on the race.
+        if from == ThreadState::Exited as usize {
+            return;
+        }
+        if !Self::transition_allowed(from, state) {
+            panic!(
+                "illegal Thread state transition {from} -> {} (tid {}): \
+                 parked->Ready must mint a Runnable via ParkedMut",
+                state as usize, self.tid,
+            );
+        }
+        self.state.store(state as usize, Ordering::Release);
+    }
+
+    /// Cap-verb door for the bug-4-gated `parked → Ready` wake. The generic
+    /// [`Self::transition_to`] deliberately forbids `parked → Ready` (its
+    /// table only permits `Running → Ready`), so this is the *sole* path
+    /// for it — used exclusively by the `cap` verbs that mint a
+    /// [`Runnable`] under a won claim / take-CAS ([`cap::ParkedMut`]'s
+    /// promoters and [`cap::RunningThread::resume_with`] /
+    /// [`cap::RunningThread::try_claim_own_pending`]).
+    ///
+    /// Validates the from-state is `Blocking`/`Suspended` and **panics**
+    /// otherwise — promoting a thread that isn't actually parked is a logic
+    /// bug. The panic is race-free here: every caller holds exclusive
+    /// logical ownership of the thread (a [`SchedGuard`]-bounded claim, or
+    /// the take-CAS / waiter-swap win on its own hart), so the from-state
+    /// cannot be concurrently mutated between this load and the store.
+    #[inline]
+    pub(crate) fn promote_ready_from_parked(&self) {
+        let from = self.state.load(Ordering::Acquire);
+        if from != ThreadState::Blocking as usize && from != ThreadState::Suspended as usize {
+            panic!(
+                "illegal parked->Ready: from {} (tid {}) — \
+                 promote_ready_from_parked requires Blocking/Suspended",
+                from, self.tid,
+            );
+        }
+        self.state.store(ThreadState::Ready as usize, Ordering::Release);
+    }
+
+    /// Scheduler assignment with a checked edge: `Ready → Assigned`.
+    /// Returns `true` if it transitioned; `false` if the thread was killed
+    /// while queued (`Exited` — the benign kill race; do not publish a dead
+    /// thread to a hart's `current`). **Panics** on any other from-state
+    /// (assigning a `Running`/`Assigned`/parked thread is a logic bug). The
+    /// assign path uses this instead of the unconditional
+    /// [`Self::mark_assigned`] so the `Ready → Assigned` edge is enforced
+    /// and a dead/illegal thread is never dispatched.
+    #[inline]
+    pub fn try_mark_assigned(&self) -> bool {
+        let from = self.state.load(Ordering::Acquire);
+        if from == ThreadState::Ready as usize {
+            self.state
+                .store(ThreadState::Assigned as usize, Ordering::Release);
+            true
+        }
+        else if from == ThreadState::Exited as usize {
+            false
+        }
+        else {
+            panic!("illegal Ready->Assigned: from {} (tid {})", from, self.tid);
+        }
+    }
+
+    /// The legal `transition_to` edges, by `(from, to)` state pair — the
+    /// *only* transitions the generic setter performs in the kernel:
+    ///
+    /// | from     | to                                    | site            |
+    /// |----------|---------------------------------------|-----------------|
+    /// | Ready    | Assigned                              | `mark_assigned` |
+    /// | Assigned | Running                               | `mark_running`  |
+    /// | Running  | Ready / Blocking / Suspended / Exited  | own-hart depart |
+    ///
+    /// `→ Ready` is permitted **only from `Running`** — the own-hart
+    /// cooperative yield, which mints its own [`Runnable`] right after the
+    /// store. A *parked* thread (`Blocking`/`Suspended`) reaching `Ready`
+    /// is the bug-4-gated wake: it must flow through
+    /// [`cap::ParkedMut::promote_wake`] / `resume_*` so the enqueue token
+    /// is minted under a claim, never this generic setter. `→ Exited` from
+    /// a non-`Running` state is the manager's sibling kill, which uses
+    /// [`cap::ManagerThread::mark_exited`] (a direct store) and bypasses
+    /// this path.
+    ///
+    /// Compiled unconditionally (release included): [`Self::transition_to`]
+    /// enforces it in every build. `from == Exited` is handled by the
+    /// caller before this is consulted (terminal — see `transition_to`), so
+    /// every arm here matches against a live from-state.
+    const fn transition_allowed(from: usize, to: ThreadState) -> bool {
+        match to {
+            ThreadState::Assigned => from == ThreadState::Ready as usize,
+            ThreadState::Running => from == ThreadState::Assigned as usize,
+            ThreadState::Ready
+            | ThreadState::Blocking
+            | ThreadState::Suspended
+            | ThreadState::Exited => from == ThreadState::Running as usize,
+        }
+    }
+
+    /// Fabricate a raw `state` with **no** transition validation.
+    /// Test/fixture only — feature-gated (`test-helpers`) so it is absent
+    /// from the kernel build and cannot be misused there. Fixtures use it
+    /// to stand up arbitrary states and to simulate other subsystems'
+    /// effects (e.g. `set_wake_reason_where`'s eager `Suspended → Ready`
+    /// promote) without performing the real cap dance.
+    #[cfg(feature = "test-helpers")]
+    #[inline]
+    pub fn transition_to_unchecked(&self, state: ThreadState) {
+        self.state.store(state as usize, Ordering::Release);
+    }
+
+    /// Fabricate a raw `state` discriminant — including out-of-range
+    /// values — to exercise the sleep-heap classifier's handling of a
+    /// garbage / freed-then-recycled allocation. Test-only.
+    #[cfg(feature = "test-helpers")]
+    #[inline]
+    pub fn store_state_raw(&self, raw: usize) {
+        self.state.store(raw, Ordering::Release);
+    }
+
+    /// Dispatch handoff: `Ready → Running`, published by the own-hart
+    /// context load as it begins executing the thread.
+    #[inline]
+    pub fn mark_running(&self) {
+        self.transition_to(ThreadState::Running);
+    }
+
+    /// Scheduler assignment: `Ready → Assigned`, published as the manager
+    /// hands a runnable thread to a target hart (before the IPI).
+    #[inline]
+    pub fn mark_assigned(&self) {
+        self.transition_to(ThreadState::Assigned);
+    }
+
+    /// Read the fault info (Copy). `None` ⇒ clean exit.
+    #[inline]
+    pub fn fault_info(&self) -> Option<FaultInfo> {
+        self.fault_info
+    }
+
+    // Writing `fault_info` (a sealed resume-payload field) flows only
+    // through the field-projecting [`cap::RunningThread::set_fault`] — the
+    // own-hart fault path. The old `pub fn set_fault_info(&mut self)` was
+    // removed: a `&mut self` setter forced callers to materialize a whole-
+    // struct `&mut Thread`, the Phase-E retag the cap layer exists to avoid.
+
+    /// Address of the saved trap frame, for handing to the context-switch
+    /// asm. Returns a `*const ()` (the location, not a writable view) —
+    /// frame *contents* stay cap-verb-only. Used only by the dispatcher's
+    /// kernel-thread `sret` hand-off.
+    #[inline]
+    pub fn frame_ptr(&self) -> *const () {
+        self.frame as *const TrapFrame as *const ()
+    }
 }
 
+/// Owning registry handle for a heap-allocated [`Thread`]. The raw
+/// pointer is **private** — mutable access is minted only through the
+/// capabilities (`as_manager(&SchedGuard)` for manager paths,
+/// `HartContext::running()` for the own-hart path), and reads through
+/// `peek()`. This is the registry-side half of the Phase-B seal: a
+/// `ThreadHandle` holder cannot reconstruct a bare `&mut Thread` to the
+/// sealed fields. (Renamed from `PThread`.)
 #[derive(Debug)]
 #[repr(transparent)]
-pub struct PThread(pub *mut Thread);
+pub struct ThreadHandle {
+    ptr: *mut Thread,
+}
+
+impl ThreadHandle {
+    /// Wrap a raw `Thread` pointer the registry owns.
+    ///
+    /// # Safety
+    /// `ptr` must come from `Box::into_raw(Box<Thread>)` and the registry
+    /// takes ownership (frees it via [`Self::into_box`]).
+    #[inline]
+    pub unsafe fn from_raw(ptr: *mut Thread) -> Self {
+        Self { ptr }
+    }
+
+    /// Reclaim the boxed thread for deallocation.
+    ///
+    /// # Safety
+    /// The thread must be fully detached — not any hart's `current`, not
+    /// a registry entry, no live capability outstanding.
+    #[inline]
+    pub unsafe fn into_box(self) -> alloc::boxed::Box<Thread> {
+        unsafe { alloc::boxed::Box::from_raw(self.ptr) }
+    }
+
+    /// Mint the manager capability. Safe to call — the `&SchedGuard` is
+    /// the proof the scheduler lock is held, and its lifetime bounds the
+    /// returned handle to the critical section.
+    #[inline]
+    pub fn as_manager<'g>(&self, _guard: &'g SchedGuard) -> ManagerThread<'g> {
+        // SAFETY: registry-owned ptr; the guard proves exclusive manager
+        // access. Mutation through the returned cap is state-checked
+        // (`claim_parked`), so it can't alias a `RunningThread` on
+        // another hart.
+        unsafe { ManagerThread::new(self.ptr) }
+    }
+
+    /// Read-only snapshot (atomics + `Copy` fields; never the frame).
+    #[inline]
+    pub fn peek(&self) -> ThreadView<'_> {
+        // SAFETY: registry-owned ptr, live for the borrow.
+        unsafe { ThreadView::new(self.ptr) }
+    }
+
+    /// Publish completion results into the thread's on-thread slot. This
+    /// is the *safe* resume path: it writes only the completion atoms
+    /// (`pending_rets` + `pending_state = SIGNALED`, via
+    /// [`Thread::publish_results`]) — never the frame, never the state,
+    /// and it mints no [`Runnable`]. The parked thread's post-park
+    /// re-check (or the manager's wake drain) does the frame marshal +
+    /// enqueue later, gated by the take-CAS. Because it cannot scribble a
+    /// live frame (**bug 2**) or enqueue without a claim (**bug 4**), it
+    /// needs no [`SchedGuard`] — unlike the mutating manager caps, the
+    /// completion slot is a sanctioned cross-actor publish channel.
+    #[inline]
+    pub fn publish_results(&self, vals: &[isize]) {
+        // SAFETY: registry-owned ptr, live for the borrow; the publish is
+        // an atomic store sequence safe against the consumer's take-CAS.
+        unsafe { (*self.ptr).publish_results(vals) };
+    }
+}
 
 #[derive(Copy, Clone, Debug)]
 pub enum ProcessState {

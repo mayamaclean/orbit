@@ -3,6 +3,13 @@ name = "process"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+# Exposes `Thread::transition_to_unchecked` for test fixtures that need to
+# fabricate arbitrary states (or stand in for another subsystem's state
+# effect) without the transition-edge validation in `transition_to`. Off
+# in the kernel build; enabled by downstream crates' `[dev-dependencies]`.
+test-helpers = []
+
 [dependencies]
 mmu = { path = "../mmu" }
 riscv = { version = "0.16.0", features = ["rt"] }

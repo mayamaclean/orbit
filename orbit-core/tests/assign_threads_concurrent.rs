@@ -84,7 +84,7 @@ fn remote_observes_state_and_ticks_via_release_acquire() {
                 let p = remote_slot.load(Ordering::Acquire);
                 if !p.is_null() {
                     let t = unsafe { &*(p as *const Thread) };
-                    observed_state.store(t.state.load(Ordering::Acquire), Ordering::Release);
+                    observed_state.store(t.state_load(Ordering::Acquire), Ordering::Release);
                     observed_ticks.store(t.ticks as usize, Ordering::Release);
                     return;
                 }

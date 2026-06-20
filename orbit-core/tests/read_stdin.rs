@@ -27,10 +27,7 @@ fn frame_with(len: usize, flags: usize) -> device::TrapFrame {
 }
 
 fn ready(ret: isize) -> SyscallOutcome {
-    SyscallOutcome::Yield {
-        state: ThreadState::Ready,
-        ret: Some(ret),
-    }
+    SyscallOutcome::DoneReschedule { ret }
 }
 
 #[test]
@@ -41,7 +38,7 @@ fn bytes_available_returns_count_synchronously() {
     let mut hw = FakeHw::default();
     hw.stdin_ready.insert(PID, vec![b"hello".to_vec()]);
 
-    let outcome = syscall::read_stdin(&mut t, &frame, &mut hw);
+    let outcome = syscall::read_stdin(common::view(&t), &frame, &mut hw);
 
     assert_eq!(outcome, ready(5));
     assert!(t.handle.is_none(), "no parking when bytes are available");
@@ -58,7 +55,7 @@ fn nonblock_empty_returns_eagain() {
     let mut hw = FakeHw::default();
     // No stdin_ready entry → drain returns 0.
 
-    let outcome = syscall::read_stdin(&mut t, &frame, &mut hw);
+    let outcome = syscall::read_stdin(common::view(&t), &frame, &mut hw);
 
     assert_eq!(outcome, ready(Errno::new(EAGAIN).to_ret()));
     assert!(t.handle.is_none());
@@ -73,20 +70,19 @@ fn block_empty_parks_then_yields_retry() {
     let mut hw = FakeHw::default();
     // Both drain calls (try + recheck) return 0.
 
-    let outcome = syscall::read_stdin(&mut t, &frame, &mut hw);
+    let outcome = syscall::read_stdin(common::view(&t), &frame, &mut hw);
 
-    assert!(matches!(
-        outcome,
-        SyscallOutcome::YieldRetry {
-            state: ThreadState::Suspended
-        }
-    ));
-    assert_eq!(
-        t.wake_time,
-        usize::MAX,
-        "indefinite park stamps wake_time = MAX so the sleep-heap deadline never fires; \
-         only the InputTid doorbell wakes it"
-    );
+    assert!(matches!(outcome, SyscallOutcome::RetryOnDoorbell));
+    // End-to-end: applying the doorbell-retry outcome stamps
+    // wake_time = MAX so the sleep-heap deadline never fires; only the
+    // InputTid doorbell wakes it (phase-C closure — `apply` owns this).
+    {
+        let mut r = unsafe { process::RunningThread::from_ptr(&mut t) };
+        let mut f = frame_with(16, 0);
+        let action = apply_syscall_outcome(outcome, &mut r, &mut f, 0x2_2000_0400);
+        assert_eq!(action, ShimAction::Yield(ThreadState::Suspended));
+    }
+    assert_eq!(common::view(&t).wake_time(), usize::MAX);
     assert!(
         t.handle.is_none(),
         "no Arc'd handle on the on-thread completion path"
@@ -116,7 +112,7 @@ fn block_empty_recheck_drain_cancels_park() {
     hw.stdin_ready
         .insert(PID, vec![Vec::new(), b"x42!".to_vec()]);
 
-    let outcome = syscall::read_stdin(&mut t, &frame, &mut hw);
+    let outcome = syscall::read_stdin(common::view(&t), &frame, &mut hw);
 
     assert_eq!(outcome, ready(4));
     assert!(t.handle.is_none(), "park cancelled before yield");
@@ -134,7 +130,7 @@ fn park_failure_returns_ebusy() {
     let mut hw = FakeHw::default();
     hw.stdin_park_ok = false;
 
-    let outcome = syscall::read_stdin(&mut t, &frame, &mut hw);
+    let outcome = syscall::read_stdin(common::view(&t), &frame, &mut hw);
 
     assert_eq!(outcome, ready(Errno::new(EBUSY).to_ret()));
     assert!(t.handle.is_none());
@@ -151,7 +147,7 @@ fn bad_user_va_returns_efault() {
         ..Default::default()
     };
 
-    let outcome = syscall::read_stdin(&mut t, &frame, &mut hw);
+    let outcome = syscall::read_stdin(common::view(&t), &frame, &mut hw);
 
     assert_eq!(outcome, ready(Errno::new(EFAULT).to_ret()));
     assert!(hw.stdin_drain_writes.is_empty(), "no drain on EFAULT");
@@ -164,7 +160,7 @@ fn len_zero_returns_einval() {
     let frame = frame_with(0, 0);
     let mut hw = FakeHw::default();
 
-    let outcome = syscall::read_stdin(&mut t, &frame, &mut hw);
+    let outcome = syscall::read_stdin(common::view(&t), &frame, &mut hw);
 
     assert_eq!(outcome, ready(Errno::new(EINVAL).to_ret()));
 }
@@ -176,7 +172,7 @@ fn len_above_page_returns_einval() {
     let frame = frame_with(PAGE_SIZE + 1, 0);
     let mut hw = FakeHw::default();
 
-    let outcome = syscall::read_stdin(&mut t, &frame, &mut hw);
+    let outcome = syscall::read_stdin(common::view(&t), &frame, &mut hw);
 
     assert_eq!(outcome, ready(Errno::new(EINVAL).to_ret()));
 }
@@ -189,7 +185,7 @@ fn rejects_kernel_vaddr() {
     frame.regs[11] = 0xFFFF_FFC0_0000_0000;
     let mut hw = FakeHw::default();
 
-    let outcome = syscall::read_stdin(&mut t, &frame, &mut hw);
+    let outcome = syscall::read_stdin(common::view(&t), &frame, &mut hw);
 
     assert_eq!(outcome, ready(Errno::new(EFAULT).to_ret()));
     assert!(
@@ -207,7 +203,7 @@ fn rejects_null_guard_vaddr() {
     frame.regs[11] = 0x0;
     let mut hw = FakeHw::default();
 
-    let outcome = syscall::read_stdin(&mut t, &frame, &mut hw);
+    let outcome = syscall::read_stdin(common::view(&t), &frame, &mut hw);
 
     assert_eq!(outcome, ready(Errno::new(EFAULT).to_ret()));
     assert!(hw.stdin_drain_writes.is_empty());
@@ -223,27 +219,28 @@ fn yield_retry_keeps_pc_so_resume_re_executes_ecall() {
     const ECALL_EPC: usize = 0x2_2000_0400;
     let mut t = make_thread(ThreadState::Running, SPP::User);
     t.pid = PID;
-    use std::sync::atomic::Ordering;
-    t.pc.store(ECALL_EPC, Ordering::Release);
+    let mut r = unsafe { process::RunningThread::from_ptr(&mut t) };
+    r.set_pc(ECALL_EPC);
     let mut frame = frame_with(16, 0);
     // Spy: stash a synthetic syscall number into a0 so we can
     // confirm the snapshot preserves it.
     frame.regs[10] = 0xDEAD_BEEF;
     let mut hw = FakeHw::default();
 
-    let outcome = syscall::read_stdin(&mut t, &frame, &mut hw);
-    let action = apply_syscall_outcome(outcome, &mut t, &mut frame, ECALL_EPC);
+    let outcome = syscall::read_stdin(r.view(), &frame, &mut hw);
+    let action = apply_syscall_outcome(outcome, &mut r, &mut frame, ECALL_EPC);
 
     assert_eq!(action, ShimAction::Yield(ThreadState::Suspended));
     assert_eq!(
-        t.pc.load(Ordering::Acquire),
+        r.view().pc(),
         ECALL_EPC,
         "park-and-retry must keep pc at the ecall"
     );
     assert_eq!(
-        t.frame.regs[10], 0xDEAD_BEEF,
+        r.frame_reg(10),
+        0xDEAD_BEEF,
         "syscall number snapshot preserved"
     );
-    assert_eq!(t.frame.regs[11], UVA as usize, "buf ptr snapshot preserved");
-    assert_eq!(t.frame.regs[12], 16, "len snapshot preserved");
+    assert_eq!(r.frame_reg(11), UVA as usize, "buf ptr snapshot preserved");
+    assert_eq!(r.frame_reg(12), 16, "len snapshot preserved");
 }

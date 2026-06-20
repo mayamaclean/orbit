@@ -29,15 +29,10 @@
 //!    seed `bucket_enter_tick` with `now()`. The first `switch_bucket`
 //!    then computes a sane elapsed.
 
-use core::sync::atomic::Ordering;
-
 use device::HartContext;
 use orbit_abi::Sysno;
-use process::Thread;
 
 pub use orbit_core::accounting::{HartBucket, SyscallSlot};
-
-use crate::kernel::shootdown::CPU_COUNT;
 
 /// Indexed by [`Sysno::ordinal`] — append-only, sized by
 /// [`Sysno::COUNT`]. The kmain side owns the global histogram so that
@@ -152,10 +147,10 @@ pub fn switch_bucket(hart: &HartContext, new: HartBucket) {
 /// the thread, the parked window is excluded because the bracket
 /// closes before the manager unparks.
 #[inline]
-pub fn record_syscall(syscall: usize, thread: &Thread, start_ticks: u64) {
+pub fn record_syscall(syscall: usize, running: &process::RunningThread, start_ticks: u64) {
     let now = riscv::register::time::read64();
     let slot = Sysno::from_usize(syscall).map(|s| &SYSCALL_STATS[s.ordinal()]);
-    orbit_core::accounting::record_syscall(slot, thread, start_ticks, now);
+    orbit_core::accounting::record_syscall(slot, running, start_ticks, now);
 }
 
 /// Iterator over every hart's `HartContext`. Computed from the
@@ -165,24 +160,9 @@ pub fn record_syscall(syscall: usize, thread: &Thread, start_ticks: u64) {
 /// [`CPU_COUNT`]; returns an empty iterator if it hasn't been
 /// published yet (early boot).
 pub fn for_each_hart_context(mut visit: impl FnMut(&HartContext)) {
-    let count = CPU_COUNT.load(Ordering::Acquire);
-    if count == 0 {
-        return;
-    }
-    let here = riscv::register::sscratch::read() as *const HartContext;
-    if here.is_null() {
-        return;
-    }
-    // SAFETY: `here` is this hart's context pointer published at boot;
-    // dereferencing for `hart_id` is the same access pattern every
-    // syscall handler uses. The array is contiguous in kpages and
-    // outlives the kernel.
-    let here_id = unsafe { (*here).hart_id } as usize;
-    let base = unsafe { here.sub(here_id) };
-    for i in 0..count {
-        // SAFETY: `base..base + count` is bounded by `CPU_COUNT` and
-        // matches the allocation in `bin/orbit.rs::rust_main`.
-        let h: &HartContext = unsafe { &*base.add(i) };
+    // Centralized boot-array walk (the `sscratch - hart_id` computation +
+    // the `CPU_COUNT` bound live in one place now).
+    for h in crate::kernel::context::hart_contexts() {
         visit(h);
     }
 }

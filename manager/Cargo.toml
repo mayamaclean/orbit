@@ -1,0 +1,28 @@
+[package]
+name = "manager"
+version = "0.1.0"
+edition = "2024"
+
+# The scheduling/registry crate, extracted from kmain's `Orbit` god-struct
+# (Phase D). Owns the thread registry, ready queue + sleep heap routing,
+# wake/resume coordination, and the wake-queue statics. Sits ABOVE
+# orbit-core in the DAG: process <- orbit-core <- manager <- kmain.
+# no_std lib; built as a dep of kmain (inherits its build-std), and the
+# miri target for Phase E.
+[dependencies]
+process    = { path = "../process" }
+orbit-core = { path = "../orbit-core" }
+orbit-abi  = { path = "../orbit-abi", features = ["kernel-policy"] }
+mmu        = { path = "../mmu" }
+# SPP / privilege-mode types only; no CSR touches (compiles on host).
+riscv      = { version = "0.16.0", features = ["rt"] }
+# Static MPSC rings — the wake/sleep/manager-work queues. Same pin as
+# kmain + orbit-core so the queue type is shared across the boundary.
+thingbuf   = { version = "0.1.6", default-features = false, features = ["static", "alloc"] }
+tracing    = { version = "0.1.44", default-features = false, features = [] }
+
+[dev-dependencies]
+# Host scheduling tests build `Thread` fixtures, which need the trap-frame /
+# stack types. `device` isn't a runtime dep of the manager (it touches no
+# hardware), only the test fixtures.
+device = { path = "../device" }

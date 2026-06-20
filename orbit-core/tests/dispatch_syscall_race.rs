@@ -23,7 +23,8 @@ use std::ptr::null_mut;
 use std::sync::atomic::{AtomicPtr, Ordering};
 use std::thread;
 
-use process::{Thread, ThreadState};
+use device::TrapFrame;
+use process::{RunningThread, Thread, ThreadState};
 use riscv::register::sstatus::SPP;
 
 use orbit_core::{ShimAction, SyscallOutcome, apply_syscall_outcome};
@@ -42,16 +43,20 @@ unsafe fn dispatch_against_slot(slot: &AtomicPtr<()>, epc: usize) -> Option<Shim
     if p.is_null() {
         return None;
     }
-    let thread = unsafe { &mut *(p as *mut Thread) };
-    // Frame stays local to the trap — use the thread's own as the
-    // trap-entry snapshot for this fixture.
-    let mut frame = *thread.frame;
+    // SAFETY: the slot holds a live, boxed Thread for the test's
+    // duration; this fixture is the one place we model "the hart's
+    // current ptr" so minting the own-hart cap is the faithful analog.
+    let mut r = unsafe { RunningThread::from_ptr(p as *mut Thread) };
+    // The fixture only asserts pc/state, so a blank trap-entry frame is
+    // sufficient (the gate-reject paths don't write it; the commit path
+    // snapshots it but no test inspects the snapshot here).
+    let mut frame = TrapFrame::empty();
+    // A Suspended park (resumes with ret 0, pc advanced). The fixture
+    // models a generic U-ecall whose outcome the gate must reject when
+    // `current` was retargeted to a kthread.
     Some(apply_syscall_outcome(
-        SyscallOutcome::Yield {
-            state: ThreadState::Suspended,
-            ret: Some(0),
-        },
-        thread,
+        SyscallOutcome::SleepUntil { deadline: 0 },
+        &mut r,
         &mut frame,
         epc,
     ))
@@ -60,8 +65,8 @@ unsafe fn dispatch_against_slot(slot: &AtomicPtr<()>, epc: usize) -> Option<Shim
 #[test]
 fn user_thread_in_slot_commits_normally() {
     let user = Box::into_raw(Box::new({
-        let t = make_thread(ThreadState::Running, SPP::User);
-        t.pc.store(USER_PC, Ordering::Release);
+        let mut t = make_thread(ThreadState::Running, SPP::User);
+        unsafe { RunningThread::from_ptr(&mut t) }.set_pc(USER_PC);
         t
     }));
 
@@ -71,7 +76,7 @@ fn user_thread_in_slot_commits_normally() {
 
     let user_ref = unsafe { &*user };
     assert_eq!(action, Some(ShimAction::Yield(ThreadState::Suspended)));
-    assert_eq!(user_ref.pc.load(Ordering::Acquire), ECALL_EPC + 4);
+    assert_eq!(user_ref.pc_load(Ordering::Acquire), ECALL_EPC + 4);
 
     unsafe { drop(Box::from_raw(user)) };
 }
@@ -84,7 +89,7 @@ fn slot_retargeted_to_kthread_does_not_corrupt() {
     // ECALL_EPC+4 into the kthread's pc.
     let kthread = Box::into_raw(Box::new({
         let mut t = make_thread(ThreadState::Running, SPP::Supervisor);
-        t.pc.store(KTHREAD_PC, Ordering::Release);
+        unsafe { RunningThread::from_ptr(&mut t) }.set_pc(KTHREAD_PC);
         t.tid = 1; // matches the QEMU repro: knet was tid=1
         t
     }));
@@ -98,12 +103,12 @@ fn slot_retargeted_to_kthread_does_not_corrupt() {
     assert_eq!(action, Some(ShimAction::Resume));
     let kthread_ref = unsafe { &*kthread };
     assert_eq!(
-        kthread_ref.pc.load(Ordering::Acquire),
+        kthread_ref.pc_load(Ordering::Acquire),
         KTHREAD_PC,
         "kthread.pc must not be stamped with a user epc",
     );
     assert_eq!(
-        kthread_ref.state.load(Ordering::Acquire),
+        kthread_ref.state_load(Ordering::Acquire),
         ThreadState::Running as usize,
         "kthread.state must not transition to Suspended via the spurious Yield",
     );
@@ -121,13 +126,13 @@ fn concurrent_retarget_never_corrupts_kthread() {
     const ITERS: usize = 200;
 
     let user = Box::into_raw(Box::new({
-        let t = make_thread(ThreadState::Running, SPP::User);
-        t.pc.store(USER_PC, Ordering::Release);
+        let mut t = make_thread(ThreadState::Running, SPP::User);
+        unsafe { RunningThread::from_ptr(&mut t) }.set_pc(USER_PC);
         t
     }));
     let kthread = Box::into_raw(Box::new({
-        let t = make_thread(ThreadState::Running, SPP::Supervisor);
-        t.pc.store(KTHREAD_PC, Ordering::Release);
+        let mut t = make_thread(ThreadState::Running, SPP::Supervisor);
+        unsafe { RunningThread::from_ptr(&mut t) }.set_pc(KTHREAD_PC);
         t
     }));
 
@@ -184,12 +189,12 @@ fn concurrent_retarget_never_corrupts_kthread() {
     // kthread.pc must equal KTHREAD_PC unchanged.
     let kthread_ref = unsafe { &*kthread };
     assert_eq!(
-        kthread_ref.pc.load(Ordering::Acquire),
+        kthread_ref.pc_load(Ordering::Acquire),
         KTHREAD_PC,
         "kthread.pc must be untouched after {ITERS} contended dispatch passes",
     );
     assert_eq!(
-        kthread_ref.state.load(Ordering::Acquire),
+        kthread_ref.state_load(Ordering::Acquire),
         ThreadState::Running as usize,
     );
 

@@ -3,6 +3,8 @@
 //! Zero-sized; constructed on demand at each syscall entry. Methods route
 //! to the real CSRs / MMIO sites.
 
+use core::time::Duration;
+
 use mmu::PAGE_SIZE;
 use mmu::sv48::{PhysAddr, VirtAddr};
 use orbit_abi::layout::UserVa;
@@ -44,12 +46,13 @@ impl Hardware for RiscvHardware {
     }
 
     fn serial_write_user(&mut self, pid: u16, tid: u32, text: &str) -> Result<(), ()> {
-        // `{t}t USER[pid.tid]: {text}` matches the tracing-subscriber
+        // `{t}s USER[pid.tid]: {text}` matches the tracing-subscriber
         // layout used by kernel info!/debug! lines — keeps user output
         // visually aligned with kernel logs in the smoke/debug streams.
+        let nanos = riscv::register::time::read64() * 100;
         crate::serialln!(
-            "{}t USER[{}.{}]: {text}",
-            riscv::register::time::read64(),
+            "{:.08}s USER[{}.{}]: {text}",
+            Duration::from_nanos(nanos).as_secs_f64(),
             pid,
             tid
         );
@@ -67,9 +70,10 @@ impl Hardware for RiscvHardware {
             // Framebuffer path not live — fall back to the serial
             // back-channel so the bytes aren't silently dropped.
             if let Ok(s) = core::str::from_utf8(bytes) {
+                let nanos = riscv::register::time::read64() * 100;
                 crate::serialln!(
-                    "{}t USER[{}]: {}",
-                    riscv::register::time::read64(),
+                    "{:.08}s USER[{}]: {}",
+                    Duration::from_nanos(nanos).as_secs_f64(),
                     dest_pid,
                     s
                 );

@@ -25,14 +25,11 @@ fn set_affinity_narrows_within_cap() {
     let mut f = make_frame();
     f.regs[11] = 0b0010;
 
-    let outcome = syscall::set_affinity(&t, &f);
+    let outcome = syscall::set_affinity(&common::running(&mut t), &f);
 
     assert_eq!(
         outcome,
-        SyscallOutcome::Yield {
-            state: ThreadState::Ready,
-            ret: Some(0)
-        }
+        SyscallOutcome::DoneReschedule { ret: 0 }
     );
     assert_eq!(t.affinity.load(Ordering::Acquire), 0b0010);
     // Cap is immutable.
@@ -48,14 +45,11 @@ fn set_affinity_zero_mask_is_einval() {
     let mut f = make_frame();
     f.regs[11] = 0;
 
-    let outcome = syscall::set_affinity(&t, &f);
+    let outcome = syscall::set_affinity(&common::running(&mut t), &f);
 
     assert_eq!(
         outcome,
-        SyscallOutcome::Yield {
-            state: ThreadState::Ready,
-            ret: Some(Errno::new(EINVAL).to_ret())
-        }
+        SyscallOutcome::DoneReschedule { ret: Errno::new(EINVAL).to_ret() }
     );
     // Reject path leaves the mask untouched — checked via the cap-immutable
     // semantics of allowed_affinity and the unchanged current value.
@@ -71,14 +65,11 @@ fn set_affinity_outside_allowed_is_eperm() {
     let mut f = make_frame();
     f.regs[11] = 0b0100; // bit outside the cap
 
-    let outcome = syscall::set_affinity(&t, &f);
+    let outcome = syscall::set_affinity(&common::running(&mut t), &f);
 
     assert_eq!(
         outcome,
-        SyscallOutcome::Yield {
-            state: ThreadState::Ready,
-            ret: Some(Errno::new(EPERM).to_ret())
-        }
+        SyscallOutcome::DoneReschedule { ret: Errno::new(EPERM).to_ret() }
     );
     assert_eq!(t.affinity.load(Ordering::Acquire), 0b0001);
 }
@@ -94,14 +85,11 @@ fn set_affinity_partial_overlap_outside_cap_is_eperm() {
     let mut f = make_frame();
     f.regs[11] = 0b0111; // bits 0,1 in cap; bit 2 outside
 
-    let outcome = syscall::set_affinity(&t, &f);
+    let outcome = syscall::set_affinity(&common::running(&mut t), &f);
 
     assert_eq!(
         outcome,
-        SyscallOutcome::Yield {
-            state: ThreadState::Ready,
-            ret: Some(Errno::new(EPERM).to_ret())
-        }
+        SyscallOutcome::DoneReschedule { ret: Errno::new(EPERM).to_ret() }
     );
 }
 
@@ -114,14 +102,11 @@ fn set_affinity_to_full_cap_is_ok() {
     let mut f = make_frame();
     f.regs[11] = 0b0011;
 
-    let outcome = syscall::set_affinity(&t, &f);
+    let outcome = syscall::set_affinity(&common::running(&mut t), &f);
 
     assert_eq!(
         outcome,
-        SyscallOutcome::Yield {
-            state: ThreadState::Ready,
-            ret: Some(0)
-        }
+        SyscallOutcome::DoneReschedule { ret: 0 }
     );
     assert_eq!(t.affinity.load(Ordering::Acquire), 0b0011);
 }
@@ -132,7 +117,7 @@ fn get_affinity_returns_current_and_allowed_in_a0_a1() {
     t.allowed_affinity = 0b1111;
     t.affinity = AtomicU64::new(0b0010);
 
-    let outcome = syscall::get_affinity(&t);
+    let outcome = syscall::get_affinity(common::view(&t));
 
     assert_eq!(
         outcome,
@@ -149,7 +134,7 @@ fn get_affinity_does_not_mutate() {
     t.allowed_affinity = 0b0101;
     t.affinity = AtomicU64::new(0b0100);
 
-    let _ = syscall::get_affinity(&t);
+    let _ = syscall::get_affinity(common::view(&t));
 
     assert_eq!(t.affinity.load(Ordering::Acquire), 0b0100);
     assert_eq!(t.allowed_affinity, 0b0101);

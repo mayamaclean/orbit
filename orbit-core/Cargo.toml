@@ -17,3 +17,9 @@ mmu = { path = "../mmu" }
 # pure-logic protocol and the live kernel impl.
 thingbuf  = { version = "0.1.6", default-features = false, features = ["static", "alloc"] }
 tracing = { version = "0.1.44", default-features = false, features = [] }
+
+[dev-dependencies]
+# Test fixtures fabricate arbitrary thread states via
+# `Thread::transition_to_unchecked`, gated behind this feature so it never
+# compiles into the kernel. Only the test/bench build pulls it in.
+process = { path = "../process", features = ["test-helpers"] }

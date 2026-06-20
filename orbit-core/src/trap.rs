@@ -4,10 +4,8 @@
 //! decides what to do. Pure logic; the shim handles the null-current and
 //! `enter_hart_context` plumbing around them.
 
-use core::sync::atomic::Ordering;
-
 use device::TrapFrame;
-use process::{Thread, ThreadState};
+use process::{RunningThread, ThreadState};
 use riscv::register::sstatus::SPP;
 
 /// Mirror of the kmain `update_thread_and_trap_frame` body.
@@ -22,24 +20,27 @@ use riscv::register::sstatus::SPP;
 /// `enter_hart_context_asm`). In that case `epc` points into kernel
 /// `.text` and saving it as `thread.pc` would break `sret` on resume —
 /// see [docs/trap-mode-guard.md](../../docs/trap-mode-guard.md).
-pub fn update_trap_frame(thread: &mut Thread, epc: usize, frame: &mut TrapFrame, from_user: bool) {
-    frame.asid = thread.pid as usize;
+pub fn update_trap_frame(
+    running: &mut RunningThread,
+    epc: usize,
+    frame: &mut TrapFrame,
+    from_user: bool,
+) {
+    let view = running.view();
+    frame.asid = view.pid() as usize;
 
-    let trap_was_in_thread = (thread.mode == SPP::User) == from_user;
+    let trap_was_in_thread = (view.mode() == SPP::User) == from_user;
     if !trap_was_in_thread {
         return;
     }
 
-    let state = thread.state.load(Ordering::Acquire);
+    let state = view.state();
     if state == ThreadState::Running as usize
         || state == ThreadState::Suspended as usize
         || state == ThreadState::Blocking as usize
     {
-        // Mutable access through the Thread owner so we satisfy Stacked
-        // Borrows: writing through `thread.frame as *const ... as *mut`
-        // when `thread: &Thread` is UB (the reborrow was SharedReadOnly
-        // but we write through it).
-        *thread.frame = *frame;
-        thread.pc.store(epc, Ordering::Release);
+        // Own-hart frame/pc snapshot — the sealed write flows through the
+        // capability, which is sound because the hart owns this thread.
+        running.save_trap_frame(frame, epc);
     }
 }

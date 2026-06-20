@@ -25,12 +25,11 @@
 //! `VecDeque` — no atomics, no contention concerns inside the type.
 
 use alloc::collections::VecDeque;
-use core::sync::atomic::Ordering;
 
-use process::Thread;
+use process::{Runnable, Thread};
 
 pub struct ReadyQueue {
-    inner: VecDeque<*mut Thread>,
+    inner: VecDeque<Runnable>,
 }
 
 impl ReadyQueue {
@@ -40,32 +39,46 @@ impl ReadyQueue {
         }
     }
 
-    /// Append a thread to the back of the queue. Caller has ensured
-    /// `state == Ready` and that this exact pointer isn't already
-    /// queued (double-queue would let `pop_for` hand the same thread
-    /// out twice in one pass — distinct-pointer contract violation).
-    pub fn push(&mut self, thread: *mut Thread) {
-        self.inner.push_back(thread);
+    /// Append a runnable thread to the back of the queue. The
+    /// [`Runnable`] token is the proof that the thread's frame was
+    /// marshaled under a won claim (or is a fresh `Ready` thread) — so
+    /// "enqueue for dispatch" is welded to "the frame is valid"
+    /// (**bug 4**, by construction). The queue now *stores* the move-only
+    /// token (not a bare `*mut Thread`), so the distinct-dispatch-right
+    /// invariant is held by the type for as long as the thread is queued:
+    /// a non-`Clone` `Runnable` can't be duplicated into two slots, and
+    /// the raw ptr is only re-materialized at the dispatch pop
+    /// ([`Self::pop_for`] → [`Runnable::into_raw`]).
+    pub fn push(&mut self, runnable: Runnable) {
+        self.inner.push_back(runnable);
     }
 
     /// Pop the oldest thread whose `affinity & hart_mask != 0`, leaving
-    /// non-matching entries in their slots. Returns `None` if no entry
-    /// matches.
+    /// non-matching entries in their slots. Returns the raw `*mut Thread`
+    /// for the dispatch seam (stored into the hart's `current`); `None` if
+    /// no entry matches.
     ///
     /// Order-preserving: entries skipped due to affinity stay where
     /// they are, so a later call with a different mask still picks
     /// them up in original push order.
     pub fn pop_for(&mut self, hart_mask: u64) -> Option<*mut Thread> {
-        // SAFETY: each pointer was supplied by a producer that owned
-        // the Thread allocation through the kernel registry. The
-        // registry only frees from `cleanup_threads_and_processes`,
-        // which runs on the manager hart in the same critical
-        // section as queue mutation — no use-after-free window.
+        // The affinity read goes through `Runnable::affinity` (which
+        // dereferences the live registry Thread); the registry only frees
+        // from `cleanup_threads_and_processes`, on the manager hart in the
+        // same critical section as queue mutation — no use-after-free.
         let idx = self
             .inner
             .iter()
-            .position(|&t| unsafe { (*t).affinity.load(Ordering::Relaxed) & hart_mask != 0 })?;
-        self.inner.remove(idx)
+            .position(|r| r.affinity() & hart_mask != 0)?;
+        self.inner.remove(idx).map(Runnable::into_raw)
+    }
+
+    /// Drop any queued token targeting `thread`. Called from the reap
+    /// path so a freed `Thread` leaves no dispatchable entry behind (which
+    /// would otherwise be popped and run as a use-after-free). A reaped
+    /// thread is `Exited`, so it has no business being dispatched.
+    pub fn remove_thread(&mut self, thread: *mut Thread) {
+        self.inner.retain(|r| !r.points_to(thread));
     }
 
     pub fn len(&self) -> usize {

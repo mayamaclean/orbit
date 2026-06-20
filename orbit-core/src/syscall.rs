@@ -6,7 +6,7 @@
 use device::TrapFrame;
 use mmu::PagePermissions;
 use orbit_abi::layout::UserVa;
-use process::{Thread, ThreadState};
+use process::{RunningThread, ThreadView};
 
 use orbit_abi::errno::{EAGAIN, EBUSY, EFAULT, EINVAL, EIO, ENAMETOOLONG, EPERM, Errno};
 use orbit_abi::layout::{user_priv_range_ok, user_range_ok, user_shared_range_ok};
@@ -50,21 +50,19 @@ fn struct_fits_in_one_page(vaddr: usize, size: usize) -> bool {
 /// into `Suspended`. The wake loop in the manager compares
 /// `now_ticks() >= thread.wake_time` to decide when to mark the thread
 /// runnable again.
-pub fn ms_sleep<H: Hardware>(thread: &mut Thread, ms: usize, hw: &H) -> SyscallOutcome {
+pub fn ms_sleep<H: Hardware>(_thread: ThreadView<'_>, ms: usize, hw: &H) -> SyscallOutcome {
     if ms >= MAX_SLEEP_MS {
         return SyscallOutcome::Return {
             ret: Errno::new(EINVAL).to_ret(),
         };
     }
 
-    let wake_time =
+    let deadline =
         (hw.now_ticks() as usize).wrapping_add(ms.wrapping_mul(hw.ticks_per_ms() as usize));
-    thread.wake_time = wake_time;
-
-    SyscallOutcome::Yield {
-        state: ThreadState::Suspended,
-        ret: Some(0),
-    }
+    // `apply` stamps `wake_time = deadline` when it commits the park, so
+    // the deadline travels with the park decision (phase-C closure)
+    // rather than being written onto the thread here.
+    SyscallOutcome::SleepUntil { deadline }
 }
 
 /// `mmap(vaddr, size, perms, share_with_kernel)` — park the thread on a
@@ -76,7 +74,7 @@ pub fn ms_sleep<H: Hardware>(thread: &mut Thread, ms: usize, hw: &H) -> SyscallO
 ///
 /// Returns `-EAGAIN` if the work ring is full so the caller can retry
 /// — same convention as `console_write`.
-pub fn mmap_req<H: Hardware>(thread: &mut Thread, frame: &TrapFrame, hw: &mut H) -> SyscallOutcome {
+pub fn mmap_req<H: Hardware>(thread: ThreadView<'_>, frame: &TrapFrame, hw: &mut H) -> SyscallOutcome {
     let Ok(vaddr) = UserVa::new(frame.regs[11] as u64)
     else {
         return SyscallOutcome::Return {
@@ -123,19 +121,16 @@ pub fn mmap_req<H: Hardware>(thread: &mut Thread, frame: &TrapFrame, hw: &mut H)
 
     let work = PendingWork::MemMap {
         req,
-        pid: thread.pid,
+        pid: thread.pid(),
         root_pa: thread.root_table_addr(),
-        tid: thread.tid,
+        tid: thread.tid(),
     };
     if hw.push_pending_work(work).is_err() {
         return SyscallOutcome::Return {
             ret: Errno::new(EAGAIN).to_ret(),
         };
     }
-    SyscallOutcome::Yield {
-        state: ThreadState::Blocking,
-        ret: None,
-    }
+    SyscallOutcome::ParkForPublish
 }
 
 /// `fb_surface_create(w, h, format)` — park the calling thread on a
@@ -149,7 +144,7 @@ pub fn mmap_req<H: Hardware>(thread: &mut Thread, frame: &TrapFrame, hw: &mut H)
 /// allocator/mapper validates again — but we cheaply reject obviously
 /// bad input (zero dims, unknown format) before queueing manager work.
 pub fn fb_surface_create_req<H: Hardware>(
-    thread: &mut Thread,
+    thread: ThreadView<'_>,
     frame: &TrapFrame,
     hw: &mut H,
 ) -> SyscallOutcome {
@@ -190,19 +185,16 @@ pub fn fb_surface_create_req<H: Hardware>(
     };
     let work = PendingWork::FbSurfaceCreate {
         req,
-        pid: thread.pid,
+        pid: thread.pid(),
         root_pa: thread.root_table_addr(),
-        tid: thread.tid,
+        tid: thread.tid(),
     };
     if hw.push_pending_work(work).is_err() {
         return SyscallOutcome::Return {
             ret: Errno::new(EAGAIN).to_ret(),
         };
     }
-    SyscallOutcome::Yield {
-        state: ThreadState::Blocking,
-        ret: None,
-    }
+    SyscallOutcome::ParkForPublish
 }
 
 /// `eventfd(vaddr_hint, initval, flags)` — park the caller and queue
@@ -211,11 +203,7 @@ pub fn fb_surface_create_req<H: Hardware>(
 /// header in-place, maps it user-RW + SharedRevocable at `vaddr_hint`,
 /// and inserts a `Handle::EventFd` slot. Resumes via `signal_pair`
 /// → `(vaddr, fd)`.
-pub fn eventfd_req<H: Hardware>(
-    thread: &mut Thread,
-    frame: &TrapFrame,
-    hw: &mut H,
-) -> SyscallOutcome {
+pub fn eventfd_req<H: Hardware>(thread: ThreadView<'_>, frame: &TrapFrame, hw: &mut H) -> SyscallOutcome {
     let vaddr_hint_raw = frame.regs[11] as u64;
     let initval = frame.regs[12] as u64;
     let flags = frame.regs[13] as u32;
@@ -251,19 +239,16 @@ pub fn eventfd_req<H: Hardware>(
     };
     let work = PendingWork::EventFdCreate {
         req,
-        pid: thread.pid,
+        pid: thread.pid(),
         root_pa: thread.root_table_addr(),
-        tid: thread.tid,
+        tid: thread.tid(),
     };
     if hw.push_pending_work(work).is_err() {
         return SyscallOutcome::Return {
             ret: Errno::new(EAGAIN).to_ret(),
         };
     }
-    SyscallOutcome::Yield {
-        state: ThreadState::Blocking,
-        ret: None,
-    }
+    SyscallOutcome::ParkForPublish
 }
 
 /// `wake_tid(target_tid)` — push a `WakeEvent::Tid(target_tid)` once
@@ -274,29 +259,22 @@ pub fn eventfd_req<H: Hardware>(
 /// `target_tid == 0` (the sentinel "no reader parked") is a no-op
 /// returning `0` synchronously without traversing the manager queue,
 /// since EventFd writers use it as a fast-path skip.
-pub fn wake_tid_req<H: Hardware>(
-    thread: &mut Thread,
-    frame: &TrapFrame,
-    hw: &mut H,
-) -> SyscallOutcome {
+pub fn wake_tid_req<H: Hardware>(thread: ThreadView<'_>, frame: &TrapFrame, hw: &mut H) -> SyscallOutcome {
     let target_tid = frame.regs[11] as u32;
     if target_tid == 0 {
         return SyscallOutcome::Return { ret: 0 };
     }
     let work = PendingWork::WakeTid {
         req: WakeTidReq { target_tid },
-        pid: thread.pid,
-        tid: thread.tid,
+        pid: thread.pid(),
+        tid: thread.tid(),
     };
     if hw.push_pending_work(work).is_err() {
         return SyscallOutcome::Return {
             ret: Errno::new(EAGAIN).to_ret(),
         };
     }
-    SyscallOutcome::Yield {
-        state: ThreadState::Blocking,
-        ret: None,
-    }
+    SyscallOutcome::ParkForPublish
 }
 
 /// Push `work` and park the caller `Blocking`, or return `-EAGAIN`
@@ -310,20 +288,13 @@ fn park_on_manager<H: Hardware>(hw: &mut H, work: PendingWork) -> SyscallOutcome
             ret: Errno::new(EAGAIN).to_ret(),
         };
     }
-    SyscallOutcome::Yield {
-        state: ThreadState::Blocking,
-        ret: None,
-    }
+    SyscallOutcome::ParkForPublish
 }
 
 /// `fs_seek(fd, offset, whence) → new_offset | -errno`. Queues
 /// [`PendingWork::FsSeek`]; the manager owns `OpenFile.offset`.
 /// Bad `whence` fails sync — no point round-tripping it.
-pub fn fs_seek_req<H: Hardware>(
-    thread: &mut Thread,
-    frame: &TrapFrame,
-    hw: &mut H,
-) -> SyscallOutcome {
+pub fn fs_seek_req<H: Hardware>(thread: ThreadView<'_>, frame: &TrapFrame, hw: &mut H) -> SyscallOutcome {
     let whence = frame.regs[13] as u32;
     if whence > 2 {
         return SyscallOutcome::Return {
@@ -339,19 +310,15 @@ pub fn fs_seek_req<H: Hardware>(
         hw,
         PendingWork::FsSeek {
             req,
-            pid: thread.pid,
-            tid: thread.tid,
+            pid: thread.pid(),
+            tid: thread.tid(),
         },
     )
 }
 
 /// `fs_fstat(fd, &mut Stat) → 0 | -errno`. Queues
 /// [`PendingWork::FsFstat`] after bounding the out-buffer.
-pub fn fs_fstat_req<H: Hardware>(
-    thread: &mut Thread,
-    frame: &TrapFrame,
-    hw: &mut H,
-) -> SyscallOutcome {
+pub fn fs_fstat_req<H: Hardware>(thread: ThreadView<'_>, frame: &TrapFrame, hw: &mut H) -> SyscallOutcome {
     let Ok(stat_vaddr) = UserVa::new(frame.regs[12] as u64)
     else {
         return SyscallOutcome::Return {
@@ -372,9 +339,9 @@ pub fn fs_fstat_req<H: Hardware>(
         hw,
         PendingWork::FsFstat {
             req,
-            pid: thread.pid,
+            pid: thread.pid(),
             root_pa: thread.root_table_addr(),
-            tid: thread.tid,
+            tid: thread.tid(),
         },
     )
 }
@@ -384,7 +351,7 @@ pub fn fs_fstat_req<H: Hardware>(
 /// (single-`UserPageWindow` constraint) — rejected sync with EINVAL,
 /// same contract as before the conversion.
 pub fn ch_inspect_req<H: Hardware>(
-    thread: &mut Thread,
+    thread: ThreadView<'_>,
     frame: &TrapFrame,
     hw: &mut H,
 ) -> SyscallOutcome {
@@ -413,9 +380,9 @@ pub fn ch_inspect_req<H: Hardware>(
         hw,
         PendingWork::ChInspect {
             req,
-            pid: thread.pid,
+            pid: thread.pid(),
             root_pa: thread.root_table_addr(),
-            tid: thread.tid,
+            tid: thread.tid(),
         },
     )
 }
@@ -423,11 +390,7 @@ pub fn ch_inspect_req<H: Hardware>(
 /// `chdir(path_ptr, path_len) → 0 | -errno`. Queues
 /// [`PendingWork::Chdir`]; manager validates the dir exists before
 /// mutating `Process.cwd`.
-pub fn chdir_req<H: Hardware>(
-    thread: &mut Thread,
-    frame: &TrapFrame,
-    hw: &mut H,
-) -> SyscallOutcome {
+pub fn chdir_req<H: Hardware>(thread: ThreadView<'_>, frame: &TrapFrame, hw: &mut H) -> SyscallOutcome {
     let path_len = frame.regs[12];
     if path_len == 0 {
         return SyscallOutcome::Return {
@@ -457,20 +420,16 @@ pub fn chdir_req<H: Hardware>(
                 path_vaddr,
                 path_len,
             },
-            pid: thread.pid,
+            pid: thread.pid(),
             root_pa: thread.root_table_addr(),
-            tid: thread.tid,
+            tid: thread.tid(),
         },
     )
 }
 
 /// `getcwd(buf_ptr, buf_len) → bytes | -errno`. Queues
 /// [`PendingWork::GetCwd`].
-pub fn getcwd_req<H: Hardware>(
-    thread: &mut Thread,
-    frame: &TrapFrame,
-    hw: &mut H,
-) -> SyscallOutcome {
+pub fn getcwd_req<H: Hardware>(thread: ThreadView<'_>, frame: &TrapFrame, hw: &mut H) -> SyscallOutcome {
     let buf_len = frame.regs[12];
     if buf_len == 0 || buf_len > PAGE_SIZE {
         return SyscallOutcome::Return {
@@ -492,9 +451,9 @@ pub fn getcwd_req<H: Hardware>(
         hw,
         PendingWork::GetCwd {
             req: GetCwdReq { buf_vaddr, buf_len },
-            pid: thread.pid,
+            pid: thread.pid(),
             root_pa: thread.root_table_addr(),
-            tid: thread.tid,
+            tid: thread.tid(),
         },
     )
 }
@@ -503,7 +462,7 @@ pub fn getcwd_req<H: Hardware>(
 /// [`PendingWork::GetGroups`]. `count == 0` is the POSIX sizing call
 /// — the buffer is ignored, so it's only validated for `count > 0`.
 pub fn getgroups_req<H: Hardware>(
-    thread: &mut Thread,
+    thread: ThreadView<'_>,
     frame: &TrapFrame,
     hw: &mut H,
 ) -> SyscallOutcome {
@@ -523,20 +482,16 @@ pub fn getgroups_req<H: Hardware>(
         hw,
         PendingWork::GetGroups {
             req: GetGroupsReq { buf_vaddr, count },
-            pid: thread.pid,
+            pid: thread.pid(),
             root_pa: thread.root_table_addr(),
-            tid: thread.tid,
+            tid: thread.tid(),
         },
     )
 }
 
 /// `getlogin(buf_ptr, buf_len) → bytes | -errno`. Queues
 /// [`PendingWork::GetLogin`].
-pub fn getlogin_req<H: Hardware>(
-    thread: &mut Thread,
-    frame: &TrapFrame,
-    hw: &mut H,
-) -> SyscallOutcome {
+pub fn getlogin_req<H: Hardware>(thread: ThreadView<'_>, frame: &TrapFrame, hw: &mut H) -> SyscallOutcome {
     let buf_len = frame.regs[12];
     if buf_len == 0 || buf_len > PAGE_SIZE {
         return SyscallOutcome::Return {
@@ -558,9 +513,9 @@ pub fn getlogin_req<H: Hardware>(
         hw,
         PendingWork::GetLogin {
             req: GetLoginReq { buf_vaddr, buf_len },
-            pid: thread.pid,
+            pid: thread.pid(),
             root_pa: thread.root_table_addr(),
-            tid: thread.tid,
+            tid: thread.tid(),
         },
     )
 }
@@ -568,37 +523,29 @@ pub fn getlogin_req<H: Hardware>(
 /// `setuid(uid) → 0 | -EPERM`. Queues [`PendingWork::SetUid`] —
 /// the manager applies POSIX triplet rules and refreshes sibling
 /// threads' credential snapshots.
-pub fn setuid_req<H: Hardware>(
-    thread: &mut Thread,
-    frame: &TrapFrame,
-    hw: &mut H,
-) -> SyscallOutcome {
+pub fn setuid_req<H: Hardware>(thread: ThreadView<'_>, frame: &TrapFrame, hw: &mut H) -> SyscallOutcome {
     park_on_manager(
         hw,
         PendingWork::SetUid {
             req: SetUidReq {
                 uid: frame.regs[11] as u32,
             },
-            pid: thread.pid,
-            tid: thread.tid,
+            pid: thread.pid(),
+            tid: thread.tid(),
         },
     )
 }
 
 /// `setgid(gid) → 0 | -EPERM`. Gid mirror of [`setuid_req`].
-pub fn setgid_req<H: Hardware>(
-    thread: &mut Thread,
-    frame: &TrapFrame,
-    hw: &mut H,
-) -> SyscallOutcome {
+pub fn setgid_req<H: Hardware>(thread: ThreadView<'_>, frame: &TrapFrame, hw: &mut H) -> SyscallOutcome {
     park_on_manager(
         hw,
         PendingWork::SetGid {
             req: SetGidReq {
                 gid: frame.regs[11] as u32,
             },
-            pid: thread.pid,
-            tid: thread.tid,
+            pid: thread.pid(),
+            tid: thread.tid(),
         },
     )
 }
@@ -607,7 +554,7 @@ pub fn setgid_req<H: Hardware>(
 /// [`PendingWork::SetGroups`]. `count == 0` legally empties the list
 /// with a (possibly null) ignored buffer.
 pub fn setgroups_req<H: Hardware>(
-    thread: &mut Thread,
+    thread: ThreadView<'_>,
     frame: &TrapFrame,
     hw: &mut H,
 ) -> SyscallOutcome {
@@ -627,20 +574,16 @@ pub fn setgroups_req<H: Hardware>(
         hw,
         PendingWork::SetGroups {
             req: SetGroupsReq { buf_vaddr, count },
-            pid: thread.pid,
+            pid: thread.pid(),
             root_pa: thread.root_table_addr(),
-            tid: thread.tid,
+            tid: thread.tid(),
         },
     )
 }
 
 /// `setlogin(name_ptr, name_len) → 0 | -errno`. Queues
 /// [`PendingWork::SetLogin`].
-pub fn setlogin_req<H: Hardware>(
-    thread: &mut Thread,
-    frame: &TrapFrame,
-    hw: &mut H,
-) -> SyscallOutcome {
+pub fn setlogin_req<H: Hardware>(thread: ThreadView<'_>, frame: &TrapFrame, hw: &mut H) -> SyscallOutcome {
     let name_len = frame.regs[12];
     if name_len == 0 || name_len > MAX_LOGIN_NAME {
         return SyscallOutcome::Return {
@@ -665,9 +608,9 @@ pub fn setlogin_req<H: Hardware>(
                 name_vaddr,
                 name_len,
             },
-            pid: thread.pid,
+            pid: thread.pid(),
             root_pa: thread.root_table_addr(),
-            tid: thread.tid,
+            tid: thread.tid(),
         },
     )
 }
@@ -679,15 +622,15 @@ pub fn setlogin_req<H: Hardware>(
 /// manager-side inserts of unrelated pids). Called once per process
 /// startup by orbit-rt, so the park cost is invisible.
 pub fn argv_envp_req<H: Hardware>(
-    thread: &mut Thread,
+    thread: ThreadView<'_>,
     _frame: &TrapFrame,
     hw: &mut H,
 ) -> SyscallOutcome {
     park_on_manager(
         hw,
         PendingWork::ArgvEnvp {
-            pid: thread.pid,
-            tid: thread.tid,
+            pid: thread.pid(),
+            tid: thread.tid(),
         },
     )
 }
@@ -697,7 +640,7 @@ pub fn argv_envp_req<H: Hardware>(
 /// looks up the surface, unmaps its user VA, removes the per-process
 /// table entry, and frees the backing frame to `kernel_pages`.
 pub fn fb_surface_destroy_req<H: Hardware>(
-    thread: &mut Thread,
+    thread: ThreadView<'_>,
     frame: &TrapFrame,
     hw: &mut H,
 ) -> SyscallOutcome {
@@ -706,19 +649,16 @@ pub fn fb_surface_destroy_req<H: Hardware>(
     };
     let work = PendingWork::FbSurfaceDestroy {
         req,
-        pid: thread.pid,
+        pid: thread.pid(),
         root_pa: thread.root_table_addr(),
-        tid: thread.tid,
+        tid: thread.tid(),
     };
     if hw.push_pending_work(work).is_err() {
         return SyscallOutcome::Return {
             ret: Errno::new(EAGAIN).to_ret(),
         };
     }
-    SyscallOutcome::Yield {
-        state: ThreadState::Blocking,
-        ret: None,
-    }
+    SyscallOutcome::ParkForPublish
 }
 
 /// `create_netch(vaddr_hint, region_size, nc_type)` — park on a handle
@@ -727,7 +667,7 @@ pub fn fb_surface_destroy_req<H: Hardware>(
 /// `(vaddr, fd)` via `signal_pair` — those land in `regs[10]` and
 /// `regs[11]` when the thread resumes.
 pub fn nc_create_req<H: Hardware>(
-    thread: &mut Thread,
+    thread: ThreadView<'_>,
     frame: &TrapFrame,
     hw: &mut H,
 ) -> SyscallOutcome {
@@ -765,47 +705,37 @@ pub fn nc_create_req<H: Hardware>(
     }
     let work = PendingWork::NetChannelCreation {
         req,
-        pid: thread.pid,
+        pid: thread.pid(),
         root_pa: thread.root_table_addr(),
-        tid: thread.tid,
+        tid: thread.tid(),
     };
     if hw.push_pending_work(work).is_err() {
         return SyscallOutcome::Return {
             ret: Errno::new(EAGAIN).to_ret(),
         };
     }
-    SyscallOutcome::Yield {
-        state: ThreadState::Blocking,
-        ret: None,
-    }
+    SyscallOutcome::ParkForPublish
 }
 
 /// `close_handle(fd)` — park on a handle and push a
 /// [`PendingWork::CloseHandle`] entry. Manager looks up the fd, revokes
 /// the underlying `SharedUserPtr` if any, drops the Arc, and signals.
-pub fn close_req<H: Hardware>(
-    thread: &mut Thread,
-    frame: &TrapFrame,
-    hw: &mut H,
-) -> SyscallOutcome {
+pub fn close_req<H: Hardware>(thread: ThreadView<'_>, frame: &TrapFrame, hw: &mut H) -> SyscallOutcome {
     let req = CloseHandleReq {
         fd: frame.regs[11] as u32,
     };
     let work = PendingWork::CloseHandle {
         req,
-        pid: thread.pid,
+        pid: thread.pid(),
         root_pa: thread.root_table_addr(),
-        tid: thread.tid,
+        tid: thread.tid(),
     };
     if hw.push_pending_work(work).is_err() {
         return SyscallOutcome::Return {
             ret: Errno::new(EAGAIN).to_ret(),
         };
     }
-    SyscallOutcome::Yield {
-        state: ThreadState::Blocking,
-        ret: None,
-    }
+    SyscallOutcome::ParkForPublish
 }
 
 /// `create_process(elf_vaddr, elf_len)` — park on a handle and push a
@@ -813,7 +743,7 @@ pub fn close_req<H: Hardware>(
 /// user memory, parses it, spawns the new process, and signals the
 /// handle with the new pid (or a negative errno on failure).
 pub fn create_process_req<H: Hardware>(
-    thread: &mut Thread,
+    thread: ThreadView<'_>,
     frame: &TrapFrame,
     hw: &mut H,
 ) -> SyscallOutcome {
@@ -848,19 +778,16 @@ pub fn create_process_req<H: Hardware>(
 
     let work = PendingWork::CreateProcess {
         req,
-        pid: thread.pid,
+        pid: thread.pid(),
         root_pa: thread.root_table_addr(),
-        tid: thread.tid,
+        tid: thread.tid(),
     };
     if hw.push_pending_work(work).is_err() {
         return SyscallOutcome::Return {
             ret: Errno::new(EAGAIN).to_ret(),
         };
     }
-    SyscallOutcome::Yield {
-        state: ThreadState::Blocking,
-        ret: None,
-    }
+    SyscallOutcome::ParkForPublish
 }
 
 /// `waitpid(pid)` — POSIX-shaped, polymorphic on pid:
@@ -884,11 +811,7 @@ pub fn create_process_req<H: Hardware>(
 /// Parks the caller and queues [`PendingWork::WaitPid`]; the manager
 /// either installs the parker tid on the appropriate waiter slot or
 /// signals the error / cached exit synchronously.
-pub fn wait_pid_req<H: Hardware>(
-    thread: &mut Thread,
-    frame: &TrapFrame,
-    hw: &mut H,
-) -> SyscallOutcome {
+pub fn wait_pid_req<H: Hardware>(thread: ThreadView<'_>, frame: &TrapFrame, hw: &mut H) -> SyscallOutcome {
     // Sign-extend the syscall arg through `i32`; the kernel-side
     // request struct carries the raw selector verbatim. Reject the
     // pgrp-reserved encodings sync — manager would have to do it
@@ -899,7 +822,7 @@ pub fn wait_pid_req<H: Hardware>(
             ret: Errno::new(EINVAL).to_ret(),
         };
     }
-    if target_pid > 0 && (target_pid as u32) == (thread.pid as u32) {
+    if target_pid > 0 && (target_pid as u32) == (thread.pid() as u32) {
         return SyscallOutcome::Return {
             ret: Errno::new(EINVAL).to_ret(),
         };
@@ -907,29 +830,22 @@ pub fn wait_pid_req<H: Hardware>(
     let req = WaitPidReq { target_pid };
     let work = PendingWork::WaitPid {
         req,
-        pid: thread.pid,
-        tid: thread.tid,
+        pid: thread.pid(),
+        tid: thread.tid(),
     };
     if hw.push_pending_work(work).is_err() {
         return SyscallOutcome::Return {
             ret: Errno::new(EAGAIN).to_ret(),
         };
     }
-    SyscallOutcome::Yield {
-        state: ThreadState::Blocking,
-        ret: None,
-    }
+    SyscallOutcome::ParkForPublish
 }
 
 /// `fs_open(path_ptr, path_len, flags) → fd | -errno`. Park the caller
 /// on a fresh handle and queue the manager work; the manager copies
 /// the path bytes, looks the inode up via the mounted filesystem, and
 /// allocates an `Fd` in the calling pid's handle table.
-pub fn fs_open_req<H: Hardware>(
-    thread: &mut Thread,
-    frame: &TrapFrame,
-    hw: &mut H,
-) -> SyscallOutcome {
+pub fn fs_open_req<H: Hardware>(thread: ThreadView<'_>, frame: &TrapFrame, hw: &mut H) -> SyscallOutcome {
     let Ok(path_vaddr) = UserVa::new(frame.regs[11] as u64)
     else {
         return SyscallOutcome::Return {
@@ -953,19 +869,16 @@ pub fn fs_open_req<H: Hardware>(
     }
     let work = PendingWork::FsOpen {
         req,
-        pid: thread.pid,
+        pid: thread.pid(),
         root_pa: thread.root_table_addr(),
-        tid: thread.tid,
+        tid: thread.tid(),
     };
     if hw.push_pending_work(work).is_err() {
         return SyscallOutcome::Return {
             ret: Errno::new(EAGAIN).to_ret(),
         };
     }
-    SyscallOutcome::Yield {
-        state: ThreadState::Blocking,
-        ret: None,
-    }
+    SyscallOutcome::ParkForPublish
 }
 
 /// Max bytes per `fs_read` call. Backed by the page cache: a 64 KiB
@@ -990,11 +903,7 @@ pub const MAX_FS_READ_LEN: usize = 16 * PAGE_SIZE;
 /// count into `regs[10]`) once every page that needs a DMA has
 /// landed. Synchronous returns happen when every page is already a
 /// cache hit. On any per-page failure the call resolves to `-EIO`.
-pub fn fs_read_req<H: Hardware>(
-    thread: &mut Thread,
-    frame: &TrapFrame,
-    hw: &mut H,
-) -> SyscallOutcome {
+pub fn fs_read_req<H: Hardware>(thread: ThreadView<'_>, frame: &TrapFrame, hw: &mut H) -> SyscallOutcome {
     let Ok(buf_vaddr) = UserVa::new(frame.regs[12] as u64)
     else {
         return SyscallOutcome::Return {
@@ -1018,30 +927,23 @@ pub fn fs_read_req<H: Hardware>(
     }
     let work = PendingWork::FsRead {
         req,
-        pid: thread.pid,
+        pid: thread.pid(),
         root_pa: thread.root_table_addr(),
-        tid: thread.tid,
+        tid: thread.tid(),
     };
     if hw.push_pending_work(work).is_err() {
         return SyscallOutcome::Return {
             ret: Errno::new(EAGAIN).to_ret(),
         };
     }
-    SyscallOutcome::Yield {
-        state: ThreadState::Blocking,
-        ret: None,
-    }
+    SyscallOutcome::ParkForPublish
 }
 
 /// `fs_stat(path_ptr, path_len, stat_ptr) → 0 | -errno`. Park on a
 /// handle and queue manager work; the manager copies the path, looks
 /// the inode up, and writes `size_of::<Stat>` bytes into the user's
 /// stat buffer.
-pub fn fs_stat_req<H: Hardware>(
-    thread: &mut Thread,
-    frame: &TrapFrame,
-    hw: &mut H,
-) -> SyscallOutcome {
+pub fn fs_stat_req<H: Hardware>(thread: ThreadView<'_>, frame: &TrapFrame, hw: &mut H) -> SyscallOutcome {
     let Ok(path_vaddr) = UserVa::new(frame.regs[11] as u64)
     else {
         return SyscallOutcome::Return {
@@ -1079,19 +981,16 @@ pub fn fs_stat_req<H: Hardware>(
     }
     let work = PendingWork::FsStat {
         req,
-        pid: thread.pid,
+        pid: thread.pid(),
         root_pa: thread.root_table_addr(),
-        tid: thread.tid,
+        tid: thread.tid(),
     };
     if hw.push_pending_work(work).is_err() {
         return SyscallOutcome::Return {
             ret: Errno::new(EAGAIN).to_ret(),
         };
     }
-    SyscallOutcome::Yield {
-        state: ThreadState::Blocking,
-        ret: None,
-    }
+    SyscallOutcome::ParkForPublish
 }
 
 /// `fs_readdir(fd, buf_ptr, len) → bytes | -errno`. Park on a handle
@@ -1102,7 +1001,7 @@ pub fn fs_stat_req<H: Hardware>(
 /// v1 contract: `len` ≤ [`PAGE_SIZE`], buffer must not span more than
 /// one page (single `UserPageWindow` for the copy-out).
 pub fn fs_readdir_req<H: Hardware>(
-    thread: &mut Thread,
+    thread: ThreadView<'_>,
     frame: &TrapFrame,
     hw: &mut H,
 ) -> SyscallOutcome {
@@ -1129,19 +1028,16 @@ pub fn fs_readdir_req<H: Hardware>(
     }
     let work = PendingWork::FsReaddir {
         req,
-        pid: thread.pid,
+        pid: thread.pid(),
         root_pa: thread.root_table_addr(),
-        tid: thread.tid,
+        tid: thread.tid(),
     };
     if hw.push_pending_work(work).is_err() {
         return SyscallOutcome::Return {
             ret: Errno::new(EAGAIN).to_ret(),
         };
     }
-    SyscallOutcome::Yield {
-        state: ThreadState::Blocking,
-        ret: None,
-    }
+    SyscallOutcome::ParkForPublish
 }
 
 /// `create_process_ex(elf_vaddr, elf_len, allowed_affinity, affinity,
@@ -1153,7 +1049,7 @@ pub fn fs_readdir_req<H: Hardware>(
 /// blob source. `argv_len == 0` (with any vaddr) is the "no args"
 /// shorthand and falls through to a plain create_process.
 pub fn create_process_ex_req<H: Hardware>(
-    thread: &mut Thread,
+    thread: ThreadView<'_>,
     frame: &TrapFrame,
     hw: &mut H,
 ) -> SyscallOutcome {
@@ -1238,19 +1134,16 @@ pub fn create_process_ex_req<H: Hardware>(
     }
     let work = PendingWork::CreateProcessEx {
         req,
-        pid: thread.pid,
+        pid: thread.pid(),
         root_pa: thread.root_table_addr(),
-        tid: thread.tid,
+        tid: thread.tid(),
     };
     if hw.push_pending_work(work).is_err() {
         return SyscallOutcome::Return {
             ret: Errno::new(EAGAIN).to_ret(),
         };
     }
-    SyscallOutcome::Yield {
-        state: ThreadState::Blocking,
-        ret: None,
-    }
+    SyscallOutcome::ParkForPublish
 }
 
 /// `futex_wait(uaddr, expected, timeout_ns)` — park on `uaddr` iff the
@@ -1263,7 +1156,7 @@ pub fn create_process_ex_req<H: Hardware>(
 /// resolves uaddr → PA, reads `*uaddr`, and either signals
 /// `-EAGAIN` (mismatch) or installs the handle on `futex_waiters[PA]`.
 pub fn futex_wait_req<H: Hardware>(
-    thread: &mut Thread,
+    thread: ThreadView<'_>,
     frame: &TrapFrame,
     hw: &mut H,
 ) -> SyscallOutcome {
@@ -1293,19 +1186,16 @@ pub fn futex_wait_req<H: Hardware>(
     };
     let work = PendingWork::FutexWait {
         req,
-        pid: thread.pid,
+        pid: thread.pid(),
         root_pa: thread.root_table_addr(),
-        tid: thread.tid,
+        tid: thread.tid(),
     };
     if hw.push_pending_work(work).is_err() {
         return SyscallOutcome::Return {
             ret: Errno::new(EAGAIN).to_ret(),
         };
     }
-    SyscallOutcome::Yield {
-        state: ThreadState::Blocking,
-        ret: None,
-    }
+    SyscallOutcome::ParkForPublish
 }
 
 /// `futex_wake(uaddr, n) → n_woken`. Manager resolves `uaddr` → PA,
@@ -1316,7 +1206,7 @@ pub fn futex_wait_req<H: Hardware>(
 /// `futex_wait`: serializing the table mutation against waiters and
 /// against `dealloc_process` cleanup.
 pub fn futex_wake_req<H: Hardware>(
-    thread: &mut Thread,
+    thread: ThreadView<'_>,
     frame: &TrapFrame,
     hw: &mut H,
 ) -> SyscallOutcome {
@@ -1341,19 +1231,16 @@ pub fn futex_wake_req<H: Hardware>(
     let req = FutexWakeReq { uaddr, n };
     let work = PendingWork::FutexWake {
         req,
-        pid: thread.pid,
+        pid: thread.pid(),
         root_pa: thread.root_table_addr(),
-        tid: thread.tid,
+        tid: thread.tid(),
     };
     if hw.push_pending_work(work).is_err() {
         return SyscallOutcome::Return {
             ret: Errno::new(EAGAIN).to_ret(),
         };
     }
-    SyscallOutcome::Yield {
-        state: ThreadState::Blocking,
-        ret: None,
-    }
+    SyscallOutcome::ParkForPublish
 }
 
 /// `serial_print(user_va, len)` — copy a UTF-8 string out of user memory
@@ -1365,7 +1252,7 @@ pub fn futex_wake_req<H: Hardware>(
 /// - `-EFAULT`   — user VA doesn't translate (bad pointer)
 /// - `-EINVAL`   — `len` exceeds a page, or bytes aren't valid UTF-8
 /// - `-EIO`      — serial write failed
-pub fn serial_print<H: Hardware>(thread: &Thread, frame: &TrapFrame, hw: &mut H) -> SyscallOutcome {
+pub fn serial_print<H: Hardware>(thread: ThreadView<'_>, frame: &TrapFrame, hw: &mut H) -> SyscallOutcome {
     let Ok(user_va) = UserVa::new(frame.regs[11] as u64)
     else {
         return ready(Errno::new(EFAULT).to_ret());
@@ -1392,7 +1279,7 @@ pub fn serial_print<H: Hardware>(thread: &Thread, frame: &TrapFrame, hw: &mut H)
         Err(_) => return ready(Errno::new(EINVAL).to_ret()),
     };
 
-    match hw.serial_write_user(thread.pid, thread.tid, s) {
+    match hw.serial_write_user(thread.pid(), thread.tid(), s) {
         Ok(()) => ready(0),
         Err(()) => ready(Errno::new(EIO).to_ret()),
     }
@@ -1407,7 +1294,7 @@ pub fn serial_print<H: Hardware>(thread: &Thread, frame: &TrapFrame, hw: &mut H)
 /// - `-EINVAL` — `len == 0` or overflows `PAGE_SIZE`
 /// - `-EAGAIN` — ring full, retry after yield
 pub fn console_write<H: Hardware>(
-    thread: &Thread,
+    thread: ThreadView<'_>,
     frame: &TrapFrame,
     hw: &mut H,
 ) -> SyscallOutcome {
@@ -1433,7 +1320,7 @@ pub fn console_write<H: Hardware>(
     // Honor `stdout_capture=1` at spawn time — the calling thread's
     // snapshot redirects the bytes to the parent's pane. `None` is
     // the legacy/default path (writes go to the producer's own pane).
-    let dest_pid = thread.stdout_redirect.unwrap_or(thread.pid);
+    let dest_pid = thread.stdout_redirect().unwrap_or(thread.pid());
     match hw.console_write_user(dest_pid, &buf[..len]) {
         Ok(()) => ready(len as isize),
         Err(()) => ready(Errno::new(EAGAIN).to_ret()),
@@ -1455,11 +1342,7 @@ pub const READ_STDIN_NONBLOCK: usize = 1;
 /// observing an empty ring and storing the handle: if a producer
 /// pushes a byte during that window, the recheck observes it and
 /// the park is cancelled before yielding.
-pub fn read_stdin<H: Hardware>(
-    thread: &mut Thread,
-    frame: &TrapFrame,
-    hw: &mut H,
-) -> SyscallOutcome {
+pub fn read_stdin<H: Hardware>(thread: ThreadView<'_>, frame: &TrapFrame, hw: &mut H) -> SyscallOutcome {
     let Ok(user_va) = UserVa::new(frame.regs[11] as u64)
     else {
         return ready(Errno::new(EFAULT).to_ret());
@@ -1478,7 +1361,7 @@ pub fn read_stdin<H: Hardware>(
     }
 
     // Synchronous drain attempt. On any nonzero count we're done.
-    let n = hw.read_stdin_drain(thread.pid, user_va, user_len);
+    let n = hw.read_stdin_drain(thread.pid(), user_va, user_len);
     if n > 0 {
         return ready(n as isize);
     }
@@ -1494,7 +1377,7 @@ pub fn read_stdin<H: Hardware>(
     // (kmain's `input::dispatch`) issues
     // `WAKE_QUEUE.push(WakeEvent::InputTid(tid))` so the manager
     // resumes the parker.
-    if !hw.park_stdin_reader(thread.pid, thread.tid) {
+    if !hw.park_stdin_reader(thread.pid(), thread.tid()) {
         return ready(Errno::new(EBUSY).to_ret());
     }
 
@@ -1503,9 +1386,9 @@ pub fn read_stdin<H: Hardware>(
     // re-draining after the park is visible, either we observe the
     // byte here (cancel the park, return synchronously) or we know
     // no producer raced us (yield safely).
-    let n2 = hw.read_stdin_drain(thread.pid, user_va, user_len);
+    let n2 = hw.read_stdin_drain(thread.pid(), user_va, user_len);
     if n2 > 0 {
-        let _ = hw.unpark_stdin_reader(thread.pid);
+        let _ = hw.unpark_stdin_reader(thread.pid());
         return ready(n2 as isize);
     }
 
@@ -1524,10 +1407,9 @@ pub fn read_stdin<H: Hardware>(
     // dropped. YieldRetry's re-drain on resume makes a spurious or
     // duplicate wake harmless — an empty re-drain just re-parks. This
     // matches read_key_event, the only other YieldRetry parker.
-    thread.wake_time = usize::MAX;
-    SyscallOutcome::YieldRetry {
-        state: ThreadState::Suspended,
-    }
+    // `apply` stamps `wake_time = usize::MAX` (sleep heap never fires;
+    // the only wake path is the input doorbell's `wake_override`).
+    SyscallOutcome::RetryOnDoorbell
 }
 
 /// Bit set in `read_key_event`'s `flags` arg: return `EAGAIN` instead
@@ -1569,7 +1451,7 @@ pub const READ_KEY_EVENT_INDEFINITE: usize = usize::MAX;
 /// Returns `EBUSY` if another tid is already parked on this ring
 /// (single-reader invariant).
 pub fn read_key_event<H: Hardware>(
-    thread: &mut Thread,
+    thread: ThreadView<'_>,
     frame: &TrapFrame,
     hw: &mut H,
 ) -> SyscallOutcome {
@@ -1608,7 +1490,7 @@ pub fn read_key_event<H: Hardware>(
     }
 
     // Synchronous drain attempt.
-    let n = hw.read_key_events_drain(thread.pid, user_va, count);
+    let n = hw.read_key_events_drain(thread.pid(), user_va, count);
     if n > 0 {
         return ready(n as isize);
     }
@@ -1636,34 +1518,35 @@ pub fn read_key_event<H: Hardware>(
     //   wakes.
     // - `Busy`: another tid claimed the ring; single-reader violation.
     use process::key_events::ParkOutcome;
-    match hw.set_key_event_parker(thread.pid, thread.tid) {
+    match hw.set_key_event_parker(thread.pid(), thread.tid()) {
         ParkOutcome::Installed => {}
         ParkOutcome::AlreadyOwned => {
-            let _ = hw.clear_key_event_parker_if(thread.pid, thread.tid);
+            let _ = hw.clear_key_event_parker_if(thread.pid(), thread.tid());
             return ready(0);
         }
         ParkOutcome::Busy => return ready(Errno::new(EBUSY).to_ret()),
     }
 
-    let n2 = hw.read_key_events_drain(thread.pid, user_va, count);
+    let n2 = hw.read_key_events_drain(thread.pid(), user_va, count);
     if n2 > 0 {
-        let _ = hw.clear_key_event_parker_if(thread.pid, thread.tid);
+        let _ = hw.clear_key_event_parker_if(thread.pid(), thread.tid());
         return ready(n2 as isize);
     }
 
-    // Schedule the deadline. Indefinite → u64::MAX (sleep_heap entry
-    // never fires; wake_override is the only wake path).
+    // Schedule the deadline. `apply` stamps `wake_time` when it commits
+    // the park (phase-C closure): indefinite → the doorbell-only retry
+    // (`wake_time = usize::MAX`, sleep heap never fires); a timeout → the
+    // deadline-bearing retry so a timer wake re-executes the ecall, which
+    // observes the elapsed timeout and returns.
     if timeout_ms == READ_KEY_EVENT_INDEFINITE {
-        thread.wake_time = usize::MAX;
+        SyscallOutcome::RetryOnDoorbell
     }
     else {
         let now = hw.now_ticks() as usize;
         let ticks = timeout_ms.wrapping_mul(hw.ticks_per_ms() as usize);
-        thread.wake_time = now.wrapping_add(ticks);
-    }
-
-    SyscallOutcome::YieldRetry {
-        state: ThreadState::Suspended,
+        SyscallOutcome::RetryUntilDeadline {
+            deadline: now.wrapping_add(ticks),
+        }
     }
 }
 
@@ -1687,7 +1570,7 @@ pub fn read_key_event<H: Hardware>(
 /// thread state. The manager rejects with `-EPERM` and the handle
 /// surfaces the errno via the standard signal_n path.
 pub fn create_thread<H: Hardware>(
-    thread: &mut Thread,
+    thread: ThreadView<'_>,
     frame: &TrapFrame,
     hw: &mut H,
 ) -> SyscallOutcome {
@@ -1715,19 +1598,16 @@ pub fn create_thread<H: Hardware>(
     }
     let work = PendingWork::CreateThread {
         req,
-        pid: thread.pid,
-        parent_allowed: thread.allowed_affinity,
-        tid: thread.tid,
+        pid: thread.pid(),
+        parent_allowed: thread.allowed_affinity(),
+        tid: thread.tid(),
     };
     if hw.push_pending_work(work).is_err() {
         return SyscallOutcome::Return {
             ret: Errno::new(EAGAIN).to_ret(),
         };
     }
-    SyscallOutcome::Yield {
-        state: ThreadState::Blocking,
-        ret: None,
-    }
+    SyscallOutcome::ParkForPublish
 }
 
 /// `pledge(req: *const PermsRequest)` — narrow this process's
@@ -1744,11 +1624,7 @@ pub fn create_thread<H: Hardware>(
 /// straddling a page boundary would silently read garbage from
 /// the next page. The request struct is 16 bytes (two `u64`s in
 /// `PermsRequest`).
-pub fn pledge_req<H: Hardware>(
-    thread: &mut Thread,
-    frame: &TrapFrame,
-    hw: &mut H,
-) -> SyscallOutcome {
+pub fn pledge_req<H: Hardware>(thread: ThreadView<'_>, frame: &TrapFrame, hw: &mut H) -> SyscallOutcome {
     let req_vaddr_raw = frame.regs[11];
     let size = core::mem::size_of::<orbit_abi::perms::PermsRequest>();
     if req_vaddr_raw & 0b111 != 0 {
@@ -1775,19 +1651,16 @@ pub fn pledge_req<H: Hardware>(
     let req = PledgeReq { req_vaddr };
     let work = PendingWork::Pledge {
         req,
-        pid: thread.pid,
+        pid: thread.pid(),
         root_pa: thread.root_table_addr(),
-        tid: thread.tid,
+        tid: thread.tid(),
     };
     if hw.push_pending_work(work).is_err() {
         return SyscallOutcome::Return {
             ret: Errno::new(EAGAIN).to_ret(),
         };
     }
-    SyscallOutcome::Yield {
-        state: ThreadState::Blocking,
-        ret: None,
-    }
+    SyscallOutcome::ParkForPublish
 }
 
 /// `create_process_v2(args: *const CreateProcessV2Args)` — role-aware
@@ -1803,7 +1676,7 @@ pub fn pledge_req<H: Hardware>(
 /// docs). Further validation (ELF range, affinity sanity) happens
 /// manager-side after the args copy.
 pub fn create_process_v2_req<H: Hardware>(
-    thread: &mut Thread,
+    thread: ThreadView<'_>,
     frame: &TrapFrame,
     hw: &mut H,
 ) -> SyscallOutcome {
@@ -1837,19 +1710,16 @@ pub fn create_process_v2_req<H: Hardware>(
     let req = CreateProcessV2Req { args_vaddr };
     let work = PendingWork::CreateProcessV2 {
         req,
-        pid: thread.pid,
+        pid: thread.pid(),
         root_pa: thread.root_table_addr(),
-        tid: thread.tid,
+        tid: thread.tid(),
     };
     if hw.push_pending_work(work).is_err() {
         return SyscallOutcome::Return {
             ret: Errno::new(EAGAIN).to_ret(),
         };
     }
-    SyscallOutcome::Yield {
-        state: ThreadState::Blocking,
-        ret: None,
-    }
+    SyscallOutcome::ParkForPublish
 }
 
 /// `set_affinity(mask)` — narrow the calling thread's per-hart eligibility.
@@ -1864,35 +1734,30 @@ pub fn create_process_v2_req<H: Hardware>(
 /// pass sees it. The store doesn't preempt: if the calling thread is
 /// running on a hart no longer in the new mask, it finishes its quantum
 /// and migrates on the next dispatch.
-pub fn set_affinity(thread: &Thread, frame: &TrapFrame) -> SyscallOutcome {
+pub fn set_affinity(running: &RunningThread, frame: &TrapFrame) -> SyscallOutcome {
     let mask = frame.regs[11] as u64;
     if mask == 0 {
         return ready(Errno::new(EINVAL).to_ret());
     }
-    if mask & !thread.allowed_affinity != 0 {
+    if mask & !running.view().allowed_affinity() != 0 {
         return ready(Errno::new(EPERM).to_ret());
     }
-    thread
-        .affinity
-        .store(mask, core::sync::atomic::Ordering::Release);
+    running.set_affinity_mask(mask);
     ready(0)
 }
 
 /// `get_affinity()` — return `(current, allowed)` in `(a0, a1)`. Windows-shape:
 /// the cap is exposed alongside the current mask so userspace can pick a
 /// valid sub-mask without trial-and-error.
-pub fn get_affinity(thread: &Thread) -> SyscallOutcome {
-    let current = thread.affinity.load(core::sync::atomic::Ordering::Acquire);
+pub fn get_affinity(thread: ThreadView<'_>) -> SyscallOutcome {
+    let current = thread.affinity();
     SyscallOutcome::Return2 {
         ret0: current as isize,
-        ret1: thread.allowed_affinity as isize,
+        ret1: thread.allowed_affinity() as isize,
     }
 }
 
 #[inline]
 fn ready(ret: isize) -> SyscallOutcome {
-    SyscallOutcome::Yield {
-        state: ThreadState::Ready,
-        ret: Some(ret),
-    }
+    SyscallOutcome::DoneReschedule { ret }
 }

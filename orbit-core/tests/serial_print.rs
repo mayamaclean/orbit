@@ -18,10 +18,7 @@ fn frame_with(len: usize) -> device::TrapFrame {
 }
 
 fn ready(ret: isize) -> SyscallOutcome {
-    SyscallOutcome::Yield {
-        state: ThreadState::Ready,
-        ret: Some(ret),
-    }
+    SyscallOutcome::DoneReschedule { ret: ret }
 }
 
 #[test]
@@ -31,7 +28,7 @@ fn prints_ascii_and_yields_ready_zero() {
     let mut hw = FakeHw::default();
     hw.user_mem.insert(UVA, b"hello world!\n".to_vec());
 
-    let outcome = syscall::serial_print(&t, &frame, &mut hw);
+    let outcome = syscall::serial_print(common::view(&t), &frame, &mut hw);
 
     assert_eq!(outcome, ready(0));
     assert_eq!(
@@ -46,7 +43,7 @@ fn rejects_len_above_page() {
     let frame = frame_with(PAGE_SIZE + 1);
     let mut hw = FakeHw::default();
 
-    let outcome = syscall::serial_print(&t, &frame, &mut hw);
+    let outcome = syscall::serial_print(common::view(&t), &frame, &mut hw);
 
     assert_eq!(outcome, ready(Errno::new(EINVAL).to_ret()));
     assert!(
@@ -62,7 +59,7 @@ fn accepts_len_exactly_page() {
     let mut hw = FakeHw::default();
     hw.user_mem.insert(UVA, vec![b'a'; PAGE_SIZE]);
 
-    let outcome = syscall::serial_print(&t, &frame, &mut hw);
+    let outcome = syscall::serial_print(common::view(&t), &frame, &mut hw);
 
     assert_eq!(outcome, ready(0));
     assert_eq!(hw.user_prints.len(), 1);
@@ -78,7 +75,7 @@ fn bad_user_va_returns_efault() {
         ..Default::default()
     };
 
-    let outcome = syscall::serial_print(&t, &frame, &mut hw);
+    let outcome = syscall::serial_print(common::view(&t), &frame, &mut hw);
 
     assert_eq!(outcome, ready(Errno::new(EFAULT).to_ret()));
     assert!(hw.user_prints.is_empty());
@@ -92,7 +89,7 @@ fn non_utf8_returns_einval() {
     // 0xFF is never a valid start byte in UTF-8.
     hw.user_mem.insert(UVA, vec![0xFF, 0xFE, 0xFD, 0xFC]);
 
-    let outcome = syscall::serial_print(&t, &frame, &mut hw);
+    let outcome = syscall::serial_print(common::view(&t), &frame, &mut hw);
 
     assert_eq!(outcome, ready(Errno::new(EINVAL).to_ret()));
     assert!(
@@ -111,7 +108,7 @@ fn valid_prefix_then_invalid_byte_returns_einval() {
     let mut hw = FakeHw::default();
     hw.user_mem.insert(UVA, vec![b'h', b'i', b'!', b'\n', 0xFF]);
 
-    let outcome = syscall::serial_print(&t, &frame, &mut hw);
+    let outcome = syscall::serial_print(common::view(&t), &frame, &mut hw);
 
     assert_eq!(outcome, ready(Errno::new(EINVAL).to_ret()));
     assert!(
@@ -130,7 +127,7 @@ fn serial_failure_returns_eio() {
     };
     hw.user_mem.insert(UVA, b"abc".to_vec());
 
-    let outcome = syscall::serial_print(&t, &frame, &mut hw);
+    let outcome = syscall::serial_print(common::view(&t), &frame, &mut hw);
 
     assert_eq!(outcome, ready(Errno::new(EIO).to_ret()));
 }
@@ -142,7 +139,7 @@ fn empty_len_still_succeeds() {
     let mut hw = FakeHw::default();
     hw.user_mem.insert(UVA, Vec::new());
 
-    let outcome = syscall::serial_print(&t, &frame, &mut hw);
+    let outcome = syscall::serial_print(common::view(&t), &frame, &mut hw);
 
     assert_eq!(outcome, ready(0));
     assert_eq!(hw.user_prints, vec![(t.pid, t.tid, String::new())]);
@@ -160,7 +157,7 @@ fn check_order_len_before_translate() {
         ..Default::default()
     };
 
-    let outcome = syscall::serial_print(&t, &frame, &mut hw);
+    let outcome = syscall::serial_print(common::view(&t), &frame, &mut hw);
 
     assert_eq!(outcome, ready(Errno::new(EINVAL).to_ret()));
 }
@@ -177,7 +174,7 @@ fn rejects_kernel_vaddr_without_translating() {
     frame.regs[12] = 4;
     let mut hw = FakeHw::default();
 
-    let outcome = syscall::serial_print(&t, &frame, &mut hw);
+    let outcome = syscall::serial_print(common::view(&t), &frame, &mut hw);
 
     assert_eq!(outcome, ready(Errno::new(EFAULT).to_ret()));
     assert!(hw.user_prints.is_empty());
@@ -191,7 +188,7 @@ fn rejects_null_guard_vaddr() {
     frame.regs[12] = 4;
     let mut hw = FakeHw::default();
 
-    let outcome = syscall::serial_print(&t, &frame, &mut hw);
+    let outcome = syscall::serial_print(common::view(&t), &frame, &mut hw);
 
     assert_eq!(outcome, ready(Errno::new(EFAULT).to_ret()));
     assert!(hw.user_prints.is_empty());
@@ -206,7 +203,7 @@ fn carries_pid_tid_to_serial() {
     let mut hw = FakeHw::default();
     hw.user_mem.insert(UVA, b"abcde".to_vec());
 
-    let _ = syscall::serial_print(&t, &frame, &mut hw);
+    let _ = syscall::serial_print(common::view(&t), &frame, &mut hw);
 
     assert_eq!(hw.user_prints, vec![(7, 42, "abcde".to_string())]);
 }

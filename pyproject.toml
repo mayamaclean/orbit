@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "orbit-tools"
+version = "0.1.0"
+description = "Host-side developer tooling for the Orbit kernel"
+requires-python = ">=3.9"
+
+# `pip install -e .` (or `uv pip install -e .`) from the repo root exposes
+# the `send-payload` command on PATH, so you can `send-payload <elf>` from
+# anywhere instead of `python3 orbit-loader/tools/send_payload.py <elf>`.
+# The module file is `send_payload.py` (underscore — Python modules can't
+# be hyphenated and still be importable for the entry point); the *command*
+# keeps the conventional `send-payload` spelling.
+[project.scripts]
+send-payload = "send_payload:main"
+
+[tool.setuptools]
+py-modules = ["send_payload"]
+
+[tool.setuptools.package-dir]
+"" = "orbit-loader/tools"

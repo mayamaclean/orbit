@@ -42,7 +42,7 @@ fn wake_tid_zero_target_returns_zero_without_pending_work() {
     frame.regs[10] = orbit_abi::syscall::WAKE_TID;
     frame.regs[11] = 0;
 
-    let outcome = syscall::wake_tid_req(&mut t, &frame, &mut hw);
+    let outcome = syscall::wake_tid_req(common::view(&t), &frame, &mut hw);
 
     assert_eq!(outcome, SyscallOutcome::Return { ret: 0 });
     assert!(
@@ -61,14 +61,11 @@ fn wake_tid_nonzero_target_pushes_pending_work_and_blocks() {
     frame.regs[10] = orbit_abi::syscall::WAKE_TID;
     frame.regs[11] = 42; // target_tid
 
-    let outcome = syscall::wake_tid_req(&mut t, &frame, &mut hw);
+    let outcome = syscall::wake_tid_req(common::view(&t), &frame, &mut hw);
 
     assert_eq!(
         outcome,
-        SyscallOutcome::Yield {
-            state: ThreadState::Blocking,
-            ret: None
-        }
+        SyscallOutcome::ParkForPublish
     );
     assert_eq!(hw.pending_work.len(), 1);
     match &hw.pending_work[0] {
@@ -92,7 +89,7 @@ fn wake_tid_returns_eagain_when_work_ring_full() {
     frame.regs[10] = orbit_abi::syscall::WAKE_TID;
     frame.regs[11] = 42;
 
-    let outcome = syscall::wake_tid_req(&mut t, &frame, &mut hw);
+    let outcome = syscall::wake_tid_req(common::view(&t), &frame, &mut hw);
 
     assert_eq!(
         outcome,
@@ -118,7 +115,7 @@ fn run_eventfd(initval: u64, flags: u32, vaddr: u64, hw: &mut FakeHw) -> Syscall
     frame.regs[11] = vaddr as usize;
     frame.regs[12] = initval as usize;
     frame.regs[13] = flags as usize;
-    syscall::eventfd_req(&mut t, &frame, hw)
+    syscall::eventfd_req(common::view(&t), &frame, hw)
 }
 
 #[test]
@@ -173,10 +170,7 @@ fn eventfd_valid_args_yield_blocking_and_push_pending_work() {
 
     assert_eq!(
         outcome,
-        SyscallOutcome::Yield {
-            state: ThreadState::Blocking,
-            ret: None
-        }
+        SyscallOutcome::ParkForPublish
     );
     assert_eq!(hw.pending_work.len(), 1);
     match &hw.pending_work[0] {

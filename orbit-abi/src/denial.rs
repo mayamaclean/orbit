@@ -23,14 +23,14 @@ use crate::perms::role::RoleId;
 
 /// Maximum entries the kernel-wide denial ring retains. Chosen for
 /// "enough to capture a regression's worth of context" while staying
-/// small enough that a full snapshot fits in a single ~2.4 KiB user
-/// buffer for `query_denial_log` (50 × 48 B = 2400 B, no header —
+/// small enough that a full snapshot fits in a single ~3 KiB user
+/// buffer for `query_denial_log` (64 × 48 B = 3072 B, no header —
 /// the reply is just a packed sequence of `DenialEvent`s). Older
 /// events are evicted on push.
 ///
 /// Also pinned as the wire-shape upper bound for `query_denial_log`'s
 /// reply, so user code can size its buffer up-front.
-pub const DENIAL_RING_CAPACITY: usize = 50;
+pub const DENIAL_RING_CAPACITY: usize = 64;
 
 /// A single permission denial. Pushed onto the kernel-wide denial
 /// ring (and the per-process counters incremented) whenever a gate
@@ -181,7 +181,7 @@ mod tests {
 
     /// Pin the variant sizes — both `PermDeny` and `RoleDeny` are
     /// 48 bytes including the 4-byte discriminant + 4 bytes of
-    /// trailing pad (40-byte payload), so 50 events fit in 2.4 KiB.
+    /// trailing pad (40-byte payload), so 64 events fit in 3 KiB.
     /// If a future field grows the variant, this fails loudly so
     /// the wire-shape impact is visible.
     #[test]
@@ -197,7 +197,7 @@ mod tests {
     fn denial_ring_capacity_pinned() {
         // DENIAL_RING_CAPACITY is part of the ABI: user code sizing a
         // query_denial_log buffer relies on this number.
-        assert_eq!(DENIAL_RING_CAPACITY, 50);
+        assert_eq!(DENIAL_RING_CAPACITY, 64);
     }
 
     #[test]

@@ -36,6 +36,34 @@ static STUB_ELF: &[u8] = include_bytes!(
     "../../smoke-stub-child/target/riscv64gc-unknown-none-elf/release/smoke-stub-child"
 );
 
+/// Page-aligned backing for a full-snapshot denial-log buffer.
+///
+/// `query_denial_log` copies through a single `UserPageWindow`, so its
+/// buffer must not straddle a 4 KiB page (same constraint as `fs_read`).
+/// A 3 KiB `[DenialEvent; 64]` fits in one page only if it doesn't
+/// cross a boundary — `#[repr(align(4096))]` pins the array to a page
+/// start so it never does, regardless of where the stack lands it.
+#[repr(align(4096))]
+struct DenialRing([DenialEvent; DENIAL_RING_CAPACITY]);
+
+impl DenialRing {
+    /// Pre-fill every slot with a sentinel `PermDeny { pid: u16::MAX }`
+    /// so an unwritten slot never accidentally matches `self_pid`.
+    fn new() -> Self {
+        Self(
+            [DenialEvent::PermDeny {
+                required_class: 0,
+                perms: 0,
+                time_ticks: 0,
+                tid: 0,
+                sysno: 0,
+                source_role: 0,
+                pid: u16::MAX,
+            }; DENIAL_RING_CAPACITY],
+        )
+    }
+}
+
 /// Mode the smoke is running against, deduced from the observed
 /// behavior of the first denied syscall. Current kernels are
 /// `Enforcement` (gate returns `-EPERM`); `Shadow` survives as a
@@ -109,19 +137,10 @@ pub extern "C" fn main() -> i32 {
     let perm_0 = stats_0.perm_denials;
     let role_0 = stats_0.role_denials;
 
-    // Buffer sized for a full snapshot (~2.4 KiB at the cap of 50).
-    // Pre-fill with a sentinel `PermDeny{ pid: u16::MAX }` so an
-    // unwritten slot never accidentally matches `self_pid`.
-    let mut ring_a: [DenialEvent; DENIAL_RING_CAPACITY] = [DenialEvent::PermDeny {
-        required_class: 0,
-        perms: 0,
-        time_ticks: 0,
-        tid: 0,
-        sysno: 0,
-        source_role: 0,
-        pid: u16::MAX,
-    }; DENIAL_RING_CAPACITY];
-    let n_ring_a = match query_denial_log(&mut ring_a) {
+    // Page-aligned buffer sized for a full snapshot (~3 KiB at the
+    // cap of 64) — `query_denial_log` rejects a page-straddling buffer.
+    let mut ring_a = DenialRing::new();
+    let n_ring_a = match query_denial_log(&mut ring_a.0) {
         Ok(n) => n,
         Err(Errno(e)) => {
             serialln!("FAIL: query_denial_log baseline failed errno={e}");
@@ -169,15 +188,19 @@ pub extern "C" fn main() -> i32 {
     serialln!("detected mode: {mode:?}");
 
     // ── Phase C — RoleDeny path ───────────────────────────────────────
-    // BOOTSTRAP's `transitions` bitset includes LOADER and SHELL only
-    // — WORKER is denied, so the role gate fires inside the manager-
-    // side `create_process_v2` handler.
+    // The test runs as LOADER (inherited from orbit-loader — payloads are
+    // spawned with `target_role: INHERIT`, which `derive_child_perms`
+    // resolves to the parent's role). LOADER's `transitions` bitset is
+    // {SHELL, SERVICE, WORKER, NET_CLIENT, FS_TOOL} — it excludes
+    // BOOTSTRAP, so `LOADER → BOOTSTRAP` is denied and the role gate fires
+    // inside the manager-side `create_process_v2` handler. (Targeting
+    // WORKER would *succeed* — LOADER → WORKER is allowed.)
     let v2_args = CreateProcessV2Args {
         elf_vaddr: STUB_ELF.as_ptr() as usize,
         elf_len: STUB_ELF.len(),
         allowed_affinity: 0,
         affinity: 0,
-        target_role: role::WORKER,
+        target_role: role::BOOTSTRAP,
         flags: 0,
         request_perms: class::raw::ALL,
         request_allowed_perms: class::raw::ALL,
@@ -229,26 +252,18 @@ pub extern "C" fn main() -> i32 {
     let role_delta = stats_1.role_denials - role_0;
     serialln!("delta: perm={perm_delta} role={role_delta}");
 
-    let mut ring_b: [DenialEvent; DENIAL_RING_CAPACITY] = [DenialEvent::PermDeny {
-        required_class: 0,
-        perms: 0,
-        time_ticks: 0,
-        tid: 0,
-        sysno: 0,
-        source_role: 0,
-        pid: u16::MAX,
-    }; DENIAL_RING_CAPACITY];
-    let n_ring_b = match query_denial_log(&mut ring_b) {
+    let mut ring_b = DenialRing::new();
+    let n_ring_b = match query_denial_log(&mut ring_b.0) {
         Ok(n) => n,
         Err(Errno(e)) => {
             serialln!("FAIL: query_denial_log post-gate failed errno={e}");
             exit(1);
         }
     };
-    let events_b = &ring_b[..n_ring_b];
+    let events_b = &ring_b.0[..n_ring_b];
 
     // Match a PermDeny matching this run: same pid, sysno =
-    // CREATE_NETCH, source_role = BOOTSTRAP, required_class = NETCH.
+    // CREATE_NETCH, source_role = LOADER, required_class = NETCH.
     let perm_hits = count_matching(events_b, self_pid, |e| match *e {
         DenialEvent::PermDeny {
             sysno,
@@ -258,13 +273,13 @@ pub extern "C" fn main() -> i32 {
         } => {
             sysno as usize == orbit_abi::syscall::CREATE_NETCH
                 && required_class == class::raw::NETCH
-                && source_role == role::BOOTSTRAP
+                && source_role == role::LOADER
         }
         _ => false,
     });
 
-    // Match a RoleDeny: same pid, source_role = BOOTSTRAP,
-    // target_role = WORKER, deny_reason = TRANSITION_DENIED.
+    // Match a RoleDeny: same pid, source_role = LOADER,
+    // target_role = BOOTSTRAP, deny_reason = TRANSITION_DENIED.
     let role_hits = count_matching(events_b, self_pid, |e| match *e {
         DenialEvent::RoleDeny {
             source_role,
@@ -272,8 +287,8 @@ pub extern "C" fn main() -> i32 {
             deny_reason,
             ..
         } => {
-            source_role == role::BOOTSTRAP
-                && target_role == role::WORKER
+            source_role == role::LOADER
+                && target_role == role::BOOTSTRAP
                 && deny_reason == deny_reason::TRANSITION_DENIED
         }
         _ => false,

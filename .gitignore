@@ -4,7 +4,17 @@
 *.dts
 *.log
 disk.img
-orbit-loader/tools/__pycache__/
+
+# Python build artifacts — bytecode caches + editable-install metadata
+# (`pip install -e .` against the root pyproject.toml drops an
+# `*.egg-info/` next to the module).
+**/__pycache__/
+*.egg-info/
+*.pyc
+
+# Forked rustc/std tree (riscv64gc-unknown-orbit target) — a 45 GB nested
+# git checkout built per docs/std-on-orbit.md, not part of this repo.
+rust/
 
 # Disk-staged user binaries — produced by tools/build-disk.sh from the
 # real source crates (console/, umode/, hello-std/). Text fixtures

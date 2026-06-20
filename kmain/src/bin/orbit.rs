@@ -5,7 +5,6 @@
 extern crate alloc;
 
 use core::arch::{asm, global_asm, naked_asm};
-use core::fmt::Arguments;
 use core::ptr::null_mut;
 use core::sync::atomic::Ordering;
 use core::{alloc::Layout, panic::PanicInfo};
@@ -78,8 +77,7 @@ extern "C" fn s_trap(
     _code: usize,
     _sarg: usize,
 ) -> usize {
-    let hart_context =
-        unsafe { (riscv::register::sscratch::read() as *mut HartContext).as_mut_unchecked() };
+    let hart_context = kmain::kernel::context::get_hart_context();
 
     // Bucket hook 1: trap entry. Whatever bucket the hart was in
     // (User on a syscall/timer from user-mode, Idle if a wfi just woke
@@ -155,10 +153,12 @@ extern "C" fn s_trap(
                     let ra = frame.regs[1];
                     let cur = hart_context.current.load(Ordering::Acquire) as *const Thread;
                     if !cur.is_null() {
-                        let t: &Thread = unsafe { cur.as_ref_unchecked() };
-                        let pc = t.pc.load(Ordering::Acquire);
-                        let state = t.state.load(Ordering::Acquire);
-                        let wake_reason = t.last_wake_reason.load(Ordering::Acquire);
+                        // Read via the view (atomics + Copy), not a bare
+                        // `&Thread`; own-hart, on a fatal-fault path.
+                        let t = unsafe { process::ThreadView::from_ptr(cur) };
+                        let pc = t.pc();
+                        let state = t.state();
+                        let wake_reason = t.last_wake_reason();
                         panic!(
                             "S-mode fault on cpu{}: cause={} epc={:#x} stval={:#x} \
                              ra={:#x} sp={:#x} satp={:#x} kptr={:#x} \
@@ -171,9 +171,9 @@ extern "C" fn s_trap(
                             sp,
                             satp,
                             kptr,
-                            t.tid,
-                            t.pid,
-                            t.mode,
+                            t.tid(),
+                            t.pid(),
+                            t.mode(),
                             pc,
                             state,
                             wake_reason,
@@ -262,8 +262,11 @@ extern "C" fn s_trap(
                 // pc the same way a regular handler would).
                 let cur = hart_context.current.load(Ordering::Acquire) as *const Thread;
                 let allowed = if !cur.is_null() {
-                    let t: &Thread = unsafe { cur.as_ref_unchecked() };
-                    kmain::perm_gate_check(t, syscall)
+                    // Field-projected read view — never a whole-struct
+                    // `&Thread` over a thread the manager may be
+                    // propagating creds to.
+                    let v = unsafe { process::ThreadView::from_ptr(cur) };
+                    kmain::perm_gate_check(v, syscall)
                 }
                 else {
                     // Null current shouldn't happen on cause=8, but
@@ -509,8 +512,7 @@ extern "C" fn s_trap(
 extern "C" fn k_harthello() {
     //println!("hey there");
 
-    let hart_context =
-        unsafe { (riscv::register::sscratch::read() as *const HartContext).as_ref_unchecked() };
+    let hart_context = kmain::kernel::context::get_hart_context();
 
     unsafe {
         info!(
@@ -560,8 +562,7 @@ pub extern "C" fn k_smpstart() {
     // active.
     kmain::drivers::goldfish_rtc::init(kmain::kernel::memmap::kmmio_rtc());
 
-    let hart_context =
-        unsafe { (riscv::register::sscratch::read() as *const HartContext).as_ref_unchecked() };
+    let hart_context = kmain::kernel::context::get_hart_context();
 
     let orbit = unsafe { (hart_context.cscratch as *mut kmain::kernel::Orbit).as_mut_unchecked() };
 

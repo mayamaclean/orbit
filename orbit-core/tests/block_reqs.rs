@@ -23,7 +23,7 @@ const SHARED_VA: usize = UPROC_SHARED_BASE as usize;
 
 #[test]
 fn mmap_req_shared_marshals_args_and_blocks() {
-    let mut t = make_thread(ThreadState::Running, SPP::User);
+    let t = make_thread(ThreadState::Running, SPP::User);
     let mut frame = make_frame();
     let mut hw = FakeHw::default();
     frame.regs[11] = SHARED_VA;
@@ -31,14 +31,11 @@ fn mmap_req_shared_marshals_args_and_blocks() {
     frame.regs[13] = 0x17; // V|R|W|U — X (0x8) cleared; shared+exec is rejected
     frame.regs[14] = 1;
 
-    let outcome = syscall::mmap_req(&mut t, &frame, &mut hw);
+    let outcome = syscall::mmap_req(common::view(&t), &frame, &mut hw);
 
     assert_eq!(
         outcome,
-        SyscallOutcome::Yield {
-            state: ThreadState::Blocking,
-            ret: None
-        }
+        SyscallOutcome::ParkForPublish
     );
     // mmap migrated to the on-thread completion path: no handle is
     // installed on the parker; the manager later calls
@@ -61,14 +58,14 @@ fn mmap_req_shared_marshals_args_and_blocks() {
 
 #[test]
 fn mmap_req_priv_marshals_args_and_blocks() {
-    let mut t = make_thread(ThreadState::Running, SPP::User);
+    let t = make_thread(ThreadState::Running, SPP::User);
     let mut frame = make_frame();
     let mut hw = FakeHw::default();
     frame.regs[11] = PRIV_VA;
     frame.regs[12] = 4096;
     frame.regs[14] = 0;
 
-    let _ = syscall::mmap_req(&mut t, &frame, &mut hw);
+    let _ = syscall::mmap_req(common::view(&t), &frame, &mut hw);
 
     match &hw.pending_work[0] {
         PendingWork::MemMap { req, .. } => {
@@ -81,14 +78,14 @@ fn mmap_req_priv_marshals_args_and_blocks() {
 
 #[test]
 fn mmap_req_returns_eagain_when_ring_full() {
-    let mut t = make_thread(ThreadState::Running, SPP::User);
+    let t = make_thread(ThreadState::Running, SPP::User);
     let mut frame = make_frame();
     let mut hw = FakeHw::default();
     frame.regs[11] = PRIV_VA;
     frame.regs[12] = 4096;
     hw.pending_work_ok = false;
 
-    let outcome = syscall::mmap_req(&mut t, &frame, &mut hw);
+    let outcome = syscall::mmap_req(common::view(&t), &frame, &mut hw);
 
     assert_eq!(
         outcome,
@@ -102,7 +99,7 @@ fn mmap_req_returns_eagain_when_ring_full() {
 
 #[test]
 fn nc_create_req_marshals_args_and_blocks() {
-    let mut t = make_thread(ThreadState::Running, SPP::User);
+    let t = make_thread(ThreadState::Running, SPP::User);
     let mut frame = make_frame();
     let mut hw = FakeHw::default();
     frame.regs[11] = SHARED_VA;
@@ -111,14 +108,11 @@ fn nc_create_req_marshals_args_and_blocks() {
     let bind = net_channel::BindSpec::ServerRetain { port: 7777 };
     frame.regs[14] = bind.pack();
 
-    let outcome = syscall::nc_create_req(&mut t, &frame, &mut hw);
+    let outcome = syscall::nc_create_req(common::view(&t), &frame, &mut hw);
 
     assert_eq!(
         outcome,
-        SyscallOutcome::Yield {
-            state: ThreadState::Blocking,
-            ret: None
-        }
+        SyscallOutcome::ParkForPublish
     );
     assert!(t.handle.is_none(), "no Arc'd handle on the migrated path");
     match &hw.pending_work[0] {
@@ -139,7 +133,7 @@ fn nc_create_req_rejects_malformed_bind_spec() {
     // Mode tag 0 (or any unknown value) in the packed BindSpec must be
     // rejected at the syscall boundary so the manager never sees a
     // bogus `req.bind`.
-    let mut t = make_thread(ThreadState::Running, SPP::User);
+    let t = make_thread(ThreadState::Running, SPP::User);
     let mut frame = make_frame();
     let mut hw = FakeHw::default();
     frame.regs[11] = SHARED_VA;
@@ -147,7 +141,7 @@ fn nc_create_req_rejects_malformed_bind_spec() {
     frame.regs[13] = 0;
     frame.regs[14] = 0; // mode 0 = invalid
 
-    let outcome = syscall::nc_create_req(&mut t, &frame, &mut hw);
+    let outcome = syscall::nc_create_req(common::view(&t), &frame, &mut hw);
 
     assert_eq!(
         outcome,
@@ -161,19 +155,16 @@ fn nc_create_req_rejects_malformed_bind_spec() {
 
 #[test]
 fn close_req_marshals_fd_and_blocks() {
-    let mut t = make_thread(ThreadState::Running, SPP::User);
+    let t = make_thread(ThreadState::Running, SPP::User);
     let mut frame = make_frame();
     let mut hw = FakeHw::default();
     frame.regs[11] = 7;
 
-    let outcome = syscall::close_req(&mut t, &frame, &mut hw);
+    let outcome = syscall::close_req(common::view(&t), &frame, &mut hw);
 
     assert_eq!(
         outcome,
-        SyscallOutcome::Yield {
-            state: ThreadState::Blocking,
-            ret: None
-        }
+        SyscallOutcome::ParkForPublish
     );
     assert!(t.handle.is_none(), "no Arc'd handle on the migrated path");
     match &hw.pending_work[0] {
@@ -190,12 +181,12 @@ fn close_req_marshals_fd_and_blocks() {
 fn close_req_truncates_fd_to_u32() {
     // frame.regs[11] is usize; CloseHandleReq::fd is u32. Values above u32::MAX
     // should truncate, matching the existing `as u32` cast in the shim.
-    let mut t = make_thread(ThreadState::Running, SPP::User);
+    let t = make_thread(ThreadState::Running, SPP::User);
     let mut frame = make_frame();
     let mut hw = FakeHw::default();
     frame.regs[11] = 0x1_0000_0005;
 
-    let _ = syscall::close_req(&mut t, &frame, &mut hw);
+    let _ = syscall::close_req(common::view(&t), &frame, &mut hw);
 
     match &hw.pending_work[0] {
         PendingWork::CloseHandle { req, .. } => assert_eq!(req.fd, 5),
@@ -205,20 +196,17 @@ fn close_req_truncates_fd_to_u32() {
 
 #[test]
 fn create_process_req_marshals_args_and_blocks() {
-    let mut t = make_thread(ThreadState::Running, SPP::User);
+    let t = make_thread(ThreadState::Running, SPP::User);
     let mut frame = make_frame();
     let mut hw = FakeHw::default();
     frame.regs[11] = 0x2_2000_0000;
     frame.regs[12] = 0x4000;
 
-    let outcome = syscall::create_process_req(&mut t, &frame, &mut hw);
+    let outcome = syscall::create_process_req(common::view(&t), &frame, &mut hw);
 
     assert_eq!(
         outcome,
-        SyscallOutcome::Yield {
-            state: ThreadState::Blocking,
-            ret: None
-        }
+        SyscallOutcome::ParkForPublish
     );
     assert!(t.handle.is_none(), "no Arc'd handle on the migrated path");
     assert_eq!(hw.pending_work.len(), 1);
@@ -243,14 +231,11 @@ fn create_thread_req_marshals_args_and_blocks() {
     frame.regs[12] = 0xF; // allowed_affinity
     frame.regs[13] = 0x4; // affinity (subset of allowed)
 
-    let outcome = syscall::create_thread(&mut t, &frame, &mut hw);
+    let outcome = syscall::create_thread(common::view(&t), &frame, &mut hw);
 
     assert_eq!(
         outcome,
-        SyscallOutcome::Yield {
-            state: ThreadState::Blocking,
-            ret: None
-        }
+        SyscallOutcome::ParkForPublish
     );
     assert!(t.handle.is_none(), "no Arc'd handle on the migrated path");
     assert_eq!(hw.pending_work.len(), 1);
@@ -274,14 +259,14 @@ fn create_thread_req_marshals_args_and_blocks() {
 
 #[test]
 fn create_thread_req_rejects_kernel_entry() {
-    let mut t = make_thread(ThreadState::Running, SPP::User);
+    let t = make_thread(ThreadState::Running, SPP::User);
     let mut frame = make_frame();
     let mut hw = FakeHw::default();
     frame.regs[11] = KERNEL_VA;
     frame.regs[12] = 0xF;
     frame.regs[13] = 0x1;
 
-    let outcome = syscall::create_thread(&mut t, &frame, &mut hw);
+    let outcome = syscall::create_thread(common::view(&t), &frame, &mut hw);
 
     assert_eq!(
         outcome,
@@ -295,14 +280,14 @@ fn create_thread_req_rejects_kernel_entry() {
 
 #[test]
 fn create_thread_req_rejects_affinity_outside_allowed() {
-    let mut t = make_thread(ThreadState::Running, SPP::User);
+    let t = make_thread(ThreadState::Running, SPP::User);
     let mut frame = make_frame();
     let mut hw = FakeHw::default();
     frame.regs[11] = USER_TEXT_BASE as usize + 0x100;
     frame.regs[12] = 0x3; // allowed = bits 0,1
     frame.regs[13] = 0x4; // affinity = bit 2 — outside allowed
 
-    let outcome = syscall::create_thread(&mut t, &frame, &mut hw);
+    let outcome = syscall::create_thread(common::view(&t), &frame, &mut hw);
 
     assert_eq!(
         outcome,
@@ -320,28 +305,25 @@ fn create_thread_req_accepts_zero_sentinel_pair() {
     // doesn't know the parent's mask, only the manager does, so the
     // syscall-side check must accept (0, 0) and let the manager
     // resolve.
-    let mut t = make_thread(ThreadState::Running, SPP::User);
+    let t = make_thread(ThreadState::Running, SPP::User);
     let mut frame = make_frame();
     let mut hw = FakeHw::default();
     frame.regs[11] = USER_TEXT_BASE as usize + 0x100;
     frame.regs[12] = 0;
     frame.regs[13] = 0;
 
-    let outcome = syscall::create_thread(&mut t, &frame, &mut hw);
+    let outcome = syscall::create_thread(common::view(&t), &frame, &mut hw);
 
     assert_eq!(
         outcome,
-        SyscallOutcome::Yield {
-            state: ThreadState::Blocking,
-            ret: None
-        }
+        SyscallOutcome::ParkForPublish
     );
     assert_eq!(hw.pending_work.len(), 1);
 }
 
 #[test]
 fn create_thread_req_returns_eagain_when_ring_full() {
-    let mut t = make_thread(ThreadState::Running, SPP::User);
+    let t = make_thread(ThreadState::Running, SPP::User);
     let mut frame = make_frame();
     let mut hw = FakeHw::default();
     frame.regs[11] = USER_TEXT_BASE as usize + 0x100;
@@ -349,7 +331,7 @@ fn create_thread_req_returns_eagain_when_ring_full() {
     frame.regs[13] = 0x1;
     hw.pending_work_ok = false;
 
-    let outcome = syscall::create_thread(&mut t, &frame, &mut hw);
+    let outcome = syscall::create_thread(common::view(&t), &frame, &mut hw);
 
     assert_eq!(
         outcome,
@@ -363,14 +345,14 @@ fn create_thread_req_returns_eagain_when_ring_full() {
 
 #[test]
 fn create_process_req_returns_eagain_when_ring_full() {
-    let mut t = make_thread(ThreadState::Running, SPP::User);
+    let t = make_thread(ThreadState::Running, SPP::User);
     let mut frame = make_frame();
     let mut hw = FakeHw::default();
     frame.regs[11] = 0x2_2000_0000;
     frame.regs[12] = 0x4000;
     hw.pending_work_ok = false;
 
-    let outcome = syscall::create_process_req(&mut t, &frame, &mut hw);
+    let outcome = syscall::create_process_req(common::view(&t), &frame, &mut hw);
 
     assert_eq!(
         outcome,
@@ -400,14 +382,14 @@ fn assert_rejected_no_work(outcome: SyscallOutcome, hw: &FakeHw, t: &process::Th
 
 #[test]
 fn mmap_req_rejects_kernel_vaddr() {
-    let mut t = make_thread(ThreadState::Running, SPP::User);
+    let t = make_thread(ThreadState::Running, SPP::User);
     let mut frame = make_frame();
     let mut hw = FakeHw::default();
     frame.regs[11] = KERNEL_VA;
     frame.regs[12] = 4096;
     frame.regs[14] = 0; // private
 
-    let outcome = syscall::mmap_req(&mut t, &frame, &mut hw);
+    let outcome = syscall::mmap_req(common::view(&t), &frame, &mut hw);
 
     // `UserVa::new` is the first gate; a kernel-half VA fails its
     // user-mappable check and surfaces as EFAULT before mmap_req's
@@ -417,14 +399,14 @@ fn mmap_req_rejects_kernel_vaddr() {
 
 #[test]
 fn mmap_req_rejects_trap_frame_region() {
-    let mut t = make_thread(ThreadState::Running, SPP::User);
+    let t = make_thread(ThreadState::Running, SPP::User);
     let mut frame = make_frame();
     let mut hw = FakeHw::default();
     frame.regs[11] = USER_VA_END as usize;
     frame.regs[12] = 4096;
     frame.regs[14] = 1; // shared — checked against shared range, still rejects
 
-    let outcome = syscall::mmap_req(&mut t, &frame, &mut hw);
+    let outcome = syscall::mmap_req(common::view(&t), &frame, &mut hw);
 
     // Same as above — the trap-frame region is outside user-mappable
     // space, so `UserVa::new` rejects with EFAULT before the
@@ -442,14 +424,14 @@ fn mmap_req_rejects_kernel_managed_user_regions() {
         USER_TEXT_BASE as usize,
         0x1000_0000usize, /* stack region */
     ] {
-        let mut t = make_thread(ThreadState::Running, SPP::User);
+        let t = make_thread(ThreadState::Running, SPP::User);
         let mut frame = make_frame();
         let mut hw = FakeHw::default();
         frame.regs[11] = vaddr;
         frame.regs[12] = 4096;
         frame.regs[14] = 0; // private — closest match for user buffers
 
-        let outcome = syscall::mmap_req(&mut t, &frame, &mut hw);
+        let outcome = syscall::mmap_req(common::view(&t), &frame, &mut hw);
 
         assert_rejected_no_work(outcome, &hw, &t, Errno::new(EINVAL).to_ret());
     }
@@ -461,14 +443,14 @@ fn mmap_req_priv_rejects_shared_vaddr() {
     // the priv/shared split is what makes per-pool teardown safe, so
     // crossing it must be rejected even though the address is
     // otherwise legal.
-    let mut t = make_thread(ThreadState::Running, SPP::User);
+    let t = make_thread(ThreadState::Running, SPP::User);
     let mut frame = make_frame();
     let mut hw = FakeHw::default();
     frame.regs[11] = SHARED_VA;
     frame.regs[12] = 4096;
     frame.regs[14] = 0;
 
-    let outcome = syscall::mmap_req(&mut t, &frame, &mut hw);
+    let outcome = syscall::mmap_req(common::view(&t), &frame, &mut hw);
 
     assert_rejected_no_work(outcome, &hw, &t, Errno::new(EINVAL).to_ret());
 }
@@ -480,7 +462,7 @@ fn mmap_req_shared_rejects_exec_perm() {
     // W^X violation across the two views — kernel writes (e.g. net
     // thread RX) would become executable in user. The syscall layer
     // must reject before the request reaches the manager work ring.
-    let mut t = make_thread(ThreadState::Running, SPP::User);
+    let t = make_thread(ThreadState::Running, SPP::User);
     let mut frame = make_frame();
     let mut hw = FakeHw::default();
     frame.regs[11] = SHARED_VA;
@@ -488,7 +470,7 @@ fn mmap_req_shared_rejects_exec_perm() {
     frame.regs[13] = 0x8; // PTE X bit
     frame.regs[14] = 1; // shared
 
-    let outcome = syscall::mmap_req(&mut t, &frame, &mut hw);
+    let outcome = syscall::mmap_req(common::view(&t), &frame, &mut hw);
 
     assert_rejected_no_work(outcome, &hw, &t, Errno::new(EINVAL).to_ret());
 }
@@ -497,7 +479,7 @@ fn mmap_req_shared_rejects_exec_perm() {
 fn mmap_req_priv_allows_exec_perm() {
     // Private mappings have no kernel-side alias, so X is fine — the
     // shared+exec rejection must not leak into the priv path.
-    let mut t = make_thread(ThreadState::Running, SPP::User);
+    let t = make_thread(ThreadState::Running, SPP::User);
     let mut frame = make_frame();
     let mut hw = FakeHw::default();
     frame.regs[11] = PRIV_VA;
@@ -505,14 +487,11 @@ fn mmap_req_priv_allows_exec_perm() {
     frame.regs[13] = 0xA; // R|X
     frame.regs[14] = 0; // private
 
-    let outcome = syscall::mmap_req(&mut t, &frame, &mut hw);
+    let outcome = syscall::mmap_req(common::view(&t), &frame, &mut hw);
 
     assert_eq!(
         outcome,
-        SyscallOutcome::Yield {
-            state: ThreadState::Blocking,
-            ret: None
-        }
+        SyscallOutcome::ParkForPublish
     );
     assert_eq!(hw.pending_work.len(), 1);
 }
@@ -520,28 +499,28 @@ fn mmap_req_priv_allows_exec_perm() {
 #[test]
 fn mmap_req_shared_rejects_priv_vaddr() {
     // Mirror of the above: share_with_kernel=true with a private VA.
-    let mut t = make_thread(ThreadState::Running, SPP::User);
+    let t = make_thread(ThreadState::Running, SPP::User);
     let mut frame = make_frame();
     let mut hw = FakeHw::default();
     frame.regs[11] = PRIV_VA;
     frame.regs[12] = 4096;
     frame.regs[14] = 1;
 
-    let outcome = syscall::mmap_req(&mut t, &frame, &mut hw);
+    let outcome = syscall::mmap_req(common::view(&t), &frame, &mut hw);
 
     assert_rejected_no_work(outcome, &hw, &t, Errno::new(EINVAL).to_ret());
 }
 
 #[test]
 fn mmap_req_rejects_overflowing_size() {
-    let mut t = make_thread(ThreadState::Running, SPP::User);
+    let t = make_thread(ThreadState::Running, SPP::User);
     let mut frame = make_frame();
     let mut hw = FakeHw::default();
     frame.regs[11] = PRIV_VA;
     frame.regs[12] = usize::MAX;
     frame.regs[14] = 0;
 
-    let outcome = syscall::mmap_req(&mut t, &frame, &mut hw);
+    let outcome = syscall::mmap_req(common::view(&t), &frame, &mut hw);
 
     assert_rejected_no_work(outcome, &hw, &t, Errno::new(EINVAL).to_ret());
 }
@@ -549,14 +528,14 @@ fn mmap_req_rejects_overflowing_size() {
 #[test]
 fn mmap_req_priv_rejects_range_crossing_priv_end() {
     // Range starts in priv but reaches into shared.
-    let mut t = make_thread(ThreadState::Running, SPP::User);
+    let t = make_thread(ThreadState::Running, SPP::User);
     let mut frame = make_frame();
     let mut hw = FakeHw::default();
     frame.regs[11] = (UPROC_PRIV_END - 4096) as usize;
     frame.regs[12] = 8192;
     frame.regs[14] = 0;
 
-    let outcome = syscall::mmap_req(&mut t, &frame, &mut hw);
+    let outcome = syscall::mmap_req(common::view(&t), &frame, &mut hw);
 
     assert_rejected_no_work(outcome, &hw, &t, Errno::new(EINVAL).to_ret());
 }
@@ -565,28 +544,28 @@ fn mmap_req_priv_rejects_range_crossing_priv_end() {
 fn mmap_req_shared_rejects_range_crossing_shared_end() {
     // Range starts at the top of the shared range and reaches into
     // the trap-frame region.
-    let mut t = make_thread(ThreadState::Running, SPP::User);
+    let t = make_thread(ThreadState::Running, SPP::User);
     let mut frame = make_frame();
     let mut hw = FakeHw::default();
     frame.regs[11] = (UPROC_SHARED_END - 4096) as usize;
     frame.regs[12] = 8192;
     frame.regs[14] = 1;
 
-    let outcome = syscall::mmap_req(&mut t, &frame, &mut hw);
+    let outcome = syscall::mmap_req(common::view(&t), &frame, &mut hw);
 
     assert_rejected_no_work(outcome, &hw, &t, Errno::new(EINVAL).to_ret());
 }
 
 #[test]
 fn nc_create_req_rejects_kernel_vaddr() {
-    let mut t = make_thread(ThreadState::Running, SPP::User);
+    let t = make_thread(ThreadState::Running, SPP::User);
     let mut frame = make_frame();
     let mut hw = FakeHw::default();
     frame.regs[11] = KERNEL_VA;
     frame.regs[12] = 4096;
     frame.regs[13] = 0;
 
-    let outcome = syscall::nc_create_req(&mut t, &frame, &mut hw);
+    let outcome = syscall::nc_create_req(common::view(&t), &frame, &mut hw);
 
     assert_rejected_no_work(outcome, &hw, &t, Errno::new(EINVAL).to_ret());
 }
@@ -595,40 +574,40 @@ fn nc_create_req_rejects_kernel_vaddr() {
 fn nc_create_req_rejects_priv_vaddr() {
     // NetChannels live in the shared range only — a priv VA must be
     // rejected even though it's otherwise legal user space.
-    let mut t = make_thread(ThreadState::Running, SPP::User);
+    let t = make_thread(ThreadState::Running, SPP::User);
     let mut frame = make_frame();
     let mut hw = FakeHw::default();
     frame.regs[11] = PRIV_VA;
     frame.regs[12] = 4096;
     frame.regs[13] = 0;
 
-    let outcome = syscall::nc_create_req(&mut t, &frame, &mut hw);
+    let outcome = syscall::nc_create_req(common::view(&t), &frame, &mut hw);
 
     assert_rejected_no_work(outcome, &hw, &t, Errno::new(EINVAL).to_ret());
 }
 
 #[test]
 fn create_process_req_rejects_kernel_vaddr() {
-    let mut t = make_thread(ThreadState::Running, SPP::User);
+    let t = make_thread(ThreadState::Running, SPP::User);
     let mut frame = make_frame();
     let mut hw = FakeHw::default();
     frame.regs[11] = KERNEL_VA;
     frame.regs[12] = 0x1000;
 
-    let outcome = syscall::create_process_req(&mut t, &frame, &mut hw);
+    let outcome = syscall::create_process_req(common::view(&t), &frame, &mut hw);
 
     assert_rejected_no_work(outcome, &hw, &t, Errno::new(EFAULT).to_ret());
 }
 
 #[test]
 fn create_process_req_rejects_overflowing_len() {
-    let mut t = make_thread(ThreadState::Running, SPP::User);
+    let t = make_thread(ThreadState::Running, SPP::User);
     let mut frame = make_frame();
     let mut hw = FakeHw::default();
     frame.regs[11] = USER_TEXT_BASE as usize;
     frame.regs[12] = usize::MAX;
 
-    let outcome = syscall::create_process_req(&mut t, &frame, &mut hw);
+    let outcome = syscall::create_process_req(common::view(&t), &frame, &mut hw);
 
     assert_rejected_no_work(outcome, &hw, &t, Errno::new(EFAULT).to_ret());
 }

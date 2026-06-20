@@ -21,7 +21,20 @@
 //! | yes | Suspended              | live — check deadline |
 //! | yes | Ready                  | stale — eagerly woken |
 //! | yes | Exited                 | stale — being torn down |
-//! | yes | Running/Assigned/Blocking | **transient** — leave entry, peek again next pass |
+//! | yes | Blocking               | stale — left this park for a Blocking one |
+//! | yes | Running/Assigned       | **transient** — leave entry, peek again next pass |
+//! | yes | (anything else)        | stale — garbage/recycled; evict, never block |
+//!
+//! Only `Running`/`Assigned` are transient; *every other* discriminant —
+//! including an out-of-range/garbage value — is stale. A blanket
+//! `else => transient` was a latent freeze: an entry whose target
+//! allocation was freed + recycled can read an arbitrary `state`, and a
+//! garbage value treated as transient would sit at the heap top and
+//! `break` the drain forever. Entries are also scrubbed on reap (see
+//! [`SleepHeap::remove_thread`], called from the kernel's `dealloc_thread`)
+//! so a dangling entry shouldn't exist at all — evicting unknown states is
+//! the belt-and-suspenders guarantee that one which slips through can never
+//! permanently stall the drain.
 //!
 //! The transient case covers `kthread_park`'s push-before-state-publish
 //! window: the asm handoff publishes `state=Suspended` after the inbox
@@ -30,6 +43,20 @@
 //! and we can't fire (deadline-not-yet-elapsed could spuriously wake).
 //! Solution: leave it in the heap; the next manager pass observes
 //! state=Suspended and proceeds normally.
+//!
+//! **`Blocking` is stale, not transient.** A `Suspended` heap entry is
+//! only created by a Suspended park; a thread now `Blocking` (with a
+//! still-matching seq, since Blocking parks don't bump `sleep_seq`) was
+//! eager-promoted out of its Suspended park and then re-parked
+//! `Blocking` (e.g. `futex_wait`). It is **not** mid-transition into
+//! Suspended (that path is Running → Suspended, never via Blocking).
+//! Classifying it transient was a heap-freeze bug: a long-lived Blocking
+//! thread's stale entry at the heap top made `drain_woken` `break`
+//! forever, so every deeper sleeper never woke (the hello-std
+//! `yield_now`/mutex hang). Reaping it as stale lets the drain proceed.
+//! `Running`/`Assigned` stay transient (genuinely in-flight, bounded by
+//! the dispatch quantum — the thread soon re-parks/exits and the entry
+//! is reaped as stale by seq or state).
 //!
 //! The seq counter alone is insufficient because re-park flips state
 //! back to Suspended with a new deadline. Without the seq check,
@@ -171,7 +198,7 @@ impl SleepHeap {
             let verdict = unsafe {
                 let t = &*top.thread;
                 let live_seq = t.sleep_seq.load(AtomicOrdering::Acquire);
-                let live_state = t.state.load(AtomicOrdering::Acquire);
+                let live_state = t.state_load(AtomicOrdering::Acquire);
                 classify(live_seq, live_state, top.sleep_seq)
             };
             match verdict {
@@ -196,6 +223,17 @@ impl SleepHeap {
                 }
             }
         }
+    }
+
+    /// Drop every entry targeting `thread`. Called from the reap path
+    /// when a `Thread` allocation is about to be freed, so no heap entry
+    /// can outlive its `Box<Thread>` — a dangling entry would later be
+    /// dereferenced by [`Self::drain_woken`] (UB), and if its freed-then-
+    /// recycled memory read a `Running`/`Assigned`-shaped state it could
+    /// sit at the heap top and `break` the drain forever, freezing every
+    /// deeper sleeper. O(N) rebuild; reap is far rarer than park/drain.
+    pub fn remove_thread(&mut self, thread: *mut Thread) {
+        self.inner.retain(|Reverse(e)| e.thread != thread);
     }
 
     /// Total entries in the heap, including stale ones. Diagnostic
@@ -243,7 +281,34 @@ fn classify(live_seq: u64, live_state: usize, entry_seq: u64) -> Verdict {
     if live_state == ThreadState::Exited as usize {
         return Verdict::Stale;
     }
-    // Running / Assigned / Blocking with matching seq: park is in
-    // flight, asm handoff hasn't published Suspended yet.
-    Verdict::Transient
+    // `Blocking` with a matching seq is **Stale**, not Transient. A
+    // `Suspended` heap entry is only ever created by a Suspended park;
+    // a thread now `Blocking` left that park (it was eager-promoted out,
+    // then `futex_wait`'d into a Blocking park — which does NOT bump
+    // `sleep_seq`). It is *not* mid-transition into Suspended (the
+    // Suspend-commit path goes Running → Suspended, never through
+    // Blocking). Treating it as Transient was a heap-freeze bug: a
+    // long-lived Blocking thread's stale entry sitting at the heap top
+    // (earliest deadline) made `drain_woken` `break` forever, so every
+    // sleeper below it never woke (the hello-std mutex/`yield_now` hang).
+    if live_state == ThreadState::Blocking as usize {
+        return Verdict::Stale;
+    }
+    // ONLY `Running`/`Assigned` with a matching seq are `Transient` — the
+    // genuine `kthread_park` push-before-asm-publish window, where the
+    // thread is mid-transition into Suspended (bounded by the dispatch
+    // quantum). Every *other* value — including a garbage/out-of-range
+    // discriminant — is `Stale` (evict), NOT `Transient` (block). This is
+    // load-bearing for robustness: a stale entry whose target allocation
+    // was freed + recycled can read an arbitrary `state`, and a blanket
+    // `else => Transient` would let such an entry sit at the heap top and
+    // `break` `drain_woken` forever, freezing every deeper sleeper. With
+    // entries also scrubbed on reap (`SleepHeap::remove_thread`), a
+    // dangling entry shouldn't exist at all — but evicting unknown states
+    // here means even one that slipped through can never permanently stall
+    // the drain.
+    if live_state == ThreadState::Running as usize || live_state == ThreadState::Assigned as usize {
+        return Verdict::Transient;
+    }
+    Verdict::Stale
 }

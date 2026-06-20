@@ -14,7 +14,7 @@
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")" && pwd)
-CRATES=(orbit-core orbit-abi mem process net_channel mmu)
+CRATES=(orbit-core orbit-abi mem process net_channel mmu manager)
 
 note() { printf ">> %s\n" "$*"; }
 
@@ -62,6 +62,8 @@ case "$MODE" in
       "orbit-core:dispatch_syscall_race"
       "process:stdin"
       "process:key_events"
+      "process:cap_aliasing"
+      "process:parkedmut_aliasing"
       "net_channel:spsc"
       "orbit-core:tlb_shootdown"
     )

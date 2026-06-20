@@ -16,7 +16,7 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use device::HartContext;
-use process::Thread;
+use process::{RunningThread, Thread};
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,8 +85,16 @@ pub fn switch_bucket(hart: &HartContext, new: HartBucket, now: u64) {
             // `exit_thread_with_state` in the same hart, before the
             // owning hart enters S-mode kernel code that would call
             // `switch_bucket`.
-            let t: &Thread = unsafe { (cur as *const Thread).as_ref_unchecked() };
-            t.cpu_ticks_total.fetch_add(elapsed, Ordering::Relaxed);
+            //
+            // Field-project the atomic bump off the raw `current` ptr —
+            // forming `&Thread` would retag the whole struct and freeze
+            // the cred fields a sibling may be propagating to this
+            // still-Running thread (the cap-layer aliasing invariant).
+            unsafe {
+                (*(cur as *const Thread))
+                    .cpu_ticks_total
+                    .fetch_add(elapsed, Ordering::Relaxed);
+            }
         }
     }
 }
@@ -129,13 +137,19 @@ impl SyscallSlot {
 /// guards with `Sysno::from_usize` so unknown sysnos don't pollute
 /// the dense ordinal table).
 #[inline]
-pub fn record_syscall(slot: Option<&SyscallSlot>, thread: &Thread, start: u64, end: u64) {
+pub fn record_syscall(
+    slot: Option<&SyscallSlot>,
+    running: &RunningThread,
+    start: u64,
+    end: u64,
+) {
     let elapsed = end.wrapping_sub(start);
     if let Some(s) = slot {
         s.count.fetch_add(1, Ordering::Relaxed);
         s.total_ticks.fetch_add(elapsed, Ordering::Relaxed);
         s.max_ticks.fetch_max(elapsed, Ordering::Relaxed);
     }
-    thread.syscall_count.fetch_add(1, Ordering::Relaxed);
-    thread.syscall_ticks.fetch_add(elapsed, Ordering::Relaxed);
+    // Field-projected per-thread bump (own-hart) — no whole-struct
+    // `&Thread` over the cred fields a sibling may be propagating.
+    running.account_syscall(elapsed);
 }

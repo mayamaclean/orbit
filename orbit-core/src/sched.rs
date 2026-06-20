@@ -7,7 +7,7 @@
 
 use core::sync::atomic::{AtomicPtr, Ordering};
 
-use process::{Thread, ThreadState};
+use process::Thread;
 
 use crate::Hardware;
 
@@ -137,11 +137,20 @@ unsafe fn assign_thread_to(view: &HartView, thread: *mut Thread) {
     // scheduler's owning storage. A `&mut Thread` reborrow here would
     // pop its tag on scope exit and invalidate the raw ptr stored in
     // `view.current` — see `HartView::assign` docs.
-    unsafe {
+    //
+    // `try_mark_assigned` is the checked `Ready → Assigned` edge: it
+    // transitions only a genuinely-Ready thread, and returns `false`
+    // (without storing or panicking) if the thread was killed while
+    // queued (`Exited` — the benign kill race). In that case we must NOT
+    // publish a dead thread to the hart's `current`, so we bump ticks /
+    // assign only on a successful transition. A non-Ready, non-Exited
+    // from-state panics inside the verb (a thread that shouldn't be in
+    // the ready queue at all).
+    let assigned = unsafe {
         (*thread).ticks = (*thread).ticks.wrapping_add(1);
-        (*thread)
-            .state
-            .store(ThreadState::Assigned as usize, Ordering::Release);
+        (*thread).try_mark_assigned()
+    };
+    if assigned {
+        view.assign(thread);
     }
-    view.assign(thread);
 }

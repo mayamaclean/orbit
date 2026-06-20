@@ -110,7 +110,14 @@ pub const CREATE_PROCESS_V2: usize = 4105;
 /// Unlike `query_stats`, the ring isn't per-process — it covers
 /// every gate event system-wide. Sized at
 /// `DENIAL_RING_CAPACITY * size_of::<DenialEvent>()` for a complete
-/// snapshot (≈2.4 KiB at the cap of 50 events).
+/// snapshot (≈3 KiB at the cap of 64 events).
+///
+/// **Buffer must not straddle a 4 KiB page** (same constraint as
+/// `fs_read`): the kernel copies the reply through a single
+/// `UserPageWindow`, so a buffer that crosses a page boundary is rejected
+/// with `EINVAL`. Page-align the snapshot buffer (e.g.
+/// `#[repr(align(4096))]`) — a 3 KiB buffer fits in one page only if it
+/// starts on one, and an unaligned stack array straddles ~58% of the time.
 ///
 /// **Cross-process disclosure.** The reply contains pids, tids,
 /// syscall numbers, and (for `RoleDeny`) source/target roles for

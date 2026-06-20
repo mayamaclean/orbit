@@ -1037,6 +1037,12 @@ pub fn create_process_v2(args: &crate::perms::CreateProcessV2Args) -> Result<u16
 /// events for a complete snapshot; smaller buffers receive the
 /// oldest prefix that fits.
 ///
+/// **`buf` must not straddle a 4 KiB page** or the call returns
+/// `EINVAL` (the kernel copies through a single page window — same as
+/// `fs_read`). A full-snapshot buffer is ≈3 KiB, so page-align it
+/// (e.g. wrap the array in a `#[repr(align(4096))]` struct); an
+/// unaligned stack array crosses a page boundary more often than not.
+///
 /// **Cross-process disclosure.** The reply contains pids, tids,
 /// syscall numbers, and (for `RoleDeny`) source/target roles for
 /// *every* denial system-wide, not just the caller's. Acceptable

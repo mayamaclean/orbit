@@ -28,10 +28,8 @@ unsafe fn park(thread: *mut process::Thread, wake_time: usize) -> u64 {
             .sleep_seq
             .fetch_add(1, Ordering::Release)
             .wrapping_add(1);
-        (*thread).wake_time = wake_time;
-        (*thread)
-            .state
-            .store(ThreadState::Suspended as usize, Ordering::Release);
+        process::RunningThread::from_ptr(thread).set_wake_time(wake_time);
+        (*thread).transition_to_unchecked(ThreadState::Suspended);
         seq
     }
 }
@@ -116,8 +114,7 @@ fn stale_entry_state_changed_to_ready() {
 
     // Eager promotion: state → Ready, no seq change. Mirrors what
     // set_wake_reason_where does in kmain.
-    t.state
-        .store(ThreadState::Ready as usize, Ordering::Release);
+    t.transition_to_unchecked(ThreadState::Ready);
 
     let mut woken = Vec::new();
     h.drain_woken(150, |p| woken.push(p));
@@ -133,8 +130,7 @@ fn stale_entry_state_exited() {
     let mut h = SleepHeap::new();
     h.push(tp, 100, seq);
 
-    t.state
-        .store(ThreadState::Exited as usize, Ordering::Release);
+    t.transition_to_unchecked(ThreadState::Exited);
 
     let mut woken = Vec::new();
     h.drain_woken(150, |p| woken.push(p));
@@ -151,8 +147,7 @@ fn stale_entry_seq_mismatch_after_repark() {
     h.push(tp, 100, seq1);
 
     // Eager wake → re-park with new deadline. seq increments.
-    t.state
-        .store(ThreadState::Ready as usize, Ordering::Release);
+    t.transition_to_unchecked(ThreadState::Ready);
     let seq2 = unsafe { park(tp, 500) };
     h.push(tp, 500, seq2);
     assert_eq!(h.len(), 2);
@@ -185,10 +180,8 @@ fn transient_state_running_with_matching_seq() {
             .sleep_seq
             .fetch_add(1, Ordering::Release)
             .wrapping_add(1);
-        (*tp).wake_time = 100;
-        (*tp)
-            .state
-            .store(ThreadState::Running as usize, Ordering::Release);
+        process::RunningThread::from_ptr(tp).set_wake_time(100);
+        (*tp).transition_to_unchecked(ThreadState::Running);
         s
     };
     let mut h = SleepHeap::new();
@@ -202,8 +195,7 @@ fn transient_state_running_with_matching_seq() {
     assert_eq!(h.len(), 1, "transient entry must stay in heap");
 
     // Once state commits to Suspended, next pass fires normally.
-    t.state
-        .store(ThreadState::Suspended as usize, Ordering::Release);
+    t.transition_to_unchecked(ThreadState::Suspended);
     h.drain_woken(500, |p| woken.push(p));
     assert_eq!(woken, vec![tp]);
     assert!(h.is_empty());
@@ -226,8 +218,7 @@ fn mix_of_live_stale_and_pending() {
     h.push(tp3, 300, s3);
 
     // Eagerly wake t1 (stale). t2 deadline-elapsed at drain time. t3 future.
-    t1.state
-        .store(ThreadState::Ready as usize, Ordering::Release);
+    t1.transition_to_unchecked(ThreadState::Ready);
 
     let mut woken = Vec::new();
     h.drain_woken(250, |p| woken.push(p));
@@ -260,4 +251,130 @@ fn drain_stops_at_first_future_live_entry() {
     assert!(woken.is_empty());
     assert_eq!(h.len(), 2);
     assert_eq!(h.next_wake(), Some(1000));
+}
+
+/// Regression: a stale heap entry whose thread is now `Blocking` (with a
+/// matching `sleep_seq`) must NOT freeze the drain. This is the
+/// hello-std `yield_now` hang: a thread `sleep_ms(0)`s (Suspended heap
+/// entry, earliest deadline), gets eager-promoted out WITHOUT its entry
+/// popped, then `futex_wait`s into a `Blocking` park (which does not bump
+/// `sleep_seq`). The stale Blocking entry sits at the heap top; if it's
+/// classified `Transient` (the old behavior) `drain_woken` `break`s on it
+/// forever and every sleeper below never wakes. It must be reaped as
+/// `Stale` so deeper Live sleepers still fire.
+#[test]
+fn blocking_stale_entry_does_not_freeze_drain() {
+    let mut blocker = make_suspended();
+    let mut sleeper = make_suspended();
+    let bp: *mut _ = &raw mut *blocker;
+    let sp: *mut _ = &raw mut *sleeper;
+
+    // Blocker parked first with the EARLIEST deadline (heap top).
+    let bseq = unsafe { park(bp, 10) };
+    let sseq = unsafe { park(sp, 100) };
+    let mut h = SleepHeap::new();
+    h.push(bp, 10, bseq);
+    h.push(sp, 100, sseq);
+
+    // The blocker left its Suspended park for a Blocking (futex) park —
+    // seq UNCHANGED (Blocking doesn't bump it), so its heap entry's seq
+    // still matches. Old classify => Transient => freeze.
+    blocker.transition_to_unchecked(ThreadState::Blocking);
+
+    let mut woken = Vec::new();
+    h.drain_woken(200, |p| woken.push(p));
+
+    // The stale Blocking entry is reaped; the genuine sleeper fires.
+    assert_eq!(
+        woken,
+        vec![sp],
+        "deeper sleeper must wake despite the stale Blocking entry on top"
+    );
+    assert!(h.is_empty(), "both entries consumed (one stale, one woken)");
+}
+
+#[test]
+fn remove_thread_scrubs_entry_and_unblocks_drain() {
+    // The reap-path scrub (`dealloc_thread` -> `Manager::forget_thread` ->
+    // `SleepHeap::remove_thread`): a reaped thread's entry sits at the heap
+    // top in a Transient-shaped (Running) state that would otherwise
+    // `break` the drain. Scrubbing it lets the genuine sleeper below wake —
+    // and, in the kernel, means a freed allocation is never dereferenced.
+    let mut reaped = make_suspended();
+    let mut sleeper = make_suspended();
+    let rp: *mut _ = &raw mut *reaped;
+    let sp: *mut _ = &raw mut *sleeper;
+
+    let rseq = unsafe { park(rp, 10) }; // earliest deadline -> heap top
+    let sseq = unsafe { park(sp, 100) };
+    let mut h = SleepHeap::new();
+    h.push(rp, 10, rseq);
+    h.push(sp, 100, sseq);
+
+    // The about-to-be-reaped thread, mid-teardown, in the freeze shape.
+    reaped.transition_to_unchecked(ThreadState::Running);
+
+    h.remove_thread(rp);
+    assert_eq!(h.len(), 1, "only the reaped thread's entry was removed");
+
+    let mut woken = Vec::new();
+    h.drain_woken(200, |p| woken.push(p));
+    assert_eq!(
+        woken,
+        vec![sp],
+        "deeper sleeper wakes; the reaped entry was scrubbed, not left to block",
+    );
+    assert!(h.is_empty());
+}
+
+#[test]
+fn remove_thread_drops_every_entry_for_that_thread() {
+    // A thread can leave several stale entries (re-parked across passes);
+    // remove_thread must drop them all, leaving other threads' entries.
+    let mut t = make_suspended();
+    let tp: *mut _ = &raw mut *t;
+    let mut other = make_suspended();
+    let op: *mut _ = &raw mut *other;
+
+    let mut h = SleepHeap::new();
+    h.push(tp, 10, 1);
+    h.push(tp, 20, 2);
+    h.push(tp, 30, 3);
+    let oseq = unsafe { park(op, 15) };
+    h.push(op, 15, oseq);
+    assert_eq!(h.len(), 4);
+
+    h.remove_thread(tp);
+    assert_eq!(h.len(), 1, "all of tp's entries gone; other's remains");
+    assert_eq!(h.next_wake(), Some(15), "other's entry survived");
+}
+
+#[test]
+fn unknown_state_entry_is_evicted_not_transient() {
+    // A matching-seq entry whose target reads a non-enumerated `state`
+    // (e.g. a freed+recycled allocation) must be evicted, never treated as
+    // Transient — otherwise it sits at the heap top and freezes the drain.
+    let mut garbage = make_suspended();
+    let mut sleeper = make_suspended();
+    let gp: *mut _ = &raw mut *garbage;
+    let sp: *mut _ = &raw mut *sleeper;
+
+    let gseq = unsafe { park(gp, 10) }; // top
+    let sseq = unsafe { park(sp, 50) };
+    let mut h = SleepHeap::new();
+    h.push(gp, 10, gseq);
+    h.push(sp, 50, sseq);
+
+    // Stamp an out-of-range discriminant via the raw state atom (what a
+    // recycled allocation might read). seq still matches the entry.
+    garbage.store_state_raw(0xDEAD);
+
+    let mut woken = Vec::new();
+    h.drain_woken(200, |p| woken.push(p));
+    assert_eq!(
+        woken,
+        vec![sp],
+        "garbage entry evicted as stale; sleeper wakes"
+    );
+    assert!(h.is_empty());
 }
