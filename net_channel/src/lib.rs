@@ -271,7 +271,7 @@ pub const NC_TX_OFF: usize = 384;
 /// Minimum region size. Everything — states, tx, rx — packs into a single
 /// 4 KiB page. Per-ring usable payload is
 /// `(NC_MIN_REGION_SIZE - NC_TX_OFF) / 2 - size_of::<NetChannelQueue>() + 1`
-/// (roughly ~1.7 KiB).
+/// (roughly ~1.4 KiB).
 pub const NC_MIN_REGION_SIZE: usize = 4096;
 
 /// Maximum region size. Cap at 8 MiB so misbehaving umode can't demand an
@@ -704,12 +704,11 @@ fn schedule_retry(ctx: &mut ChannelCtx, now_us: u64) {
 
 /// Ring holding `(offset, len)` pairs pointing into [`NetChannelQueue::buf`].
 ///
-/// Sized to match the e1000 RX ring (8 descriptors): a PLIC IRQ batch
-/// can land 8 frames into smoltcp at once, and we want the staging path
-/// to absorb that without forcing a `ch_yield` round-trip per frame.
-/// N=16 → capacity 15 (one slot reserved for the empty/full sentinel),
-/// so up to 15 staged slices in flight before the user has to wait on
-/// the kernel to drain.
+/// A PLIC IRQ batch can land several frames into smoltcp at once, and we
+/// want the staging path to absorb a burst without forcing a `ch_yield`
+/// round-trip per frame. N=16 → capacity 15 (one slot reserved for the
+/// empty/full sentinel), so up to 15 staged slices in flight before the
+/// user has to wait on the kernel to drain.
 type SliceQueue = SpscQueue<(usize, usize), 16>;
 /// Ring of byte counts the consumer has advanced past. Sized in lockstep
 /// with `SliceQueue` so the pipelining is symmetric: every staged slice
@@ -943,9 +942,9 @@ impl NetChannel {
     /// producer.
     ///
     /// # Safety
-    /// Must be called after observing `current.state == 0` (which
-    /// establishes that the kernel has already done its half) and
-    /// before re-engaging on a fresh session.
+    /// Must be called after the kernel has finished its half — i.e. the
+    /// channel has left the `ACTIVE`/`CLOSING` states (`reset_kernel_side`
+    /// has run) — and before re-engaging on a fresh session.
     #[cfg(not(feature = "kernel"))]
     pub unsafe fn reset_user_side(&self) {
         let tx = self.tx();
@@ -1009,7 +1008,7 @@ impl NetChannel {
         // Two-phase tear-down: enter `Closing` (graceful FIN, drain
         // smoltcp tx, observe peer FIN-ACK) instead of immediately
         // aborting + recycling. The old single-phase path discarded
-        // any tx queued in the final `write_all` — see roadmap.
+        // any tx queued in the final `write_all`.
         if was_engaged && !engaged && matches!(ctx.phase, Phase::Active) {
             // Drain any tx the user wrote between the previous poll
             // and this disengage. Without this the bytes sit in the
@@ -1493,14 +1492,16 @@ impl NetChannel {
     }
 
     /// Release the current session. Writes `desired.engaged = 0`; the
-    /// reconciler observes the `1 → 0` edge and tears down the smoltcp
-    /// socket (for retain bindings, immediately re-arms; for one-shot
-    /// bindings, transitions to the terminal `Failed` state).
+    /// reconciler observes the `1 → 0` edge and enters the `Closing`
+    /// drain (graceful FIN, drain tx, wait for the peer FIN-ACK). Once
+    /// smoltcp reaches `Closed` the kernel runs `reset_kernel_side` and
+    /// moves the channel to `IN_FLIGHT` (retain bindings re-listen) /
+    /// `IDLE` (one-shot client) / `FAILED`.
     ///
     /// After calling this, the user must wait for `current.state` to
-    /// drop to 0 before resetting the user-owned ring halves and
-    /// engaging again. The blocking sequence is owned by the wrapper in
-    /// orbit-rt; this method is just the signal.
+    /// leave `ACTIVE`/`CLOSING` before resetting the user-owned ring
+    /// halves and engaging again. The blocking sequence is owned by the
+    /// wrapper in orbit-rt; this method is just the signal.
     #[cfg(not(feature = "kernel"))]
     pub fn disengage(&self) {
         self.desired().engaged.store(0, Ordering::Release);

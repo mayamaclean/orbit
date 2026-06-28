@@ -3,15 +3,15 @@
 //! Each blocking syscall whose handler needs `&mut Orbit` (page-table
 //! mutations, allocator access, process-table edits) drops a
 //! [`PendingWork`] entry onto the kernel's `MANAGER_WORK` thingbuf via
-//! [`crate::Hardware::push_pending_work`]. Whichever hart next acquires
-//! `MANAGER_LOCK` drains the queue, runs the handler, and signals the
-//! paired [`CompletionHandle`] with the result; the blocked thread's
-//! return value is read off the handle on the next scheduler scan.
+//! [`crate::Hardware::push_pending_work`]. Each entry carries the
+//! parked caller's `tid`. Whichever hart next holds the scheduler lock
+//! drains the queue, runs the handler, and resumes the parked thread
+//! via `publish_pending_for_tid` (writes the result a-regs, then pushes
+//! `WakeEvent::Tid`). No `CompletionHandle` is carried in the work item.
 //!
-//! The queue replaces the per-thread `block_reason` enum: new async
-//! waits (e.g. §9's `read_stdin`) only need a [`CompletionHandle`] on
-//! the thread and a signaler somewhere — no work-queue entry, no
-//! manager involvement.
+//! Some async waits don't need a work-queue entry at all: `read_stdin`
+//! and `read_key_event` park on a per-process `parked_tid` slot and are
+//! resumed by a `WakeEvent::InputTid` push from the producer side.
 
 use mmu::sv48::PhysAddr;
 use net_channel::BindSpec;
@@ -171,8 +171,8 @@ pub struct CreateProcessReq {
 pub struct FutexWaitReq {
     pub uaddr: UserVa,
     pub expected: u32,
-    /// `0` → wait forever (current v1 contract). Reserved for the
-    /// future timeout-scan path (see roadmap §13a.5).
+    /// `0` → wait forever (current v1 contract). Reserved for a
+    /// future timeout-scan path.
     pub timeout_ns: u64,
 }
 
@@ -244,7 +244,7 @@ pub struct CreateProcessExReq {
 /// `kernel_pages` frame sized to `w * h * bytes_per_pixel(format)`
 /// (rounded up to a page), maps it user-writable in the calling
 /// process's shared range, registers the entry in the per-process
-/// surface table, and signals the handle with `(handle_id, user_va)`.
+/// surface table, and resumes the caller with `(handle_id, user_va)`.
 #[derive(Debug, Clone, Copy)]
 pub struct FbSurfaceCreateReq {
     pub width: u32,
@@ -291,7 +291,7 @@ pub struct WakeTidReq {
 pub const MAX_LOGIN_NAME: usize = 32;
 
 // The next eleven requests were converted from sync trap-path
-// handlers (see docs/dev/fd-unix-io-scope.md item 0): they read or
+// handlers: they read or
 // mutate manager-owned state (`process_handles`, `Process` cwd /
 // creds), and a lock-free trap-path access races the manager's
 // BTreeMap mutations on other harts. Routing them through the work
@@ -474,9 +474,8 @@ pub enum PendingWork {
         /// Calling thread's tid. The cache-driven path resumes the
         /// thread directly via `Orbit::resume_thread_with_value`
         /// once every page in the read has landed (or any one
-        /// fails), bypassing `CompletionHandle` entirely. fs_read
-        /// is the first hot path on this thinner shape; remaining
-        /// blocking syscalls keep the handle protocol for now.
+        /// fails). This on-thread publish path (no `CompletionHandle`)
+        /// is now how every converted blocking syscall resumes.
         tid: u32,
     },
     FsStat {
@@ -746,8 +745,8 @@ pub struct SpawnContext {
     /// Copy of the caller-provided args struct. Used by `install_spawn`
     /// to re-walk the caller's user memory for the cwd / argv / envp
     /// blobs (those copies need the still-alive parent's PT, which is
-    /// only safe while the parent is parked on the original
-    /// CompletionHandle).
+    /// only safe while the parent is still parked `Blocking` on the
+    /// original spawn syscall).
     pub args: orbit_abi::perms::CreateProcessV2Args,
     pub parent_pid: u16,
     pub root_pa: PhysAddr,

@@ -101,7 +101,7 @@ pub fn setup_interrupts() {
 ///   0: TOR [0, 0x80000000)              RWX, L=0  — MMIO. S allowed, M bypasses.
 ///   1: TOR [0x80000000, _rodata_start)  ---, L=0  — bl text/bss/data. S denied. M bypasses.
 ///   2: TOR [_rodata_start, _rodata_end) R--, L=1  — rodata RO for *both* modes (stack guard).
-///   3: TOR [_rodata_end, 0x84000000)    ---, L=0  — bl stack + id_tables + trap frames + slack. S denied. M bypasses.
+///   3: TOR [_rodata_end, 0x84000000)    ---, L=0  — bl stack + trap frames + slack. S denied. M bypasses.
 ///   4: TOR [0x84000000, !0)             RWX, L=0  — kmain region + everything past it. S allowed.
 ///
 /// The asymmetry on rodata (M+S both R, neither W) is a PMP limitation:
@@ -129,8 +129,8 @@ pub unsafe fn setup_pmp() {
     let entry4 = TOR | R | W | X; // 0x0F
     let pmpcfg0 = entry0 | (entry1 << 8) | (entry2 << 16) | (entry3 << 24) | (entry4 << 32);
 
-    // Upper bound for "below kmain" — bl's text/data, stack, id_map_tables
-    // and the M-mode trap frames at 0x80800000 all live below this.
+    // Upper bound for "below kmain" — bl's text/data, stack, and the
+    // M-mode trap frames at 0x80800000 all live below this.
     // kmain's load base is `0x80000000 + 64 MiB = 0x84000000`.
     const KMAIN_LOAD_BASE: u64 = 0x8400_0000;
 
@@ -268,7 +268,7 @@ pub extern "C" fn kmain_enter(serial_addr: usize, dtb_addr: usize) {
             "li t0, 0x02004000",          // mtimecmp address
             "li t1, 0x0200bff8",    // mtime address
             "ld t2, 0(t1)",               // Load current 64-bit mtime
-            "li t3, 100000000",             // Example interval (1 million cycles)
+            "li t3, 100000000",             // Example interval (100M ticks ≈ 10 s at 10 MHz)
             "add t2, t2, t3",             // t2 = mtime + interval
             "sd t2, 0(t0)",
             "mv sp, {s}",

@@ -42,7 +42,7 @@
 //! let region = shared_mmap(Layout::from_size_align(8192, 4096).unwrap())?;
 //! let buf = unsafe { core::slice::from_raw_parts_mut(region.as_mut_ptr(), region.len()) };
 //! // ... use buf ...
-//! drop(region); // returns the VA range to SharedVa; munmap arrives in a future milestone.
+//! drop(region); // returns the VA range to SharedVa; munmap is not yet implemented.
 //! ```
 //!
 //! # Reserving a VA hint for `create_netch`

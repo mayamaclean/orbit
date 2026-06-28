@@ -211,7 +211,7 @@ fn concurrent_senders_one_target() {
 }
 
 /// One sender broadcasts to multiple targets, drained concurrently.
-/// Mirrors §10's typical case: hart 0 does a single-PTE invalidation
+/// Mirrors the typical case: hart 0 does a single-PTE invalidation
 /// affecting harts 1..N, and the wait_zero_spin observes Acquire-
 /// ordered decrements from N independent threads. Catches the
 /// counter's release/acquire pairing under miri.

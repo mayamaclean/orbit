@@ -3,8 +3,11 @@
 //!
 //! Flow: `console_write` syscalls (and the kernel's trace shim) build
 //! a [`Cmd`] and push it onto [`CONSOLE_RING`] via
-//! `thingbuf::StaticThingBuf::push_ref`, then SSWI `k_gpu`'s hart. The
-//! UART-RX PLIC handler enqueues a `CycleActive` command the same way.
+//! `thingbuf::StaticThingBuf::push_ref`. Producers do not wake `k_gpu`
+//! directly — the manager nudges it once per pass
+//! (`Orbit::nudge_gpu_if_pending`). Pane cycling pushes a `CycleActive`
+//! command the same way, driven by Ctrl+Tab through the virtio-input
+//! driver.
 //! `k_gpu` drains, mutates its owned [`Display`], and if anything
 //! changed issues a `TRANSFER_TO_HOST_2D` + `RESOURCE_FLUSH` on the
 //! virtio-gpu control queue before parking.
@@ -26,7 +29,7 @@ use crate::exit_thread_with_state;
 /// split across multiple pushes by the syscall layer.
 pub const CMD_BYTES: usize = 4096;
 
-/// Depth of the ring. 8 slots × (4 KiB + small header) ≈ 32 KiB total.
+/// Depth of the ring. 256 slots × (4 KiB + small header) ≈ 1 MiB total.
 pub const RING_CAP: usize = 256;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

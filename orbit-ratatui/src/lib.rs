@@ -15,7 +15,7 @@
 //! # Scope
 //!
 //! - **Static frames work; events do not yet** — `Backend` only owns
-//!   output. Input wiring (key events, mouse) lands with the M3
+//!   output. Input wiring (key events, mouse) lands with the
 //!   `read_key_event` syscall.
 //! - **Whole-surface present on flush.** A future revision tracks
 //!   damage in the surface and presents tight rects; v1 just blasts

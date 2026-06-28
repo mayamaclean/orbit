@@ -65,12 +65,11 @@ pub fn ms_sleep<H: Hardware>(_thread: ThreadView<'_>, ms: usize, hw: &H) -> Sysc
     SyscallOutcome::SleepUntil { deadline }
 }
 
-/// `mmap(vaddr, size, perms, share_with_kernel)` — park the thread on a
-/// fresh [`CompletionHandle`] and push a [`PendingWork::MemMap`] entry
-/// onto the manager's work ring. Whichever hart next holds
-/// `MANAGER_LOCK` runs the page-table mutation and signals the handle;
-/// the next scheduler scan reads the result off the handle into a0 and
-/// resumes the thread.
+/// `mmap(vaddr, size, perms, share_with_kernel)` — park the thread
+/// `Blocking` and push a [`PendingWork::MemMap`] entry onto the
+/// manager's work ring. Whichever hart next holds the scheduler lock
+/// runs the page-table mutation and resumes the parked thread via
+/// `publish_pending_for_tid` (writes the result into a0).
 ///
 /// Returns `-EAGAIN` if the work ring is full so the caller can retry
 /// — same convention as `console_write`.
@@ -133,12 +132,13 @@ pub fn mmap_req<H: Hardware>(thread: ThreadView<'_>, frame: &TrapFrame, hw: &mut
     SyscallOutcome::ParkForPublish
 }
 
-/// `fb_surface_create(w, h, format)` — park the calling thread on a
-/// completion handle and queue a [`PendingWork::FbSurfaceCreate`]. The
+/// `fb_surface_create(w, h, format)` — park the calling thread
+/// `Blocking` and queue a [`PendingWork::FbSurfaceCreate`]. The
 /// manager validates dims/format, allocates a `kernel_pages` frame
 /// sized to `w * h * bpp` (rounded up to `PAGE_SIZE`), maps it into
 /// the user PT in the shared range, registers the per-process surface
-/// table entry, and signals `(handle_id, user_va)` via `signal_pair`.
+/// table entry, and resumes the caller with `(handle_id, user_va)`
+/// via `publish_pending_for_tid`.
 ///
 /// Validation here at the syscall boundary is light because the
 /// allocator/mapper validates again — but we cheaply reject obviously
@@ -201,8 +201,8 @@ pub fn fb_surface_create_req<H: Hardware>(
 /// a [`PendingWork::EventFdCreate`]. Manager allocates a `kernel_pages`
 /// frame, initializes the [`EventFd`](orbit_abi::event_fd::EventFd)
 /// header in-place, maps it user-RW + SharedRevocable at `vaddr_hint`,
-/// and inserts a `Handle::EventFd` slot. Resumes via `signal_pair`
-/// → `(vaddr, fd)`.
+/// and inserts a `Handle::EventFd` slot. Resumes the caller with
+/// `(vaddr, fd)` via `publish_pending_for_tid`.
 pub fn eventfd_req<H: Hardware>(thread: ThreadView<'_>, frame: &TrapFrame, hw: &mut H) -> SyscallOutcome {
     let vaddr_hint_raw = frame.regs[11] as u64;
     let initval = frame.regs[12] as u64;
@@ -279,9 +279,9 @@ pub fn wake_tid_req<H: Hardware>(thread: ThreadView<'_>, frame: &TrapFrame, hw: 
 
 /// Push `work` and park the caller `Blocking`, or return `-EAGAIN`
 /// sync when the manager ring is full. The shared tail of every
-/// converted-from-sync request below — see
-/// `docs/dev/fd-unix-io-scope.md` item 0 for why these round-trip
-/// instead of touching manager state from the trap path.
+/// converted-from-sync request below — they round-trip through the
+/// manager instead of touching manager-owned state from the trap path
+/// (a lock-free trap-path access races the manager's BTreeMap edits).
 fn park_on_manager<H: Hardware>(hw: &mut H, work: PendingWork) -> SyscallOutcome {
     if hw.push_pending_work(work).is_err() {
         return SyscallOutcome::Return {
@@ -635,8 +635,8 @@ pub fn argv_envp_req<H: Hardware>(
     )
 }
 
-/// `fb_surface_destroy(handle)` — park the caller on a completion
-/// handle and queue a [`PendingWork::FbSurfaceDestroy`]. Manager
+/// `fb_surface_destroy(handle)` — park the caller `Blocking` and
+/// queue a [`PendingWork::FbSurfaceDestroy`]. Manager
 /// looks up the surface, unmaps its user VA, removes the per-process
 /// table entry, and frees the backing frame to `kernel_pages`.
 pub fn fb_surface_destroy_req<H: Hardware>(
@@ -661,11 +661,11 @@ pub fn fb_surface_destroy_req<H: Hardware>(
     SyscallOutcome::ParkForPublish
 }
 
-/// `create_netch(vaddr_hint, region_size, nc_type)` — park on a handle
-/// and push a [`PendingWork::NetChannelCreation`] entry. Manager runs
-/// the allocation + smoltcp socket setup and signals the handle with
-/// `(vaddr, fd)` via `signal_pair` — those land in `regs[10]` and
-/// `regs[11]` when the thread resumes.
+/// `create_netch(vaddr_hint, region_size, nc_type)` — park the caller
+/// `Blocking` and push a [`PendingWork::NetChannelCreation`] entry.
+/// Manager runs the allocation + smoltcp socket setup and resumes the
+/// caller with `(vaddr, fd)` via `publish_pending_for_tid` — those land
+/// in `regs[10]` and `regs[11]`.
 pub fn nc_create_req<H: Hardware>(
     thread: ThreadView<'_>,
     frame: &TrapFrame,
@@ -717,9 +717,10 @@ pub fn nc_create_req<H: Hardware>(
     SyscallOutcome::ParkForPublish
 }
 
-/// `close_handle(fd)` — park on a handle and push a
+/// `close_handle(fd)` — park the caller `Blocking` and push a
 /// [`PendingWork::CloseHandle`] entry. Manager looks up the fd, revokes
-/// the underlying `SharedUserPtr` if any, drops the Arc, and signals.
+/// the underlying `SharedUserPtr` if any, drops the Arc, and resumes
+/// the caller via `publish_pending_for_tid`.
 pub fn close_req<H: Hardware>(thread: ThreadView<'_>, frame: &TrapFrame, hw: &mut H) -> SyscallOutcome {
     let req = CloseHandleReq {
         fd: frame.regs[11] as u32,
@@ -738,10 +739,11 @@ pub fn close_req<H: Hardware>(thread: ThreadView<'_>, frame: &TrapFrame, hw: &mu
     SyscallOutcome::ParkForPublish
 }
 
-/// `create_process(elf_vaddr, elf_len)` — park on a handle and push a
-/// [`PendingWork::CreateProcess`] entry. Manager copies the ELF out of
-/// user memory, parses it, spawns the new process, and signals the
-/// handle with the new pid (or a negative errno on failure).
+/// `create_process(elf_vaddr, elf_len)` — park the caller `Blocking`
+/// and push a [`PendingWork::CreateProcess`] entry. Manager copies the
+/// ELF out of user memory, parses it, spawns the new process, and
+/// resumes the caller with the new pid (or a negative errno) via
+/// `publish_pending_for_tid`.
 pub fn create_process_req<H: Hardware>(
     thread: ThreadView<'_>,
     frame: &TrapFrame,
@@ -842,7 +844,7 @@ pub fn wait_pid_req<H: Hardware>(thread: ThreadView<'_>, frame: &TrapFrame, hw: 
 }
 
 /// `fs_open(path_ptr, path_len, flags) → fd | -errno`. Park the caller
-/// on a fresh handle and queue the manager work; the manager copies
+/// `Blocking` and queue the manager work; the manager copies
 /// the path bytes, looks the inode up via the mounted filesystem, and
 /// allocates an `Fd` in the calling pid's handle table.
 pub fn fs_open_req<H: Hardware>(thread: ThreadView<'_>, frame: &TrapFrame, hw: &mut H) -> SyscallOutcome {
@@ -885,8 +887,8 @@ pub fn fs_open_req<H: Hardware>(thread: ThreadView<'_>, frame: &TrapFrame, hw: &
 /// read fans out into up to 16 cache-page slots, each contributing
 /// up to two waiters (one per straddled user page). Sized at 16
 /// pages so a single call comfortably fits inside the cache's
-/// frame pool with slack for concurrent readers; raise alongside
-/// `CACHE_PAGES` if larger reads ever pay off.
+/// frame pool with slack for concurrent readers; raise alongside the
+/// page cache's capacity if larger reads ever pay off.
 pub const MAX_FS_READ_LEN: usize = 16 * PAGE_SIZE;
 
 /// `fs_read(fd, buf_ptr, len) → bytes | -errno`. The kernel reads at
@@ -993,8 +995,8 @@ pub fn fs_stat_req<H: Hardware>(thread: ThreadView<'_>, frame: &TrapFrame, hw: &
     SyscallOutcome::ParkForPublish
 }
 
-/// `fs_readdir(fd, buf_ptr, len) → bytes | -errno`. Park on a handle
-/// and queue manager work; the manager looks up the directory fd,
+/// `fs_readdir(fd, buf_ptr, len) → bytes | -errno`. Park the caller
+/// `Blocking` and queue manager work; the manager looks up the directory fd,
 /// asks the filesystem to pack as many entries as fit into the user
 /// buffer, and signals with bytes-written (`0` at end-of-dir).
 ///
@@ -1041,9 +1043,9 @@ pub fn fs_readdir_req<H: Hardware>(
 }
 
 /// `create_process_ex(elf_vaddr, elf_len, allowed_affinity, affinity,
-/// argv_vaddr, argv_len) → pid | -errno`. §13a.3 extension to
+/// argv_vaddr, argv_len) → pid | -errno`. Extension to
 /// `create_process` that carries an argv blob. Same async shape:
-/// park the caller, queue manager work, return on signal.
+/// park the caller `Blocking`, queue manager work, resume on publish.
 ///
 /// Bound-checks the argv user-VA range so the manager can trust the
 /// blob source. `argv_len == 0` (with any vaddr) is the "no args"
@@ -1153,8 +1155,9 @@ pub fn create_process_ex_req<H: Hardware>(
 ///
 /// The syscall layer's job is just to bound-check the user pointer
 /// (4-byte aligned, mapped word) and queue the work; the manager
-/// resolves uaddr → PA, reads `*uaddr`, and either signals
-/// `-EAGAIN` (mismatch) or installs the handle on `futex_waiters[PA]`.
+/// resolves uaddr → PA, reads `*uaddr`, and either resumes with
+/// `-EAGAIN` (mismatch) or installs the waiter (its tid) on
+/// `futex_waiters[PA]`.
 pub fn futex_wait_req<H: Hardware>(
     thread: ThreadView<'_>,
     frame: &TrapFrame,
@@ -1334,8 +1337,9 @@ pub const READ_STDIN_NONBLOCK: usize = 1;
 /// `read_stdin(buf, len, flags)` — drain up to `len` bytes of the
 /// caller's stdin ring into `buf`. On non-empty: returns `Ok(n)`
 /// synchronously. On empty + NONBLOCK: returns `Err(EAGAIN)`. On
-/// empty + blocking: parks on a `CompletionHandle` and yields with
-/// `YieldRetry` so the resumed thread re-executes the ecall (and
+/// empty + blocking: parks the thread (its tid in the per-process
+/// stdin slot) and yields with `YieldRetry` so the resumed thread
+/// re-executes the ecall (and
 /// drains the bytes that woke it).
 ///
 /// The park-then-recheck dance closes the race window between
@@ -1552,9 +1556,10 @@ pub fn read_key_event<H: Hardware>(
 
 /// `create_thread(entry, allowed_affinity, affinity)` — spawn a sibling
 /// thread in the calling process. Async manager round-trip: the
-/// caller parks on a `CompletionHandle` while the manager allocates the
-/// new thread, sets up its trap frame and stack, and inserts it into
-/// `process.threads`; the handle is signaled with the new tid.
+/// caller parks `Blocking` while the manager allocates the new thread,
+/// sets up its trap frame and stack, and inserts it into
+/// `process.threads`; the caller is resumed with the new tid via
+/// `publish_pending_for_tid`.
 ///
 /// Sanitization happens here, not in the manager:
 /// - `entry` must lie in the calling process's user range (the
@@ -1611,8 +1616,8 @@ pub fn create_thread<H: Hardware>(
 }
 
 /// `pledge(req: *const PermsRequest)` — narrow this process's
-/// effective + cap masks. Park the caller on a fresh handle and
-/// queue [`PendingWork::Pledge`]; the manager — sole writer of
+/// effective + cap masks. Park the caller `Blocking` and queue
+/// [`PendingWork::Pledge`]; the manager — sole writer of
 /// `Process.permissions` — reads the request struct under the
 /// caller's satp, applies the narrowing, and walks every live
 /// thread of the process to rewrite each `Thread.permissions`
@@ -1664,11 +1669,11 @@ pub fn pledge_req<H: Hardware>(thread: ThreadView<'_>, frame: &TrapFrame, hw: &m
 }
 
 /// `create_process_v2(args: *const CreateProcessV2Args)` — role-aware
-/// spawn with explicit perms narrowing. Park the caller on a fresh
-/// handle and queue [`PendingWork::CreateProcessV2`]; the manager
-/// copies the args struct + ELF, runs `check_transition`, and
-/// signals the new pid on success or `-EPERM` (logged as a
-/// `RoleDeny` audit event) on a denied transition.
+/// spawn with explicit perms narrowing. Park the caller `Blocking`
+/// and queue [`PendingWork::CreateProcessV2`]; the manager copies the
+/// args struct + ELF, runs `check_transition`, and resumes the caller
+/// with the new pid on success or `-EPERM` (logged as a `RoleDeny`
+/// audit event) on a denied transition.
 ///
 /// The args struct must be 8-byte aligned, bound-checked against
 /// the caller's mappable range, and contained within a single page

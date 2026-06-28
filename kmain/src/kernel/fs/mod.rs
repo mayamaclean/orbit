@@ -10,9 +10,9 @@
 //!    archive sector-by-sector via `Block::read_blocks_blocking`,
 //!    builds a `BTreeMap<String, TarInode>`, and returns the mounted
 //!    filesystem.
-//! 3. The filesystem is published via [`install`]; consumers
-//!    (currently nobody, eventually 12d's syscall handlers) reach it
-//!    through [`mounted`].
+//! 3. The filesystem is published via [`install`]; consumers (the
+//!    fs syscall handlers: fs_open / fs_stat / fs_read / readdir, and
+//!    path-mode spawn) reach it through [`mounted`].
 
 use orbit_abi::fs::Stat;
 
@@ -54,7 +54,7 @@ pub trait Filesystem: Send + Sync {
     /// Future FSes (ext2/minix) walk indirect blocks here.
     ///
     /// Errors `BadInode` / `NotRegular` / `BadRange` mirror the
-    /// existing `read_async` shape.
+    /// page-cache fill path (`submit_blk_read_cached`).
     fn lba_for_page(&self, ino: Inode, page_idx: u64) -> Result<u64, FsErr>;
 
     /// Resolve `path` to an inode. Path is normalized: leading `./`
@@ -90,8 +90,8 @@ pub trait Filesystem: Send + Sync {
     fn readdir(&self, ino: Inode, cursor: u64, out: &mut [u8]) -> Result<(usize, u64), FsErr>;
 }
 
-/// Single global mount slot. Write-once at boot from hart 0; readers
-/// (eventually 12d's syscall handlers) Acquire-load.
+/// Single global mount slot. Write-once at boot from hart 0; the fs
+/// syscall handlers Acquire-load.
 static MOUNTED: spin::Once<&'static dyn Filesystem> = spin::Once::new();
 
 /// Install the boot-mounted filesystem. Idempotent — a second call

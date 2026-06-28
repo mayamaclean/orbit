@@ -356,11 +356,14 @@ pub struct Thread {
     /// Set by the trap handler when this thread is killed by a fault.
     /// `None` means the thread exited cleanly (e.g. via the exit syscall).
     pub(crate) fault_info: Option<FaultInfo>,
-    /// Wait/signal handle this thread is parked on while
-    /// `state == Blocking`. The manager scans for signaled handles each
-    /// scheduler pass; on a hit it writes `result()` / `extra()` into
-    /// `frame.regs[10]` / `frame.regs[11]`, clears the slot, and marks
-    /// the thread `Ready`.
+    /// Wait/signal handle a thread could park on while
+    /// `state == Blocking`. When a signaler claims the waiter, `signal_n`
+    /// fires the registered wake hook (kmain's `wake_blocked_inline`),
+    /// which marshals the handle's `ret(0..ret_count())` into
+    /// `frame.regs[10..]`, clears the slot, and marks the thread `Ready`
+    /// — there is no per-pass scan. No live blocking syscall installs
+    /// this today (they use `pending_rets` below); it's kept for a
+    /// future IRQ-driven signaler.
     pub handle: Option<CompletionHandle>,
     /// On-thread completion-result slots used by manager-resolved
     /// blocking syscalls — the no-Arc alternative to [`Self::handle`].
@@ -374,9 +377,10 @@ pub struct Thread {
     /// reads them at most once on the post-publish re-check or via the
     /// drain path; both happen *after* the manager's Release-store of
     /// `pending_state = SIGNALED`, which Acquire-paired loads observe.
-    /// Trap-context signalers (read_stdin's `push_byte`, future IRQ
-    /// paths) keep using [`Self::handle`] instead — the swap-of-waiter
-    /// protocol is what makes that case safe without the lock.
+    /// `read_stdin` / `read_key_event` parkers don't use this slot at
+    /// all — `push_byte` swaps the per-process `parked_tid` and the
+    /// producer pushes `WakeEvent::InputTid`; the swap-of-waiter protocol
+    /// is what makes that case safe without the lock.
     pub(crate) pending_rets: [AtomicI64; 4],
     /// Snapshot of the owning process's [`Permissions`] at the time
     /// the thread was created. Refreshed when the process pledges
@@ -417,7 +421,7 @@ pub struct Thread {
     /// Cumulative user-mode CPU time in `time` CSR ticks. Credited at
     /// each User → ¬User hart-bucket transition by the owning hart;
     /// foreign-hart reads (stats snapshot) are racy but tear-safe on
-    /// RV64 via the atomic. Phase 2.
+    /// RV64 via the atomic.
     pub cpu_ticks_total: AtomicU64,
     /// Times this thread transitioned into Running. Incremented by the
     /// scheduler on dispatch; foreign-hart reads as above.
@@ -430,9 +434,9 @@ pub struct Thread {
     /// Snapshot of the owning process's POSIX credential triplet. Read
     /// without locking by the `getuid`/`geteuid`/`getgid`/`getegid`
     /// fast paths; refreshed alongside [`Self::permissions`] when the
-    /// process mutates its credentials (today: only at construction;
-    /// future: by `setuid`/`setgid` propagating across all threads of
-    /// the process under MANAGER_LOCK, same shape as pledge).
+    /// process mutates its credentials — at construction and on
+    /// `setuid`/`setgid`, which propagate across all threads of the
+    /// process under the scheduler lock (same shape as pledge).
     ///
     /// Supplementary groups and login name are *not* snapshotted onto
     /// the thread — they're variable-size and rarely-read; the
@@ -951,7 +955,7 @@ pub const NGROUPS_MAX: usize = 16;
 pub struct Process {
     pub pid: u16,
     /// Pid of the spawning process. `0` for the boot process (no
-    /// parent). §13a.2's `wait_pid` checks this against the caller's
+    /// parent). The `wait_pid` syscall checks this against the caller's
     /// pid to gate exit-status visibility.
     pub parent_pid: u16,
     /// Last exit status observed for this process — written when the
@@ -967,10 +971,10 @@ pub struct Process {
     /// `exit_code` alone — the value the exit-caller passed wins,
     /// regardless of the order in which sibling threads are reaped.
     pub exit_finalized: bool,
-    /// Single-waiter slot for §13a.2 `wait_pid(pid > 0)`. v1 contract:
+    /// Single-waiter slot for `wait_pid(pid > 0)`. v1 contract:
     /// at most one parent thread parks here at a time; a second
     /// `wait_pid` call returns EBUSY. Multi-waiter wants a `Vec<u32>`
-    /// and lands with futex (§13a.5).
+    /// and lands with futex.
     ///
     /// Stores the parker's tid. `dealloc_process` resolves it via
     /// `Orbit::publish_pending_for_tid(tid, &[0, exit_code])` — the
@@ -1007,13 +1011,13 @@ pub struct Process {
     /// is reaped its identity is forgotten; a parent-side `wait_pid`
     /// will see `ECHILD` and not block.
     pub detached: bool,
-    /// §13a.3 argv blob backing — `Some` when the process was
+    /// argv blob backing — `Some` when the process was
     /// spawned via `CREATE_PROCESS_EX` with non-empty argv. The
     /// kernel maps this single page R+U+S at
     /// `USER_ARGV_BASE` in the process PT; `dealloc_process` returns
     /// the frame to `kernel_pages`.
     pub argv_blob: Option<PhysBacking>,
-    /// §13e envp blob backing — `Some` when the process was spawned
+    /// envp blob backing — `Some` when the process was spawned
     /// via `CREATE_PROCESS_EX` with a non-zero `envp_vaddr`. Wire
     /// format is identical to `argv_blob`; the kernel maps this
     /// single page R+U+S at `USER_ENVP_BASE`. `dealloc_process`
@@ -1069,18 +1073,16 @@ pub struct Process {
     /// process rather than a fully-trusted one — the safer failure
     /// mode.
     pub permissions: Permissions,
-    /// Real uid — POSIX `getuid()`. Identity-only, not used for
-    /// authentication or authorization (roles + permissions own that
-    /// surface). Carried for Unix-compat observability (`getuid`,
-    /// `ps`-style diagnostics) and for fs ownership metadata once
-    /// writes land. The real/effective/saved triplet matches POSIX
-    /// `_POSIX_SAVED_IDS` so a future `setuid(2)` can implement the
-    /// standard saved-set rules without growing this struct.
+    /// Real uid — POSIX `getuid()`. Carried for Unix-compat
+    /// observability (`getuid`, `ps`-style diagnostics) and consulted
+    /// by `vaccess` on `fs_open` against inode ownership; roles +
+    /// permissions own the rest of authorization. The real/effective/saved triplet matches POSIX
+    /// `_POSIX_SAVED_IDS` so `setuid(2)` implements the standard
+    /// saved-set rules without growing this struct.
     pub uid: u32,
     /// Effective uid — POSIX `geteuid()`. The id used for FS access
-    /// checks (`vaccess` against inode `st_uid`) once enforcement
-    /// lands. v1: equals `uid` for every process; only diverges when
-    /// `setuid`/`seteuid` ship.
+    /// checks (`vaccess` against inode `st_uid`). Equals `uid` unless
+    /// `setuid` toggles only the effective id.
     pub euid: u32,
     /// Saved-set uid — POSIX `getresuid()`'s third slot. Stamped at
     /// spawn from the parent's `euid` (POSIX exec semantics carried
@@ -1109,9 +1111,8 @@ pub struct Process {
     /// accounting / observability surface; auth never consults it
     /// (mirrors OpenBSD's documented "advisory" classification).
     /// `None` means "no login name installed" — the read syscall
-    /// reports `ENOENT`. Set once at spawn by the future `login`
-    /// binary; mutable in-process via the future `setlogin(2)` (gated
-    /// on `euid == 0`).
+    /// reports `ENOENT`. Set at spawn (e.g. by a future `login` binary)
+    /// and mutable in-process via `setlogin(2)` (gated on `euid == 0`).
     pub login_name: Option<String>,
     /// Count of times the dispatch-site bitmask gate has EPERMed a
     /// syscall from this process. Surfaced via `query_stats`'s

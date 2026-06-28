@@ -30,18 +30,19 @@
 //!   drops its clones when it processes socket_deletions, and the
 //!   backing hits `pending_frees` when the last clone goes.
 //!
-//! Fds are monotonic per process; on hitting `i32::MAX` (4096 short of
-//! `u32::MAX` for the high-bit safety margin) we'd need a free list,
-//! but no realistic workload approaches that.
+//! Fds are monotonic per process; on hitting `i32::MAX` (the largest
+//! value that round-trips through the `isize` syscall return without
+//! looking like a negative errno) we'd need a free list, but no
+//! realistic workload approaches that.
 //!
 //! ## CLOEXEC default
 //!
 //! Per-slot `cloexec: bool` defaults to `false` (Linux semantics):
 //! caller has to opt in via `O_CLOEXEC` at create or
-//! `fcntl(F_SETFD, FD_CLOEXEC)`. Inheritance at spawn time is already
-//! explicit on orbit (parent names the inherited fds in
-//! `CreateProcessV2Args`), so the flag is mostly there to satisfy
-//! libc-shaped consumers that read/set it programmatically.
+//! `fcntl(F_SETFD, FD_CLOEXEC)`. There is no fd inheritance at spawn
+//! today — children only get fresh stdio — so the flag is currently
+//! inert at spawn and mostly there to satisfy libc-shaped consumers
+//! that read/set it programmatically.
 
 use alloc::collections::BTreeMap;
 use core::sync::atomic::AtomicU32;
@@ -59,8 +60,9 @@ use crate::kernel::shared_user_ptr::SharedUserPtr;
 /// Storage is `u32` for natural "ID counter" semantics, but every
 /// allocated value is guaranteed `<= i32::MAX` so the value casts
 /// losslessly to `RawFd = c_int` at the std PAL boundary. The
-/// allocator panics on overflow rather than wrapping into the high
-/// bit — wrap would silently produce a negative fd in user code.
+/// allocator returns `None` at the `i32::MAX` ceiling (callers surface
+/// `EMFILE`) rather than wrapping into the high bit — wrap would
+/// silently produce a negative fd in user code.
 pub type Fd = u32;
 
 /// Upper bound on allocated [`Fd`] values. Matches `i32::MAX` so the
@@ -134,9 +136,10 @@ pub struct OpenFile {
 /// these are the bits `fcntl(F_GETFD)` / `F_GETFL` actually return.
 pub struct Slot {
     pub handle: Handle,
-    /// `FD_CLOEXEC` — when true, this slot is *not* cloned into a
-    /// child's handle table at spawn time. Default `false` (Linux
-    /// semantics).
+    /// `FD_CLOEXEC` — recorded per slot for libc consumers. There is no
+    /// spawn-time fd cloning yet, so the flag is inert at spawn today
+    /// (it would suppress cloning once inheritance lands). Default
+    /// `false` (Linux semantics).
     pub cloexec: bool,
     /// `O_NONBLOCK` — when true, `read` / `write` on this fd return
     /// `EAGAIN` instead of blocking on an empty / full ring. Default

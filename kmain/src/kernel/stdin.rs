@@ -41,7 +41,7 @@ pub static ACTIVE_PID: AtomicI32 = AtomicI32::new(NO_ACTIVE);
 pub static STDIN_TABLE: Mutex<BTreeMap<u16, Arc<ProcessStdin>>> = Mutex::new(BTreeMap::new());
 
 /// Insert a fresh stdin slot for `pid`. Idempotent: if `pid` already
-/// has an entry (shouldn't happen post-§9 but cheap to defend), the
+/// has an entry (shouldn't happen, but cheap to defend), the
 /// existing entry is kept.
 pub fn register(pid: u16) {
     let mut t = STDIN_TABLE.lock();

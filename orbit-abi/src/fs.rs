@@ -6,8 +6,8 @@
 //! (`include/uapi/asm-generic/stat.h` — what riscv64 Linux uses).
 //! 128 bytes on 64-bit. Picked over a hand-rolled shape so a future
 //! POSIX `std::fs::Metadata` shim translates field-for-field.
-//! Forward-compat path (`statx`-style new syscall + new struct) lives
-//! in §12+ when we actually need a field that doesn't fit here.
+//! A forward-compat path (`statx`-style new syscall + new struct) can
+//! land if we ever need a field that doesn't fit here.
 
 /// `flags` argument to `fs_open`. v1 is read-only — no actual flag
 /// bits today; the field is reserved for future O_NONBLOCK / O_CREAT

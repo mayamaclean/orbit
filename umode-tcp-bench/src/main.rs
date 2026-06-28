@@ -2,12 +2,12 @@
 //!
 //! Connects out to `192.168.76.2:<port>` (the host gateway in QEMU's
 //! user-mode NAT — same as the smoke listener), pumps `TARGET_BYTES`
-//! of zeros as fast as `write_all` will accept them, and prints
-//! elapsed ticks + computed throughput on serial. Repeats `ROUNDS`
+//! of zeros as fast as `write_all` will accept them, and prints the
+//! elapsed time + computed throughput on serial. Repeats `ROUNDS`
 //! times so we can eyeball variance.
 //!
-//! Tick basis: QEMU virt's `time` CSR runs at 10 MHz, matching kmain's
-//! `TICKS_PER_MS = 10_000`. Throughput math uses that constant.
+//! Timing comes from `get_micros()` (microseconds since boot); the
+//! throughput math divides byte counts by the elapsed µs.
 //!
 //! Port: 7780 by default (see `BENCH_PORT`); the bench-tcp script
 //! starts an `nc -l 7780 > /dev/null` on the host before launching
@@ -69,7 +69,7 @@ fn run_round(round: usize) -> bool {
     // Request the largest valid ring capacity. A small ring throttles
     // throughput by capping in-flight bytes — the bench would measure
     // ring-drain latency, not raw scheduler/TCP throughput. The cap
-    // comes from NC_MAX_REGION_SIZE (256 KiB) minus header overhead.
+    // comes from NC_MAX_REGION_SIZE (8 MiB) minus header overhead.
     let nc = match NetCh::open(
         NetChannel::capacity_for(NC_MAX_REGION_SIZE),
         SockType::Tcp,
@@ -146,7 +146,7 @@ fn run_round(round: usize) -> bool {
     true
 }
 
-// orbit-rt's `_start` (§13b) is the canonical entrypoint; downstream
+// orbit-rt's `_start` is the canonical entrypoint; downstream
 // binaries provide `main` and let orbit-rt do the eager argv resolve
 // and exit.
 #[unsafe(no_mangle)]

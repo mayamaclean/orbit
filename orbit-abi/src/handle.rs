@@ -1,18 +1,20 @@
 //! Per-process handle table kinds.
 //!
 //! Every fd-shaped resource the kernel hands back to userspace carries
-//! a kind tag from this enum. The tag is part of the ABI: `fstat(fd)`
-//! returns it so consumers (mio's `Selector::register`, libc `fstat`
-//! shims, future `/proc/<pid>/fd/`-style tooling) can dispatch on what
-//! the fd actually backs.
+//! a kind tag from this enum. The tag is part of the ABI: the
+//! `ch_inspect` syscall returns it (as `ChInfo.kind`) so consumers
+//! (mio's `Selector::register`, libc shims, future `/proc/<pid>/fd/`-style
+//! tooling) can dispatch on what the fd actually backs.
 //!
 //! **Numeric values are ABI-stable.** Reserve numbers up-front for
 //! variants we don't ship yet so future tooling parsing kind tags
 //! doesn't churn when a new variant lands.
 
-/// Tag carried in [`Stat::kind`](crate::fs::Stat) and returned by the
-/// kind-aware introspection paths. `repr(u8)` keeps the on-wire field
-/// compact and ABI-stable.
+/// Returned by the `ch_inspect` syscall as `ChInfo.kind`. `repr(u8)`
+/// keeps the on-wire field compact and ABI-stable. The per-variant
+/// `read`/`write` notes below describe the intended fd contract — there
+/// is no unified `read(fd)`/`write(fd)` syscall yet, so today each kind
+/// is driven by its own calls (`fs_read`, eventfd region ops, etc.).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum HandleKind {
@@ -22,9 +24,9 @@ pub enum HandleKind {
     /// address + connection state for `FromRawFd` rehydration.
     NetChannel = 1,
 
-    /// Regular file or directory on the active filesystem. `read` /
-    /// `fstat` / `fs_seek` route to the fs layer; `write` returns
-    /// `EROFS` while tarfs is read-only.
+    /// Regular file or directory on the active filesystem. Backed by
+    /// the fs layer (`fs_read` / `fs_fstat` / `fs_seek`); writes are
+    /// unsupported while tarfs is read-only.
     File = 2,
 
     /// Standard input — seeded in slot 0 at process creation. `read`
@@ -48,18 +50,18 @@ pub enum HandleKind {
     /// signaling primitives).
     EventFd = 6,
 
-    /// Read end of a pipe. **Reserved**; lands with the
-    /// `Stdio::MakePipe` / shell-pipeline milestone.
+    /// Read end of a pipe. **Reserved**; lands with pipe support
+    /// (`Stdio::MakePipe` / shell pipelines).
     PipeRead = 7,
 
     /// Write end of a pipe. **Reserved**; counterpart of
     /// [`HandleKind::PipeRead`].
     PipeWrite = 8,
 
-    /// pidfd — refers to a child process. **Reserved**; lands with the
-    /// `Child::kill` / `Child::try_wait` / `tokio::process` milestone.
-    /// `read(fd)` blocks on child exit and returns the exit status;
-    /// `close(fd)` releases the reference without affecting the child.
+    /// pidfd — refers to a child process. **Reserved**; lands with
+    /// `Child::kill` / `Child::try_wait`. `read(fd)` would block on
+    /// child exit and return the exit status; `close(fd)` releases the
+    /// reference without affecting the child.
     Pidfd = 9,
 }
 

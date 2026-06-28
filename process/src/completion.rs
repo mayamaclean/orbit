@@ -6,12 +6,13 @@
 //! - [`CompletionHandle`] — heap-allocated, refcounted, sleeping waiter.
 //!   A thread parks in `ThreadState::Blocking` with a clone of the
 //!   handle; signalers (manager, trap handlers, kernel threads) call
-//!   [`CompletionHandle::signal`] to store an `isize` result and flip
-//!   the state. The manager loop scans for signaled handles and wakes
-//!   their threads.
+//!   [`CompletionHandle::signal`] to store the result(s) and claim the
+//!   waiter, which fires the registered wake hook (kmain's
+//!   `wake_blocked_inline`) to marshal the rets and enqueue the thread
+//!   Ready — there is no manager scan of signaled handles.
 //!
-//! - [`AckCounter`] — refcounted `AtomicU32` for the
-//!   "1-sender / N-receivers / sender spins" pattern (§10's TLB
+//! - [`AckCounter`] — refcounted counter for the
+//!   "1-sender / N-receivers / sender spins" pattern (TLB
 //!   shootdowns). Sender allocates the counter at `n`, hands clones to
 //!   receivers, each calls [`AckCounter::decrement`] when done; sender
 //!   calls [`AckCounter::wait_zero_spin`].
@@ -84,7 +85,7 @@ pub const MAX_RET_SLOTS: usize = 4;
 /// exactly that many regs (`regs[10..10+ret_count]`) on resume and
 /// leaves the rest alone, so user-side a-regs that the handler doesn't
 /// claim retain their trap-entry snapshot. Critical for syscalls with
-/// a 1-reg return: pre-§8 the kernel never touched a1, and at least
+/// a 1-reg return: earlier the kernel never touched a1, and at least
 /// some user-mode code paths (orbit-loader against orbit-rt) depend on
 /// that survival even though the inline-asm contract technically
 /// permits the clobber.
@@ -258,11 +259,10 @@ impl Default for CompletionHandle {
 }
 
 /// Refcounted counter for "1 sender / N receivers / sender spins".
-/// §10's TLB-shootdown protocol uses one of these per request: sender
+/// The TLB-shootdown protocol uses one of these per request: sender
 /// allocates with `new(n)`, hands clones to each target hart, receivers
 /// `decrement` after servicing, sender `wait_zero_spin`s before
-/// returning. Built here so the type is in place when §10 lands; §8
-/// has no consumer.
+/// returning.
 #[derive(Clone, Debug)]
 pub struct AckCounter {
     inner: Arc<AtomicUsize>,

@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! a0 = MMAP
-//! a1 = hint_vaddr           (0 if kernel should pick)
+//! a1 = vaddr                (required; must be in the priv/shared range — 0 is rejected)
 //! a2 = len                  (bytes, will be rounded up to a page)
 //! a3 = perms                (PTE-style R/W/X bits — see `prot`)
 //! a4 = share_with_kernel    (0 = private, 1 = shared)
@@ -26,8 +26,9 @@ pub mod prot {
 }
 
 pub mod flags {
-    /// Require the kernel to use exactly `hint_vaddr`. Fails with `EEXIST` if
-    /// the region overlaps an existing mapping, or `EINVAL` if out of range.
+    /// Reserved. `mmap` has no flags argument today and always maps at
+    /// exactly the requested vaddr; there is no overlap check, so this
+    /// flag is not yet wired.
     pub const FIXED: u64 = 1 << 0;
 
     /// Reserve a guard at the lower end; the mapping may grow down to fill it.

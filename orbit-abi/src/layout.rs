@@ -130,7 +130,7 @@ pub const fn validate_user_stack_size(size: u64) -> bool {
 pub const USER_TEXT_BASE: u64 = 0x2_2000_0000;
 
 /// One-page argv blob mapped read-only into every process spawned via
-/// `CREATE_PROCESS_EX` (§13a.3). Sits in the high end of the ELF
+/// `CREATE_PROCESS_EX`. Sits in the high end of the ELF
 /// region (just below `UPROC_PRIV_BASE`) so the linker — which the
 /// orbit-rt build script keeps below `USER_ENVP_BASE` — won't lay
 /// anything on top.
@@ -146,7 +146,7 @@ pub const USER_ARGV_LEN: u64 = PAGE_SIZE;
 /// after process creation.
 ///
 /// `0` is the syscall-level sentinel for "no envp installed" — see
-/// the second return slot of `argv_envp` (§13e). If non-zero, this is
+/// the second return slot of `argv_envp`. If non-zero, this is
 /// the value the kernel returns there.
 pub const USER_ENVP_BASE: u64 = 0x2_FFFF_E000;
 pub const USER_ENVP_LEN: u64 = PAGE_SIZE;

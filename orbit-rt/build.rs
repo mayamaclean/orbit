@@ -29,8 +29,8 @@ fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
 
     // The ELF region runs from USER_TEXT_BASE up to (but not into) the
-    // §13e envp blob page (which sits one page below the §13a.3 argv
-    // blob, both just under UPROC_PRIV_BASE). Capping LENGTH here
+    // envp blob page (which sits one page below the argv blob, both
+    // just under UPROC_PRIV_BASE). Capping LENGTH here
     // turns an oversized image into a link error instead of a runtime
     // collision with the kernel-mapped envp/argv pages.
     let length = USER_ENVP_BASE - USER_TEXT_BASE;

@@ -24,11 +24,11 @@ sequenceDiagram
     participant P2 as pid 2<br/>init child
 
     Note over H0,Hs: M-mode (bl)
-    H0->>H0: _start (asm/boot.S): zero bss, set sp, call kmain_enter
-    H0->>H0: parse DTB, init UART, setup_pmp, setup_interrupts
-    H0->>H0: copy KERNEL_ELF PT_LOADs into RAM at VBASE
-    H0->>H0: build identity Sv48 (ID_MAP_TABLES), publish KMAIN_ENTRY
-    H0->>H0: csrw mstatus.MPP=S, mepc=KMAIN_ENTRY, mret
+    H0->>H0: _start (asm/boot.S): zero bss, set sp, mret to kinit
+    H0->>H0: kinit: parse DTB, init UART, setup_pmp, set mtvec
+    H0->>H0: kmain_enter: setup_interrupts, copy KERNEL_ELF PT_LOADs into RAM at VBASE
+    H0->>H0: publish KMAIN_ENTRY (bare satp; kmain builds its own trampoline PT)
+    H0->>H0: csrw mstatus.SPP=S, sepc=KMAIN_ENTRY, sret
     Hs->>Hs: kinit_hart: setup_pmp, M-mode WFI on KMAIN_ENTRY
 
     Note over H0: S-mode (kmain) — primary path
@@ -43,25 +43,26 @@ sequenceDiagram
     H0->>H0: re-init serial at kmmio_uart()
     H0->>H0: get_environment_info, populate PLIC S-context per hart
     H0->>P1: create_new_process(orbit-loader ELF, argv=["/bin/orbit-loader", init_path])
-    H0->>Hs: SECONDARY_GO[i]=true, supervisor_wake_hart(i) (CLINT MSIP)
+    H0->>Hs: SECONDARY_GO[i]=true, supervisor_wake_hart(i) (ACLINT SSWI)
     H0->>H0: shootdown::mark_secondaries_kicked()
 
     Note over Hs: S-mode (kmain) — secondary path
     Hs->>Hs: _start_secondary (asm): setup early stack
     Hs->>Hs: secondary_rust_setup: load KSATP, install HartContext
-    Hs->>Hs: setup_interrupts (SSWI/STIE), WFI in k_idle
+    Hs->>Hs: k_harthello: setup_interrupts (SSWI/STIE), WFI in k_hart_loop
 
     Note over P1,Hs: scheduler picks up pid 1 on whichever hart is idle
     P1->>P1: orbit-rt _start: argv resolve via argv_envp syscall
     P1->>P1: spawn_init_from_argv: fs_stat + fs_open + chunked fs_read
-    P1->>P2: create_process(init ELF)
+    P1->>P2: create_process_v2(init ELF)
     P1->>P1: NetCh::open ServerRetain :7777, loop accept_and_load
     P2->>P2: orbit-rt _start, main()
 ```
 
 The sequence omits a few details for clarity (per-hart trap-frame
-allocation, CLINT MSIP write coalescing, `KDMAP_BIAS` publish) — see
-the source files cited under each stage for the full story.
+allocation, the early M-mode `KMAIN_ENTRY` sret, the S-mode
+`SECONDARY_GO` / `KDMAP_BIAS_BOOT` handshake) — see the source files
+cited under each stage for the full story.
 
 ## Stages
 
@@ -73,23 +74,27 @@ at PA `0x80000000` ([bl/memory.x](../bl/memory.x)).
 - **Asm entry** [bl/asm/boot.S](../bl/asm/boot.S): zero `.bss`, set
   per-hart sp from `KERNEL_STACK_END`, hart 0 calls `kmain_enter`,
   others call `kinit_hart`.
-- **`kmain_enter`** [bl/src/lib.rs](../bl/src/lib.rs): UART init from
-  the DTB, `setup_pmp` (TOR regions for bl text vs rodata vs the rest),
-  `setup_interrupts` (M-mode mtvec → `m_trap_vector`), parse the
-  embedded kernel ELF (`KERNEL_ELF` from
-  [bl/src/lib.rs](../bl/src/lib.rs)), copy `PT_LOAD` segments into
-  RAM at `VBASE = 0x80000000 + 64 MiB`, build identity Sv48 at
-  `ID_MAP_TABLES` (`0x80800000 - 2 MiB`), publish
-  `KMAIN_ENTRY = entrypoint`, `mret` into S-mode kmain.
+- **`kinit` / `kmain_enter`** [bl/src/bin/launch.rs](../bl/src/bin/launch.rs),
+  [bl/src/lib.rs](../bl/src/lib.rs): `kinit` installs the M-mode trap
+  vector (`mtvec → m_trap_vector`), `setup_pmp` (TOR regions for bl
+  text vs rodata vs the rest), and UART init from the DTB, then calls
+  `kmain_enter`. `kmain_enter` runs `setup_interrupts` (delegation +
+  timer/SSWI enables — it does *not* touch `mtvec`), parses the
+  embedded kernel ELF (`KERNEL_ELF`), copies `PT_LOAD` segments into
+  RAM at `VBASE = 0x80000000 + 64 MiB`, publishes
+  `KMAIN_ENTRY = entrypoint`, and `sret`s into S-mode kmain with a
+  **bare satp** — kmain's `_start` builds its own trampoline page
+  tables, so bl no longer hand-sets an identity map.
 - **`kinit_hart`** (secondaries): same `setup_pmp`, then M-mode WFI
-  spinning on `KMAIN_ENTRY`. Hart 0's MSIP wake unblocks them once
-  kmain has published its `KSATP` (and the `KDMAP_BIAS` over an
-  M-mode `ecall(4)`).
+  spinning on `KMAIN_ENTRY`. Once hart 0 publishes `KMAIN_ENTRY`, each
+  secondary `sret`s into kmain's `_start`; the kernel satp and the
+  KDMAP bias are picked up later in S-mode (`SECONDARY_GO` /
+  `KDMAP_BIAS_BOOT`), not over an M-mode `ecall`.
 - **Trap frames** for all harts live at `0x80800000` so the M-mode
-  trap handler can route interrupts before paging is on.
-  `m_trap_vector` switches `sp` to bl's own `KERNEL_STACK_END`
-  before calling Rust so spills don't end up on the kernel's KDMAP
-  stack (which M-mode would dereference bare).
+  trap handler can route interrupts before paging is on. The M-mode
+  stack region is split per-hart into a boot half and a trap half;
+  `m_trap_vector` switches `sp` into the hart's trap slot before
+  calling Rust so trap spills don't clobber the boot stack.
 
 ### 2. S-mode trampoline (kmain `_start`)
 
@@ -154,9 +159,10 @@ Still hart 0.
 - Asm entry sets the early stack, then jumps to
   `secondary_rust_setup(hartid)`.
 - `secondary_rust_setup` Acquire-loads `KSATP`, `HART_CTX_PA`, and
-  `KDMAP_BIAS_BOOT` (publishes from `rust_main`), installs its
-  `HartContext`, calls `setup_interrupts` (SSWI + STIE), then
-  drops into `k_idle`/WFI.
+  `KDMAP_BIAS_BOOT` (published from `rust_main`), installs its
+  `HartContext`, and enters `k_harthello`, which sets `stvec` and
+  calls `setup_interrupts` (SSWI + STIE) before dropping into
+  `k_hart_loop`/WFI.
 - A scheduler decision on the manager hart wakes a secondary via
   SSWI; the secondary takes the trap, drains its shootdown ring,
   pops a runnable thread off `ReadyQueue`, and context-switches
@@ -175,13 +181,13 @@ Still hart 0.
   - `fs_open(path)` → fd.
   - Chunked `fs_read(fd, &mut sector)` (sector-aligned) into a heap
     `Vec<u8>` until size bytes accumulated.
-  - `create_process(elf_ptr, elf_len, 0, 0)` → pid 2.
+  - `create_process_v2(args)` → pid 2.
   - All failure paths log and fall through (loader still hosts the
     TCP listener; an unmounted FS or mistyped path doesn't strand
     the boot).
 - **TCP listener**: `NetCh::open(ServerRetain :7777)`, loop
   `accept_and_load` forever. Used for ad-hoc binary delivery via
-  [send-payload.py](../orbit-loader/tools/send-payload.py).
+  [send_payload.py](../orbit-loader/tools/send_payload.py).
 
 ### 7. Init child (pid 2)
 
@@ -199,13 +205,13 @@ the init child is created with no argv today — convention may grow
 | Reset | 0..N | M | [bl/asm/boot.S](../bl/asm/boot.S) |
 | Hart 0 M-init | 0 | M | [`kmain_enter`](../bl/src/lib.rs) |
 | Secondaries M-park | 1..N | M | [`kinit_hart`](../bl/src/lib.rs) |
-| `mret` to S | 0 | M→S | [bl/src/lib.rs](../bl/src/lib.rs) |
+| `sret` to S | 0 | M→S | [bl/src/lib.rs](../bl/src/lib.rs) |
 | Trampoline | 0 | S | [`_start`, `post_trampoline_entry`](../kmain/src/bin/orbit.rs) |
 | Kernel state setup | 0 | S | [`rust_main`](../kmain/src/bin/orbit.rs) |
 | First user spawn | 0 | S | [`k_smpstart`](../kmain/src/bin/orbit.rs) |
-| Secondary M-wake | 1..N | M→S | bl `kinit_hart` MSIP path → kmain `_start_secondary` |
+| Secondary M-wake | 1..N | M→S | bl `kinit_hart` KMAIN_ENTRY path → kmain `_start_secondary` |
 | Secondary kernel setup | 1..N | S | [`secondary_rust_setup`](../kmain/src/bin/orbit.rs) |
-| Idle / scheduler | 1..N | S | `k_idle` / scheduler dispatch |
+| Idle / scheduler | 1..N | S | `k_hart_loop` / scheduler dispatch |
 | `sret` to U | any | S→U | trap return after `create_new_process` |
 | pid 1 main | any | U | [`orbit-loader main`](../orbit-loader/src/main.rs) |
 | pid 2 main | any | U | console / smoke / hello-std |
@@ -221,21 +227,16 @@ violating them is the source of most boot-bringup bugs.
   hart has observed user mappings yet. Calling broadcast pre-mark
   would `wait_zero_spin` against harts still spinning in
   `secondary_rust_setup` — instant deadlock.
-- **`MANAGER_LOCK` is uncontended on hart 0** during stages 3–4.
-  No syscall-driven `PendingWork` exists yet; hart 0 holds the
-  lock implicitly. Once secondaries come online and the scheduler
-  starts dispatching threads, the lock becomes a proper contention
-  point and the manager role floats per
-  [architecture.md](architecture.md).
-- **Serial init order matters.** `init_serial` runs twice on hart 0
-  — once in bl (raw PA), once in `k_smpstart` after the kernel
-  satp's KMMIO alias is live. Anything between the two prints
-  through bl's mapping; anything after uses `kmmio_uart()`.
-- **`KDMAP_BIAS` must publish before the first `kinit_hart` MSIP**.
-  Secondaries dereference KDMAP VAs (their `sscratch` and `sp`)
-  before they `csrw satp` to the kernel's table; the bias is the
-  arithmetic that makes those dereferences work in M-mode.
-  Published over `ecall(4)` from kmain to bl.
+- **The scheduler lock is uncontended on hart 0** during stages 3–4.
+  No syscall-driven `PendingWork` exists yet; hart 0 holds it
+  implicitly. Once secondaries come online and the scheduler starts
+  dispatching threads, the lock becomes a proper contention point and
+  the manager role floats per [architecture.md](architecture.md).
+- **Serial init order matters.** `init_serial` runs three times on
+  hart 0 — in bl (raw PA), again in `rust_main` (raw PA under the
+  trampoline satp), and once more in `k_smpstart` after the kernel
+  satp's KMMIO alias is live. Anything before the last init prints
+  through a raw-PA mapping; anything after uses `kmmio_uart()`.
 - **`SECONDARY_GO[i]` Release publishes the kernel state.** Secondary
   harts Acquire-load it and observe `KSATP` / `HART_CTX_PA` /
   `KDMAP_BIAS_BOOT` published in `rust_main`. Reordering the

@@ -9,13 +9,14 @@
 //! Capacity is `N - 1` — one slot stays reserved so `head == tail`
 //! unambiguously means empty.
 //!
-//! Two consumers in the kernel today:
-//! - [`net_channel`'s NetChannel queues](../../net_channel/src/lib.rs)
-//!   re-export this type. Its layout (`#[repr(C)]`) is part of the
-//!   user/kernel ABI for that path; do not reorder fields.
-//! - [`crate::stdin::ProcessStdin`](../../kmain/src/kernel/stdin.rs) —
-//!   per-process keystroke ring (input::dispatch producer, read_stdin
-//!   consumer).
+//! In-crate consumers:
+//! - [`crate::stdin::ProcessStdin`] — per-process stdin byte ring
+//!   (input::dispatch producer, read_stdin consumer).
+//! - [`crate::key_events::ProcessKeyEvents`] — per-process key-event ring.
+//!
+//! `net_channel` keeps its own independent identical copy of this type
+//! (its `#[repr(C)]` layout is part of the user/kernel ABI for that
+//! path; do not reorder fields there).
 //!
 //! # Safety contract
 //!

@@ -90,7 +90,7 @@ pub const UMODE_TEST_ELF: &'static [u8] =
 pub use orbit_abi::layout::*;
 
 // ─── Scheduling / wake / registry statics + notice types: relocated to
-// the `manager` crate (Phase D). Re-exported here so the existing
+// the `manager` crate. Re-exported here so the existing
 // `crate::kernel::X` producer sites (trap path, drivers, hw, syscall
 // layer) keep resolving — the storage now lives in `manager`. ───
 pub use manager::{
@@ -206,7 +206,7 @@ pub fn try_wake_pending_inline(thread_ptr: *mut Thread) -> bool {
 /// `HartContext`). Returns `Err` if the inbox is full — caller is
 /// responsible for logging; the dropped notice means the thread is
 /// `Ready` but not queued, and currently nothing rescues it (no
-/// fallback scan exists post-Phase C). At cap=32 per hart this should
+/// fallback scan exists). At cap=32 per hart this should
 /// not realistically fire.
 pub fn push_ready_notice(runnable: Runnable) -> Result<(), ()> {
     let hart_id = get_hart_context().hart_id as usize;
@@ -232,10 +232,10 @@ pub fn push_ready_notice(runnable: Runnable) -> Result<(), ()> {
 ///     loop in `plic::dispatch`.
 ///  2. Push a `WakeEvent::Net` so the manager wakes k_net at the
 ///     next scheduler scan
-/// Drops the wake event silently if `WAKE_QUEUE` is full. Cap is 64;
+/// Drops the wake event silently if `WAKE_QUEUE` is full. Cap is 128;
 /// at e1000 burst rates (~1 IRQ per 1446 B at 1 Gbps = 86k IRQ/s)
 /// the manager will drain faster than we fill, but a temporarily-
-/// stalled manager would just lose redundant wakes — k_net's 10 ms
+/// stalled manager would just lose redundant wakes — k_net's ~100 ms
 /// heartbeat is the safety net.
 pub fn e1000_plic_handler(src: u32) {
     let icr = crate::drivers::e1000::ack_irq_static();
@@ -259,7 +259,7 @@ pub struct Orbit {
 
     processes: BTreeMap<u16, Process>,
 
-    /// The scheduling manager (Phase D extraction): owns the thread
+    /// The scheduling manager: owns the thread
     /// registry, the ready queue + sleep heap, and the latched driver-
     /// kthread tids (k_net / k_gpu / k_serial). All scheduling-state
     /// access goes through its accessors / guard-bounded methods; the
@@ -304,7 +304,7 @@ pub struct Orbit {
     /// signaled). Replaces the old k_io kthread.
     spawns_in_progress: BTreeMap<u32, SpawnInProgress>,
 
-    /// §13a.5 — futex wait queues keyed on the *physical* page+offset
+    /// Futex wait queues keyed on the *physical* page+offset
     /// of `uaddr`. Two threads in different processes that mapped the
     /// same shared frame end up under the same key, so a single
     /// `futex_wake` reaches them both. Manager-only; mutated under
@@ -388,8 +388,8 @@ pub struct FsReadInProgress {
 /// each per-page `CacheFill` lands the manager checks
 /// `spawns_in_progress[tid]`; if found and more pages remain, it
 /// issues the next page; if all pages have landed it runs
-/// [`Orbit::install_spawn`] and signals the handle with the new
-/// pid (or errno).
+/// [`Orbit::install_spawn`] and resumes the parked caller with the new
+/// pid (or errno) via `publish_pending_for_tid`.
 ///
 /// The state machine replaces the old k_io kthread loop, which
 /// parked synchronously on per-sector handles. Splitting the work
@@ -438,7 +438,7 @@ impl Orbit {
     pub const IGB_BAR_PA: u64 = 0x4000_0000;
 
     /// Snapshot per-process and kernel-wide accounting for `pid`.
-    /// Phase 1 covers memory only — time-related fields (cpu_ticks,
+    /// Covers memory only — time-related fields (cpu_ticks,
     /// syscall_ticks, hart_*_ticks, context_switches, syscalls) read
     /// as 0 until the per-hart bucket state machine lands.
     ///
@@ -2178,7 +2178,7 @@ impl Orbit {
         to_write as isize
     }
 
-    /// §13a.3 — `create_process_ex`. Same shape as
+    /// `create_process_ex`. Same shape as
     /// `run_create_process_req` plus the argv blob copy + map step.
     /// The blob is one page at most (cap enforced at the syscall
     /// boundary); copy it out via a single page walk, then after the
@@ -2465,8 +2465,9 @@ impl Orbit {
         };
 
         // ELF range validation only applies to bytes mode — path mode
-        // gets its bytes from k_io reading off disk, so elf_vaddr /
-        // elf_len are ignored there. Bytes mode is also LOADER-only;
+        // gets its bytes from the page cache (via the SpawnInProgress
+        // state machine), so elf_vaddr / elf_len are ignored there.
+        // Bytes mode is also LOADER-only;
         // both checks happen below at the spawn-source branch after
         // the role-transition gate has fired.
 
@@ -2801,7 +2802,7 @@ impl Orbit {
         // Copy the ELF (same loop as run_create_process_req). Bytes-
         // mode path: source bytes from caller's user memory and
         // converge on the canonical `install_spawn` helper below
-        // (same one path-mode hits via the SpawnReady bounce).
+        // (the same one path-mode reaches once its CacheFill pages complete).
         let mut blob: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(args.elf_len);
         let mut copied = 0usize;
         while copied < args.elf_len {
@@ -2859,11 +2860,11 @@ impl Orbit {
     /// per-thread perms + credential snapshots.
     ///
     /// Both spawn front-doors (bytes-mode in the manager and path-mode
-    /// via `k_spawn` bouncing back as `PendingWork::SpawnReady`) call
-    /// this helper with their resolved blob. The split lets the path
-    /// front-door do its FS reads without holding the manager up while
-    /// keeping a single canonical install codepath — one place to fix
-    /// any spawn-related regression.
+    /// via the `SpawnInProgress` state machine, driven by page-cache
+    /// `CacheFill` completions) call this helper with their resolved
+    /// blob. The split lets the path front-door do its FS reads without
+    /// holding the manager up while keeping a single canonical install
+    /// codepath — one place to fix any spawn-related regression.
     ///
     /// Caller responsibilities:
     /// - `args` validated (struct copy + `stdout_capture <= 1` + `_pad2 == 0`)
@@ -3325,7 +3326,7 @@ impl Orbit {
         }
         if target.exit_waiter.is_some() {
             // Single-waiter v1 — multi-waiter wants a Vec and lands
-            // with futex (§13a.5).
+            // with futex.
             self.publish_pending_for_tid(
                 caller_tid,
                 &[Errno::new(orbit_abi::errno::EBUSY).to_ret(), 0],
@@ -3398,10 +3399,10 @@ impl Orbit {
         info!("wait_any_child: pid={caller_pid} tid={caller_tid} parked on any-child exit");
     }
 
-    /// §13a.5 — futex wait. Owns the signaling: sync errors signal
-    /// here; the async park installs the waiter on the per-PA queue
-    /// and a later `futex_wake` (or process teardown) signals the
-    /// handle.
+    /// Futex wait. Owns the resume: sync errors resume here; the async
+    /// park installs the waiter (its tid) on the per-PA queue and a
+    /// later `futex_wake` (or process teardown) resumes it via
+    /// `publish_pending_for_tid`.
     ///
     /// The compare-then-park is atomic against any concurrent
     /// `futex_wake` because both run on the manager hart under
@@ -3463,7 +3464,7 @@ impl Orbit {
         );
     }
 
-    /// §13a.5 — futex wake. Drains up to `req.n` waiters from
+    /// Futex wake. Drains up to `req.n` waiters from
     /// `futex_waiters[pa]`, resumes each via
     /// `publish_pending_for_tid(w.tid, &[0])`, and returns the count
     /// of waiters woken (or a negative errno on translation failure).
@@ -3756,10 +3757,11 @@ impl Orbit {
         }
     }
 
-    /// Drain `MANAGER_WORK`. Each entry is a syscall handler bundled
-    /// with its [`CompletionHandle`]; we run the handler, signal the
-    /// handle with the result, and let the next scheduler scan resume
-    /// the parked thread off `thread.handle.is_signaled()`.
+    /// Drain `MANAGER_WORK`. Each entry carries the parked caller's
+    /// tid; we run the matching handler and resume the thread via
+    /// `publish_pending_for_tid` (writes the result a-regs, then pushes
+    /// `WakeEvent::Tid`). No `CompletionHandle` is carried in the work
+    /// item.
     /// Drain [`CACHE_FILLS`] — virtio-blk completion events. Runs at
     /// the top of every [`Self::drain_pending_work`] pass so fills
     /// resolve (and their parked fs_read waiters unblock) before new
@@ -3963,9 +3965,9 @@ impl Orbit {
                     self.publish_pending_for_tid(tid, &[result]);
                 }
                 // The next twelve arms are the converted-from-sync
-                // handlers (docs/dev/fd-unix-io-scope.md item 0): the
-                // run_* bodies predate the conversion unchanged; only
-                // the call site moved from the trap path to here, so
+                // handlers: the run_* bodies predate the conversion
+                // unchanged; only the call site moved from the trap
+                // path to here, so
                 // `process_handles` / `Process` cwd + creds are now
                 // touched exclusively under the manager.
                 PendingWork::FsSeek { req, pid, tid } => {
@@ -4103,19 +4105,14 @@ impl Orbit {
         }
     }
 
-    /// Stub manager arm for [`PendingWork::CacheFill`]. The IRQ
-    /// handler posts these whenever a chain submitted via the
-    /// cached path completes. Once the cache is wired into
-    /// `run_fs_read_req`, this method will drain the slot's waiter
-    /// list, copy bytes per waiter, and resume the waiting tids.
-    /// IRQ → manager handler for a completed cache fill. Drains
-    /// the slot's waiter list (transitioning the slot to Ready on
-    /// success or removing it on failure), iterates each waiter
-    /// performing the appropriate copy (UserPageWindow for User
-    /// waiters, direct memcpy for Kernel waiters), and decrements
-    /// per-tid `FsReadInProgress` accounting; the last decrement
-    /// per tid resumes the parked thread with the byte count or
-    /// `-EIO`.
+    /// Manager arm for [`PendingWork::CacheFill`]. The IRQ handler
+    /// posts these whenever a chain submitted via the cached path
+    /// completes. Drains the slot's waiter list (transitioning the
+    /// slot to Ready on success or removing it on failure), iterates
+    /// each waiter performing the appropriate copy (UserPageWindow for
+    /// User waiters, direct memcpy for Kernel waiters), and decrements
+    /// per-tid `FsReadInProgress` accounting; the last decrement per
+    /// tid resumes the parked thread with the byte count or `-EIO`.
     fn run_cache_fill(&mut self, guard: &SchedGuard, packed_key: u64, status: u8) {
         use crate::kernel::page_cache::Waiter;
 
@@ -4311,15 +4308,14 @@ impl Orbit {
     /// `CompletionHandle::set_waiter` / `is_signaled` shape, just
     /// with a per-thread atom instead of an Arc.
     ///
-    /// `WakeEvent::Tid` push covers the Suspended branch: future
-    /// migrations (read_stdin, read_key_event in Phase 6) park in
-    /// `Suspended` rather than `Blocking`, and the eager
-    /// `Suspended → Ready` CAS in `set_wake_reason_where` handles
-    /// those — already extended in Phase 1.5 to marshal
+    /// `WakeEvent::Tid` push covers the Suspended branch: the
+    /// `read_stdin` / `read_key_event` parkers use `Suspended` rather
+    /// than `Blocking`, and the eager `Suspended → Ready` CAS in
+    /// `set_wake_reason_where` handles those — it marshals
     /// `pending_rets` before promoting.
     pub fn publish_pending_for_tid(&self, tid: u32, vals: &[isize]) {
         // Forwarder: the registry + the guard-free publish now live on
-        // `Manager` (Phase D). Kept on `Orbit` so the ~58 manager-side
+        // `Manager`. Kept on `Orbit` so the ~58 manager-side
         // syscall handlers that call `self.publish_pending_for_tid(...)`
         // resolve unchanged.
         self.manager.publish_pending_for_tid(tid, vals);
@@ -4558,7 +4554,7 @@ impl Orbit {
     /// either issues the next read or finalizes).
     ///
     /// On per-page IO failure, drops the in-progress entry and
-    /// signals the carried handle with `-EIO`.
+    /// resumes the parked caller with `-EIO` via `publish_pending_for_tid`.
     fn advance_spawn(&mut self, guard: &SchedGuard, tid: u32, status: u8) {
         if status != 0 {
             if self.spawns_in_progress.remove(&tid).is_none() {
@@ -4577,9 +4573,9 @@ impl Orbit {
         self.issue_next_spawn_page(guard, tid);
     }
 
-    /// Manager arm for [`PendingWork::SpawnReady`]. k_spawn has already
-    /// loaded the bytes; the manager now runs the canonical install
-    /// pipeline (same one bytes-mode calls inline).
+    /// Finalizes a path-mode spawn once `issue_next_spawn_page` has
+    /// pulled every ELF page through the cache. Runs the canonical
+    /// install pipeline (the same one bytes-mode calls inline).
     fn run_spawn_ready(
         &mut self,
         guard: &SchedGuard,
@@ -4675,7 +4671,7 @@ impl Orbit {
 
         // Forward-progress IPI: any hart currently running a doomed
         // sibling needs to trap so its `check_context_and_switch` arm
-        // notices `state == Exited` and bails to k_idle. Without this
+        // notices `state == Exited` and bails to k_hart_loop. Without this
         // we'd wait for the next timer tick on that hart — bounded
         // (sub-ms with Sstc) but not immediate.
         crate::kernel::accounting::for_each_hart_context(|h| {
@@ -4818,22 +4814,19 @@ impl Orbit {
         let process_root_table_pa = PhysAddr::from(process.satp);
 
         // Drop every `futex_waiters` entry whose owner is this dying
-        // process. Their `CompletionHandle` clones drop with the entry;
-        // the matching `Thread.handle` drops in `dealloc_thread` after
-        // we return. Without this sweep a later `futex_wake` on the
-        // same PA (e.g. a child process re-using the same physical
-        // page in its private heap) would walk the stale entry and
-        // dereference the dead Thread via the wake hook —
-        // `wake_blocked_inline` reads `t.handle.take().ret_count()` on
-        // freed memory and faults inside `CompletionHandle::ret_count`.
-        // FutexWaiter.pid was reserved for exactly this sweep.
+        // process. Each entry holds only a parked tid now. Without this
+        // sweep a later `futex_wake` on the same PA (e.g. a child
+        // process re-using the same physical page in its private heap)
+        // would resume a stale — possibly already-recycled — tid via
+        // `publish_pending_for_tid`. FutexWaiter.pid was reserved for
+        // exactly this sweep.
         let dead_pid = process.pid;
         self.futex_waiters.retain(|_pa, waiters| {
             waiters.retain(|w| w.pid != dead_pid);
             !waiters.is_empty()
         });
 
-        // §13a.2 — three exit paths:
+        // Three exit paths:
         //  1. Parent already parked on `wait_pid` → signal the waiter
         //     directly with `(0, exit_code)`. Wake hook copies into
         //     a-regs on resume.
@@ -4883,7 +4876,7 @@ impl Orbit {
             }
         }
 
-        // §13a.3 / §13e — return the argv / envp blob pages to kernel_pages.
+        // Return the argv / envp blob pages to kernel_pages.
         if let Some(backing) = process.argv_blob.take() {
             self.free_backing(backing);
         }
@@ -4899,8 +4892,9 @@ impl Orbit {
         );
 
         // Tear down the per-process stdin slot. If a reader is parked
-        // on it, `unregister` signals the handle so the manager-scan
-        // unblocks the thread; the resumed thread re-enters
+        // on it, `unregister` swaps out its tid and pushes
+        // `WakeEvent::InputTid` so the manager unblocks the thread; the
+        // resumed thread re-enters
         // `read_stdin` and gets ENOENT for the gone pid (in practice
         // this only fires if a thread parks an instant before the
         // owning process exits — rare).
@@ -6526,7 +6520,7 @@ impl Orbit {
         next
     }
 
-    /// §13a.3 — does the named process have an argv blob installed?
+    /// Does the named process have an argv blob installed?
     /// Backs the argv half of the `argv_envp` syscall return pair
     /// (returns `USER_ARGV_BASE` if true, `0` otherwise).
     pub fn process_has_argv(&self, pid: u16) -> bool {
@@ -6536,7 +6530,7 @@ impl Orbit {
             .unwrap_or(false)
     }
 
-    /// §13e — does the named process have an envp blob installed?
+    /// Does the named process have an envp blob installed?
     /// Backs the envp half of the `argv_envp` syscall return pair
     /// (returns `USER_ENVP_BASE` if true, `0` otherwise).
     pub fn process_has_envp(&self, pid: u16) -> bool {
@@ -6883,9 +6877,9 @@ impl Orbit {
         let group_count = match self.processes.get(&pid) {
             Some(p) => {
                 if p.groups.len() > snap.len() {
-                    // Defensive: setgroups (when it lands) will cap
-                    // input at NGROUPS_MAX; a longer list shouldn't
-                    // be reachable, but EIO not panic if it is.
+                    // Defensive: setgroups caps input at NGROUPS_MAX,
+                    // so a longer list shouldn't be reachable — but EIO
+                    // not panic if it is.
                     return Errno::new(EIO).to_ret();
                 }
                 for (i, &g) in p.groups.iter().enumerate() {
@@ -7157,9 +7151,9 @@ impl Orbit {
         if (buf_vaddr & (PAGE_SIZE as u64 - 1)) + buf_len as u64 > PAGE_SIZE as u64 {
             return Errno::new(EINVAL).to_ret();
         }
-        // setlogin (when it lands) will cap names at MAXLOGNAME; until
-        // then no path produces a long name, but use the same cwd-shape
-        // stack snapshot to keep the borrow narrow.
+        // setlogin caps names at MAXLOGNAME, so no path produces a long
+        // name here; use the same cwd-shape stack snapshot to keep the
+        // borrow narrow.
         const MAX_LOGIN_NAME: usize = 256;
         let mut snap = [0u8; MAX_LOGIN_NAME];
         let name_len = match self.processes.get(&pid) {
@@ -7219,8 +7213,8 @@ impl Orbit {
         next
     }
 
-    /// End-of-manager-pass nudge for k_gpu. Called from `k_manage`'s
-    /// loop after `drain_wakes` + `check_net` and before
+    /// End-of-manager-pass nudge for k_gpu. Called from `k_hart_loop`
+    /// after `drain_wakes` + `check_net` and before
     /// `assign_threads`, so any k_gpu-readying CAS lands in `self.ready`
     /// in time for this same pass to dispatch.
     ///

@@ -1,5 +1,5 @@
 //! orbit-loader — u-mode listener that accepts an ELF over TCP and asks
-//! the kernel to spawn it via `create_process`. Replaces `include_bytes!`
+//! the kernel to spawn it via `create_process_v2`. Replaces `include_bytes!`
 //! rebuild cycles for test binaries; kmain embeds this loader once and
 //! iteration happens over the wire.
 //!
@@ -11,9 +11,9 @@
 //! string) and `name` (text string). The inverse-length check rejects
 //! obvious corruption before we allocate.
 //!
-//! One [`NetCh`] serves the loader's lifetime; after each client we
-//! call `reset()` to recycle the channel rather than tearing down and
-//! reallocating between clients.
+//! One [`NetCh`] serves the loader's lifetime; each client runs in a
+//! `Session` whose `Drop` recycles the channel, so we don't tear down
+//! and reallocate between clients.
 
 #![no_std]
 #![no_main]
@@ -87,9 +87,8 @@ struct Payload<'a> {
     affinity: u64,
     /// Optional argv. Each element is a borrowed UTF-8 string from
     /// the CBOR body; the loader converts to `&[u8]` and hands the
-    /// packed blob to `create_process_with_argv_envp`. Empty /
-    /// missing → child sees argc=0, which is what the legacy
-    /// `create_process` path produces. Strings (rather than byte
+    /// packed blob through `CreateProcessV2Args.argv_vaddr`. Empty /
+    /// missing → child sees argc=0. Strings (rather than byte
     /// strings) keep the CBOR shape simple and work for every CLI
     /// argv we've shipped so far.
     #[n(4)]
@@ -111,7 +110,7 @@ enum LoaderErr {
 #[unsafe(no_mangle)]
 pub extern "C" fn main() -> i32 {
     // Boot init: read argv[1] (init path), fs_load it from tarfs, and
-    // create_process. Replaces the previous `include_bytes!` of the
+    // create_process_v2. Replaces the previous `include_bytes!` of the
     // console binary — kmain now passes the init path as argv when
     // spawning the loader, so the same loader image serves
     // default/console, smoke/umode, and hello-std bringups by just
@@ -174,7 +173,7 @@ fn log_boot_env() {
 }
 
 /// Read argv[1] (init path), pull the ELF off tarfs, hand to
-/// `create_process`. All failure modes log and return — the caller
+/// `create_process_v2`. All failure modes log and return — the caller
 /// continues into the TCP listen loop regardless.
 fn spawn_init_from_argv() {
     let args = orbit_rt::argv::args();
@@ -218,9 +217,9 @@ fn spawn_init_from_argv() {
         }
     };
 
-    // Sector-aligned scratch buf. fs_read demands `len == 512` and
-    // rejects buffers that straddle a 4 KiB page; aligning to 512
-    // keeps the allocation page-resident.
+    // Sector-sized scratch buf. fs_read now accepts any length up to
+    // 64 KiB across multiple pages; we keep a 512-byte aligned buffer
+    // and read a sector at a time for simplicity.
     #[repr(align(512))]
     struct AlignedBuf([u8; 512]);
     let mut scratch = AlignedBuf([0u8; 512]);
@@ -308,7 +307,7 @@ fn spawn_init_from_argv() {
 
 /// Snapshot the current process env (seeded from the kernel envp at
 /// boot) and pack it into `buf` for handoff to a child via
-/// `create_process_with_argv_envp`. Returns the page-aligned VA, or
+/// `create_process_v2` (`CreateProcessV2Args.envp_vaddr`). Returns the page-aligned VA, or
 /// `0` if there's nothing to install (empty env or pack failure).
 ///
 /// `buf` must be exactly one page and page-aligned — the kernel-side
@@ -389,7 +388,7 @@ fn recv_payload(s: &Session<'_>) -> Result<(Vec<u8>, String), LoaderErr> {
     let body = &scratch[8..total];
 
     // Decode name eagerly so we can log it; elf bytes stay in `scratch`
-    // and the kernel reads them via create_process.
+    // and the kernel reads them via create_process_v2.
     let payload: Payload = minicbor::decode(body).map_err(|_| LoaderErr::Cbor)?;
     let name = String::from(payload.name);
 

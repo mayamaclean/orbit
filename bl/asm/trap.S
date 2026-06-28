@@ -93,10 +93,10 @@ m_trap_vector:
 1:
 	# Note: hardware already sets mstatus.MIE = 0 on trap entry, which
 	# blocks nested M-mode interrupts for the duration of m_trap_vector.
-	# We deliberately do NOT touch `mie` here: m_trap's per-cause arms
-	# need to clear specific bits (e.g. mie.SSIE on cause-1, mie.MTIE on
-	# cause-7) to prevent the same interrupt re-firing the instant we
-	# mret. Clobbering mie around the call would undo those clears.
+	# We deliberately do NOT touch `mie` here: m_trap's only async arm
+	# (cause-3) clears the CLINT MSIP to stop the same interrupt
+	# re-firing the instant we mret. Clobbering mie around the call could
+	# undo state the handler relies on.
 
 	csrr	a0, mepc
 	sd		a0, TRAPFRAME_MEPC_SAVE(t5)

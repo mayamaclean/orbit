@@ -686,7 +686,7 @@ pub extern "C" fn k_net(device: *mut NetPackage) {
                     // we need when peer has stalled mid-burst (drained
                     // rx buffer, no new data → smoltcp's window_to_update
                     // heuristic doesn't fire on its own, peer parks on
-                    // RTO backoff). 100 ms is short enough to nudge peer
+                    // RTO backoff). 5 s is short enough to nudge peer
                     // before its RTO doubles to noticeable territory,
                     // long enough to not flood normal traffic with
                     // probes (steady-state ACKs reset the timer anyway).
@@ -883,7 +883,7 @@ pub fn update_thread_and_trap_frame(
 ///
 /// Terminates the *whole calling process*, not just the calling
 /// thread. Marks every sibling thread `Exited` and IPIs any hart
-/// still running one so it traps and bails to k_idle. The manager's
+/// still running one so it traps and bails to k_hart_loop. The manager's
 /// next `cleanup_threads_and_processes` pass reaps the process.
 ///
 /// Why exit-group instead of thread-exit: every consumer of sysno 0
@@ -897,7 +897,7 @@ pub fn update_thread_and_trap_frame(
 /// needs it.
 ///
 /// Noreturn: ends with `exit_thread_with_state(Exited)` for the
-/// calling thread, which jumps to k_idle.
+/// calling thread, which jumps to k_hart_loop.
 #[unsafe(no_mangle)]
 pub unsafe fn handle_exit(
     epc: usize,
@@ -1296,7 +1296,7 @@ pub fn handle_query_denial_log(
     });
 }
 
-/// §13a.3 — `create_process_ex(elf, argv_blob)`. Same async shape as
+/// `create_process_ex(elf, argv_blob)`. Same async shape as
 /// `create_process` but carries an argv blob the kernel maps into
 /// the new process at `USER_ARGV_BASE`.
 #[unsafe(no_mangle)]
@@ -1310,7 +1310,7 @@ pub fn handle_create_process_ex(
     });
 }
 
-/// §13a.3 / §13e — `argv_envp() → (argv_va, envp_va)`. Manager
+/// `argv_envp() → (argv_va, envp_va)`. Manager
 /// round-trip: reads the caller's `Process.argv_blob` / `envp_blob`
 /// presence flags and resumes with the fixed blob VAs (or `0` for
 /// "not installed" — orbit-rt treats those as empty `argv` / `envp`).
@@ -1385,7 +1385,7 @@ pub fn handle_wait_pid(epc: usize, hart_context: &'static HartContext, frame: &m
     });
 }
 
-/// §13a.5 — `futex_wait(uaddr, expected, timeout_ns) → 0 | -EAGAIN
+/// `futex_wait(uaddr, expected, timeout_ns) → 0 | -EAGAIN
 /// | -ETIMEDOUT | -E*`. Park on the per-PA queue; wake by
 /// `futex_wake` or sync error.
 #[unsafe(no_mangle)]
@@ -1395,7 +1395,7 @@ pub fn handle_futex_wait(epc: usize, hart_context: &'static HartContext, frame: 
     });
 }
 
-/// §13a.5 — `futex_wake(uaddr, n) → n_woken | -E*`. Drain up to `n`
+/// `futex_wake(uaddr, n) → n_woken | -E*`. Drain up to `n`
 /// waiters from the per-PA queue and signal each with `0`.
 #[unsafe(no_mangle)]
 pub fn handle_futex_wake(epc: usize, hart_context: &'static HartContext, frame: &mut TrapFrame) {

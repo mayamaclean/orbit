@@ -29,9 +29,11 @@
 ///   `Char` is encoded as `(codepoint << 8) | KeyCode::Char as u8`).
 /// - All other variants: bytes 1..4 are zero.
 ///
-/// Encoding/decoding goes through [`KeyEvent::new`] / [`KeyEvent::code`]
-/// / [`KeyEvent::char`]; consumers should not reach for the raw `code`
-/// field unless they're matching the on-wire bits.
+/// Construction goes through [`KeyEvent::new`]; decoding goes through
+/// the accessors [`KeyEvent::key_code`] / [`KeyEvent::mods`] /
+/// [`KeyEvent::event_kind`] (plus the free `decoded_char` / `decoded_fn`
+/// helpers); consumers should not reach for the raw `code` field unless
+/// they're matching the on-wire bits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(C)]
 pub struct KeyEvent {

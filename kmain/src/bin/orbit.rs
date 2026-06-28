@@ -53,7 +53,7 @@ fn setup_interrupts() {
         riscv::register::sie::set_stimer();
         riscv::register::sstatus::set_sie();
 
-        // §13a.4 — set scounteren.TM as forward-prep. By itself this
+        // Set scounteren.TM as forward-prep. By itself this
         // is *not* enough on QEMU virt: the `time` CSR is spec'd as a
         // view onto CLINT mtime, not a hardware register, so U-mode
         // `csrr time` still traps even with the permission bit set —
@@ -610,7 +610,7 @@ pub extern "C" fn k_smpstart() {
         .expect("boot argv fits in 256 bytes");
     let argv_blob = &argv_buf[..argv_len];
 
-    // §13e — boot envp. orbit-loader inherits these from the kernel;
+    // Boot envp. orbit-loader inherits these from the kernel;
     // when it spawns the init binary it can repack and propagate. A
     // tiny baseline keeps env-aware tools (PATH lookups, terminal
     // detection) working with no per-process setup. Values are
@@ -969,9 +969,11 @@ unsafe extern "C" fn secondary_rust_setup(hartid: usize) -> ! {
 /// Entries installed:
 ///   identity gigapage  [0, 1 GiB)                  — MMIO (UART, CLINT, ACLINT, e1000)
 ///   identity gigapages [2, 4 GiB)                  — all of RAM
-///   high-half          KTEXT_NOMINAL..+2 MiB       — aliases `[load_addr, load_addr+2MB)`
-///                                                    so symbol S at linked LINK_BASE+N is
-///                                                    accessible at KTEXT_NOMINAL + N.
+///   high-half          KTEXT_NOMINAL..+image       — aliases `[load_addr, load_addr+image)`,
+///                                                    dynamically sized to the loaded image
+///                                                    (rounded up to 2 MiB), so symbol S at
+///                                                    linked LINK_BASE+N is accessible at
+///                                                    KTEXT_NOMINAL + N.
 ///
 /// The identity half keeps the subsequent asm executing after `csrw satp`.
 /// rust_main later installs the full final satp.

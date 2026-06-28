@@ -9,7 +9,7 @@
 //! line buffer (which lives across iterations).
 //!
 //! Builtins MVP: `echo`, `help`, `clear`. `ps` is gated on the
-//! `ps_snapshot` syscall (deferred from §9) so it isn't wired today.
+//! `ps_snapshot` syscall so it isn't wired today.
 //!
 //! Display compositor support (kmain/src/drivers/display.rs):
 //! - `\x08` (backspace) — pops the last char from the in-progress line.
@@ -130,8 +130,8 @@ impl LineEditor {
 
 /// Snapshot the kernel's view of this process and dump it in a
 /// `top`-ish two-column format. Time fields are displayed even when
-/// the kernel returns 0 — Phase 2 wires the per-hart bucket state
-/// machine that populates them.
+/// the kernel returns 0 — the per-hart bucket state machine that
+/// populates them isn't wired yet.
 fn stats_cmd() {
     let stats = match query_stats() {
         Ok(s) => s,

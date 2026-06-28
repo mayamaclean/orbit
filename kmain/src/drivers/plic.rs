@@ -400,12 +400,11 @@ pub fn plic_register(src: u32, handler: Handler, hart: usize) -> Result<(), ()> 
     Ok(())
 }
 
-/// Register the UART-RX → pane-cycle handler on IRQ 10 pinned to hart 0
-/// and configure the ns16550a to raise RX interrupts. After this,
-/// every keystroke typed in the QEMU console fires exactly one
-/// cause-9 trap, drains the byte, and enqueues a `CycleActive`
-/// command onto `k_gpu`'s ring — the visible display source rotates
-/// on the next `k_gpu` wake (≤50 ms).
+/// Configure the ns16550a to raise RX interrupts. The UART-RX →
+/// pane-cycle handler registration is currently disabled (pane cycling
+/// is driven by Ctrl+Tab through the virtio-input driver instead), so
+/// this only programs the FCR/MCR/IER; it no longer wires a PLIC
+/// handler for IRQ 10.
 pub fn install_uart_rx_cycle() -> Result<(), ()> {
     const UART_RX_IRQ: u32 = 10;
     //plic_register(UART_RX_IRQ, uart_rx_cycle_handler, 0)?;

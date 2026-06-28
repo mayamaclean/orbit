@@ -596,7 +596,7 @@ impl Display {
     }
 
     /// Advance `active` to the next source in key order (wraps).
-    /// Used by the UART-RX "cycle pane" keybind.
+    /// Used by the Ctrl+Tab "cycle pane" keybind (virtio-input).
     pub fn cycle_active(&mut self) {
         info!("cycling pane");
 

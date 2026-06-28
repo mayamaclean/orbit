@@ -124,7 +124,7 @@ pub fn dispatch(ev: InputEvent) {
             // Captured a parker: keep the tid for a single
             // post-loop wake. First byte that finds a parker wins;
             // subsequent bytes in this multi-byte burst (e.g. the
-            // four-byte CSI sequence for an arrow key) just
+            // three-byte CSI sequence for an arrow key) just
             // enqueue, since the slot is now empty.
             Ok(Some(tid)) => wake_tid = Some(tid),
             // Ring is full — drop the rest. The reader will drain

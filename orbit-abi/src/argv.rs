@@ -1,4 +1,4 @@
-//! Layout of the §13a.3 argv blob.
+//! Layout of the argv blob.
 //!
 //! Producer side: userland packs `[ArgvHeader][argv_offsets;
 //! argc][string_table]` into a buffer, hands it to
@@ -8,13 +8,13 @@
 //! [`crate::layout::USER_ARGV_BASE`]), and installs the page R+U+S
 //! in the new process's PT.
 //!
-//! Consumer side: orbit-rt's startup calls the `argv_envp` syscall;
-//! a non-zero return is the VA of the mapped blob (always
-//! `USER_ARGV_BASE` in v1). [`Argv::parse`] walks `[ArgvHeader]
-//! [argv_ptrs][string_table]` and yields per-arg byte slices.
+//! Consumer side: orbit-rt's startup calls the `argv_envp` syscall,
+//! which returns a `(argv_va, envp_va)` pair (the argv VA is
+//! `USER_ARGV_BASE`, or `0` if no blob was installed). [`Argv::parse`]
+//! walks `[ArgvHeader][argv_ptrs][string_table]` and yields per-arg
+//! byte slices.
 //!
-//! v1 carries argv only — no envp. envp lands when there's a
-//! consumer that wants it.
+//! envp uses the identical wire format — see [`crate::envp`].
 
 use core::mem::size_of;
 

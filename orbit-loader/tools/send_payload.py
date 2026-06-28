@@ -17,7 +17,7 @@ Usage:
 
 Pass argv as `--arg foo --arg bar ...` (repeatable). The loader
 packs them with `orbit_abi::argv::pack` and hands the blob to
-`create_process_with_argv_envp`. By convention the first --arg is
+`create_process_v2`. By convention the first --arg is
 argv[0] (the program name); the loader's --name (which defaults to
 basename(PATH)) is *not* auto-prepended — pass it explicitly when
 the consumer expects argv[0] (most do).
@@ -25,7 +25,7 @@ the consumer expects argv[0] (most do).
 Defaults: --host 127.0.0.1, --port 7777, --name = basename(PATH).
 Affinity masks default to 0 ("all harts" sentinel — kernel substitutes
 the real cpu_count mask). Pass e.g. --affinity 0x4 to pin a process to
-hart 2 (used by §10's TLB-shootdown stress test).
+hart 2 (used by the TLB-shootdown stress test).
 QEMU is expected to forward host:7777 to guest:7777 via -netdev
 user,...,hostfwd=tcp::7777-:7777 (already wired in bl/.cargo/config.toml).
 """

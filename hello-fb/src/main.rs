@@ -1,4 +1,4 @@
-//! `/bin/hello-fb` — drawing-surface smoke test for milestone M1.
+//! `/bin/hello-fb` — drawing-surface smoke test.
 //!
 //! Loop:
 //! 1. `fb_query` to read the active framebuffer dims.

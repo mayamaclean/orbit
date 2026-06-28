@@ -1,6 +1,6 @@
 //! End-to-end smoke for the EventFd doorbell pattern.
 //!
-//! Validates the full chain landed in Milestone A4 + the orbit-rt
+//! Validates the full chain + the orbit-rt
 //! `EventFd` wrapper:
 //!
 //! 1. `eventfd(2)` allocates a kernel-shared region and maps it into
@@ -124,7 +124,7 @@ extern "C" fn worker_entry(region_va: usize) -> ! {
 pub extern "C" fn main() -> i32 {
     logln!("umode-event-fd-smoke: starting (main tid={})", gettid());
 
-    // §1. Allocate the EventFd. `Arc` so Drop is deferred past the
+    // Allocate the EventFd. `Arc` so Drop is deferred past the
     // worker's lifetime — the worker exits before main does, but
     // we shouldn't rely on that ordering.
     let efd = match EventFd::create(0, 0) {
@@ -141,7 +141,7 @@ pub extern "C" fn main() -> i32 {
         }
     };
 
-    // §2. Spawn the worker, packing the EventFd region pointer into
+    // Spawn the worker, packing the EventFd region pointer into
     // the spawn `arg` slot — the kernel writes it into the new
     // thread's a0 before sret, so `worker_entry` receives it as its
     // first C-ABI argument. allowed_affinity=0/affinity=0 inherit
@@ -157,7 +157,7 @@ pub extern "C" fn main() -> i32 {
         }
     };
 
-    // §4. Wait for the worker to publish its own tid (sanity-check
+    // Wait for the worker to publish its own tid (sanity-check
     // that the spawn actually landed and we're seeing cross-thread
     // memory visibility on the published value).
     let t_start = get_micros();
@@ -183,18 +183,18 @@ pub extern "C" fn main() -> i32 {
         get_micros().saturating_sub(t_start)
     );
 
-    // §5. Give the worker a slice so it actually falls into
+    // Give the worker a slice so it actually falls into
     // `ch_yield`. Without this we'd race the worker's loop and the
     // doorbell might land while the worker is still on the polling
     // pass, defeating the test of the wake_tid path.
     let _ = sleep_ms(50);
 
-    // §6. Fire the doorbell. `signal_waker` bumps count + issues
+    // Fire the doorbell. `signal_waker` bumps count + issues
     // wake_tid(worker_tid).
     let signal_at = get_micros();
     efd.signal_waker(worker_tid);
 
-    // §7. Wait for the worker to consume + exit. Bounded at 2s — the
+    // Wait for the worker to consume + exit. Bounded at 2s — the
     // doorbell should resolve in milliseconds; anything close to the
     // bound is a sign wake_tid isn't reaching the parked thread.
     let woken = wait_until(get_micros(), 2_000_000, 5, || {

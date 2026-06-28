@@ -92,7 +92,7 @@ pub trait Hardware {
     /// `scrollbacks[Process(dest_pid)]` and repaints if that source
     /// is active. Returns `Err(())` if the ring is full or the gpu
     /// package isn't initialized — in which case the syscall returns
-    /// `-7` (EAGAIN-analog).
+    /// `-EAGAIN`.
     ///
     /// `dest_pid` is the *destination* pane, which the syscall
     /// resolves from the calling thread's `stdout_redirect` snapshot

@@ -203,9 +203,9 @@ extern "C" fn kinit_hart() {
     }
 
     // PMP first — same rationale as `kinit`: lock rodata RO and deny
-    // S-mode access to bl before anything else. mtvec/mscratch were set
-    // by boot.S part3 before mret to here, so traps from PMP violations
-    // resolve correctly.
+    // S-mode access to bl before anything else. mscratch was set in the
+    // common _start prologue and mtvec in boot.S part3, both before the
+    // mret to here, so traps from PMP violations resolve correctly.
     unsafe {
         bl::setup_pmp();
     }

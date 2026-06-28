@@ -59,7 +59,8 @@ part2:
 	# to the very end of the stack range.
 	la		sp, _stack_end
 	# Setting `mstatus` register:
-	# 0b01 << 11: Machine's previous protection mode is 2 (MPP=2).
+	# 0b11 << 11: MPP = Machine (mret returns to M-mode kinit).
+	# 1 << 13:    FS = Initial (enable the FPU state field).
 	li		t0, 0b11 << 11 | (1 << 13)
 	csrw	mstatus, t0
 	

@@ -319,8 +319,8 @@ pub extern "C" fn main() -> i32 {
     match mode {
         Mode::Shadow => {
             // Historical: shadow mode logged + fell through, so the
-            // v2 spawn returned a positive child pid. PR3 deleted
-            // the fall-through; if anything still reports Shadow,
+            // v2 spawn returned a positive child pid. The fall-through
+            // was later deleted; if anything still reports Shadow,
             // it should be because the smoke is running against an
             // older kernel.
             if rc_role <= 0 {

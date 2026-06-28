@@ -23,7 +23,7 @@
 //! 2. Just before sret back to user — `→ User`.
 //! 3. Top of `k_hart_loop` WFI — `→ Idle`. Wake-up is bracketed by
 //!    the next `s_trap` `→ Kernel` so no explicit "exit Idle" hook.
-//! 4. Successful `try_acquire_manager` — `→ Scheduler`.
+//! 4. Winning the scheduler lock (`SchedGuard::try_with`) — `→ Scheduler`.
 //! 5. Just before `release_manager` — `→ Kernel`.
 //! 6. Hart bringup (`k_harthello`) — call [`init_hart_bucket`] to
 //!    seed `bucket_enter_tick` with `now()`. The first `switch_bucket`

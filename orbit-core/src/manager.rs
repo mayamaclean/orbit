@@ -1,5 +1,6 @@
-//! Manager-side completion policy — pure decisions that the scheduler
-//! thread (k_manage) makes while fulfilling user-blocked requests. The
+//! Manager-side completion policy — pure decisions the manager makes
+//! (in `k_hart_loop`, on whichever hart holds the scheduler lock) while
+//! fulfilling user-blocked requests. The
 //! bulk of the manager handlers is allocator / page-table plumbing that
 //! stays in kmain; this module is for the decisions that are cleanly
 //! separable from that state.

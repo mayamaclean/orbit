@@ -1,6 +1,6 @@
 //! Process and kernel statistics ABI.
 //!
-//! Syscall signature (`sys_query_stats`, syscall number
+//! Syscall signature (`handle_query_stats`, syscall number
 //! [`QUERY_STATS`](crate::syscall::QUERY_STATS)):
 //!
 //! ```text
@@ -133,7 +133,7 @@ pub struct ProcessStats {
     pub wake_queue_drops: u64,
     /// Build-time capacity of `WAKE_QUEUE`. Reported in the snapshot
     /// so userland can compute headroom without depending on a
-    /// kernel-side const that might change. Today's value: 64.
+    /// kernel-side const that might change. Today's value: 128.
     pub wake_queue_capacity: u64,
 }
 

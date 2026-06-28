@@ -7,7 +7,7 @@
 //! off the region base, which [`NetChannel`](net_channel::NetChannel)
 //! accessors compute at runtime.
 //!
-//! Syscall signature (`sys_create_netch`, syscall number
+//! Syscall signature (number
 //! [`CREATE_NETCH`](crate::syscall::CREATE_NETCH)):
 //!
 //! ```text
@@ -16,7 +16,8 @@
 //! a2 = region_size   (bytes; kernel clamps to [NC_MIN_REGION_SIZE,
 //!                     NC_MAX_REGION_SIZE] and rounds up to a page)
 //! a3 = sock_type     (SockType)
-//! -> a0 = 0 on success, -errno on failure
+//! a4 = bind_spec     (packed BindSpec; required)
+//! -> a0 = user_va, a1 = fd on success; a0 = -errno on failure
 //! ```
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

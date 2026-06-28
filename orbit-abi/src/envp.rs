@@ -1,6 +1,6 @@
-//! Layout of the §13e envp blob.
+//! Layout of the envp blob.
 //!
-//! Wire format is **identical** to the §13a.3 argv blob — see
+//! Wire format is **identical** to the argv blob — see
 //! [`crate::argv`] for the on-the-wire layout, packer, and reader. The
 //! only differences are:
 //!
@@ -22,7 +22,9 @@
 //!
 //! let mut buf = [0u8; ENVP_BLOB_MAX];
 //! let n = pack(&[b"PATH=/bin", b"HOME=/", b"TERM=dumb"], &mut buf).unwrap();
-//! // ... hand &buf[..n] to create_process_ex's envp arg ...
+//! // ... copy into a page-aligned buffer and pass its VA to
+//! //     create_process_v2's envp arg (a non-page-aligned envp VA is
+//! //     rejected with EINVAL) ...
 //!
 //! // Consumer side:
 //! let envp = unsafe { Envp::from_ptr(USER_ENVP_BASE as *const EnvpHeader) }

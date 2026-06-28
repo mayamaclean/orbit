@@ -30,7 +30,7 @@ fn main() {
         Err(e) => println!("FAIL: SystemTime::now: {e}"),
     }
 
-    // §13e — std::thread::spawn round trip.
+    // std::thread::spawn round trip.
     let counter = Arc::new(AtomicU32::new(0));
     let worker_counter = counter.clone();
     let handle = std::thread::spawn(move || {
@@ -42,7 +42,7 @@ fn main() {
     handle.join().unwrap();
     println!("post-join counter = {}", counter.load(Ordering::Acquire));
 
-    // §13e — Mutex round trip. Each worker takes the lock, bumps the
+    // Mutex round trip. Each worker takes the lock, bumps the
     // shared counter, releases. Final value should be N_THREADS *
     // BUMPS_PER_THREAD = 30.
     let m = Arc::new(Mutex::new(0u32));
@@ -66,7 +66,7 @@ fn main() {
     }
     println!("post-mutex counter = {}", *m.lock().unwrap());
 
-    // §13e — Condvar round trip. Producer flips a flag and signals;
+    // Condvar round trip. Producer flips a flag and signals;
     // consumer waits until the flag is true.
     let pair = Arc::new((Mutex::new(false), Condvar::new()));
     let pair2 = pair.clone();
@@ -88,7 +88,7 @@ fn main() {
     consumer.join().unwrap();
     println!("condvar round trip done");
 
-    // §13e — RwLock smoke. One writer, two readers.
+    // RwLock smoke. One writer, two readers.
     let rw = Arc::new(std::sync::RwLock::new(0u32));
     let writer = {
         let rw = rw.clone();
@@ -112,7 +112,7 @@ fn main() {
     }
     println!("rwlock final = {}", *rw.read().unwrap());
 
-    // §13e — mpsc round trip. Producer ships 5 messages; consumer
+    // mpsc round trip. Producer ships 5 messages; consumer
     // sums and reports. Channel internals layer on top of Mutex +
     // Condvar so this is end-to-end coverage of the parking shape.
     let (tx, rx) = std::sync::mpsc::channel::<u32>();
@@ -128,14 +128,14 @@ fn main() {
     producer.join().unwrap();
     println!("mpsc total = {total}");
 
-    // §13e — args + parallelism (read-only, no thread).
+    // args + parallelism (read-only, no thread).
     let args: Vec<_> = std::env::args_os().collect();
     println!("argc = {}", args.len());
     for (i, a) in args.iter().enumerate() {
         println!("argv[{i}] = {}", a.to_string_lossy());
     }
 
-    // §13e env smoke. Boot envp is kmain-installed PATH=/bin / HOME=/
+    // env smoke. Boot envp is kmain-installed PATH=/bin / HOME=/
     // / TERM=dumb, propagated by orbit-loader. Validates the std PAL
     // path (env/orbit.rs's OnceLock<RwLock<BTreeMap>>) round-trips
     // both reads and mutations — the latter only mutate the in-process
@@ -186,7 +186,7 @@ fn main() {
             .unwrap_or(0)
     );
 
-    // §13e — HashMap. Backed by `hashmap_random_keys` which on orbit
+    // HashMap. Backed by `hashmap_random_keys` which on orbit
     // pulls a stack+heap address pair (low-quality entropy, but
     // enough to bring HashMap up before a real RNG lands).
     use std::collections::HashMap;
@@ -200,7 +200,7 @@ fn main() {
     println!("hashmap keys = {keys:?}");
     println!("hashmap sum = {sum}");
 
-    // §13e — String formatting + sort + iteration over a heap-allocated
+    // String formatting + sort + iteration over a heap-allocated
     // slice. Catches any subtle alignment / unwind path that the
     // earlier tests didn't exercise.
     let mut nums: Vec<i32> = vec![5, 2, 8, 1, 9, 3];
@@ -213,12 +213,12 @@ fn main() {
         .join(",");
     println!("joined = {s}");
 
-    // §13e — current thread identity. ThreadId's u64 accessor is
+    // current thread identity. ThreadId's u64 accessor is
     // unstable behind `thread_id_value`; print Debug for now.
     let main_id = std::thread::current().id();
     println!("main thread id = {main_id:?}");
 
-    // §13e — std::fs smoke. Runs before the network section so it
+    // std::fs smoke. Runs before the network section so it
     // doesn't depend on DHCP / TCP listener completion.
     {
         use std::fs;
@@ -311,7 +311,7 @@ fn main() {
             Err(e) => println!("FAIL: std::fs::metadata /does-not-exist unexpected err: {e}"),
         }
 
-        // §13e File::seek round trip. /bin/hello.txt is 26 bytes
+        // File::seek round trip. /bin/hello.txt is 26 bytes
         // ("hello from /bin/hello.txt\n"). SeekFrom::Start past the
         // first word, SeekFrom::End(-5), and SeekFrom::Current after
         // a partial read each verify the kernel-side cursor and the
@@ -370,7 +370,7 @@ fn main() {
             Err(e) => println!("FAIL: open /bin/hello.txt for seek tests: {e}"),
         }
 
-        // §13e File::metadata round trip via fstat-by-fd. The same
+        // File::metadata round trip via fstat-by-fd. The same
         // stat data is reachable via fs::metadata(path) but file
         // handles that have outlived their open path (e.g. piped
         // through a function that lost the path) need fstat.
@@ -399,7 +399,7 @@ fn main() {
         }
     }
 
-    // §13e — cwd round trip. Boot cwd is `/` (init process default).
+    // cwd round trip. Boot cwd is `/` (init process default).
     // chdir to /bin → relative "hello.txt" should now resolve to
     // /bin/hello.txt. chdir back to / so the rest of the smoke isn't
     // perturbed.
@@ -457,12 +457,12 @@ fn main() {
         }
     }
 
-    // §13e — std::process::Command smoke. Spawn /bin/hello (a tiny
+    // std::process::Command smoke. Spawn /bin/hello (a tiny
     // arg-printing binary on the disk image), wait for it, and check
-    // the exit code matches the value its main() returns. Exercises
-    // the full Phase-7 path: fs read of program → argv pack → envp
-    // pack from current std::env table → create_process_with_argv_envp
-    // → wait_pid round trip.
+    // the exit code matches the value its main() returns. The PAL uses
+    // path-mode create_process_v2 (the kernel opens the program off fs;
+    // argv + envp packed from the current std::env table) → wait_pid
+    // round trip.
     {
         use std::process::Command;
         // /bin/hello returns 42 from main() and prints its argv via
@@ -500,10 +500,10 @@ fn main() {
             Err(e) => println!("FAIL: std::process::Command spawn missing unexpected: {e}"),
         }
 
-        // Command::current_dir override. v1 implementation does
-        // parent chdir + spawn + restore (the EX path doesn't carry
-        // cwd). The child should observe the override; the parent's
-        // cwd should be restored afterward.
+        // Command::current_dir override. The PAL passes the override
+        // through CreateProcessV2Args.cwd_vaddr — no parent chdir/restore.
+        // The child should observe the override; the parent's cwd is
+        // untouched.
         let parent_cwd_before = std::env::current_dir().ok();
         let mut cmd = Command::new("/bin/hello");
         cmd.current_dir("/bin");
@@ -529,7 +529,7 @@ fn main() {
         }
     }
 
-    // §13e — std::net::TcpStream::connect over the kernel's NetChannel
+    // std::net::TcpStream::connect over the kernel's NetChannel
     // primitive. Connect to QEMU's user-net gateway (which maps to host
     // loopback) on a port the smoke harness has nc(1) listening on.
     // Wait for DHCP first — NetChannel::open eats the DHCP-not-ready
@@ -558,8 +558,8 @@ fn main() {
         Err(e) => println!("tcp connect failed: {e}"),
     }
 
-    // §13f — `os::fd` lift smoke. Validates the std PAL changes from
-    // Milestone C: File / TcpStream / TcpListener carry RawFd-shaped
+    // `os::fd` lift smoke. Validates the std PAL changes: File /
+    // TcpStream / TcpListener carry RawFd-shaped
     // handles, expose `AsRawFd` / `AsFd` through the orbit-side
     // `os::fd` plumbing, and `set_nonblocking(true)` is a real
     // userspace operation (no kernel syscall, just an atomic flag).
@@ -620,14 +620,11 @@ fn main() {
         }
     }
 
-    // §13g — mio compile + minimal API smoke. Validates the orbit
-    // mio fork actually links (the major scaffolding payoff for
-    // Milestone E) and that `Poll::new` + `Waker::new` + `Registry`
-    // operations resolve at runtime against the orbit sys backend.
-    // The selector scan loop is still a stub at this point, so we
-    // don't exercise `poll()` for real events — just the
-    // construction + register/deregister surface that tokio leans
-    // on at startup.
+    // mio compile + minimal API smoke. Validates the orbit mio fork
+    // actually links and that `Poll::new` + `Waker::new` + `Registry`
+    // operations resolve at runtime against the orbit sys backend. The
+    // poll()/readiness path is exercised for real below (and in the
+    // cross-thread doorbell smoke), not just the construction surface.
     //
     // Markers go through `orbit_abi::serialln!` so they land on the
     // QEMU `-serial` channel (the only place we can read them
@@ -706,7 +703,7 @@ fn main() {
         drop(waker);
     }
 
-    // §13h — ch_inspect smoke. Validates kind tags + region metadata
+    // ch_inspect smoke. Validates kind tags + region metadata
     // for every Handle variant the kernel can serve today.
     {
         use orbit_abi::handle::{ChInfo, HandleKind};
@@ -822,7 +819,7 @@ fn main() {
         }
     }
 
-    // §13i — Raw-fd round-trip smoke. Exercises the new orbit
+    // Raw-fd round-trip smoke. Exercises the new orbit
     // `FromRawFd` / `IntoRawFd` impls on std::net::TcpListener: a
     // bound listener's fd is extracted, then reconstituted into a
     // fresh wrapper, and the resulting object is asserted to share
@@ -903,8 +900,8 @@ fn main() {
         }
     }
 
-    // §13j — Cross-thread wake_tid doorbell. §13g exercises the
-    // shared-mem `count.fetch_add` path with a single thread (wake
+    // Cross-thread wake_tid doorbell. The single-threaded mio smoke
+    // above exercises the shared-mem `count.fetch_add` path (wake
     // fires before park), so it never engages the `wake_tid` →
     // `WakeEvent::Tid` → manager-driven unpark chain. Here the
     // parent parks in `poll.poll(events, 5s)` and a child thread
@@ -986,7 +983,7 @@ fn main() {
         drop(waker);
     }
 
-    // §13e — TcpListener round-trip. Bind to port 7778, accept one
+    // TcpListener round-trip. Bind to port 7778, accept one
     // peer, echo what they send. The host driver sends a single
     // line and disconnects.
     use std::net::TcpListener;

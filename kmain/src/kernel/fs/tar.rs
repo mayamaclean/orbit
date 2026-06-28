@@ -4,9 +4,9 @@
 //! polled-completion `Block::read_blocks_blocking`, parse each header,
 //! build a `BTreeMap<String, Inode>` index plus a `Vec<TarInode>`
 //! table keyed by inode id. Once mount returns, the FS no longer
-//! touches the block device synchronously — `read_async` submits
-//! through the IRQ-driven path in
-//! [`crate::drivers::virtio_blk_dev::submit_blk_read`].
+//! touches the block device synchronously — reads go through the
+//! page cache, whose fills are submitted on the IRQ-driven path in
+//! [`crate::drivers::virtio_blk_dev::submit_blk_read_cached`].
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -435,7 +435,8 @@ fn parse_octal(bytes: &[u8]) -> Option<u64> {
 /// - Trailing `/` on directory entries is stripped so lookup keys are
 ///   uniform: `/bin` rather than `/bin/`.
 /// - The archive root (the bare `./` entry) collapses to `""` and
-///   the caller skips it — there's no inode for the FS root in v1.
+///   the caller skips it; `mount` synthesizes the `/` root inode
+///   (`ROOT_INO = 1`) separately.
 fn canonicalize_path(prefix: &str, name: &str) -> String {
     let mut joined = String::new();
     if !prefix.is_empty() {

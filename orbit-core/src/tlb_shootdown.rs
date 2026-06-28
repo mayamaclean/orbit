@@ -19,7 +19,7 @@
 //! # Capacity choice
 //!
 //! [`SHOOTDOWN_RING_CAP`] is 16. Each entry is `(u64, u64,
-//! Arc<AtomicU32>)` ≈ 24 bytes; per hart that's 384 bytes of static.
+//! Arc<AtomicUsize>)` ≈ 24 bytes; per hart that's 384 bytes of static.
 //! With four harts that's 1.5 KiB total — negligible. The cap need
 //! only exceed the maximum number of in-flight shootdowns the same
 //! target hart can be hit with before it gets to drain. Today every

@@ -10,7 +10,7 @@ use mmu::sv48::{PhysAddr, VirtAddr};
 use orbit_abi::layout::UserVa;
 use orbit_core::{Hardware, PendingWork};
 // CompletionHandle no longer referenced — the on-thread completion
-// path replaced the stdin park-handle protocol in Phase 6.
+// path replaced the stdin park-handle protocol.
 
 use crate::UserAccess;
 use crate::kernel::MANAGER_WORK;

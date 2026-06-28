@@ -29,7 +29,7 @@ pub const GET_MICROS: usize = 8;
 /// monotonic intervals use [`GET_MICROS`].
 pub const GET_REALTIME: usize = 10;
 
-/// `read_key_event(buf: *mut KeyEvent, count: usize, flags: usize) -> n | -errno`
+/// `read_key_event(buf: *mut KeyEvent, count: usize, flags: usize, timeout_ms: usize) -> n | -errno`
 /// — drain up to `count` structured key events from the calling
 /// process's event ring into `buf`. Companion to [`READ_STDIN`]:
 /// same producer (`kernel::input::dispatch`), but exposes the raw
@@ -353,9 +353,10 @@ pub const FB_QUERY: usize = 7000;
 /// the calling process's shared range. Returns the new handle in `a0`
 /// and the mapped user VA in `a1`.
 ///
-/// Frame backing tracks in `Process.heap_pages` for free teardown on
-/// exit; the per-process surface table records the metadata k_gpu needs
-/// for compositing.
+/// Frame backing is owned by the per-process `SURFACE_TABLE` entry
+/// (independent of `Process.heap_pages`); `dealloc_process` frees it via
+/// `SURFACE_TABLE.unregister(pid)`. The same entry records the metadata
+/// k_gpu needs for compositing.
 ///
 /// Errnos:
 /// - `EINVAL` — width or height zero, format unknown, or computed size
@@ -391,12 +392,15 @@ pub const FB_SURFACE_DESTROY: usize = 7002;
 /// - `EAGAIN` — k_gpu ring full (caller should retry after a yield).
 pub const FB_PRESENT: usize = 7003;
 
-// 8000+ — unified handle operations. These dispatch on the kind of
-// the fd's `Handle` table entry (NetChannel / File / Stdin / Stdout /
+// 8000+ — unified handle operations. Designed to dispatch on the kind
+// of the fd's `Handle` table entry (NetChannel / File / Stdin / Stdout /
 // Stderr / EventFd / Pipe / Pidfd / ...) so a single syscall surface
 // covers every fd-shaped resource. Mirrors POSIX `dup`/`fcntl`/`fstat`
 // shapes so the libc shim and `std::os::fd::*` plumbing can compile
-// against orbit without a per-kind detour.
+// against orbit without a per-kind detour. NOTE: only `EVENTFD` (8004)
+// is dispatched today; `dup` / `dup2` / `fcntl` / `fstat` (8000-8003)
+// are reserved — the numbers + docs are fixed, but there is no dispatch
+// arm or permission-class entry yet.
 
 /// `dup(fd: i32) -> newfd | -errno` — POSIX `dup(2)`. Clone the slot's
 /// `Handle` (Arc-clone for shareable variants; fresh `OpenFile` for
@@ -434,13 +438,13 @@ pub const DUP2: usize = 8001;
 /// - `EINVAL` — unsupported `cmd`.
 pub const FCNTL: usize = 8002;
 
-/// `fstat(fd: i32, *mut StatX) -> 0 | -errno` — kind-aware metadata
-/// for any fd. For `Handle::File`, fills the POSIX-shaped fields the
-/// same way [`FS_FSTAT`] does; for `Handle::NetChannel` and
-/// `Handle::EventFd`, fills the POSIX fields with kind-appropriate
-/// stubs (`S_IFSOCK` / `S_IFCHR`) plus the kind tail used by
-/// `FromRawFd`-shaped consumers to rehydrate user-side state without
-/// a separate `nc_inspect`.
+/// `fstat(fd: i32, *mut Stat) -> 0 | -errno` — **reserved** (no
+/// dispatch arm yet; use `ch_inspect` for kind/region metadata). When
+/// it lands: kind-aware metadata for any fd. For `Handle::File`, fills
+/// the POSIX-shaped fields the same way [`FS_FSTAT`] does; for
+/// `Handle::NetChannel` and `Handle::EventFd`, fills the POSIX fields
+/// with kind-appropriate stubs (`S_IFSOCK` / `S_IFCHR`) plus the kind
+/// tail used by `FromRawFd`-shaped consumers.
 ///
 /// Errnos:
 /// - `EBADF` — `fd` not open.
@@ -480,7 +484,6 @@ pub const POLL: usize = 8005;
 /// region size) plus two `Handle::PipeRead` / `Handle::PipeWrite`
 /// slots in the calling process's table. Needed for
 /// `Stdio::MakePipe`-shaped `Command` flows and shell `|` pipelines.
-/// Lands with the tokio::process milestone.
 pub const PIPE: usize = 8006;
 
 /// `pidfd_open(pid: u16) -> fd | -errno` — **reserved**. Will install
@@ -638,7 +641,8 @@ impl Sysno {
 
     /// Stable, dense ordinal for stats tables. Tied to the order of
     /// `match` arms below — append-only, never reorder. The raw
-    /// syscall-number space is sparse (0-7, 4096-4102, 5000) so we
+    /// syscall-number space is sparse (small low numbers plus several
+    /// high ranges like 4096+, 5000+, 6000+, 7000+, 8000+) so we
     /// can't use it as an array index.
     pub const fn ordinal(self) -> usize {
         match self {

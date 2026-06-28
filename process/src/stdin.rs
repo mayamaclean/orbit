@@ -40,7 +40,7 @@ pub const RING_CAP: usize = 4096;
 const RING_N: usize = RING_CAP + 1;
 
 /// Sentinel for "no parked reader." Tids are non-zero in practice
-/// (the boot thread starts at 1 in `Process::create_initial_thread`),
+/// (tids are allocated from 1 by the kernel's `next_tid`),
 /// so 0 is safe as the empty-slot value.
 const NO_PARKER: u32 = 0;
 

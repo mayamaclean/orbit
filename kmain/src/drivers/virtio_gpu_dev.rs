@@ -22,12 +22,12 @@ use virtio_gpu::{ARENA_SIZE, FORMAT_B8G8R8A8_UNORM, Gpu, GpuBacking};
 use crate::drivers::virtio_probe;
 use crate::kernel::memmap::KernelPages;
 
-// Queue sizing: 64 entries is plenty for gpu ctrl-queue traffic
+// Queue sizing: 32 entries is plenty for gpu ctrl-queue traffic
 // (bursty but never many in-flight at once). Fits in one page with
 // room to spare:
-//   desc  = 64 × 16 = 1024 B   → offset 0
-//   avail = 4 + 64×2 + 2 = 134 → rounded to offset 1024 (1 KiB slot)
-//   used  = 4 + 64×8 + 2 = 518 → rounded to offset 2048 (2 KiB slot)
+//   desc  = 32 × 16 = 512 B    → offset 0
+//   avail = 4 + 32×2 + 2 = 70  → rounded to offset 1024 (1 KiB slot)
+//   used  = 4 + 32×8 + 2 = 262 → rounded to offset 2048 (2 KiB slot)
 pub const QUEUE_SIZE: u16 = 32;
 pub const QUEUE_PAGE_SIZE: usize = 4096;
 const DESC_OFFSET: u64 = 0;

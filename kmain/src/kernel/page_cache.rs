@@ -61,7 +61,7 @@ pub struct CacheKey {
 
 /// Bit layout (low → high):
 ///   bits  0..=7    → dev (8 bits)
-///   bits  8..=62   → lba (55 bits → 2^55 sectors × 512 B = 16 ZiB)
+///   bits  8..=62   → lba (55 bits → 2^55 sectors × 512 B = 16 EiB)
 ///   bit   63       → occupied flag (1 = in flight, 0 = empty)
 const SLOT_OCCUPIED: u64 = 1 << 63;
 const SLOT_DEV_MASK: u64 = 0xFF;

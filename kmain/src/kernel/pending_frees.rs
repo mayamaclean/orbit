@@ -4,10 +4,10 @@
 //! Drop can fire from any kernel-thread context — including `k_net` on a
 //! hart that does *not* hold the Orbit lock, so calling the frame
 //! allocator inline is unsound. Instead, [`SharedInner::drop`] pushes the
-//! [`PhysBacking`] here and the manager drains via [`drain`] from
+//! `FreeItem` (`(Frame<Shared>, Layout)`) here and the manager drains via [`drain`] from
 //! [`Orbit::cleanup_threads_and_processes`], under the Orbit lock.
 //!
-//! Each hart has its own `heapless::spsc::Queue<PhysBacking, CAP>` split
+//! Each hart has its own `heapless::spsc::Queue<FreeItem, CAP>` split
 //! into a `Producer` (owned by that hart) and `Consumer` (owned by the
 //! manager). SPSC invariants hold by construction:
 //!

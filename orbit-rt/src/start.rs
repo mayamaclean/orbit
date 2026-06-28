@@ -1,4 +1,4 @@
-//! §13b — process startup ABI.
+//! Process startup ABI.
 //!
 //! orbit-rt provides the `_start` symbol named in `memory.x`'s
 //! `ENTRY(_start)`. Downstream binaries write `#![no_main]` and
@@ -20,7 +20,7 @@
 //! ## Panic hook
 //!
 //! v1 keeps the `panic = "abort"` shape — each binary supplies its
-//! own `#[panic_handler]`. orbit-std (§13d) introduces
+//! own `#[panic_handler]`. orbit-std introduces
 //! `set_hook` / `take_hook` and the default-hook-prints-then-aborts
 //! behavior; until then the binary's panic handler is the abort
 //! point.

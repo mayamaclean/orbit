@@ -72,7 +72,7 @@ s_trap_vector:
 	csrr	a4, sscratch
 	call	s_trap
 
-	# When we get here, we've returned from m_trap, restore registers
+	# When we get here, we've returned from s_trap, restore registers
 	# and return.
 	# s_trap will return the return address via a0.
 
@@ -140,8 +140,9 @@ enter_hart_kcontext_asm:
 #   a2 = asid (for sfence.vma)
 #
 # Precondition: sscratch already holds this hart's HartContext, and the kernel
-# (text, data, GOT, kpages, MMIO) is identity-mapped into the user pagetable
-# via map_kernel_shared, so this asm keeps executing across the satp switch.
+# (text, data, GOT, kpages, MMIO) is mapped into the user pagetable via the
+# shared high-half L2 (map_kernel_shared), so this asm keeps executing across
+# the satp switch.
 # The trap vector restores sscratch on every entry, so we don't need to
 # round-trip it through the frame here.
 enter_hart_context_asm:

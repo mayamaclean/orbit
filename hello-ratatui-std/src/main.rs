@@ -6,7 +6,7 @@
 //! `Paragraph`, and `List` widgets across a two-column layout, presents
 //! it, sleeps so the human can look at it, and tears down. No event
 //! loop yet — input wiring lands with the kernel-side
-//! `read_key_event` syscall (M3).
+//! `read_key_event` syscall.
 //!
 //! Run via the loader: bundled into `disk.img` by `tools/build-disk.sh`,
 //! launched from the console with `hello-ratatui-std`.

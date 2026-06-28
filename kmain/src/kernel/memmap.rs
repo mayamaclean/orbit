@@ -259,7 +259,7 @@ pub const LINK_BASE: u64 = 0x1000;
 
 // Nominal high-half base values. Fixed for non-KASLR; a future randomizer
 // picks different values at boot and feeds them into `init_layout`. The
-// four windows are 16 GiB apart — well over the range any of them will
+// four windows are 64 GiB apart — well over the range any of them will
 // occupy — so they can't collide.
 pub const KTEXT_NOMINAL: u64 = 0xFFFF_FFC0_0000_0000;
 pub const KDMAP_NOMINAL: u64 = 0xFFFF_FFD0_0000_0000;
@@ -272,9 +272,10 @@ pub const KSCRATCH_NOMINAL: u64 = 0xFFFF_FFF0_0000_0000;
 // up to a megapage multiple).
 pub const KSCRATCH_SIZE: u64 = 32 * mmu::MB;
 
-// KMMIO window slot assignments. Three single-page fixed slots at the
-// bottom of the window — UART, CLINT MSIP, ACLINT SSWI — and an arena
-// past them for dynamically-discovered MMIO (PCI config, e1000 BAR, ...).
+// KMMIO window slot assignments. Four single-page fixed slots at the
+// bottom of the window — UART, CLINT MSIP, ACLINT SSWI, Goldfish RTC —
+// and an arena past them for dynamically-discovered MMIO (PCI config,
+// e1000 BAR, ...).
 #[inline]
 pub fn kmmio_uart() -> u64 {
     kmmio_base()
@@ -405,7 +406,7 @@ pub fn kernel_root<'a>(table: &'a PageTable) -> RootTable<'a> {
 
 /// Translate a linked kernel VA (as seen in symbols like `_text_start`) to
 /// the high-half VA the kernel will execute from. Under the identity layout
-/// used in Phase 1 this is the identity function.
+/// this is the identity function.
 #[inline]
 pub fn linked_to_high_half(linked_va: u64) -> u64 {
     ktext_base() + (linked_va - LINK_BASE)
@@ -445,9 +446,9 @@ unsafe extern "C" {
 //     with `mem_end = ram_end - DTB_GUARD`.
 //
 // `user_pages` is the home of user-private allocations (stacks, ELF
-// backings, anon mmaps) once pool-split routing lands (roadmap milestone 3).
-// Reserved and tracked from day one; wiring an allocator and actually
-// drawing from it is later steps in the same milestone.
+// backings, anon mmaps) once pool-split routing lands. Reserved and
+// tracked from day one; wiring an allocator and actually drawing from
+// it comes later.
 pub const KTABLES_SIZE: u64 = 128 * mmu::MB;
 pub const KHEAP_SIZE: u64 = 128 * mmu::MB;
 pub const KPAGES_SIZE: u64 = 128 * mmu::MB;
@@ -567,7 +568,7 @@ fn pool_regions(layout: &KernelLayout) -> [Region; 3] {
 // Shared KMMIO L2 page table.
 //
 // All kernel-side MMIO mappings live under one root-table slot
-// (`vpn3 = (kmmio_base() >> 39) & 0x1FF`, normally 0x1FE for
+// (`vpn3 = (kmmio_base() >> 39) & 0x1FF`, normally 0x1FF for
 // `KMMIO_NOMINAL = 0xFFFF_FFE0_0000_0000`). The L2 page table backing
 // that slot is allocated once during kernel root construction and
 // shared by every other root table — kernel and user — by writing the
@@ -586,7 +587,7 @@ fn pool_regions(layout: &KernelLayout) -> [Region; 3] {
 static SHARED_KERNEL_L2_PA: AtomicU64 = AtomicU64::new(0);
 
 /// Sv48 root index that hosts the entire kernel high-half. KTEXT, KDMAP,
-/// KMMIO, and KSCRATCH are all 16 GiB apart starting at their
+/// KMMIO, and KSCRATCH are all 64 GiB apart starting at their
 /// `_NOMINAL` bases — comfortably inside the 512 GiB span of a single
 /// root entry — so all four share the same Mid-1 page table. This
 /// returns that one slot.
@@ -815,7 +816,7 @@ pub unsafe fn map_kernel_shared(
         }
         else {
             // User satps: KTEXT/KDMAP/KMMIO/KSCRATCH share root slot 511
-            // (16 GiB apart, all inside one 512-GiB root entry), so the
+            // (64 GiB apart, all inside one 512-GiB root entry), so the
             // cached kernel Mid-1 covers the entire kernel surface in a
             // single PTE write. Don't materialize anything else here —
             // `map_kernel_high_half` would walk this same root slot,
@@ -901,9 +902,9 @@ fn self_only_pool_regions(layout: &KernelLayout) -> [Region; 1] {
 
 /// Map every kernel region the S-mode kernel needs under its own satp. This
 /// is a superset of `map_kernel_shared`: on top of the process-visible surface
-/// it adds the ktables page-table pool (so the kernel can walk/modify satp
-/// tables) and the DTB (parsed once during boot), along with dynamic-link
-/// sections consumed during self-relocation.
+/// it adds the DTB (parsed once during boot) and the dynamic-link sections
+/// consumed during self-relocation. (ktables now lives in the shared surface,
+/// reachable under every satp.)
 pub unsafe fn map_kernel_self(
     rt: &RootTable<'_>,
     pa: &mut PageAlloc,

@@ -9,11 +9,8 @@
 //!   role registry (which gates create_process_v2 transitions). Constants
 //!   in [`role`].
 //!
-//! See [docs/dev/permissions-roles.md](../../../docs/dev/permissions-roles.md)
-//! for the design rationale, the role transition matrix, and the
-//! migration plan. This module owns the *types* and the *syscall→class*
-//! lookup; the kernel-side registry + clamping logic live in
-//! `orbit-core::roles`.
+//! This module owns the *types* and the *syscall→class* lookup; the
+//! role registry + clamping logic live in [`crate::roles`].
 //!
 //! # ABI shape vs kernel-internal type
 //!
@@ -193,7 +190,7 @@ pub mod class {
     pub const NETCH: ClassMask = ClassMask::from_raw(raw::NETCH);
 
     /// `fs_open` (read-only, today's only mode), `fs_read`, `fs_stat`,
-    /// future readdir. Becomes `FS_RW` once writes land — at which
+    /// `fs_readdir`. Becomes `FS_RW` once writes land — at which
     /// point this bit narrows to "read paths only" and a new bit
     /// covers the writing surface.
     pub const FS_RO: ClassMask = ClassMask::from_raw(raw::FS_RO);
@@ -297,7 +294,7 @@ pub mod role {
     /// surface needs. Real role-aware spawn paths (the loader chain,
     /// service supervisors) pass a concrete `RoleId`.
     ///
-    /// **TODO (role-metadata milestone):** every kernel/userland call
+    /// **TODO (role metadata):** every kernel/userland call
     /// site that currently passes `INHERIT` is a placeholder. Once
     /// per-binary role metadata exists (signed manifest, ELF note,
     /// or tarfs sidecar — TBD), each `INHERIT` should be replaced

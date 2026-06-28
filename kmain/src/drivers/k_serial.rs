@@ -42,7 +42,8 @@ pub const CHUNK_BYTES: usize = 1024;
 /// Depth of the ring. 64 slots × ~1 KiB ≈ 64 KiB total. Bursts during
 /// the densest trace activity (multi-hart eza-stress runs) peaked
 /// around ~30 lines/ms; 64 slots gives ~2 ms of buffering at that rate
-/// before producers fall back to the spinlock path on overflow.
+/// before producers drop lines on overflow (they can't fall back to the
+/// UART — `k_serial` owns the lock for its lifetime).
 pub const RING_CAP: usize = 64;
 
 /// One queue slot. Fixed-size so slot reuse (`push_ref`/`pop_ref`)
@@ -86,9 +87,11 @@ fn mark_ready() {
 }
 
 /// Push `bytes` (≤ [`CHUNK_BYTES`]) onto the ring as one chunk.
-/// Returns `false` if the ring was full or the chunk would be empty;
-/// caller should fall back to the synchronous serial path on `false`
-/// to keep the line from being dropped.
+/// Returns `false` if the ring was full or the chunk would be empty.
+/// Once `k_serial` is running the caller must drop the line on `false`
+/// — it owns the UART lock for its lifetime, so a synchronous fallback
+/// would deadlock. The synchronous `serial::print!` path is only used
+/// before `k_serial` spawns.
 ///
 /// Lock-free; safe from any context including trap handlers.
 pub fn push_chunk(bytes: &[u8]) -> bool {
@@ -141,9 +144,10 @@ pub extern "C" fn k_serial(_a0: usize) {
         }
 
         // Park with a ~50 ms wake deadline (timebase = 10 MHz →
-        // 500k ticks). A producer that pushes onto SERIAL_RING can
-        // wake us via `WakeEvent::Serial` (handled by the manager's
-        // end-of-pass nudge in `Orbit::nudge_serial_if_pending`).
+        // 500k ticks). When SERIAL_RING has pending lines the manager
+        // nudges us at the end of its pass
+        // (`Orbit::nudge_serial_if_pending`) rather than via a queued
+        // wake event.
         let wake_at = riscv::register::time::read64().wrapping_add(500_000) as usize;
         crate::kernel::context::kthread_park(ThreadState::Suspended, wake_at);
     }

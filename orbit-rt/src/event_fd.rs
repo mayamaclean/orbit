@@ -17,9 +17,9 @@
 //! On the orbit selector path the eventfd's *own* `parked_tid` field
 //! stays zero — the reactor isn't parking on a specific eventfd, it's
 //! parking on `ch_yield` with the selector's tracked tid. The
-//! eventfd's `parked_tid` is only meaningful for the direct
-//! blocking-`read(eventfd)` path the kernel implements but userspace
-//! rarely uses.
+//! eventfd's `parked_tid` is reserved for a direct
+//! blocking-`read(eventfd)` path that the kernel does not implement
+//! yet, so it stays zero in practice.
 
 #![cfg(feature = "mem-alloc")]
 

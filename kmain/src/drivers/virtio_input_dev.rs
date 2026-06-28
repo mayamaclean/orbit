@@ -122,7 +122,7 @@ pub fn setup_virtio_input(kernel_pages: &mut KernelPages) -> bool {
     let leaked: &'static mut Input = Box::leak(Box::new(dev));
     INPUT_PTR.store(leaked as *mut _, Ordering::Release);
 
-    // Arm the IRQ. Pin to hart 0 (same as UART RX); rates are low enough
+    // Arm the IRQ. Pin to hart 0; rates are low enough
     // that load distribution doesn't matter.
     if plic::plic_register(slot.irq, virtio_input_handler, 0).is_err() {
         error!("virtio-input: plic_register failed for irq {}", slot.irq);

@@ -26,7 +26,7 @@ use orbit_abi::{
 use orbit_rt::netch::NetCh;
 
 // =====================================================================
-// §11 TLS isolation probe.
+// TLS isolation probe.
 //
 // Two `#[thread_local]` statics — one zero-init (lands in .tbss), one
 // initialized to a sentinel value (lands in .tdata). Each thread sees
@@ -64,8 +64,7 @@ extern "C" fn tls_worker_entry() -> ! {
 
     TLS_WORKER_DONE.store(1, Ordering::Release);
     // Per-thread exit: `exit(0)` is exit-group since the
-    // whole-process-exit change and was racily killing main here —
-    // see docs/dev/fd-unix-io-scope.md addendum.
+    // whole-process-exit change and was racily killing main here.
     thread_exit();
 }
 
@@ -151,8 +150,7 @@ extern "C" fn worker_entry() -> ! {
     let hart = get_hart_id();
     WORKER_HART.store(hart, Ordering::Release);
     // Per-thread exit: `exit(0)` is exit-group since the
-    // whole-process-exit change and was racily killing main here —
-    // see docs/dev/fd-unix-io-scope.md addendum.
+    // whole-process-exit change and was racily killing main here.
     thread_exit();
 }
 
@@ -224,8 +222,7 @@ extern "C" fn shootdown_worker_entry() -> ! {
     let _stale = unsafe { core::ptr::read_volatile(va as *const u8) };
     SD_WORKER_SURVIVED.store(1, Ordering::Release);
     // Per-thread exit: `exit(0)` is exit-group since the
-    // whole-process-exit change and was racily killing main here —
-    // see docs/dev/fd-unix-io-scope.md addendum.
+    // whole-process-exit change and was racily killing main here.
     thread_exit();
 }
 
@@ -369,7 +366,7 @@ fn run_create_thread_probe() {
 }
 
 // =====================================================================
-// §13a.5 futex probe.
+// futex probe.
 //
 // Two threads in the same process share a 4-byte counter at a fixed
 // process-private VA (a `static AtomicU32`). The worker `futex_wait`s
@@ -403,8 +400,7 @@ extern "C" fn futex_worker_entry() -> ! {
     };
     FUTEX_WORKER_RESULT.store(code, Ordering::Release);
     // Per-thread exit: `exit(0)` is exit-group since the
-    // whole-process-exit change and was racily killing main here —
-    // see docs/dev/fd-unix-io-scope.md addendum.
+    // whole-process-exit change and was racily killing main here.
     thread_exit();
 }
 
@@ -553,8 +549,8 @@ fn check_ok<T: core::fmt::Debug + PartialEq>(name: &str, got: Result<T, Errno>, 
     w.flush();
 }
 
-/// Exercise the orbit-rt heap: first touch forces the talc `Source` to
-/// mmap its first arena; subsequent pushes stay in that arena. Prints
+/// Exercise the orbit-rt heap: first touch forces dlmalloc's page
+/// source to mmap its first arena; subsequent pushes stay in that arena. Prints
 /// PASS/FAIL for the smoke script to grep.
 fn run_heap_smoke() {
     use alloc::boxed::Box;
@@ -704,7 +700,7 @@ fn run_error_path_tests() {
 }
 
 /// FS smoke: stat / open / read / close against the boot-mounted
-/// tarfs. Validates the §12d syscall stack end-to-end:
+/// tarfs. Validates the syscall stack end-to-end:
 ///   /README is 217 bytes → one short sector; first byte is 'O'
 ///     (the README starts with "Orbit rootfs.").
 ///   /bin/hello.txt is 26 bytes → one short sector starting with 'h'.
@@ -752,9 +748,8 @@ fn run_fs_smoke() {
         Err(e) => logln!("FAIL: fs_stat /bin errored: {e:?}"),
     }
 
-    // open + read /bin/hello.txt. Buffer is sector-aligned via the
-    // explicit alignment; the kernel rejects buffers that straddle a
-    // 4 KiB page boundary.
+    // open + read /bin/hello.txt. Buffer is sector-sized; fs_read now
+    // accepts any length up to 64 KiB and walks multi-page buffers.
     #[repr(align(512))]
     struct AlignedBuf([u8; 512]);
     let mut buf = AlignedBuf([0; 512]);
@@ -780,7 +775,7 @@ fn run_fs_smoke() {
     }
 
     // Past-EOF read returns 0 (the kernel sees offset >= file_size
-    // after the previous successful read auto-advanced to 512).
+    // after the previous read advanced the offset by the bytes returned).
     match fs_read(fd, &mut buf.0) {
         Ok(0) => logln!("PASS: fs_read past EOF returns 0"),
         Ok(n) => logln!("FAIL: fs_read past EOF returned {n}"),
@@ -964,7 +959,7 @@ fn walk_dirents(buf: &[u8], mut visit: impl FnMut(&str, u8, u64)) -> bool {
     true
 }
 
-/// §13a.1 identity probe. Calls `getpid` and `gettid` from the main
+/// identity probe. Calls `getpid` and `gettid` from the main
 /// thread, asserts pid is the boot pid (1) and tid is non-zero +
 /// stable across calls. tid is system-global (matches Linux's
 /// `gettid()` shape), so its absolute value depends on how many
@@ -972,7 +967,7 @@ fn walk_dirents(buf: &[u8], mut visit: impl FnMut(&str, u8, u64)) -> bool {
 /// started; assert nonzero and stability instead of a fixed value.
 ///
 /// pid was previously asserted == 1 because umode was the boot
-/// process. Post §13e tarfs-init, orbit-loader is pid 1 and umode
+/// process. Post tarfs-init, orbit-loader is pid 1 and umode
 /// is pid 2 (loaded from `/bin/smoke`). The exact pid varies with
 /// the boot lineage; assert > 0 instead of pinning a value.
 fn run_identity_probe() {
@@ -984,7 +979,7 @@ fn run_identity_probe() {
         logln!("FAIL: getpid main got {pid} (want >0)");
     }
 
-    // §multi-user Phase 2 — credential probe. orbit-loader stamps
+    // Credential probe. orbit-loader stamps
     // every payload it spawns with uid=1000/gid=1000 today. If those
     // exact values change at the loader, update them here.
     //
@@ -1026,7 +1021,7 @@ fn run_identity_probe() {
         ),
     }
 
-    // §multi-user Phase 3 — set* gate probe. We're running as
+    // set* gate probe. We're running as
     // uid=1000:1000 (loader-stamped), so the EPERM paths cover the
     // standard "non-root tried to mutate identity" cases. The
     // setuid(1000) success path exercises the POSIX privilege-toggle
@@ -1070,7 +1065,7 @@ fn run_identity_probe() {
         Err(e) => serialln!("FAIL: setgroups errno {} (want EPERM={})", e.0, EPERM),
     }
 
-    // §multi-user Phase 4 — VFS access enforcement. /etc/secret is
+    // VFS access enforcement. /etc/secret is
     // mode 0o600 owned by uid=0 in tarfs; uid=1000 hits the "other"
     // branch with bits=0 → EACCES. Confirms the vaccess gate fires.
     // /bin/hello.txt is mode 0o644 owned by uid=1000 (build user) →
@@ -1105,7 +1100,7 @@ fn run_identity_probe() {
     }
 }
 
-/// §13e env probe — confirms the kernel-installed envp blob seeded
+/// env probe — confirms the kernel-installed envp blob seeded
 /// `orbit_rt::env`'s BTreeMap end-to-end (kmain pack →
 /// `install_envp_blob` → orbit-loader inherit + repack →
 /// install_envp_blob into us → seed BTreeMap on first access). Each
@@ -1175,7 +1170,7 @@ fn run_env_probe() {
     }
 }
 
-/// §12e exec smoke: read `/bin/hello` (a real ELF on the disk image)
+/// exec smoke: read `/bin/hello` (a real ELF on the disk image)
 /// and hand it to `create_process`. Spawn-only flavor — no `wait_pid`
 /// yet, so we just sleep briefly for the child to print its marker.
 ///
@@ -1199,9 +1194,8 @@ fn run_exec_smoke() {
     let total = st.st_size as usize;
     logln!("PASS: exec_smoke fs_stat /bin/hello size={total}");
 
-    // Open + chunked read into a heap buffer. Sector-aligned scratch
-    // buf for the read syscall (kernel rejects buffers that straddle
-    // a 4 KiB page).
+    // Open + chunked read into a heap buffer. Sector-sized scratch
+    // buf; fs_read now accepts any length up to 64 KiB across pages.
     let fd = match fs_open("/bin/hello", 0) {
         Ok(fd) => fd,
         Err(e) => {
@@ -1244,7 +1238,7 @@ fn run_exec_smoke() {
     }
     logln!("PASS: exec_smoke ELF magic present");
 
-    // §13a.3 — pack argv ["world", "peace"] (hello's own path lands
+    // Pack argv ["world", "peace"] (hello's own path lands
     // implicitly as argv[0] later if a convention emerges; v1 just
     // packs whatever umode hands in). Spawn via create_process_ex.
     let mut argv_buf = [0u8; 256];
@@ -1264,7 +1258,7 @@ fn run_exec_smoke() {
         }
     };
 
-    // §13a.2 — block until the child exits. Validates the full chain:
+    // Block until the child exits. Validates the full chain:
     // dealloc_process takes exit_waiter, signal_pair fires the wake
     // hook, the parked thread resumes with exit_code in a1.
     match wait_pid(child_pid) {
@@ -1447,13 +1441,13 @@ pub extern "C" fn main() -> i32 {
 
     run_heap_smoke();
 
-    // §13a.1 identity probe — runs before any worker thread spawns so
-    // the main thread's tid is deterministic (= 1, the first tid the
-    // kernel allocates). pid is whatever orbit-loader assigned us;
-    // we just assert nonzero + stability.
+    // identity probe — runs before any worker thread spawns. tid is
+    // system-global (kernel threads take earlier tids), so we assert
+    // nonzero + stability rather than a fixed value; pid is whatever
+    // orbit-loader assigned us.
     run_identity_probe();
 
-    // §13e env probe — confirms boot envp survived kernel install +
+    // env probe — confirms boot envp survived kernel install +
     // orbit-loader inheritance and seeded our BTreeMap. Runs early so
     // a regression here surfaces before the longer-running test paths.
     run_env_probe();
@@ -1462,7 +1456,7 @@ pub extern "C" fn main() -> i32 {
 
     run_exec_smoke();
 
-    // §13a.2 follow-up — POSIX `waitpid(-1)` shape. Runs after
+    // POSIX `waitpid(-1)` shape follow-up. Runs after
     // run_exec_smoke (which leaves no live children) so the pre-spawn
     // ECHILD assertion holds.
     run_wait_any_child_smoke();
@@ -1475,17 +1469,17 @@ pub extern "C" fn main() -> i32 {
     // the point of the test.
     run_create_thread_probe();
 
-    // §11 TLS isolation — verifies #[thread_local] statics are
+    // TLS isolation — verifies #[thread_local] statics are
     // per-thread (each thread sees its own copy). Must run before
     // the shootdown probe pins main to hart 0.
     run_tls_isolation_probe();
 
-    // §13a.5 futex round trip — must run before the shootdown probe
+    // futex round trip — must run before the shootdown probe
     // pins main to hart 0; the worker pinned to hart 1 needs main on
     // a different hart so the wake crosses the IPI boundary.
     run_futex_probe();
 
-    // §10 layer-3: cross-hart TLB shootdown probe. Pins itself and
+    // cross-hart TLB shootdown probe. Pins itself and
     // restores affinity on the way out. Must run before the TCP
     // listener flow below opens its real netchannel — they're
     // sequential users of the per-process NetCh slot.

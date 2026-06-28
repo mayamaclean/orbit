@@ -1,6 +1,6 @@
 //! System-wide per-syscall latency table.
 //!
-//! Syscall signature (`sys_query_syscall_stats`, syscall number
+//! Syscall signature (`handle_query_syscall_stats`, syscall number
 //! [`QUERY_SYSCALL_STATS`](crate::syscall::QUERY_SYSCALL_STATS)):
 //!
 //! ```text

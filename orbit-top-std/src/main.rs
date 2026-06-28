@@ -7,7 +7,7 @@
 //! No process enumeration — `query_stats` only returns the caller's
 //! own counters today. The "this process" pane shows the demo's own
 //! state; everything else is system-wide. A real `htop`-shaped
-//! process table is gated on the `query_proc_list` syscall (M7).
+//! process table is gated on the `query_proc_list` syscall.
 //!
 //! Loop shape:
 //!

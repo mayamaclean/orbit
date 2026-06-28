@@ -118,7 +118,8 @@ pub static DENIAL_EVENTS_DROPPED: AtomicU64 = AtomicU64::new(0);
 pub enum WakeEvent {
     /// Sentinel default — drained as a no-op (thingbuf needs `Default`).
     None,
-    /// Wake every kernel thread (pid=0).
+    /// Wake k_net (targets the latched `net_thread_tid`; coarse pid=0
+    /// fallback during the boot window).
     Net,
     /// Wake every thread of the given user pid (each re-checks + re-parks).
     Pid(u16),

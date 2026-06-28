@@ -25,9 +25,6 @@
 //!   the kernel's `create_process_v2` handler when it logs an audit
 //!   event before returning EPERM.
 //!
-//! See [docs/dev/permissions-roles.md](../../../docs/dev/permissions-roles.md)
-//! for the design rationale, the role transition diagram, and how this
-//! module fits into the broader create_process_v2 flow.
 //!
 //! No `Hardware` dependency — the registry is static data and the
 //! clamping math is pure. Host-testable in unit tests below.

@@ -84,10 +84,9 @@ pub unsafe fn ecall3(code: usize, arg0: usize, arg1: usize, arg2: usize) -> isiz
 }
 
 /// Six-argument syscall returning an `isize` in `a0`. RISC-V's
-/// calling convention has plenty of arg registers (a0..a7); used by
-/// `create_process_with_argv` so the kernel can read elf + affinity
-/// + argv-blob fields in one trap without the caller marshalling
-/// them through user memory first.
+/// calling convention has plenty of arg registers (a0..a7), so wide
+/// spawn-shaped syscalls can pass elf + affinity + blob fields in one
+/// trap without marshalling them through user memory first.
 #[inline]
 pub unsafe fn ecall6(
     code: usize,
@@ -332,9 +331,9 @@ pub const READ_STDIN_NONBLOCK: usize = 1;
 /// dispatcher when this process is the active framebuffer source.
 ///
 /// Returns the byte count drained on success. With `flags == 0` the
-/// call blocks (the kernel parks the thread on a completion handle
-/// and resumes it on the next keystroke); with
-/// `flags & READ_STDIN_NONBLOCK` an empty ring returns `Err(EAGAIN)`.
+/// call blocks (the kernel parks the thread and resumes it on the next
+/// keystroke); with `flags & READ_STDIN_NONBLOCK` an empty ring returns
+/// `Err(EAGAIN)`.
 ///
 /// Other errors:
 /// - `EINVAL` — `len == 0` or `len > 4 KiB`.
@@ -394,7 +393,7 @@ pub fn sleep_ms(ms: usize) -> Result<(), Errno> {
 }
 
 /// Push a `WakeEvent::Net` so the kernel net thread wakes immediately
-/// (instead of waiting up to its 10 ms heartbeat) — useful after a
+/// (instead of waiting up to its ~100 ms heartbeat) — useful after a
 /// NetCh ring-write where the kernel needs to drain an increment or
 /// stage a slice for us. Then optionally park the caller for up to
 /// `timeout_ms` milliseconds, returning early if the kernel marks the
@@ -414,7 +413,7 @@ pub fn ch_yield(timeout_ms: usize) -> Result<(), Errno> {
 }
 
 /// Ask the kernel for a user-accessible region at `hint_va` of `len`
-/// bytes. `share_with_kernel` selects the backing pool (roadmap §3):
+/// bytes. `share_with_kernel` selects the backing pool:
 /// `false` → `user_pages` (no KDMAP alias), `true` → `kernel_pages`.
 /// Returns the mapped VA on success.
 ///
@@ -928,7 +927,7 @@ pub fn wait_any_child() -> Result<(u16, i32), Errno> {
 /// see [`get_realtime`] — `get_micros` is monotonic only, no
 /// time-of-day offset.
 ///
-/// A direct `csrr time` from U-mode (the §13a.4 zero-syscall idea)
+/// A direct `csrr time` from U-mode (the zero-syscall idea)
 /// is gated behind a CSR-emulation handler we don't have yet —
 /// QEMU's virt machine traps `rdtime` to M-mode for emulation even
 /// with `scounteren.TM` set, because the `time` CSR is spec'd as a
@@ -1072,12 +1071,13 @@ pub fn fs_open(path: &str, flags: usize) -> Result<u32, Errno> {
         .map(|fd| fd as u32)
 }
 
-/// `fs_read(fd, buf)` — read one sector at the fd's current offset.
-/// `buf.len()` must equal 512; the buffer must not straddle a 4 KiB
-/// page boundary (sector-align it). Returns bytes considered valid
-/// (up to 512); 0 at EOF. Auto-advances the fd's offset by 512 on
-/// success, even at the file tail. Trailing bytes past the file size
-/// in the final sector are zero-padded by the on-disk archive.
+/// `fs_read(fd, buf)` — read up to `buf.len()` bytes at the fd's
+/// current offset, served through the page cache. `buf.len()` may be
+/// `1..=MAX_FS_READ_LEN` (64 KiB) and may span multiple pages (the
+/// kernel walks the destination page by page). Returns the number of
+/// bytes read (0 at EOF) and advances the fd's offset by exactly that
+/// many bytes. Trailing bytes past the file size in the final page are
+/// zero-padded by the cache.
 #[inline]
 pub fn fs_read(fd: u32, buf: &mut [u8]) -> Result<usize, Errno> {
     Errno::from_ret(unsafe {
@@ -1350,9 +1350,9 @@ impl ConsoleWriter {
         if self.len == 0 {
             return;
         }
-        // The kernel's CONSOLE_RING is small (8 slots, shared with
-        // kernel ktrace). A burst of prints can fill it, in which case
-        // console_write returns EAGAIN. Yield via sleep_ms(0) and
+        // The kernel's CONSOLE_RING is bounded (256 slots). A burst of
+        // prints can fill it, in which case console_write returns
+        // EAGAIN. Yield via sleep_ms(0) and
         // retry so output isn't silently dropped. Bounded so a
         // permanently-broken consumer doesn't deadlock the writer.
         const MAX_RETRIES: usize = 64;

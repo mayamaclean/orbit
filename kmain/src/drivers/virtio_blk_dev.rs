@@ -30,7 +30,8 @@ use mmu::sv48::PhysAddr;
 
 // Queue page layout matches virtio_input_dev / virtio_gpu_dev — one
 // page holds desc / avail / used with comfortable slack at the chosen
-// 64-deep ring (desc 1 KiB, avail 138 B at +1 KiB, used 522 B at +2 KiB).
+// 64-deep ring: desc fills 1 KiB at offset 0, avail is 134 B at +1 KiB,
+// used is 518 B at +2 KiB.
 pub const QUEUE_PAGE_SIZE: usize = 4096;
 const DESC_OFFSET: u64 = 0;
 const AVAIL_OFFSET: u64 = 1024;
@@ -54,9 +55,9 @@ static IN_FLIGHT: [AtomicU64; QUEUE_SIZE as usize] = {
 ///
 /// **Why a real spinlock and not just SIE masking:** the manager is
 /// greedy (any hart can drain MANAGER_WORK), but the virtio-blk IRQ
-/// is PLIC-pinned to hart 0. When the manager submits from hart N≠0,
-/// masking SIE locally on hart N has no effect on hart 0's IRQ
-/// handler — the IRQ's `pop_used` mutates `Virtqueue::free_head`
+/// is PLIC-pinned to one hart (the last, `CPU_COUNT - 1`). When the
+/// manager submits from a different hart, masking SIE locally has no
+/// effect on the IRQ hart's handler — the IRQ's `pop_used` mutates `Virtqueue::free_head`
 /// concurrently with the submitter's `peek_next_head`, leaving the
 /// stashed `IN_FLIGHT[predicted]` at the wrong slot and producing
 /// "completion for head=X with no registered key" / "non-zero at

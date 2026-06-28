@@ -1,5 +1,5 @@
-//! User-side accessors for the §13a.3 argv blob (mapped at
-//! [`orbit_abi::layout::USER_ARGV_BASE`]) and §13e envp blob (mapped
+//! User-side accessors for the argv blob (mapped at
+//! [`orbit_abi::layout::USER_ARGV_BASE`]) and envp blob (mapped
 //! at [`orbit_abi::layout::USER_ENVP_BASE`]). Both share a wire
 //! format, so the same [`Argv`]-shaped view serves both.
 //!

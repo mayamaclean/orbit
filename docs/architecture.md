@@ -29,11 +29,11 @@ graph TD
 
     BL -->|"sret + KERNEL_ELF copy"| KMAIN
     KMAIN -->|"include_bytes! + create_new_process"| LOADER
-    LOADER -->|"fs_open + fs_read + create_process"| CONSOLE
+    LOADER -->|"fs_open + fs_read + create_process_v2"| CONSOLE
     LOADER -->|"argv-driven, default = console"| UMODE
     LOADER -->|"argv-driven"| HELLOSTD
-    UMODE -.->|"send-payload.py / TCP"| LOADER
-    CONSOLE -->|"create_process"| HELLO
+    UMODE -.->|"send_payload.py / TCP"| LOADER
+    CONSOLE -->|"create_process_v2"| HELLO
 
     click BL "../bl/src/lib.rs" "M-mode bootloader: UART init, page tables, ELF copy, sret to S-mode"
     click KMAIN "../kmain/src/bin/orbit.rs" "S-mode kernel binary `orbit`: trampoline, rust_main, k_smpstart"
@@ -57,10 +57,10 @@ selects which init the loader will spawn; cfg features
 
 **orbit-loader → init child** is the first link that goes through
 tarfs. The loader `fs_open`s the path it received as argv[1],
-chunked-`fs_read`s it into a heap buffer, and `create_process`es
+chunked-`fs_read`s it into a heap buffer, and `create_process_v2`es
 the result. After init spawns, the loader stays alive listening on
 TCP :7777 for ad-hoc payloads delivered via
-[`send-payload.py`](../orbit-loader/tools/send-payload.py).
+[`send_payload.py`](../orbit-loader/tools/send_payload.py).
 
 ## Kernel-side subsystems
 
@@ -77,8 +77,8 @@ graph TD
     subgraph SCHED["scheduling"]
         READY["ReadyQueue"]
         SLEEP["SleepHeap"]
-        MANAGER["manager role<br/>(any hart, MANAGER_LOCK)"]
-        IDLE["k_idle / WFI<br/>(non-manager harts)"]
+        MANAGER["manager role<br/>(any hart, scheduler lock)"]
+        IDLE["k_hart_loop / WFI<br/>(non-manager harts)"]
         MANAGER -->|"pop runnable"| READY
         MANAGER -->|"wake-time scan"| SLEEP
         MANAGER -->|"assign + IPI"| IDLE
@@ -87,6 +87,7 @@ graph TD
     subgraph KTHREADS["kernel threads"]
         KNET["k_net<br/>smoltcp + e1000"]
         KGPU["k_gpu<br/>scrollback + framebuffer"]
+        KSERIAL["k_serial<br/>exclusive UART owner"]
     end
 
     subgraph DRIVERS["drivers"]
@@ -98,42 +99,43 @@ graph TD
 
     subgraph FS["filesystem (read-only)"]
         TARFS["tarfs<br/>BTreeMap<path, Inode>"]
-        BLOCKDEV["Block + IRQ slots<br/>IN_FLIGHT[head]"]
+        BLOCKDEV["Block + IRQ slots<br/>IN_FLIGHT (CacheKey)"]
     end
 
     DISP -->|"PendingWork::*"| MANAGER
-    MANAGER -->|"NetReq"| KNET
+    MANAGER -->|"SocketReq"| KNET
     KNET --> E1000
     KGPU --> VIRTIOGPU
     PLIC -->|"virtio-blk IRQ"| BLOCKDEV
     BLOCKDEV --> TARFS
-    TARFS -->|"submit_blk_read"| BLOCKDEV
+    TARFS -->|"submit_blk_read_cached"| BLOCKDEV
     SHOOT -->|"sfence.vma per page"| TRAP
 
     click STRAP "../kmain/src/bin/orbit.rs" "S-mode trap entry; routes ecall / SSWI / PLIC"
     click DISP "../kmain/src/bin/orbit.rs" "syscall number → handler in kmain::handle_*"
     click SHOOT "../kmain/src/kernel/shootdown.rs" "TLB-shootdown ring drain"
     click PLIC "../kmain/src/drivers/plic.rs" "PLIC source claim + dispatch"
-    click READY "../orbit-core/src/ready_queue.rs" "MPSC ring of runnable threads"
+    click READY "../orbit-core/src/ready_queue.rs" "FIFO of runnable threads with an affinity-filtered scan"
     click SLEEP "../orbit-core/src/sleep_heap.rs" "wake-time min-heap for sleep_ms / futex_wait"
-    click MANAGER "../orbit-core/src/manager.rs" "manager loop; runs on whichever hart currently holds MANAGER_LOCK"
-    click IDLE "../kmain/src/bin/orbit.rs" "harts not holding MANAGER_LOCK — WFI until SSWI"
+    click MANAGER "../kmain/src/lib.rs" "manager pass in k_hart_loop; runs on whichever hart holds the scheduler lock (SchedGuard)"
+    click IDLE "../kmain/src/lib.rs" "harts not holding the scheduler lock — WFI until SSWI"
     click KNET "../kmain/src/lib.rs" "k_net kthread: drives smoltcp sockets + NetChannel rings"
     click KGPU "../kmain/src/drivers/k_gpu.rs" "k_gpu kthread: scrollback + framebuffer"
+    click KSERIAL "../kmain/src/drivers/k_serial.rs" "k_serial kthread: owns the UART; drains SERIAL_RING"
     click E1000 "../kmain/src/drivers/e1000.rs" "e1000 NIC driver (PCI-discovered)"
     click VIRTIOBLK "../kmain/src/drivers/virtio_blk_dev.rs" "kmain wrapper around virtio_blk crate"
     click VIRTIOGPU "../kmain/src/drivers/virtio_gpu_dev.rs" "virtio-gpu driver"
     click UART "../serial/src/lib.rs" "MpUart wrapping ns16550a"
     click TARFS "../kmain/src/kernel/fs/tar.rs" "ustar fs over a single virtio-blk device"
-    click BLOCKDEV "../kmain/src/drivers/virtio_blk_dev.rs" "submit_blk_read + IRQ-driven completion via IN_FLIGHT[head]"
+    click BLOCKDEV "../kmain/src/drivers/virtio_blk_dev.rs" "submit_blk_read_cached + IRQ-driven completion via IN_FLIGHT (CacheKey) → PendingWork::CacheFill"
 ```
 
 **Manager role vs idle harts.** The "manager" isn't a fixed hart —
-it's a role any hart picks up by acquiring `MANAGER_LOCK`
-([kmain/src/lib.rs](../kmain/src/lib.rs)). Whichever hart wins the
-swap drains the `PendingWork` ring, scans the sleep heap, and makes
-cross-hart schedule decisions; the rest spin in `k_idle` / WFI
-waiting on SSWI from the ACLINT
+it's a role any hart picks up by taking the scheduler lock
+(`SchedGuard::try_with`, [process/src/sched_lock.rs](../process/src/sched_lock.rs)).
+Whichever hart wins the swap drains the `PendingWork` ring, scans the
+sleep heap, and makes cross-hart schedule decisions; the rest spin in
+`k_hart_loop`'s WFI waiting on SSWI from the ACLINT
 ([memmap](../kmain/src/kernel/memmap.rs)). When the manager assigns
 work, recipients pick it off `ReadyQueue` and context-switch into
 the user thread. Hart 0 is just first to *try* the lock during
@@ -149,12 +151,13 @@ mode bit. `k_net` is the canonical example
 NetChannel-owned socket. Conventions for writing new ones land in
 [docs/kernel-threads.md](kernel-threads.md).
 
-**Async block I/O.** `submit_blk_read`
+**Async block I/O.** `submit_blk_read_cached`
 ([`kmain/src/drivers/virtio_blk_dev.rs`](../kmain/src/drivers/virtio_blk_dev.rs))
-predicts the next descriptor head, publishes the caller's
-`CompletionHandle` into `IN_FLIGHT[head]` *before* the device-side
-notify, then submits. The PLIC IRQ handler drains the used ring,
-swaps the handle out, and signals it with the bytes-valid result.
+predicts the next descriptor head, records the page-cache key in
+`IN_FLIGHT[head]` *before* the device-side notify, then submits. The
+PLIC IRQ handler drains the used ring and forwards each completion to
+the manager as `PendingWork::CacheFill`, which fills the page-cache
+slot and resumes whatever was waiting on it.
 
 **TLB shootdown.** Any path that mutates a user PTE
 (`mmap`, `munmap`-shaped revokes, `install_argv_blob`) calls
@@ -217,7 +220,7 @@ boundary, so their layouts are load-bearing:
 - **[orbit-rt/](../orbit-rt/)** — user-side runtime. Provides
   `_start` ([orbit-rt/src/start.rs](../orbit-rt/src/start.rs)), argv
   resolver ([orbit-rt/src/argv.rs](../orbit-rt/src/argv.rs)),
-  `talc`-backed global allocator for `no_std` binaries, and a
+  `dlmalloc`-backed global allocator for `no_std` binaries, and a
   `NetCh` wrapper that owns the shared ring lifecycle.
 
 ## Memory layout
@@ -246,7 +249,7 @@ graph LR
     subgraph PROC["Process (kmain)"]
         SATP["satp / page table"]
         MAPS["UserMappings"]
-        HANDLES["ProcessHandles<br/>NetChannels + OpenFiles"]
+        HANDLES["ProcessHandles<br/>NetChannel/File/Stdin/Stdout/Stderr/EventFd"]
         ARGV["argv blob<br/>USER_ARGV_BASE"]
         THREADS["Threads + thread_slots"]
     end
@@ -261,22 +264,22 @@ graph LR
 
     click PROC "../process/src/lib.rs" "Process struct"
     click THREAD "../process/src/lib.rs" "Thread struct"
-    click HANDLES "../kmain/src/kernel/handle.rs" "Handle::NetChannel | Handle::File"
+    click HANDLES "../kmain/src/kernel/handle.rs" "Handle::{NetChannel, File, Stdin, Stdout, Stderr, EventFd}"
     click ARGV "../kmain/src/kernel/mod.rs" "install_argv_blob"
 ```
 
 A `Process` ([process/src/lib.rs](../process/src/lib.rs)) owns its
 page table, the kernel-side mappings, the per-process handle table
-(NetChannels + OpenFiles), and 256 thread slots. Each `Thread` carries
-its own TrapFrame, ThreadState, and a `CompletionHandle` slot for
-blocking syscalls.
+(NetChannels, open files, std streams, eventfds), and 256 thread
+slots. Each `Thread` carries its own TrapFrame, ThreadState, and the
+per-thread slots the manager writes results into when a blocking
+syscall completes.
 
-Blocking syscalls park the thread and queue a `PendingWork` entry;
-whichever hart next acquires `MANAGER_LOCK` drains the ring, runs
-the kernel-side action, and signals the handle. The lifecycle
-contract is documented on
-[`PendingWork`](../orbit-core/src/pending_work.rs) and
-[`CompletionHandle`](../process/src/lib.rs).
+Blocking syscalls park the thread and queue a tid-carrying
+`PendingWork` entry; whichever hart next holds the scheduler lock
+drains the ring, runs the kernel-side action, and resumes the parked
+thread via `publish_pending_for_tid`. The lifecycle contract is
+documented on [`PendingWork`](../orbit-core/src/pending_work.rs).
 
 ## File / struct map (top-level)
 

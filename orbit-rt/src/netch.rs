@@ -176,8 +176,9 @@ impl NetCh {
         self.channel().writeable()
     }
 
-    /// Block until the kernel reports an active session (`current.state
-    /// >= 2`), then return a guard the caller reads/writes through.
+    /// Block until the kernel reports an active session
+    /// (`current.state == ACTIVE`), then return a guard the caller
+    /// reads/writes through.
     /// The guard's `Drop` disengages, signalling the kernel to recycle
     /// the smoltcp socket — for retain bindings, recycle immediately
     /// re-arms the listen/connect; for one-shot bindings, recycle
@@ -413,16 +414,13 @@ impl<'a> Session<'a> {
 impl Drop for Session<'_> {
     fn drop(&mut self) {
         // Signal disengagement; the kernel reconciler picks up the
-        // 1→0 edge on its next poll and starts recycling. Wait for
-        // the kernel to acknowledge by transitioning *out of state
-        // 2* — for ServerRetain the kernel goes 2 → 1 (re-listening
-        // immediately), for ClientRetain 2 → 0 (idle, awaiting next
-        // engage), for one-shot 2 → -1 (terminal). All of these
-        // mean "kernel has aborted the smoltcp socket and reset its
-        // ring halves," which is what we need before reset_user_side
-        // can run safely.
+        // 1→0 edge on its next poll and enters the CLOSING drain. Wait
+        // for the channel to leave both ACTIVE and CLOSING — at that
+        // point the kernel has run reset_kernel_side and moved on:
+        // ServerRetain → IN_FLIGHT (re-listening), ClientRetain → IDLE,
+        // one-shot → FAILED. Only then is reset_user_side safe.
         //
-        // Cap the wait at ~100 polls (~1s at DEFAULT_POLL_MS=10) so
+        // Cap the wait at ~100 polls (~5s at DEFAULT_POLL_MS=50) so
         // a wedged kernel can't hang the drop indefinitely.
         let nc = self.nc;
         nc.channel().disengage();
@@ -445,9 +443,9 @@ impl Drop for Session<'_> {
         }
 
         // SAFETY: `Session` owned exclusive access to the rings while
-        // it was alive, and the state-out-of-2 wait above observed
-        // the kernel's recycle. Kernel has reset_kernel_side'd in the
-        // disengage edge handler before flipping state away from 2.
+        // it was alive, and the wait above observed the channel leave
+        // ACTIVE/CLOSING — i.e. the kernel ran reset_kernel_side in the
+        // Closing arm before moving the channel on.
         unsafe {
             nc.channel().reset_user_side();
         }
@@ -471,7 +469,8 @@ impl Drop for Session<'_> {
 /// from a recycle path would terminate `read_some`/`write_all` with
 /// EIO instead of waiting it out.
 ///
-/// Sticky-negative (anything else) is the real-failure path → EIO.
+/// Anything else (including a sticky-negative failure, and the positive
+/// CLOSING state if it leaks through) maps to EIO.
 fn map_io_err(e: isize) -> Errno {
     match e {
         -4 | -5 => Errno::new(EAGAIN),

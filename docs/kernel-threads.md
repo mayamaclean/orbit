@@ -4,8 +4,8 @@ Conventions for writing S-mode kernel threads (kthreads) — long-lived
 work loops that own a kernel-side resource and serve user processes
 through shared rings or syscall round-trips. Read
 [architecture.md](architecture.md) for the static picture and
-[boot.md](boot.md) for where the existing kthreads (`k_net`, `k_gpu`)
-get spawned.
+[boot.md](boot.md) for where the existing kthreads (`k_net`, `k_gpu`,
+`k_serial`) get spawned.
 
 A kthread is an S-mode `Thread` with `pid = 0`, scheduled identically
 to a user thread except for the mode bit. It runs on whichever hart
@@ -20,9 +20,7 @@ stateDiagram-v2
     Ready --> Running: scheduler picks up
     Running --> Ready: timer slice expires
     Running --> Suspended: kthread_park(Suspended, wake_time)
-    Running --> Blocking: kthread_park(Blocking, 0)
     Suspended --> Ready: wake_time reached<br/>or wake_override set
-    Blocking --> Ready: wake_override set<br/>(producer signals)
     Running --> Exited: exit_thread_with_state(Exited)
     Exited --> [*]
 ```
@@ -34,11 +32,12 @@ The transitions match user threads exactly — kthreads use the same
 
 - **Yield path is different.** User threads yield via syscalls
   (the `s_trap` `cause = 8` arm). Kthreads yield via
-  [`kthread_park`](../kmain/src/kernel/context.rs) — a setjmp-style
-  save that hands off to `k_hart_loop` without going through the trap
-  vector. Calling the syscall path from a kthread panics; calling
-  `kthread_park` from a user thread is also a panic (asserted in the
-  function).
+  [`kthread_park`](../kmain/src/kernel/context.rs), which stages its
+  park state and then issues an S-mode `ecall` (`cause = 9`, tagged
+  with `KPARK_ECALL_NR` in `a7`) so it goes through the canonical
+  trap-save path before handing off to `k_hart_loop`. Calling the
+  user syscall path from a kthread panics; calling `kthread_park`
+  from a user thread is also a panic (asserted in the function).
 - **Stack is kernel-allocated.** Each kthread gets a 2 MiB stack from
   `kernel_pages` ([Orbit::THREAD_STACK_LAYOUT](../kmain/src/kernel/mod.rs)).
   No TLS, no per-thread user-VA region.
@@ -68,12 +67,14 @@ pub fn create_kernel_thread(
 - Returns the kernel-allocated `tid`.
 
 **Caller context.** Must be called with `&mut Orbit` in hand — i.e.,
-under `MANAGER_LOCK` or during boot bringup. The two existing call
-sites both live in [kmain/src/kernel/mod.rs](../kmain/src/kernel/mod.rs):
-the e1000/PCI-NIC setup spawns `k_net` once the smoltcp `Interface`
-is built, and the virtio-gpu setup spawns `k_gpu` once the
-framebuffer is ready. Both run from `setup_*` paths hart 0 calls
-during `rust_main`/`k_smpstart`, so the lock is uncontended.
+under the scheduler lock or during boot bringup. The three existing
+call sites all live in [kmain/src/kernel/mod.rs](../kmain/src/kernel/mod.rs):
+`setup_serial_kthread` spawns `k_serial` (the exclusive UART owner)
+from `get_environment_info`, the e1000/PCI-NIC setup spawns `k_net`
+once the smoltcp `Interface` is built, and the virtio-gpu setup
+spawns `k_gpu` once the framebuffer is ready. All run from `setup_*`
+paths hart 0 calls during `rust_main`/`k_smpstart`, so the lock is
+uncontended.
 
 **Latching the tid.** When a kthread serves user requests, the
 producer side (e.g. a syscall that wants to wake the kthread) needs
@@ -153,7 +154,7 @@ A `static StaticThingBuf<Cmd, N>` lets producers (any hart) push
 work onto a fixed-capacity ring without `&mut Orbit`. The kthread
 drains the ring at the top of each loop iteration. Used by `k_gpu`
 ([CONSOLE_RING](../kmain/src/drivers/k_gpu.rs) carries
-`Cmd { kind, source, len, bytes }`).
+`Cmd { kind, source, len, bytes, present }`).
 
 Producers push via a non-blocking `push_ref()`; ring-full returns
 `Err` and the producer logs-and-drops (or backs off). Consumers
@@ -163,19 +164,21 @@ Use this for stream-shaped traffic where producers are many and
 the kthread is the single consumer. Don't use it for request/reply
 — there's no per-message handle the producer can wait on.
 
-### 3. CompletionHandle round-trip
+### 3. PendingWork round-trip
 
-Producer creates a `CompletionHandle::new()`
-([process/src/lib.rs](../process/src/lib.rs)), enqueues a request
-that *carries* a clone of the handle, then either parks (user
-thread) or polls (kthread waker). The handler signals the handle
-with a result `isize`; the producer reads it on resume.
+A blocking syscall parks its thread and pushes a tid-carrying
+`PendingWork` variant ([orbit-core/src/pending_work.rs](../orbit-core/src/pending_work.rs))
+onto `MANAGER_WORK`. Whichever hart holds the scheduler lock runs the
+matching arm and resumes the parked thread via
+`publish_pending_for_tid` (writes the result a-regs, then pushes
+`WakeEvent::Tid`). No `CompletionHandle` is carried in the work item.
 
-This is the canonical syscall-blocking shape; kthreads can be on
-either end. `k_net` is the canonical *consumer* — `nc_create`
-syscall hands a `SocketReq` with a handle clone to the
-`socket_reqs` ring; `k_net` drains, builds the smoltcp socket, and
-signals the user thread parked on the handle.
+A kthread can be the *worker* on this path. `k_net` is the canonical
+example: `nc_create` is resolved on the manager side
+(`run_nc_create_req` allocates + maps the ring and resumes the
+caller); `k_net` itself receives a handle-free `SocketReq` on the
+`socket_reqs` ring and only builds and pumps the smoltcp socket from
+there on.
 
 Use this whenever a request needs a return value, especially when
 the request can fail or carry an out-band result (e.g. an allocated
@@ -191,18 +194,21 @@ A kthread parked in `kthread_park(Suspended, wake_at)` resumes when:
 2. **`wake_override` is set** — any producer can `fetch_or` bits into
    `Thread::wake_override`; the next scheduler scan observes the
    non-zero value and dispatches early. This is how an IRQ handler
-   tickles `k_net` before its 50 ms park elapses.
+   tickles `k_net` before its ~100 ms park elapses.
 3. **Both** — earliest of the two wins.
 
 The producer-side helper for case 2 is `WakeEvent`
-([orbit-core/src/manager.rs](../orbit-core/src/manager.rs)): push
-a `WakeEvent::Net` (or your own variant) onto `WAKE_QUEUE` and the
-manager turns it into the right `wake_override` bit on the right
-tid. For known-tid wakes, `WakeEvent::Tid(tid)` skips the lookup.
+([manager/src/lib.rs](../manager/src/lib.rs), re-exported through
+`crate::kernel`): push a `WakeEvent::Net` (or your own variant) onto
+`WAKE_QUEUE` and the manager turns it into the right `wake_override`
+bit on the right tid. For known-tid wakes, `WakeEvent::Tid(tid)`
+skips the lookup.
 
-For `Blocking` parks (no deadline), `wake_at` is `0` and the
-`SleepHeap` scan never promotes the thread; the producer must
-trigger `wake_override` or the kthread sleeps forever.
+`kthread_park` only accepts `Suspended` — a `Blocking` park panics
+(the wake-hook protocol that backs `Blocking` only makes sense for
+user threads). A kthread that wants to sleep until a producer pokes
+it parks `Suspended` with a far-future (or heartbeat) deadline and
+relies on `wake_override`.
 
 ## Critical-section rules
 
@@ -213,13 +219,13 @@ likely they are to bite you.
   off to `k_hart_loop` and another hart will dispatch the kthread
   before we ever release; meanwhile any code waiting on the same
   lock deadlocks. Drop locks before park; reacquire after resume.
-- **`MANAGER_LOCK` is held by the manager hart, not by the kthread.**
-  A kthread that needs `&mut Orbit` (e.g. to spawn another kthread,
-  edit the process table, build a syscall reply) enqueues the work
-  via the appropriate manager-side mechanism (`PendingWork`,
-  `socket_associations`, or a dedicated MPSC). Do *not* try to
-  acquire `MANAGER_LOCK` directly from a kthread — the loop holds
-  no `&mut Orbit` and there's no machinery to give it one.
+- **The scheduler lock is held by the manager hart, not by the
+  kthread.** A kthread that needs `&mut Orbit` (e.g. to spawn another
+  kthread, edit the process table, build a syscall reply) enqueues
+  the work via the appropriate manager-side mechanism (`PendingWork`,
+  `socket_associations`, or a dedicated MPSC). Do *not* try to take
+  the scheduler lock directly from a kthread — the loop holds no
+  `&mut Orbit` and there's no machinery to give it one.
 - **Clear `sstatus.SIE` before reading hart-local state across a
   potential trap point.** A timer or SSWI mid-read can yield the
   kthread to a different hart on resume; per-hart aliases captured
@@ -252,12 +258,12 @@ calling `exit_thread_with_state` so the cause is in the log.
 |---|---|---|---|
 | `k_net` | [kmain/src/lib.rs](../kmain/src/lib.rs) | smoltcp `Interface`, e1000 phy, NetChannel-backed sockets, DHCP client | Spawned after the e1000 PCI device is up and the smoltcp `Interface` is built; runs forever, handles socket creates / packet pumping / disconnects |
 | `k_gpu` | [kmain/src/drivers/k_gpu.rs](../kmain/src/drivers/k_gpu.rs) | virtio-gpu framebuffer, scrollback per source, repaint loop | Spawned after virtio-gpu init; 50 ms park between repaints, woken by `CONSOLE_RING` producers |
+| `k_serial` | [kmain/src/drivers/k_serial.rs](../kmain/src/drivers/k_serial.rs) | exclusive ownership of the UART | Spawned from `get_environment_info`; drains `SERIAL_RING` (logs/traces) and writes the UART — producers drop on ring-full rather than touch the UART |
 
-Both are configured at boot from a kernel-resident "package" pointer
-and never serve more than one tenant at a time. The conventions in
-this doc are calibrated against those two; departures (multi-instance
-kthreads, dynamically-spawned per-tenant kthreads) need a fresh look
-at the spawn / shutdown / reaping story.
+All are configured at boot and never serve more than one tenant at a
+time. The conventions in this doc are calibrated against those three;
+departures (multi-instance kthreads, dynamically-spawned per-tenant
+kthreads) need a fresh look at the spawn / shutdown / reaping story.
 
 ## Adding a new kthread — checklist
 

@@ -15,9 +15,7 @@
 //!   `orbit-core::denial_ring::DenialRing`, tests use a `Vec`-backed
 //!   sink.
 //!
-//! See [docs/dev/permissions-roles.md](../../../docs/dev/permissions-roles.md)
-//! for the broader design and how the ring fits into
-//! `query_denial_log`.
+//! Entries are drained by `query_denial_log`.
 
 use crate::perms::role::RoleId;
 
@@ -101,7 +99,7 @@ pub enum DenialEvent {
         source_role: RoleId,
         /// Role the spawn was targeting.
         target_role: RoleId,
-        /// Discriminant of the [`crate::perms::SpawnDeny`]-shaped reason
+        /// Discriminant of the [`crate::roles::SpawnDeny`]-shaped reason
         /// for the denial: `0` = `UnknownParentRole`, `1` =
         /// `UnknownTargetRole`, `2` = `TransitionDenied`. Inlined as
         /// `u32` so the wire layout doesn't depend on a Rust enum's
