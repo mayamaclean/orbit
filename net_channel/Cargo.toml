@@ -16,7 +16,7 @@ kernel = ["dep:smoltcp", "dep:serial", "dep:tracing"]
 rustc-dep-of-std = ["core"]
 
 [dependencies]
-smoltcp = { path = "../../smoltcp", default-features = false, features = ["socket-raw", "socket-udp", "socket-tcp", "socket-icmp", "socket-dhcpv4", "socket-dns", "proto-ipv4", "socket-tcp-cubic"], optional = true }
+smoltcp = { git = "https://github.com/mayamaclean/smoltcp", branch = "orbit", default-features = false, features = ["socket-raw", "socket-udp", "socket-tcp", "socket-icmp", "socket-dhcpv4", "socket-dns", "proto-ipv4", "socket-tcp-cubic"], optional = true }
 serial = { path = "../serial", optional = true }
 tracing = { version = "0.1.44", default-features = false, features = [], optional = true }
 core = { version = "1.0.0", optional = true, package = "rustc-std-workspace-core" }

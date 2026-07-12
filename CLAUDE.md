@@ -35,7 +35,7 @@ The `riscv64gc-unknown-orbit` target spec is built into the fork ([rust/compiler
 
 For an as-built map of the orbit-side std PAL — what's wired, what's stubbed, file paths, build-loop gotchas, and the priority order of remaining holes — see `docs/dev/std-on-orbit.md` (local dev notes; `docs/dev/` is untracked scratch space, so this file may be absent in a fresh clone).
 
-External dependency: `smoltcp` is a path dependency at `../smoltcp` (sibling of this repo), not a crates.io version. If it is missing the workspace will fail to build `kmain`, `process`, and `net_channel`.
+External dependency: `smoltcp` is a git dependency on the `orbit` branch of the fork at <https://github.com/mayamaclean/smoltcp> (declared identically in `kmain`, `process`, and `net_channel` — keep the three specs in sync or cargo will build two conflicting smoltcp copies). To hack on smoltcp locally, temporarily point the three deps back at a sibling checkout (`path = "../../smoltcp"`), then push the fork branch and restore the git specs before committing.
 
 ## Architecture
 

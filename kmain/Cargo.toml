@@ -18,7 +18,7 @@ riscv_plic = "0.2.0"
 heapless = { version = "0.9.2", features = ["portable-atomic", "mpmc_large"] }
 elf = { version = "0.8.0", default-features = false }
 dtoolkit = { version = "0.1.1", default-features = false }
-smoltcp = { path = "../../smoltcp", default-features = false, features = ["alloc", "log", "socket-raw", "socket-udp", "socket-tcp", "socket-icmp", "socket-dhcpv4", "socket-dns", "proto-ipv4", "socket-tcp-cubic"] }
+smoltcp = { git = "https://github.com/mayamaclean/smoltcp", branch = "orbit", default-features = false, features = ["alloc", "log", "socket-raw", "socket-udp", "socket-tcp", "socket-icmp", "socket-dhcpv4", "socket-dns", "proto-ipv4", "socket-tcp-cubic"] }
 net_channel = {path = "../net_channel", features = ["kernel"] }
 tracing = { version = "0.1.44", default-features = false, features = [] }
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["alloc"] }
