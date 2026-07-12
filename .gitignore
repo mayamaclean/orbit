@@ -24,3 +24,7 @@ rootfs/bin/smoke
 rootfs/bin/hello-std
 
 runs/
+
+# Editor state + local scratch notes
+.vscode/
+notes.txt
