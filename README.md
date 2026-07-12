@@ -4,7 +4,9 @@ A hobby RISC-V 64 kernel written in Rust, running on the QEMU `virt` machine
 with 4 harts and 2 GiB of RAM. Three privilege levels, three ELFs: an M-mode
 bootloader ([bl/](bl/)), a fully relocatable PIE S-mode kernel
 ([kmain/](kmain/)), and U-mode userspace loaded over TCP at runtime
-([orbit-loader/](orbit-loader/)).
+([orbit-loader/](orbit-loader/)). It's largely written to experiment with
+kernel development, LLM-assisted development, rustc internals, permissions,
+project organization, and anything else that I'm feeling interested in.
 
 Highlights:
 
