@@ -1,3 +1,8 @@
+# Derived from Stephen Marz's osblog (The Adventures of OS):
+# https://github.com/sgmarz/osblog — MIT, Copyright (c) 2019 Stephen Marz
+# (original header below). Heavily modified for orbit; full license text
+# in THIRD_PARTY_NOTICES.md at the repo root.
+#
 # boot.S
 # bootloader for SoS
 # Stephen Marz
