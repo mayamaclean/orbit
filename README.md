@@ -95,10 +95,16 @@ Building std-based user programs (`hello-std`, `hello-ratatui-std`,
 target, cloned to `rust/` inside this repo:
 
 ```sh
-git clone --depth 1 -b orbit-std https://github.com/mayamaclean/rust rust
+git clone --filter=blob:none -b orbit-std https://github.com/mayamaclean/rust rust
 cd rust && ./x build library --stage 1 --target riscv64gc-unknown-orbit
 rustup toolchain link orbit-stage1 "$(pwd)/build/x86_64-unknown-linux-gnu/stage1"
 ```
+
+(Don't `--depth 1` the rust clone — bootstrap walks git history to locate the
+CI LLVM artifact and fails without it; `--filter=blob:none` keeps the commit
+graph at a fraction of the size. The orbit target's `cc` in `bootstrap.toml`
+is `riscv64-unknown-elf-gcc`, so a RISC-V bare-metal GNU toolchain must be on
+`PATH`.)
 
 Prebuilt copies of the std demos are checked in under [rootfs/bin/](rootfs/bin/),
 so the disk image includes them even without the fork. See
