@@ -1,5 +1,13 @@
 //! Single-producer / single-consumer ring queue.
 //!
+//! Ring algorithm adapted from the `heapless` crate's `spsc::Queue`
+//! (<https://github.com/rust-embedded/heapless>, dual MIT/Apache-2.0,
+//! used here under MIT — Copyright (c) 2017 Jorge Aparicio; full text
+//! in THIRD_PARTY_NOTICES.md at the repo root). Orbit changes:
+//! `#[repr(C)]` shared-memory ABI layout, unsafe sole-producer/
+//! sole-consumer API, volatile slot access, defensive index masking,
+//! cooperative reset helpers.
+//!
 //! Lock-free via atomic head/tail + `[UnsafeCell<T>; N]` slots. The
 //! producer owns `tail`, the consumer owns `head`; they synchronize
 //! through Acquire/Release pairs on those atomics. Slots are read /
