@@ -23,7 +23,7 @@ Unit tests live across the crates (notably `orbit-core/tests/`, plus `orbit-abi`
 
 ### Building Orbit's std (forked rustc at [rust/](rust/))
 
-Std-on-orbit binaries (currently only [hello-std/](hello-std/), eventually any user app that wants `std`) require a custom rustc fork that knows about the `riscv64gc-unknown-orbit` target. The fork lives at [rust/](rust/); its bootstrap config in [rust/bootstrap.toml](rust/bootstrap.toml) targets both the host and orbit. Build flow:
+Std-on-orbit binaries (currently only [hello-std/](hello-std/), eventually any user app that wants `std`) require a custom rustc fork that knows about the `riscv64gc-unknown-orbit` target. The fork lives at [rust/](rust/) — a checkout of the `orbit-std` branch of <https://github.com/mayamaclean/rust> (`git clone -b orbit-std https://github.com/mayamaclean/rust rust` if absent); its bootstrap config in [rust/bootstrap.toml](rust/bootstrap.toml) targets both the host and orbit. Build flow:
 
 1. `cd rust && ./x build library --stage 1 --target riscv64gc-unknown-orbit` — compiles `core`/`alloc`/`std` for orbit. Stage 1 is enough; stage 2 adds nothing relevant. Output lives under [rust/build/x86_64-unknown-linux-gnu/stage1/lib/rustlib/riscv64gc-unknown-orbit/lib/](rust/build/x86_64-unknown-linux-gnu/stage1/lib/rustlib/riscv64gc-unknown-orbit/lib/).
 2. The toolchain is rustup-linked as `orbit-stage1` (run once from the repo root: `rustup toolchain link orbit-stage1 "$(pwd)/rust/build/x86_64-unknown-linux-gnu/stage1"`).
