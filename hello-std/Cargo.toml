@@ -15,17 +15,18 @@ panic = "abort"
 
 [dependencies]
 ab_glyph = "0.2.32"
-mio = { version = "1.2", default-features = false, features = ["os-poll", "net"] }
+mio = { git = "https://github.com/mayamaclean/mio", branch = "orbit-mio", default-features = false, features = ["os-poll", "net"] }
 # orbit-abi for direct serial-print so smoke markers land on the
 # QEMU `-serial` channel instead of the framebuffer (which is
 # invisible under `-nographic`).
 orbit-abi = { path = "../orbit-abi" }
 
-# Orbit fork of mio at /home/maya/projects/mio. Sibling of the orbit
-# repo; relative path steps out of hello-std/ → orbit/ → into the
-# mio fork. libc is vendored under rust/library/ (the orbit shim);
-# without the patch, cargo would pull a crates.io libc that has no
-# orbit arm.
+# libc is vendored under rust/library/ (the orbit shim); without the
+# patch, cargo would pull a crates.io libc that has no orbit arm.
+# Building this crate requires the rustc fork at rust/ anyway (see
+# CLAUDE.md "Building Orbit's std"), so the libc path stays local.
+# (mio's orbit fork is a direct git dependency above, not a patch —
+# cargo declined to substitute the 1.2.999 git patch for the ^1.2
+# registry dep, so the dep names the fork source explicitly.)
 [patch.crates-io]
 libc = { path = "../rust/library/libc" }
-mio = { path = "../../mio" }
