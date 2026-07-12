@@ -90,7 +90,8 @@ else
     printf 'warn: orbit-stage1 toolchain or rust/ fork checkout missing; staging prebuilt rootfs/bin std binaries as-is (hello-fb-std, hello-ratatui-std, orbit-top-std, orbit-metricd; hello-std only if previously built)\n' >&2
 fi
 
-# eza — modern `ls` replacement, out-of-tree at ../eza. Built against
+# eza — modern `ls` replacement, out-of-tree at ../eza (orbit branch
+# of https://github.com/mayamaclean/eza). Built against
 # orbit-stage1 with --no-default-features (drops git2). The crate's
 # Cargo.toml carries [patch.crates-io] entries pointing at the
 # vendored libc / backtrace / terminal_size / uzers under
@@ -108,7 +109,8 @@ else
     printf 'warn: orbit-stage1 toolchain or %s missing; skipping /bin/eza\n' "$EZA_SRC" >&2
 fi
 
-# ripgrep — `rg` recursive grep, out-of-tree at ../ripgrep. Same
+# ripgrep — `rg` recursive grep, out-of-tree at ../ripgrep (orbit
+# branch of https://github.com/mayamaclean/ripgrep). Same
 # build pattern as eza but uses the `release-lto` profile (defined
 # in ripgrep's Cargo.toml) to get a stripped + LTO'd binary instead
 # of the 29 MB debug-info-laden default release. Patches in
