@@ -6,8 +6,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
 
 use orbit_core::tlb_shootdown::{
-    SHOOTDOWN_RING_CAP, ShootdownEntry, ShootdownErr, ShootdownRing, drain_shootdown_ring,
-    tlb_shootdown,
+    FlushScope, SHOOTDOWN_RING_CAP, ShootdownEntry, ShootdownErr, ShootdownRing,
+    drain_shootdown_ring, tlb_shootdown,
 };
 
 use common::FakeHw;
@@ -20,16 +20,23 @@ use common::FakeHw;
 // without bringing concurrency in. Concurrent tests come further down.
 // =====================================================================
 
-/// Drain helper that just records `(va, len)` pairs into a Vec. Stand-in
-/// for `sfence.vma` in tests.
-fn record_into(vec: &mut Vec<(u64, u64)>) -> impl FnMut(u64, u64) + '_ {
-    |va, len| vec.push((va, len))
+/// Drain helper that just records `(scope, va, len)` tuples into a Vec.
+/// Stand-in for `sfence.vma` in tests.
+fn record_into(vec: &mut Vec<(FlushScope, u64, u64)>) -> impl FnMut(FlushScope, u64, u64) + '_ {
+    |scope, va, len| vec.push((scope, va, len))
 }
 
 #[test]
 fn zero_targets_short_circuits_without_ack() {
     let mut hw = FakeHw::default();
-    let result = tlb_shootdown(0, core::iter::empty(), 0xdead_0000, 4096, &mut hw);
+    let result = tlb_shootdown(
+        0,
+        core::iter::empty(),
+        FlushScope::Asid(7),
+        0xdead_0000,
+        4096,
+        &mut hw,
+    );
     assert_eq!(result, Ok(()));
     assert!(hw.wakes.is_empty(), "no IPIs for zero-target shootdown");
 }
@@ -43,7 +50,14 @@ fn single_target_push_drain_ack_roundtrip() {
     // returns. (The orchestrator blocks on the ack until we pop+ack.)
     let h = thread::spawn(|| {
         let mut hw = FakeHw::default();
-        tlb_shootdown(1, core::iter::once((2, &RING)), 0x4000_0000, 4096, &mut hw)
+        tlb_shootdown(
+            1,
+            core::iter::once((2, &RING)),
+            FlushScope::Asid(9),
+            0x4000_0000,
+            4096,
+            &mut hw,
+        )
     });
 
     // Wait for the entry to appear (push happens before wake on the
@@ -60,7 +74,7 @@ fn single_target_push_drain_ack_roundtrip() {
 
     let result = h.join().unwrap();
     assert_eq!(result, Ok(()));
-    assert_eq!(got, vec![(0x4000_0000u64, 4096u64)]);
+    assert_eq!(got, vec![(FlushScope::Asid(9), 0x4000_0000u64, 4096u64)]);
 }
 
 #[test]
@@ -72,13 +86,13 @@ fn multi_target_each_acks_once() {
     let h = thread::spawn(|| {
         let mut hw = FakeHw::default();
         let targets = [(0, &R0), (1, &R1), (2, &R2)];
-        let r = tlb_shootdown(3, targets, 0xc0de_0000, 0x1000, &mut hw);
+        let r = tlb_shootdown(3, targets, FlushScope::Asid(5), 0xc0de_0000, 0x1000, &mut hw);
         (r, hw.wakes)
     });
 
     // Drain each ring once. Until all three drain, the orchestrator is
     // spinning on the ack.
-    let mut got: Vec<(u64, u64)> = Vec::new();
+    let mut got: Vec<(FlushScope, u64, u64)> = Vec::new();
     let mut total_serviced = 0u32;
     while total_serviced < 3 {
         for ring in [&R0, &R1, &R2] {
@@ -93,7 +107,7 @@ fn multi_target_each_acks_once() {
     assert_eq!(result, Ok(()));
     // Every target got exactly one entry with the right (va, len).
     for entry in &got {
-        assert_eq!(*entry, (0xc0de_0000u64, 0x1000u64));
+        assert_eq!(*entry, (FlushScope::Asid(5), 0xc0de_0000u64, 0x1000u64));
     }
     assert_eq!(got.len(), 3);
     // Every target got an IPI.
@@ -119,7 +133,7 @@ fn ring_full_returns_failed_count_after_other_acks() {
     let h = thread::spawn(|| {
         let mut hw = FakeHw::default();
         let targets = [(7, &FULL_RING), (8, &OPEN_RING)];
-        tlb_shootdown(2, targets, 0x9000_0000, 0x1000, &mut hw)
+        tlb_shootdown(2, targets, FlushScope::Asid(3), 0x9000_0000, 0x1000, &mut hw)
     });
 
     // Drain only the open ring — failed one stays full but the
@@ -135,11 +149,11 @@ fn ring_full_returns_failed_count_after_other_acks() {
 
     let result = h.join().unwrap();
     assert_eq!(result, Err(ShootdownErr::RingFull { failed: 1 }));
-    assert_eq!(got, vec![(0x9000_0000u64, 0x1000u64)]);
+    assert_eq!(got, vec![(FlushScope::Asid(3), 0x9000_0000u64, 0x1000u64)]);
 
     // Drain the pre-fill so subsequent tests reusing FULL_RING (none
     // today, statics are per-test) start clean.
-    while drain_shootdown_ring(&FULL_RING, |_, _| {}) > 0 {}
+    while drain_shootdown_ring(&FULL_RING, |_, _, _| {}) > 0 {}
 }
 
 // =====================================================================
@@ -173,7 +187,14 @@ fn concurrent_senders_one_target() {
                 // some pushes will fail. Recover by re-trying after
                 // the drainer has caught up.
                 loop {
-                    let r = tlb_shootdown(1, core::iter::once((0, &TARGET)), va, 4096, &mut hw);
+                    let r = tlb_shootdown(
+                        1,
+                        core::iter::once((0, &TARGET)),
+                        FlushScope::Asid(1),
+                        va,
+                        4096,
+                        &mut hw,
+                    );
                     match r {
                         Ok(()) => break,
                         Err(ShootdownErr::RingFull { .. }) => {
@@ -194,7 +215,7 @@ fn concurrent_senders_one_target() {
         drainer_bar.wait();
         let target_count = (SENDERS * PER_SENDER_REQS) as u32;
         while drainer_total.load(Ordering::Acquire) < target_count {
-            let n = drain_shootdown_ring(&TARGET, |_, _| {});
+            let n = drain_shootdown_ring(&TARGET, |_, _, _| {});
             drainer_total.fetch_add(n, Ordering::AcqRel);
         }
     });
@@ -235,7 +256,7 @@ fn one_sender_concurrent_drainers() {
                 thread::spawn(move || {
                     let mut got = None;
                     while got.is_none() {
-                        drain_shootdown_ring(ring, |va, len| {
+                        drain_shootdown_ring(ring, |_scope, va, len| {
                             got = Some((va, len));
                         });
                         if got.is_none() {
@@ -249,7 +270,7 @@ fn one_sender_concurrent_drainers() {
 
         let mut hw = FakeHw::default();
         let targets = [(0, &R0), (1, &R1), (2, &R2), (3, &R3)];
-        let result = tlb_shootdown(4, targets, va, 4096, &mut hw);
+        let result = tlb_shootdown(4, targets, FlushScope::Asid(4), va, 4096, &mut hw);
         assert_eq!(result, Ok(()));
 
         for h in drainers {

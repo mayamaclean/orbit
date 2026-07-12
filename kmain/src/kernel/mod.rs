@@ -67,6 +67,7 @@ pub mod shared_user_ptr;
 pub mod shootdown;
 pub mod stdin;
 pub mod surface;
+pub mod tlb;
 pub mod user_page;
 
 pub use memmap::KernelLayout;
@@ -836,11 +837,10 @@ impl Orbit {
         core::sync::atomic::fence(Ordering::SeqCst);
 
         // Local single-VA fence handles the manager hart. Cross-hart
-        // broadcast (whole-TLB sentinel via len=0) covers every other
-        // hart that may have cached a negative entry for this newly-
-        // mapped range.
+        // broadcast covers every other hart that may have cached a
+        // negative entry for this newly-mapped range.
         riscv::asm::sfence_vma(pid as usize, req.vaddr.raw() as usize);
-        crate::kernel::shootdown::broadcast(0, 0);
+        crate::kernel::shootdown::broadcast(pid, 0, 0);
 
         info!("fulfilled {req:?}:\n\tpa={backing_pa:016X?} {layout:08X?}");
 
@@ -991,8 +991,8 @@ impl Orbit {
         surfaces.insert(id, entry);
 
         core::sync::atomic::fence(Ordering::SeqCst);
-        riscv::asm::sfence_vma(pid as usize, 0);
-        crate::kernel::shootdown::broadcast(0, 0);
+        crate::kernel::tlb::flush_asid(pid as usize);
+        crate::kernel::shootdown::broadcast(pid, 0, 0);
 
         info!(
             "fb_surface_create: pid={pid} id={id} {}x{} user_va=0x{:X} kva=0x{:016X} size={}",
@@ -1055,8 +1055,8 @@ impl Orbit {
         }
 
         core::sync::atomic::fence(Ordering::SeqCst);
-        riscv::asm::sfence_vma(pid as usize, 0);
-        crate::kernel::shootdown::broadcast(0, 0);
+        crate::kernel::tlb::flush_asid(pid as usize);
+        crate::kernel::shootdown::broadcast(pid, 0, 0);
 
         // Return the backing to kernel_pages.
         self.free_backing(entry.backing);
@@ -1191,10 +1191,10 @@ impl Orbit {
 
         core::sync::atomic::fence(Ordering::SeqCst);
 
-        // Local whole-asid + cross-hart whole-TLB broadcast — same
+        // Local whole-asid + cross-hart broadcast — same
         // shape as run_mmap_req's post-install fence.
-        riscv::asm::sfence_vma(pid as usize, 0);
-        crate::kernel::shootdown::broadcast(0, 0);
+        crate::kernel::tlb::flush_asid(pid as usize);
+        crate::kernel::shootdown::broadcast(pid, 0, 0);
 
         let socket_req = SocketReq {
             netchan: shared,
@@ -1413,8 +1413,8 @@ impl Orbit {
         };
 
         core::sync::atomic::fence(Ordering::SeqCst);
-        riscv::asm::sfence_vma(pid as usize, 0);
-        crate::kernel::shootdown::broadcast(0, 0);
+        crate::kernel::tlb::flush_asid(pid as usize);
+        crate::kernel::shootdown::broadcast(pid, 0, 0);
 
         info!(
             "eventfd created user_va=0x{:08X} kva=0x{:016X} fd={fd}",
@@ -3268,7 +3268,7 @@ impl Orbit {
         }
 
         riscv::asm::sfence_vma(pid as usize, target_va as usize);
-        crate::kernel::shootdown::broadcast(0, 0);
+        crate::kernel::shootdown::broadcast(pid, 0, 0);
         Ok(backing)
     }
 
@@ -4761,14 +4761,14 @@ impl Orbit {
                                     unsafe {
                                         let _ = unmap_page(&root_table, VirtAddr::new(v), 3);
                                         riscv::asm::sfence_vma(pid as usize, v as usize);
-                                        crate::kernel::shootdown::broadcast(0, 0);
+                                        crate::kernel::shootdown::broadcast(pid, 0, 0);
                                     }
                                 }
                             }
                             MappingKind::TrapFrame { .. } => unsafe {
                                 let _ = unmap_page(&root_table, VirtAddr::new(m.vaddr), 4);
                                 riscv::asm::sfence_vma(pid as usize, m.vaddr as usize);
-                                crate::kernel::shootdown::broadcast(0, 0);
+                                crate::kernel::shootdown::broadcast(pid, 0, 0);
                             },
                             MappingKind::Guard { .. } => {
                                 // No leaf backs the guard; only the proc.maps
@@ -4782,7 +4782,7 @@ impl Orbit {
                                     let _ = unmap_page(&root_table, VirtAddr::new(m.vaddr), 3);
                                     riscv::asm::sfence_vma(pid as usize, m.vaddr as usize);
                                 }
-                                crate::kernel::shootdown::broadcast(0, 0);
+                                crate::kernel::shootdown::broadcast(pid, 0, 0);
                             }
                             // mappings_for_slot filters on MappingKind::slot(),
                             // which only returns Some for the arms above.
@@ -5044,10 +5044,10 @@ impl Orbit {
             // Whole-ASID flush before `next_pid` can hand this u16 to a
             // fresh process. The dealloc_thread loop sfenced stack/trap
             // leaves, but ELF / anon / NetCh mappings were only zapped by
-            // `unmap` above. Cross-hart broadcast (whole-TLB sentinel)
-            // catches every hart that ever ran this pid's threads.
-            riscv::asm::sfence_vma(process.pid as usize, 0);
-            crate::kernel::shootdown::broadcast(0, 0);
+            // `unmap` above. Cross-hart broadcast catches every hart
+            // that ever ran this pid's threads.
+            crate::kernel::tlb::flush_asid(process.pid as usize);
+            crate::kernel::shootdown::broadcast(process.pid, 0, 0);
         }
     }
 
@@ -5301,7 +5301,7 @@ impl Orbit {
             device.write_bar(0, Self::IGB_BAR_PA as u32);
 
             riscv::register::satp::write(self.satp);
-            riscv::asm::sfence_vma(0, 0);
+            riscv::asm::sfence_vma_all();
 
             kva
         };
@@ -5484,7 +5484,7 @@ impl Orbit {
                     return;
                 }
             };
-            riscv::asm::sfence_vma(0, 0);
+            riscv::asm::sfence_vma_all();
             va
         };
 

@@ -70,7 +70,7 @@ impl UserPageWindow {
                     0,
                 )
                 .expect("KSCRATCH intermediate missing — reserve_va_range not run?");
-                riscv::asm::sfence_vma(0, vaddr as usize);
+                crate::kernel::tlb::flush_page_all_asid(vaddr as usize);
             }
         }
 
@@ -118,7 +118,7 @@ impl Drop for UserPageWindow {
                 if let Err(e) = write_leaf_pte(&root, VirtAddr::new(vaddr), None, 0, 0) {
                     warn!("UserPageWindow::drop: leaf teardown failed at {vaddr:#x}: {e:?}");
                 }
-                riscv::asm::sfence_vma(0, vaddr as usize);
+                crate::kernel::tlb::flush_page_all_asid(vaddr as usize);
             }
         }
     }

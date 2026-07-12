@@ -319,7 +319,7 @@ pub unsafe fn install(
     let base_kva = unsafe {
         memmap::install_kmmio_alias(rt, pa_alloc, info.pa_base..info.pa_base + info.size)?
     };
-    riscv::asm::sfence_vma(0, 0);
+    riscv::asm::sfence_vma_all();
 
     let plic = unsafe { Plic::new(base_kva, info.ndev) };
 

@@ -62,7 +62,7 @@ pub fn discover(fdt: &Fdt<'_>, rt: &RootTable<'_>, table_pages: &mut TablePages)
                 }
             }
         };
-        riscv::asm::sfence_vma(0, 0);
+        riscv::asm::sfence_vma_all();
         let mmio = unsafe { Mmio::new(kva) };
         let (magic, device_id) = unsafe { (mmio.magic(), mmio.device_id()) };
         info!(

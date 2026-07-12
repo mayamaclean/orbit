@@ -222,12 +222,12 @@ impl<T> SharedUserPtr<T> {
             va += PAGE_SIZE as u64;
         }
 
-        // One whole-TLB broadcast covers every leaf we just cleared,
-        // regardless of region size. Receivers do `sfence.vma x0, x0`.
+        // One whole-ASID broadcast covers every leaf we just cleared,
+        // regardless of region size. Receivers do `sfence.vma x0, asid`.
         // Coarser than necessary but at least once per revoke instead
         // of once per page; threading per-page requests through the
         // ring is a possible follow-up.
-        crate::kernel::shootdown::broadcast(0, 0);
+        crate::kernel::shootdown::broadcast(pid, 0, 0);
 
         Ok(())
     }

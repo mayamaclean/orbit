@@ -25,9 +25,9 @@ unsafe fn jump(context: &'static HartContext, target: usize) -> ! {
         riscv::register::sstatus::set_spp(riscv::register::sstatus::SPP::Supervisor);
 
         if context.satp.bits() != riscv::register::satp::read().bits() {
-            riscv::asm::sfence_vma(context.satp.asid(), 0);
+            crate::kernel::tlb::flush_asid(context.satp.asid());
             riscv::register::satp::write(context.satp);
-            riscv::asm::sfence_vma(context.satp.asid(), 0);
+            crate::kernel::tlb::flush_asid(context.satp.asid());
         }
 
         asm!(

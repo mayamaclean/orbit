@@ -40,6 +40,22 @@ use thingbuf::StaticThingBuf;
 
 use crate::Hardware;
 
+/// Which address spaces a shootdown request flushes.
+///
+/// A sum type rather than an in-band sentinel ASID: there's no reserved
+/// pid value to keep out of circulation, and the receiver's match is
+/// exhaustive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FlushScope {
+    /// One address space, identified by its ASID (a process pid). The
+    /// receiver flushes either the whole ASID or a single VA within it,
+    /// depending on the request's `va`.
+    Asid(u16),
+    /// Every address space — a whole-TLB flush (`sfence.vma x0, x0`).
+    /// For kernel-global changes that aren't scoped to one process.
+    All,
+}
+
 /// One shootdown request as it sits on a target hart's queue.
 ///
 /// `Empty` is the default for `StaticThingBuf` slot pre-init; the
@@ -50,13 +66,16 @@ pub enum ShootdownEntry {
     #[default]
     Empty,
     Req {
-        /// First VA in the range to invalidate. Page-aligned in
-        /// practice but the protocol doesn't enforce it — the receiver
-        /// passes whatever the sender wrote into `sfence.vma`'s rs1.
+        /// Address space(s) the flush applies to. [`FlushScope::All`]
+        /// requests a whole-TLB flush and the receiver ignores `va`.
+        scope: FlushScope,
+        /// First VA to invalidate, or `0` for a whole-`scope` flush.
+        /// Page-aligned in practice but the protocol doesn't enforce
+        /// it — the receiver passes it straight into `sfence.vma`'s rs1.
         va: u64,
-        /// Length in bytes. `0` means "whole-ASID flush" — receivers
-        /// translate to `sfence.vma x0, asid` when wired up; for now
-        /// the orchestrator only emits per-page requests.
+        /// Length in bytes of the range. Informational today: the
+        /// receiver invalidates the single page at `va` regardless. A
+        /// future range variant would loop over `[va, va + len)`.
         len: u64,
         /// Sender's ack-counter clone. The receiver decrements after
         /// servicing; the sender spins on the underlying counter until
@@ -112,6 +131,7 @@ pub enum ShootdownErr {
 pub fn tlb_shootdown<I, H>(
     n_targets: usize,
     targets: I,
+    scope: FlushScope,
     va: u64,
     len: u64,
     hw: &mut H,
@@ -131,6 +151,7 @@ where
         match ring.push_ref() {
             Ok(mut slot) => {
                 *slot = ShootdownEntry::Req {
+                    scope,
                     va,
                     len,
                     ack: ack.clone(),
@@ -158,9 +179,9 @@ where
     }
 }
 
-/// Drain `ring` until empty, calling `apply(va, len)` for each request
-/// and decrementing the carried [`AckCounter`] afterwards. Returns
-/// the number of entries serviced.
+/// Drain `ring` until empty, calling `apply(scope, va, len)` for each
+/// request and decrementing the carried [`AckCounter`] afterwards.
+/// Returns the number of entries serviced.
 ///
 /// Intended call site: the SSWI handler in kmain's `s_trap` arm. The
 /// `apply` callback is the place where `sfence.vma` actually runs;
@@ -173,7 +194,10 @@ where
 /// (it shouldn't — kernel sfence is infallible), the ack stays
 /// outstanding and the sender deadlocks. The kmain caller must keep
 /// `apply` straight-line and panic-free.
-pub fn drain_shootdown_ring(ring: &'static ShootdownRing, mut apply: impl FnMut(u64, u64)) -> u32 {
+pub fn drain_shootdown_ring(
+    ring: &'static ShootdownRing,
+    mut apply: impl FnMut(FlushScope, u64, u64),
+) -> u32 {
     let mut serviced = 0u32;
     while let Some(mut slot) = ring.pop_ref() {
         let entry = core::mem::take(&mut *slot);
@@ -193,8 +217,13 @@ pub fn drain_shootdown_ring(ring: &'static ShootdownRing, mut apply: impl FnMut(
                 // handle it defensively rather than asserting.
                 continue;
             }
-            ShootdownEntry::Req { va, len, ack } => {
-                apply(va, len);
+            ShootdownEntry::Req {
+                scope,
+                va,
+                len,
+                ack,
+            } => {
+                apply(scope, va, len);
                 ack.decrement();
                 serviced += 1;
             }

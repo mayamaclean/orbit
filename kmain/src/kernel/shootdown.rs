@@ -19,7 +19,7 @@
 
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use orbit_core::tlb_shootdown::{ShootdownEntry, ShootdownRing, drain_shootdown_ring};
+use orbit_core::tlb_shootdown::{FlushScope, ShootdownEntry, ShootdownRing, drain_shootdown_ring};
 use process::AckCounter;
 use tracing::warn;
 
@@ -87,25 +87,41 @@ pub fn mark_secondaries_kicked() {
     SECONDARIES_KICKED.store(true, Ordering::Release);
 }
 
-/// Send a TLB-shootdown request for `[va, va + len)` to every hart
-/// other than the caller and block until each acks. The request shape
-/// the receiver honors:
+/// Send a per-process TLB-shootdown to every hart other than the caller
+/// and block until each acks. `asid` is the target process's pid; the
+/// receiver honors:
 ///
-/// - `va == 0 && len == 0` → whole-TLB flush (`sfence.vma x0, x0`).
-///   Use for whole-process invalidations (post-mmap, post-revoke,
-///   process teardown).
-/// - otherwise → single-page invalidation at `va` (`sfence.vma va, x0`).
-///   `len` is currently ignored beyond the sentinel check; a future
-///   range-broadcast variant would loop on the receiver side.
+/// - `va == 0` → whole-ASID flush (`sfence.vma x0, asid`): drop every
+///   cached translation for that process. Used for post-mmap,
+///   post-revoke, and teardown invalidations.
+/// - otherwise → single page (`sfence.vma va, asid`). `len` is
+///   informational today; a future range variant would loop the
+///   receiver over `[va, va + len)`.
 ///
-/// Caller is responsible for the local-hart `sfence.vma` — the
-/// orchestrator excludes the calling hart from `targets` so we don't
-/// waste an IPI on ourselves.
+/// For a whole-TLB flush across every address space use
+/// [`broadcast_all`] instead.
+///
+/// Caller is responsible for the local-hart fence — the orchestrator
+/// excludes the calling hart from `targets` so we don't waste an IPI on
+/// ourselves.
 ///
 /// No-op if [`init`] hasn't run (`cpu_count == 0`) or if there's only
 /// one hart online — useful for early-boot mmap that happens before
 /// secondary harts come up.
-pub fn broadcast(va: u64, len: u64) {
+pub fn broadcast(asid: u16, va: u64, len: u64) {
+    broadcast_scope(FlushScope::Asid(asid), va, len);
+}
+
+/// Whole-TLB cross-hart shootdown: every other hart drops every cached
+/// translation in every address space (`sfence.vma x0, x0`). The blunt
+/// instrument — reserved for kernel-global mapping changes that aren't
+/// scoped to a single process. Per-process invalidations should pass
+/// their pid to [`broadcast`].
+pub fn broadcast_all() {
+    broadcast_scope(FlushScope::All, 0, 0);
+}
+
+fn broadcast_scope(scope: FlushScope, va: u64, len: u64) {
     let n = CPU_COUNT.load(Ordering::Acquire);
     if n <= 1 {
         return;
@@ -136,6 +152,7 @@ pub fn broadcast(va: u64, len: u64) {
         match ring.push_ref() {
             Ok(mut slot) => {
                 *slot = ShootdownEntry::Req {
+                    scope,
                     va,
                     len,
                     ack: ack.clone(),
@@ -208,23 +225,24 @@ pub fn drain_local() {
         hart_id,
     );
     let ring = &SHOOTDOWN_RINGS[hart_id];
-    drain_shootdown_ring(ring, |va, len| {
-        // SAFETY: sfence.vma is always safe (it's a fence, not a
-        // memory access). The arms differ in scope only.
-        if va == 0 && len == 0 {
-            // Sentinel: whole-TLB flush. Equivalent to the
-            // pre-shootdown `sfence_vma(pid, 0)` + `sfence_vma(0, 0)`
-            // pair the senders used to do locally.
-            riscv::asm::sfence_vma(0, 0);
-        }
-        else {
-            // Per-page invalidation across all ASIDs. Slightly
-            // broader than `sfence.vma va, asid` would be, but
-            // the ring entries don't carry asid today and "all
-            // ASIDs" is always correct (per RISC-V Privileged
-            // ISA: rs2=x0 means the fence orders accesses to
-            // all ASIDs).
-            riscv::asm::sfence_vma(0, va as usize);
+    drain_shootdown_ring(ring, |scope, va, _len| {
+        // SAFETY: SFENCE.VMA is a fence, not a memory access — always
+        // safe to issue. The arms differ in scope only.
+        match scope {
+            FlushScope::All => {
+                // Whole-TLB flush: every leaf in every address space.
+                riscv::asm::sfence_vma_all();
+            }
+            FlushScope::Asid(asid) if va == 0 => {
+                // Whole-ASID flush — drop every leaf for this process.
+                crate::kernel::tlb::flush_asid(asid as usize);
+            }
+            FlushScope::Asid(asid) => {
+                // Single page in one ASID. Both operands are non-zero
+                // (a live ASID is never 0 and `va != 0` here), so the
+                // crate's register-form helper encodes the right scope.
+                riscv::asm::sfence_vma(asid as usize, va as usize);
+            }
         }
     });
 }
