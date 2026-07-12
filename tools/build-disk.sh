@@ -60,9 +60,13 @@ cp umode/target/riscv64gc-unknown-none-elf/release/umode rootfs/bin/smoke
 
 # §13e std-on-orbit binary. Requires the `orbit-stage1` rustup toolchain
 # linked from rust/build/x86_64-unknown-linux-gnu/stage1 (see CLAUDE.md
-# under "Building Orbit's std"). Skip-with-warning if absent so a
-# fresh checkout without the rust fork built can still run ./smoke.
-if rustup toolchain list 2>/dev/null | grep -q '^orbit-stage1\b'; then
+# under "Building Orbit's std") AND the rust fork checkout in this tree
+# (hello-std's [patch.crates-io] libc points at rust/library/libc, so a
+# globally-linked toolchain isn't enough on its own). Skip-with-warning
+# if either is absent so a fresh checkout can still boot: the prebuilt
+# copies tracked in rootfs/bin/ stay in place and land in disk.img.
+if rustup toolchain list 2>/dev/null | grep -q '^orbit-stage1\b' \
+   && [ -d "$ROOT/rust/library/libc" ]; then
     note "building hello-std (+orbit-stage1, release) → /bin/hello-std"
     ( cd hello-std && cargo +orbit-stage1 build --release >/dev/null )
     cp hello-std/target/riscv64gc-unknown-orbit/release/hello-std rootfs/bin/hello-std
@@ -83,8 +87,7 @@ if rustup toolchain list 2>/dev/null | grep -q '^orbit-stage1\b'; then
     ( cd orbit-metricd && cargo +orbit-stage1 build --release >/dev/null )
     cp orbit-metricd/target/riscv64gc-unknown-orbit/release/orbit-metricd rootfs/bin/orbit-metricd
 else
-    rm -f rootfs/bin/hello-std rootfs/bin/hello-fb-std rootfs/bin/hello-ratatui-std rootfs/bin/orbit-top-std rootfs/bin/orbit-metricd
-    printf 'warn: orbit-stage1 toolchain not linked; skipping /bin/hello-std, /bin/hello-fb-std, /bin/hello-ratatui-std, /bin/orbit-top-std, and /bin/orbit-metricd\n' >&2
+    printf 'warn: orbit-stage1 toolchain or rust/ fork checkout missing; staging prebuilt rootfs/bin std binaries as-is (hello-fb-std, hello-ratatui-std, orbit-top-std, orbit-metricd; hello-std only if previously built)\n' >&2
 fi
 
 # eza — modern `ls` replacement, out-of-tree at ../eza. Built against
