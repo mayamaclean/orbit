@@ -6,6 +6,8 @@ extern crate alloc;
 #[cfg(feature = "alloc")]
 pub mod frame;
 
+// From the `buddy_system_allocator` crate (MIT, Copyright 2019-2020 Jiajie
+// Chen) — see THIRD_PARTY_NOTICES.md at the repo root.
 pub const fn prev_power_of_two(num: usize) -> usize {
     1 << (usize::BITS as usize - num.leading_zeros() as usize - 1)
 }

@@ -23,6 +23,22 @@ import sys
 from pathlib import Path
 
 
+def parse_attribution(text: str) -> list[str]:
+    """Return the BDF's COPYRIGHT and NOTICE property values, if present.
+
+    These carry the font's license attribution (e.g. Terminus ships
+    'Copyright (C) 2020 Dimitar Toshkov Zhekov' + the OFL notice), which
+    must survive into the generated Rust so the embedded glyphs stay
+    attributed. See THIRD_PARTY_NOTICES.md at the repo root.
+    """
+    lines = []
+    for key in ("COPYRIGHT", "NOTICE"):
+        m = re.search(rf'^{key}\s+"(.*)"\s*$', text, re.MULTILINE)
+        if m:
+            lines.append(m.group(1))
+    return lines
+
+
 def parse_bdf(text: str, expected_height: int):
     """Return a dict of {codepoint: [row0, row1, ...]} for cp < 256."""
     glyphs: dict[int, list[int]] = {}
@@ -70,10 +86,16 @@ def emit_rust(
     bdf_path: Path,
     name: str,
     height: int,
+    attribution: list[str],
 ) -> None:
     with out_path.open("w") as f:
-        f.write(f"// Generated from {bdf_path.name} by tools/bdf_to_rust.py\n")
+        f.write(f"// Generated from {bdf_path.name} by kmain/tools/bdf_to_rust.py\n")
         f.write("// Do not hand-edit — regenerate if you swap fonts.\n")
+        if attribution:
+            f.write("//\n")
+            for line in attribution:
+                f.write(f"// {line}\n")
+            f.write("// Full license text in THIRD_PARTY_NOTICES.md at the repo root.\n")
         f.write("//\n")
         f.write("// Each glyph is MSB-first: row byte bit 7 = leftmost pixel.\n")
         f.write("// Missing codepoints in 0..256 render as blank.\n\n")
@@ -109,8 +131,11 @@ def main() -> None:
 
     text = args.input.read_text()
     glyphs = parse_bdf(text, args.height)
+    attribution = parse_attribution(text)
     print(f"extracted {len(glyphs)} glyphs in U+0000..U+00FF", file=sys.stderr)
-    emit_rust(glyphs, args.output, args.input, args.name, args.height)
+    if not attribution:
+        print("warning: no COPYRIGHT/NOTICE properties in BDF", file=sys.stderr)
+    emit_rust(glyphs, args.output, args.input, args.name, args.height, attribution)
 
 
 if __name__ == "__main__":

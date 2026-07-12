@@ -1,5 +1,9 @@
-// Generated from ter-u16n.bdf by tools/bdf_to_rust.py
+// Generated from ter-u16n.bdf by kmain/tools/bdf_to_rust.py
 // Do not hand-edit — regenerate if you swap fonts.
+//
+// Copyright (C) 2020 Dimitar Toshkov Zhekov
+// Licensed under the SIL Open Font License, Version 1.1
+// Full license text in THIRD_PARTY_NOTICES.md at the repo root.
 //
 // Each glyph is MSB-first: row byte bit 7 = leftmost pixel.
 // Missing codepoints in 0..256 render as blank.

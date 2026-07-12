@@ -1,3 +1,12 @@
+// Adapted from the `buddy_system_allocator` crate's FrameAllocator (~v0.11):
+// https://github.com/rcore-os/buddy_system_allocator
+// Copyright 2019-2020 Jiajie Chen. MIT license — full text in
+// THIRD_PARTY_NOTICES.md at the repo root.
+//
+// Orbit changes vs upstream: dropped LockedFrameAllocator and alloc_at,
+// const-fn new(), added allocated()/total() accounting, added host unit
+// tests.
+
 use super::prev_power_of_two;
 use core::alloc::Layout;
 use core::cmp::{max, min};
