@@ -8,6 +8,8 @@ bootloader ([bl/](bl/)), a fully relocatable PIE S-mode kernel
 kernel development, LLM-assisted development, rustc internals, permissions,
 project organization, and anything else that I'm feeling interested in.
 
+![Orbit booting under QEMU](docs/images/otop.png)
+
 Highlights:
 
 - **SMP** with a greedy, unpinned scheduler — every hart contends for the
